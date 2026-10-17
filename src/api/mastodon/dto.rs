@@ -530,7 +530,7 @@ fn media_meta_json(media: &MediaAttachment) -> Value {
     if let (Some(width), Some(height)) = (media.width, media.height) {
         original.insert("width".into(), json!(width));
         original.insert("height".into(), json!(height));
-        original.insert("size".into(), json!("{width}x{height}"));
+        original.insert("size".into(), json!(format!("{width}x{height}")));
         if height > 0 {
             original.insert("aspect".into(), json!(width as f64 / height as f64));
         }
@@ -555,7 +555,7 @@ fn media_meta_json(media: &MediaAttachment) -> Value {
         let mut small = Map::new();
         small.insert("width".into(), json!(width));
         small.insert("height".into(), json!(height));
-        small.insert("size".into(), json!("{width}x{height}"));
+        small.insert("size".into(), json!(format!("{width}x{height}")));
         if height > 0 {
             small.insert("aspect".into(), json!(width as f64 / height as f64));
         }

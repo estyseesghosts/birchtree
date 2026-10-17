@@ -115,6 +115,11 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 | GET | `/api/v1/timelines/tag` | optional | read | planned (Phase 4) | In | |
 | GET | `/api/v1/timelines/list` | user | read | planned (Phase 4) | In | |
 | GET | `/api/v1/timelines/link` | optional | read | planned (Phase 7) | In | |
+| GET | `/api/v1/media/:id` | user | write \| write:media | implemented (Phase 4) | In | 206 while unprocessed; 422 on processing failure (Mastodon's controller authorizes write on every action, `show` included) |
+| POST | `/api/v1/media` | user | write \| write:media | implemented (Phase 4) | In | media v1 (multipart, inline processing → 200) |
+| PUT | `/api/v1/media/:id` | user | write \| write:media | implemented (Phase 4) | In | description/focus/thumbnail; 206 while unprocessed |
+| DELETE | `/api/v1/media/:id` | user | write \| write:media | implemented (Phase 4) | In | 422 while attached to a status |
+| POST | `/api/v2/media` | user | write \| write:media | implemented (Phase 4) | In | media v2 (multipart; video/audio delayed → 202, images inline → 200) |
 | GET | `/api/v1/notifications` | user | read:notifications | implemented (Phase 4) | In | `limit` 20/max 40 with `limit_param` semantics (`limit=0` → empty page); `types[]`/`exclude_types[]` silently drop unknown values; `group_key` uses the `ungrouped-<id>` fallback (no server-side merging in the v1 profile) |
 | GET | `/api/v1/notifications/:id` | user | read:notifications | implemented (Phase 4) | In | 404 `{"error":"Record not found"}` for foreign/missing |
 | POST | `/api/v1/notifications/clear` | user | write \| write:notifications | implemented (Phase 4) | In | `200 {}` |
@@ -190,6 +195,5 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 - **No transcoding toolchain (no ffmpeg)**: animated GIF uploads keep the wire type `image` (Mastodon would produce `gifv` + mp4); video/audio keep their original bytes untouched; `meta.small`/`preview_url` exist only when an image preview was generated; duration/frame rate/bitrate stay `null` (MP4 `tkhd` dimensions are read when present).
 - **Blob keys are sharded by a per-upload random 16-hex name** (`{aa}/{bb}/{random16}/original.{ext}`), not the attachment id: bytes must be staged *before* the id-minting commit (`birchtree.md` §5), so the id cannot appear in its own key. The wire URLs are unaffected.
 - **The upload size cap equals the multipart body limit** (`ApiState` carries no `Config`); `Config::validate` enforces `max_file_size ≤ max_body_size`, so the effective cap matches the default 16 MB. The 422 message formats the cap like Rails `number_to_human_size` ("16 MB", "1 KB", …).
-- **`meta.original.size` currently renders the literal string `{width}x{height}`** — a pre-existing `dto.rs` bug outside the media slice's file set; flagged for the Phase 4 integration pass.
 - **A non-numeric `focus` param answers `422 Validation failed: Focus is invalid`** instead of Ruby's `Float()` coercion to `0.0`; a blank focus is ignored (upload) or clears the point (update).
 - **An image upload carrying a thumbnail answers "Thumbnail must be blank"** before the thumbnail's own content-type/size checks (Mastodon's model validates the thumbnail's content type first); the pinned messages are otherwise exact.

@@ -240,14 +240,11 @@ async fn v1_png_upload_is_processed_and_served() {
     assert!(attachment["text_url"].is_null());
     assert!(attachment["blurhash"].as_str().is_some_and(|s| !s.is_empty()));
 
-    // meta.original carries the decoded dimensions. (NOTE: the `size` field
-    // is currently rendered as the literal "{width}x{height}" by
-    // `dto::media_meta_json` — a pre-existing bug in the shared dto.rs that
-    // the media slice is not allowed to touch; it is asserted below only to
-    // document the deviation until dto.rs is fixed.)
+    // meta.original carries the decoded dimensions and the "WxH" size
+    // string (Rails `image_geometry` shape).
     assert_eq!(attachment["meta"]["original"]["width"], 3);
     assert_eq!(attachment["meta"]["original"]["height"], 2);
-    assert_eq!(attachment["meta"]["original"]["size"], "{width}x{height}");
+    assert_eq!(attachment["meta"]["original"]["size"], "3x2");
     assert_eq!(attachment["meta"]["original"]["aspect"], 1.5);
     assert!(attachment["meta"]["small"].is_object());
 
