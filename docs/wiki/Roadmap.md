@@ -1,0 +1,17 @@
+# Roadmap
+
+Per `birchtree.md` §9, Phases 0–8.
+
+| Phase | Focus | Status |
+|---|---|---|
+| 0 | Freeze source contracts; initialize crate | in progress |
+| 1 | Runtime, `redb`, IDs, configuration, CLI bootstrap | planned |
+| 2 | OAuth, registration, exact read APIs | planned |
+| 3 | Local statuses, relationships, interaction semantics | planned |
+| 4 | Media, timelines, notifications, client usability | planned |
+| 5 | Streaming (SSE + WebSocket) | planned |
+| 6 | ActivityPub federation | planned |
+| 7 | Broader 4.7.3 public API parity | planned |
+| 8 | Performance qualification; optional materialized feeds | planned |
+
+Non-goals: PostgreSQL/Redis/separate broker; multi-node mode; full web UI/admin dashboard; React/Electron client.

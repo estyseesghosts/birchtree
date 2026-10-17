@@ -1,0 +1,17 @@
+# Feature matrix
+
+Status: planned (filled in as phases exit).
+
+| Feature | Mastodon 4.7.3 | birchtree | Status |
+|---|---|---|---|
+| Account registration + OAuth (auth-code, PKCE S256, client-credentials) | yes | — | planned |
+| Statuses: create/read/edit/delete, source, context, history | yes | — | planned |
+| Visibility: public/unlisted/private/direct | yes | — | planned |
+| Quotes: state machine, policy, revocation | yes | — | planned |
+| Relationships: follow/block/mute/favourite/bookmark | yes | — | planned |
+| Polls, media v1/v2, lists, filters, search | yes | — | planned |
+| Timelines: home/public/local/hashtag/list | yes | — | planned |
+| Notifications: read/clear/dismiss | yes | — | planned |
+| Streaming: SSE + WebSocket | yes | — | planned |
+| Federation: WebFinger, inbox, signed delivery, activities | yes | — | planned |
+| `redb` single-node storage | n/a (Mastodon uses PostgreSQL+Redis) | — | planned |

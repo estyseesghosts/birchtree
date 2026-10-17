@@ -1,0 +1,37 @@
+# docs/compatibility-profile.md
+
+Status: Draft
+
+Versioned API compatibility profile for the birchtree server, per `birchtree.md` §1 and §6.1.
+
+## Target release
+
+Mastodon **4.7.3** (API v7), commit `8ff11c2b`. The pinned tag and its changelog are the compatibility authority; `main`/unversioned docs are used only to detect later changes, never to silently change the target.
+
+## Declared scope (Phase 0/1 baseline)
+
+- **Local usable:** clients can register/authenticate, post/read/edit/delete, follow, interact, upload media, receive correct timelines/notifications — on a single server instance.
+- **Federating:** not claimed in Phase 0/1. Two-server interop is a Phase 6 milestone.
+- **Declared API compatibility:** not claimed by default. Every endpoint in the chosen public profile must have a passing contract test or a documented intentional exclusion before compatibility is advertised (Phase 7 exit gate).
+
+## Exclusions (explicit, not implied gaps)
+
+- Admin API, moderation dashboard, and full Mastodon web UI: explicitly out of scope until separately scoped.
+- PostgreSQL, Redis, external broker: non-goals (`birchtree.md` §9).
+- Multi-node / cluster mode: non-goal for the initial implementation.
+- Full administrative compatibility in the public-client milestone; operator controls still required (CLI bootstrap, registration policy).
+- React/Electron/separate client app/full frontend: non-goal. Minimal server-rendered login/consent only.
+
+## Open decisions (to resolve in Phase 0, per `birchtree.md` §9)
+
+- Supported signup/verification modes; local-only or closed-registration default.
+- Exact target clients for client smoke tests.
+- Whether push notifications and collections are in the declared profile.
+- Policy for search indexing without Elasticsearch.
+- Maximum status/media limits.
+- Whether public web/ActivityPub object routes are part of the first federation milestone.
+- Latency/resource acceptance thresholds.
+
+## Reporting rule
+
+Never report full v4.7.3 compatibility by default. Report exact scope: local only, federation subset, or declared public API. Remaining exclusions must be published and obvious.
