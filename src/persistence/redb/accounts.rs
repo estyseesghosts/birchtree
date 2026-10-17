@@ -1,6 +1,8 @@
 //! Account and local-credential persistence.
 
-use redb::{ReadableDatabase, ReadableTable};
+use std::collections::HashMap;
+
+use redb::ReadableTable;
 
 use crate::application::ports::{
     AccountProfileUpdate, AccountStore, NewLocalAccount, UserSettingsUpdate,
@@ -11,7 +13,7 @@ use super::schema::{ACCOUNTS, HANDLE_INDEX, LOCAL_USERS};
 use super::{decode, encode, RedbStore, StoreResult};
 
 fn read_account(store: &RedbStore, id: Id) -> StoreResult<Option<Account>> {
-    let read = store.db().begin_read()?;
+    let read = store.begin_read()?;
     let table = read.open_table(ACCOUNTS)?;
     match table.get(id.value())? {
         Some(guard) => Ok(Some(decode(guard.value())?)),
@@ -20,7 +22,7 @@ fn read_account(store: &RedbStore, id: Id) -> StoreResult<Option<Account>> {
 }
 
 fn read_local_user(store: &RedbStore, account_id: Id) -> StoreResult<Option<LocalUser>> {
-    let read = store.db().begin_read()?;
+    let read = store.begin_read()?;
     let table = read.open_table(LOCAL_USERS)?;
     match table.get(account_id.value())? {
         Some(guard) => Ok(Some(decode(guard.value())?)),
@@ -34,7 +36,7 @@ impl AccountStore for RedbStore {
 
         // Single writer: concurrent creates serialize here and the handle check
         // inside the transaction is authoritative.
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
 
         {
             let handles = write.open_table(HANDLE_INDEX)?;
@@ -134,7 +136,7 @@ impl AccountStore for RedbStore {
         domain: &str,
     ) -> Result<Option<Account>> {
         let key = crate::domain::account::handle_key(normalized_username, domain);
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         let id = {
             let handles = read.open_table(HANDLE_INDEX)?;
             match handles.get(key.as_str())? {
@@ -167,9 +169,27 @@ impl AccountStore for RedbStore {
 
     fn account_count(&self) -> Result<u64> {
         use redb::ReadableTableMetadata;
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         let accounts = read.open_table(ACCOUNTS)?;
         Ok(accounts.len()?)
+    }
+
+    fn accounts_by_ids(&self, ids: &[Id]) -> Result<HashMap<Id, Account>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let read = self.begin_read()?;
+        let accounts = read.open_table(ACCOUNTS)?;
+        let mut out: HashMap<Id, Account> = HashMap::with_capacity(ids.len());
+        for id in ids {
+            if out.contains_key(id) {
+                continue;
+            }
+            if let Some(guard) = accounts.get(id.value())? {
+                out.insert(*id, decode(guard.value())?);
+            }
+        }
+        Ok(out)
     }
 
     fn update_account_profile(
@@ -177,7 +197,7 @@ impl AccountStore for RedbStore {
         account_id: Id,
         update: AccountProfileUpdate,
     ) -> Result<Account> {
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         let mut account: Account = {
             let accounts = write.open_table(ACCOUNTS)?;
             match accounts.get(account_id.value())? {
@@ -209,7 +229,7 @@ impl AccountStore for RedbStore {
         account_id: Id,
         update: UserSettingsUpdate,
     ) -> Result<LocalUser> {
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         let mut user: LocalUser = {
             let users = write.open_table(LOCAL_USERS)?;
             match users.get(account_id.value())? {

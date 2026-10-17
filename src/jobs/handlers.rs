@@ -6,12 +6,17 @@
 //! remaining kinds become reachable as their phases land.
 
 use crate::application::crypto;
-use crate::application::ports::{MailSender, Store};
+use crate::application::ports::{BlobStore, MailSender, Store};
 use crate::application::notifications;
 use crate::domain::{Error, Id, Job, JobKind, NotificationType, Result};
 
 /// Execute a claimed job.
-pub fn handle(job: &Job, store: &dyn Store, mailer: &dyn MailSender) -> Result<()> {
+pub fn handle(
+    job: &Job,
+    store: &dyn Store,
+    mailer: &dyn MailSender,
+    blobs: &dyn BlobStore,
+) -> Result<()> {
     match job.kind {
         JobKind::UserCreated => {
             let account_id = job
@@ -56,9 +61,34 @@ pub fn handle(job: &Job, store: &dyn Store, mailer: &dyn MailSender) -> Result<(
             store.mark_poll_expired(poll_id, job.due_at_ms)?;
             Ok(())
         }
-        JobKind::ProcessMedia => Err(Error::Internal(
-            "process_media handler arrives in Phase 4".into(),
-        )),
+        JobKind::ProcessMedia => {
+            let media_id = job
+                .payload
+                .get("media_id")
+                .and_then(|v| v.as_u64())
+                .map(Id::new)
+                .ok_or_else(|| Error::Internal("process_media: missing media_id".into()))?;
+            crate::application::media::process_media_job(store, blobs, media_id, job.due_at_ms)
+        }
+        JobKind::PublishScheduledStatus => {
+            let scheduled_id = job
+                .payload
+                .get("scheduled_id")
+                .and_then(|v| v.as_u64())
+                .map(Id::new)
+                .ok_or_else(|| {
+                    Error::Internal("publish_scheduled_status: missing scheduled_id".into())
+                })?;
+            let base_url = job
+                .payload
+                .get("base_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            crate::application::scheduled_statuses::publish_scheduled_job(
+                store, scheduled_id, &base_url, job.due_at_ms,
+            )
+        }
         JobKind::DeliverActivity => Err(Error::Internal(
             "deliver_activity handler arrives in Phase 6".into(),
         )),

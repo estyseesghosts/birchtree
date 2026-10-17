@@ -11,6 +11,8 @@ pub mod quotes;
 pub mod relationships;
 pub mod timelines;
 pub mod notifications;
+pub mod markers;
+pub mod emoji;
 pub mod polls;
 pub mod media;
 pub mod search;

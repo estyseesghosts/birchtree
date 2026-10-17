@@ -9,13 +9,16 @@ use redb::{Database, ReadableDatabase};
 
 use super::schema::{
     self, ACCESS_TOKENS, ACCOUNTS, ACCOUNT_NOTES, ACCOUNT_STATS, AUTHORIZATION_CODES, BLOCKS,
-    BLOCKS_BY_BLOCKED, BOOKMARKS, BOOKMARKS_BY_STATUS, DOMAIN_BLOCKS, ENDORSEMENTS,
-    ENDORSEMENTS_BY_ENDORSED, FAVOURITES, FAVOURITES_BY_STATUS, FOLLOWS, FOLLOWS_BY_FOLLOWED,
-    HANDLE_INDEX, HASHTAG_INDEX, IDEMPOTENCY, JOBS, JOBS_INDEX, LOCAL_USERS, MEDIA, MEDIA_BY_OWNER,
-    MENTIONS_BY_ACCOUNT, META, MUTES, MUTES_BY_MUTED, NOTIFICATIONS, NOTIFICATIONS_BY_RECIPIENT,
-    NOTIFICATION_DEDUP, OAUTH_APPS, POLL_BY_STATUS, POLLS, POLL_VOTES, QUOTES, QUOTES_BY_QUOTED,
-    QUOTES_BY_QUOTING, REBLOGS_BY_ACCOUNT, SESSIONS, STATUSES, STATUS_AUTHOR_INDEX,
-    STATUS_PARENT_INDEX, STATUS_PINS, STATUS_REBLOG_INDEX, STATUS_VERSIONS,
+    BLOCKS_BY_BLOCKED, BOOKMARKS, BOOKMARKS_BY_STATUS, CUSTOM_EMOJI, DOMAIN_BLOCKS, ENDORSEMENTS,
+    ENDORSEMENTS_BY_ENDORSED, FAVOURITES, FAVOURITES_BY_STATUS, FILTERS, FILTER_KEYWORDS,
+    FILTER_KEYWORDS_BY_FILTER, FILTER_STATUSES, FILTER_STATUSES_BY_FILTER, FILTERS_BY_ACCOUNT,
+    FOLLOWS, FOLLOWS_BY_FOLLOWED, HANDLE_INDEX, HASHTAG_INDEX, IDEMPOTENCY, JOBS, JOBS_INDEX,
+    LISTS, LISTS_BY_ACCOUNT, LIST_MEMBERS, LOCAL_USERS, MARKERS, MEDIA, MEDIA_BY_OWNER,
+    MEMBERSHIPS_BY_ACCOUNT, MENTIONS_BY_ACCOUNT, META, MUTES, MUTES_BY_MUTED, NOTIFICATIONS,
+    NOTIFICATIONS_BY_RECIPIENT, NOTIFICATION_DEDUP, OAUTH_APPS, POLL_BY_STATUS, POLLS, POLL_VOTES,
+    QUOTES, QUOTES_BY_QUOTED, QUOTES_BY_QUOTING, REBLOGS_BY_ACCOUNT, SCHEDULED_BY_ACCOUNT,
+    SCHEDULED_STATUSES, SESSIONS, STATUSES, STATUS_AUTHOR_INDEX, STATUS_PARENT_INDEX,
+    STATUS_PINS, STATUS_REBLOG_INDEX, STATUS_VERSIONS, TIMELINE_LOCAL, TIMELINE_PUBLIC,
 };
 use super::StoreError;
 
@@ -119,6 +122,71 @@ pub fn apply(db: &Database) -> Result<u64, StoreError> {
             let _ = write.open_table(MEDIA_BY_OWNER)?;
             let _ = write.open_table(MENTIONS_BY_ACCOUNT)?;
             let _ = write.open_table(HASHTAG_INDEX)?;
+        }
+
+        // Step v4: timeline ranges, lists, markers, filters, scheduled
+        // statuses and custom emoji (Phase 4), plus a backfill of the
+        // timeline indexes from existing statuses.
+        if current < 4 {
+            let _ = write.open_table(TIMELINE_PUBLIC)?;
+            let _ = write.open_table(TIMELINE_LOCAL)?;
+            let _ = write.open_table(LISTS)?;
+            let _ = write.open_table(LISTS_BY_ACCOUNT)?;
+            let _ = write.open_table(LIST_MEMBERS)?;
+            let _ = write.open_table(MEMBERSHIPS_BY_ACCOUNT)?;
+            let _ = write.open_table(MARKERS)?;
+            let _ = write.open_table(FILTERS)?;
+            let _ = write.open_table(FILTERS_BY_ACCOUNT)?;
+            let _ = write.open_table(FILTER_KEYWORDS)?;
+            let _ = write.open_table(FILTER_KEYWORDS_BY_FILTER)?;
+            let _ = write.open_table(FILTER_STATUSES)?;
+            let _ = write.open_table(FILTER_STATUSES_BY_FILTER)?;
+            let _ = write.open_table(SCHEDULED_STATUSES)?;
+            let _ = write.open_table(SCHEDULED_BY_ACCOUNT)?;
+            let _ = write.open_table(CUSTOM_EMOJI)?;
+
+            // Backfill the timeline indexes. A status joins the public range
+            // when it is public and not deleted; it joins the local range
+            // when its author's account row says the account is local. The
+            // scan is bounded by the status count of the pre-v4 database
+            // (federation is Phase 6, so this is one node's worth of rows)
+            // and idempotent: re-inserting the same keys is a no-op.
+            use redb::{ReadableTable, ReadableTableMetadata};
+            use crate::domain::{Account, Status, Visibility};
+            let backfill: Vec<(u64, bool)> = {
+                let statuses = write.open_table(STATUSES)?;
+                let accounts = write.open_table(ACCOUNTS)?;
+                let status_count = statuses.len()? as usize;
+                let mut backfill: Vec<(u64, bool)> = Vec::new();
+                for entry in statuses.range(0u64..=u64::MAX)? {
+                    let (key, value) = entry?;
+                    let id = key.value();
+                    let status: Status = super::decode(value.value())?;
+                    if status.is_deleted() || status.visibility != Visibility::Public {
+                        continue;
+                    }
+                    let author_local = match accounts.get(status.account_id.value())? {
+                        Some(guard) => {
+                            let account: Account = super::decode(guard.value())?;
+                            account.local
+                        }
+                        None => false,
+                    };
+                    backfill.push((id, author_local));
+                    if backfill.len() >= status_count {
+                        break;
+                    }
+                }
+                backfill
+            };
+            let mut public = write.open_table(TIMELINE_PUBLIC)?;
+            let mut local = write.open_table(TIMELINE_LOCAL)?;
+            for (id, author_local) in backfill {
+                public.insert(schema::desc_id(id), ())?;
+                if author_local {
+                    local.insert(schema::desc_id(id), ())?;
+                }
+            }
         }
 
         {

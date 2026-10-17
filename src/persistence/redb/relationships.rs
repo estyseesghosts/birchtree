@@ -7,7 +7,9 @@
 //! (`birchtree.md` §5); the notification itself is fan-out work, created
 //! after commit by the `FanOutNotification` job.
 
-use redb::{ReadableDatabase, ReadableTable, WriteTransaction};
+use std::collections::HashMap;
+
+use redb::{ReadableTable, WriteTransaction};
 
 use crate::application::notifications::fan_out_payload;
 use crate::application::ports::{
@@ -120,7 +122,7 @@ impl RelationshipStore for RedbStore {
 
         // ONE transaction: row, reverse index, both sides' counters and the
         // notification job commit (or abort) together.
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         let key = schema::pair_key(follower_id.value(), followed_id.value());
         let existing = read_follow_txn(&write, key.as_slice())?;
         let old_state = existing.as_ref().map(|f| f.state);
@@ -211,7 +213,7 @@ impl RelationshipStore for RedbStore {
 
     fn unfollow(&self, follower_id: Id, followed_id: Id, now_ms: u64) -> Result<Option<Follow>> {
         let _ = now_ms; // Removal records no transition timestamp and no job.
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         let key = schema::pair_key(follower_id.value(), followed_id.value());
         let Some(existing) = read_follow_txn(&write, key.as_slice())? else {
             return Ok(None);
@@ -241,6 +243,9 @@ impl RelationshipStore for RedbStore {
         }
         // Mastodon destroys matching AccountPins with the follow.
         remove_endorsement_txn(&write, follower_id, followed_id)?;
+        // `list_accounts.follow_id` cascades on follow deletion upstream: the
+        // followed account leaves every list the follower owns.
+        super::lists::retain_membership_txn(&write, follower_id, followed_id)?;
         write_stats_txn(&write, follower_id, &follower_stats)?;
         write_stats_txn(&write, followed_id, &followed_stats)?;
         write.commit()?;
@@ -249,7 +254,7 @@ impl RelationshipStore for RedbStore {
 
     fn remove_follower(&self, account_id: Id, follower_id: Id, now_ms: u64) -> Result<Option<Follow>> {
         let _ = now_ms; // Removal records no transition timestamp and no job.
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         let key = schema::pair_key(follower_id.value(), account_id.value());
         let Some(existing) = read_follow_txn(&write, key.as_slice())? else {
             return Ok(None);
@@ -278,6 +283,9 @@ impl RelationshipStore for RedbStore {
         }
         // Destroying a follow destroys its matching endorsement.
         remove_endorsement_txn(&write, follower_id, account_id)?;
+        // `list_accounts.follow_id` cascades on follow deletion upstream: the
+        // removed follower's lists lose this member.
+        super::lists::retain_membership_txn(&write, follower_id, account_id)?;
         write_stats_txn(&write, account_id, &account_stats)?;
         write_stats_txn(&write, follower_id, &follower_stats)?;
         write.commit()?;
@@ -293,7 +301,7 @@ impl RelationshipStore for RedbStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         let lower = schema::pair_key(target_id.value(), 0);
         let upper = schema::pair_key(target_id.value(), u64::MAX);
 
@@ -344,7 +352,7 @@ impl RelationshipStore for RedbStore {
         follower_id: Id,
         now_ms: u64,
     ) -> Result<Follow> {
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         let key = schema::pair_key(follower_id.value(), target_id.value());
         let Some(mut follow) = read_follow_txn(&write, key.as_slice())? else {
             return Err(Error::NotFound("follow request".into()));
@@ -392,7 +400,7 @@ impl RelationshipStore for RedbStore {
         now_ms: u64,
     ) -> Result<Option<Follow>> {
         let _ = now_ms; // A dropped request schedules no job.
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         let key = schema::pair_key(follower_id.value(), target_id.value());
         let Some(existing) = read_follow_txn(&write, key.as_slice())? else {
             return Ok(None);
@@ -423,7 +431,7 @@ impl RelationshipStore for RedbStore {
         }
         // ONE transaction: both follows (with counters), both endorsements and
         // the block row commit together.
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         let block_key = schema::pair_key(account_id.value(), target_id.value());
         let existing: Option<Block> = {
             let blocks = write.open_table(BLOCKS)?;
@@ -479,6 +487,10 @@ impl RelationshipStore for RedbStore {
         // Blocking severs endorsements in both directions.
         remove_endorsement_txn(&write, account_id, target_id)?;
         remove_endorsement_txn(&write, target_id, account_id)?;
+        // Both follows die with the block, so list memberships that depended
+        // on them die too (Mastodon's `list_accounts.follow_id` cascade).
+        super::lists::retain_membership_txn(&write, account_id, target_id)?;
+        super::lists::retain_membership_txn(&write, target_id, account_id)?;
         write_stats_txn(&write, account_id, &account_stats)?;
         write_stats_txn(&write, target_id, &target_stats)?;
 
@@ -502,7 +514,7 @@ impl RelationshipStore for RedbStore {
 
     fn unblock(&self, account_id: Id, target_id: Id, now_ms: u64) -> Result<Option<Block>> {
         let _ = now_ms; // A dropped block records no timestamp.
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         let block_key = schema::pair_key(account_id.value(), target_id.value());
         let existing: Option<Block> = {
             let blocks = write.open_table(BLOCKS)?;
@@ -545,7 +557,7 @@ impl RelationshipStore for RedbStore {
             notify: hide_notifications,
             created_at_ms: now_ms,
         };
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         {
             let mut mutes = write.open_table(MUTES)?;
             mutes.insert(
@@ -563,7 +575,7 @@ impl RelationshipStore for RedbStore {
 
     fn unmute(&self, account_id: Id, target_id: Id, now_ms: u64) -> Result<Option<Mute>> {
         let _ = now_ms; // A dropped mute records no timestamp.
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         let key = schema::pair_key(account_id.value(), target_id.value());
         let existing: Option<Mute> = {
             let mutes = write.open_table(MUTES)?;
@@ -591,7 +603,7 @@ impl RelationshipStore for RedbStore {
         comment: &str,
         now_ms: u64,
     ) -> Result<Option<AccountNote>> {
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         let key = schema::pair_key(viewer_id.value(), target_id.value());
         if comment.is_empty() {
             // An empty comment clears the note (Mastodon deletes the row).
@@ -620,7 +632,7 @@ impl RelationshipStore for RedbStore {
         if domain.is_empty() {
             return Err(Error::InvalidInput("Domain cannot be blank".into()));
         }
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         let key = schema::domain_block_key(account_id.value(), domain);
         let existing: Option<DomainBlock> = {
             let blocks = write.open_table(DOMAIN_BLOCKS)?;
@@ -641,7 +653,7 @@ impl RelationshipStore for RedbStore {
     }
 
     fn unblock_domain(&self, account_id: Id, domain: &str) -> Result<Option<DomainBlock>> {
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         let key = schema::domain_block_key(account_id.value(), domain);
         let existing: Option<DomainBlock> = {
             let blocks = write.open_table(DOMAIN_BLOCKS)?;
@@ -667,7 +679,7 @@ impl RelationshipStore for RedbStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         let blocks = read.open_table(DOMAIN_BLOCKS)?;
         let prefix = schema::domain_block_key(account_id.value(), "");
         // Keys ascend by domain. A `max_domain` cursor starts strictly after
@@ -698,7 +710,7 @@ impl RelationshipStore for RedbStore {
     }
 
     fn endorse(&self, account_id: Id, target_id: Id, now_ms: u64) -> Result<Endorsement> {
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         let pair = schema::pair_key(account_id.value(), target_id.value());
 
         // Mastodon pins only accounts you actively follow.
@@ -737,7 +749,7 @@ impl RelationshipStore for RedbStore {
     }
 
     fn unendorse(&self, account_id: Id, target_id: Id) -> Result<Option<Endorsement>> {
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         let pair = schema::pair_key(account_id.value(), target_id.value());
         let existing: Option<Endorsement> = {
             let endorsements = write.open_table(ENDORSEMENTS)?;
@@ -755,7 +767,7 @@ impl RelationshipStore for RedbStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         let lower = schema::pair_key(account_id.value(), 0);
         let upper = schema::pair_key(account_id.value(), u64::MAX);
 
@@ -789,7 +801,7 @@ impl RelationshipStore for RedbStore {
         targets: &[(Id, String)],
         now_ms: u64,
     ) -> Result<Vec<Relationship>> {
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         let follows = read.open_table(FOLLOWS)?;
         let blocks = read.open_table(BLOCKS)?;
         let mutes = read.open_table(MUTES)?;
@@ -865,7 +877,7 @@ impl RelationshipStore for RedbStore {
     }
 
     fn pair_state(&self, a: Id, b: Id, now_ms: u64) -> Result<PairState> {
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         let blocks = read.open_table(BLOCKS)?;
         let follows = read.open_table(FOLLOWS)?;
         let mutes = read.open_table(MUTES)?;
@@ -891,7 +903,7 @@ impl RelationshipStore for RedbStore {
     }
 
     fn follow_of(&self, follower_id: Id, followed_id: Id) -> Result<Option<Follow>> {
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         let follows = read.open_table(FOLLOWS)?;
         Ok(json_at(
             &follows,
@@ -903,7 +915,7 @@ impl RelationshipStore for RedbStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         let lower = schema::pair_key(account_id.value(), 0);
         let upper = schema::pair_key(account_id.value(), u64::MAX);
 
@@ -921,6 +933,7 @@ impl RelationshipStore for RedbStore {
                     break;
                 }
             }
+            self.note_scanned(follower_ids.len());
         }
         follower_ids.reverse();
 
@@ -952,7 +965,7 @@ impl RelationshipStore for RedbStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         let lower = schema::pair_key(account_id.value(), 0);
         let upper = schema::pair_key(account_id.value(), u64::MAX);
 
@@ -971,6 +984,7 @@ impl RelationshipStore for RedbStore {
                     break;
                 }
             }
+            self.note_scanned(followed_ids.len());
         }
         followed_ids.reverse();
 
@@ -999,11 +1013,107 @@ impl RelationshipStore for RedbStore {
     }
 
     fn account_stats(&self, account_id: Id) -> Result<AccountStats> {
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         let stats = read.open_table(ACCOUNT_STATS)?;
         match stats.get(account_id.value())? {
             Some(guard) => Ok(decode(guard.value())?),
             None => Ok(AccountStats::default()),
         }
+    }
+
+    fn account_stats_by_ids(&self, ids: &[Id]) -> Result<HashMap<Id, AccountStats>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let read = self.begin_read()?;
+        let stats = read.open_table(ACCOUNT_STATS)?;
+        let mut out = HashMap::with_capacity(ids.len());
+        for id in ids {
+            if out.contains_key(id) {
+                continue;
+            }
+            let value = match stats.get(id.value())? {
+                Some(guard) => decode(guard.value())?,
+                None => AccountStats::default(),
+            };
+            out.insert(*id, value);
+        }
+        Ok(out)
+    }
+
+    fn batch_pair_states(
+        &self,
+        viewer: Id,
+        others: &[Id],
+        now_ms: u64,
+    ) -> Result<HashMap<Id, (PairState, PairState)>> {
+        if others.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // ONE read transaction: five relationship gets per `other`, instead of
+        // one transaction per pair.
+        let read = self.begin_read()?;
+        let blocks = read.open_table(BLOCKS)?;
+        let follows = read.open_table(FOLLOWS)?;
+        let mutes = read.open_table(MUTES)?;
+
+        let mut out = HashMap::with_capacity(others.len());
+        for other in others {
+            if out.contains_key(other) {
+                continue;
+            }
+            // pair_state(other, viewer): rows keyed (other, viewer) first, then
+            // the mirrored (viewer, other) rows for pair_state(viewer, other).
+            let other_blocks_viewer: Option<Block> = json_at(
+                &blocks,
+                schema::pair_key(other.value(), viewer.value()).as_slice(),
+            )?;
+            let viewer_blocks_other: Option<Block> = json_at(
+                &blocks,
+                schema::pair_key(viewer.value(), other.value()).as_slice(),
+            )?;
+            let other_follows_viewer: Option<Follow> = json_at(
+                &follows,
+                schema::pair_key(other.value(), viewer.value()).as_slice(),
+            )?;
+            let viewer_follows_other: Option<Follow> = json_at(
+                &follows,
+                schema::pair_key(viewer.value(), other.value()).as_slice(),
+            )?;
+            let other_mutes_viewer: Option<Mute> = json_at(
+                &mutes,
+                schema::pair_key(other.value(), viewer.value()).as_slice(),
+            )?;
+            let viewer_mutes_other: Option<Mute> = json_at(
+                &mutes,
+                schema::pair_key(viewer.value(), other.value()).as_slice(),
+            )?;
+
+            let active = |f: &Option<Follow>| f.as_ref().is_some_and(|f| f.state == FollowState::Active);
+            out.insert(
+                *other,
+                (
+                    PairState {
+                        blocking: other_blocks_viewer.is_some(),
+                        blocked_by: viewer_blocks_other.is_some(),
+                        following: active(&other_follows_viewer),
+                        followed_by: active(&viewer_follows_other),
+                        muting: other_mutes_viewer
+                            .as_ref()
+                            .is_some_and(|m| m.is_active_at(now_ms)),
+                    },
+                    PairState {
+                        blocking: viewer_blocks_other.is_some(),
+                        blocked_by: other_blocks_viewer.is_some(),
+                        following: active(&viewer_follows_other),
+                        followed_by: active(&other_follows_viewer),
+                        muting: viewer_mutes_other
+                            .as_ref()
+                            .is_some_and(|m| m.is_active_at(now_ms)),
+                    },
+                ),
+            );
+        }
+        Ok(out)
     }
 }

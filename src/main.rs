@@ -200,7 +200,13 @@ async fn shutdown_signal() {
 
 async fn serve(cfg: Config) {
     let (store, clock, ids) = build_store(&cfg);
-    let context = Arc::new(Context::new(clock.clone(), ids, store.clone()));
+    let blobs: Arc<dyn birchtree::application::ports::BlobStore> =
+        Arc::new(birchtree::media::blob_store::FsBlobStore::open(cfg.data_dir.join("media"))
+            .unwrap_or_else(|err| {
+                eprintln!("open blob store: {err}");
+                std::process::exit(1);
+            }));
+    let context = Arc::new(Context::new(clock.clone(), ids, store.clone(), blobs.clone()));
     let server = Arc::new(ServerInfo::from_config(&cfg));
     let state = ApiState {
         context,
@@ -230,6 +236,7 @@ async fn serve(cfg: Config) {
         store.clone(),
         clock.clone(),
         mailer,
+        blobs,
         cfg.worker_poll_interval,
         jobs::worker::DEFAULT_BATCH,
         shutdown_rx,

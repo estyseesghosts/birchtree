@@ -4,7 +4,9 @@
 //! a single-row update inside ONE transaction that also commits the ballot,
 //! its indexes and the vote-notification job (see `birchtree.md` §5).
 
-use redb::{ReadableDatabase, ReadableTable, WriteTransaction};
+use std::collections::HashMap;
+
+use redb::{ReadableTable, WriteTransaction};
 
 use crate::application::notifications::fan_out_payload;
 use crate::application::ports::{NewPollSpec, PollStore, VoteRejection};
@@ -94,7 +96,7 @@ pub(super) fn schedule_expiry_job(
 
 impl PollStore for RedbStore {
     fn poll_by_id(&self, id: Id) -> Result<Option<Poll>> {
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         let polls = read.open_table(POLLS)?;
         match polls.get(id.value())? {
             Some(guard) => Ok(Some(decode(guard.value())?)),
@@ -103,7 +105,7 @@ impl PollStore for RedbStore {
     }
 
     fn poll_by_status(&self, status_id: Id) -> Result<Option<Poll>> {
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         let poll_id = {
             let by_status = read.open_table(POLL_BY_STATUS)?;
             match by_status.get(status_id.value())? {
@@ -119,7 +121,7 @@ impl PollStore for RedbStore {
     }
 
     fn ballot(&self, poll_id: Id, account_id: Id) -> Result<Option<Vec<u64>>> {
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         let votes = read.open_table(POLL_VOTES)?;
         match votes.get(schema::pair_key(poll_id.value(), account_id.value()).as_slice())? {
             Some(guard) => {
@@ -130,6 +132,44 @@ impl PollStore for RedbStore {
         }
     }
 
+    fn polls_by_ids(&self, ids: &[Id]) -> Result<HashMap<Id, Poll>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let read = self.begin_read()?;
+        let polls = read.open_table(POLLS)?;
+        let mut out = HashMap::with_capacity(ids.len());
+        for id in ids {
+            if out.contains_key(id) {
+                continue;
+            }
+            if let Some(guard) = polls.get(id.value())? {
+                out.insert(*id, decode(guard.value())?);
+            }
+        }
+        Ok(out)
+    }
+
+    fn ballots(&self, poll_ids: &[Id], account_id: Id) -> Result<HashMap<Id, Vec<u64>>> {
+        if poll_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let read = self.begin_read()?;
+        let votes = read.open_table(POLL_VOTES)?;
+        let mut out = HashMap::with_capacity(poll_ids.len());
+        for poll_id in poll_ids {
+            if out.contains_key(poll_id) {
+                continue;
+            }
+            let key = schema::pair_key(poll_id.value(), account_id.value());
+            if let Some(guard) = votes.get(key.as_slice())? {
+                let vote: PollVote = decode(guard.value())?;
+                out.insert(*poll_id, vote.choices);
+            }
+        }
+        Ok(out)
+    }
+
     fn vote_poll(
         &self,
         poll_id: Id,
@@ -137,7 +177,7 @@ impl PollStore for RedbStore {
         choices: &[u64],
         now_ms: u64,
     ) -> std::result::Result<Poll, VoteRejection> {
-        let write = self.db().begin_write().map_err(vote_err)?;
+        let write = self.begin_write().map_err(vote_err)?;
 
         // One transaction: validation, tallies, ballot row and the
         // vote-notification job commit (or abort) together.
@@ -255,7 +295,7 @@ impl PollStore for RedbStore {
 
     fn mark_poll_expired(&self, poll_id: Id, now_ms: u64) -> Result<Option<Poll>> {
         let _ = now_ms; // The sticky flag records expiry; no timestamp column.
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         let mut poll = match read_poll_txn(&write, poll_id)? {
             Some(poll) => poll,
             // Idempotent: a replayed PollExpired job finds nothing to do.

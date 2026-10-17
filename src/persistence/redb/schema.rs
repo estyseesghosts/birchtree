@@ -170,11 +170,75 @@ pub const MENTIONS_BY_ACCOUNT: TableDefinition<&[u8], ()> =
 /// Hashtag index: `(tag_be || 0xFF || status_id_be)` -> status ID.
 pub const HASHTAG_INDEX: TableDefinition<&[u8], u64> = TableDefinition::new("hashtag_index");
 
+// ---------------------------------------------------------------------------
+// Phase 4 (schema v4): timelines, lists, markers, filters, scheduled
+// statuses, custom emoji.
+// ---------------------------------------------------------------------------
+
+/// Public timeline range: `desc(status_id)_be` -> () for `public`-visibility
+/// statuses (local and remote), so the public timeline is a forward scan in
+/// descending id order.
+pub const TIMELINE_PUBLIC: TableDefinition<u64, ()> = TableDefinition::new("timeline_public");
+
+/// Local timeline range: `desc(status_id)_be` -> () for public statuses
+/// authored by local accounts.
+pub const TIMELINE_LOCAL: TableDefinition<u64, ()> = TableDefinition::new("timeline_local");
+
+/// Lists by numeric list ID.
+pub const LISTS: TableDefinition<u64, &[u8]> = TableDefinition::new("lists");
+
+/// Lists owned by an account: `(account_id_be || desc(list_id)_be)` -> ().
+pub const LISTS_BY_ACCOUNT: TableDefinition<&[u8], ()> = TableDefinition::new("lists_by_account");
+
+/// List membership: `(list_id_be || member_id_be)` -> ().
+pub const LIST_MEMBERS: TableDefinition<&[u8], ()> = TableDefinition::new("list_members");
+
+/// Reverse membership index (unfollow/block cleanup): `(member_id_be ||
+/// list_id_be)` -> ().
+pub const MEMBERSHIPS_BY_ACCOUNT: TableDefinition<&[u8], ()> =
+    TableDefinition::new("memberships_by_account");
+
+/// Per-user timeline markers (home / notifications last-read ids):
+/// `(account_id_be || 0xFF || timeline)` -> JSON marker.
+pub const MARKERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("markers");
+
+/// Custom filters (filter v2 model) by numeric ID.
+pub const FILTERS: TableDefinition<u64, &[u8]> = TableDefinition::new("filters");
+
+/// Filters owned by an account: `(account_id_be || filter_id_be)` -> ().
+pub const FILTERS_BY_ACCOUNT: TableDefinition<&[u8], ()> = TableDefinition::new("filters_by_account");
+
+/// Filter keywords by numeric keyword ID.
+pub const FILTER_KEYWORDS: TableDefinition<u64, &[u8]> = TableDefinition::new("filter_keywords");
+
+/// Keywords of a filter: `(filter_id_be || keyword_id_be)` -> ().
+pub const FILTER_KEYWORDS_BY_FILTER: TableDefinition<&[u8], ()> =
+    TableDefinition::new("filter_keywords_by_filter");
+
+/// Filter status rules by numeric rule ID.
+pub const FILTER_STATUSES: TableDefinition<u64, &[u8]> = TableDefinition::new("filter_statuses");
+
+/// Status rules of a filter: `(filter_id_be || rule_id_be)` -> ().
+pub const FILTER_STATUSES_BY_FILTER: TableDefinition<&[u8], ()> =
+    TableDefinition::new("filter_statuses_by_filter");
+
+/// Scheduled statuses by numeric ID (params + attached media ids embedded).
+pub const SCHEDULED_STATUSES: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("scheduled_statuses");
+
+/// Scheduled statuses of an account: `(account_id_be || desc(id)_be)` -> ().
+pub const SCHEDULED_BY_ACCOUNT: TableDefinition<&[u8], ()> =
+    TableDefinition::new("scheduled_by_account");
+
+/// Custom emoji by shortcode (ordered, so the index endpoint lists them
+/// alphabetically).
+pub const CUSTOM_EMOJI: TableDefinition<&str, &[u8]> = TableDefinition::new("custom_emoji");
+
 /// Key under `META` holding the applied schema version (big-endian `u64`).
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// Current schema version. Bump with a new migration step.
-pub const SCHEMA_VERSION: u64 = 3;
+pub const SCHEMA_VERSION: u64 = 4;
 
 /// All table names, for diagnostics and migration verification.
 pub const TABLE_NAMES: &[&str] = &[

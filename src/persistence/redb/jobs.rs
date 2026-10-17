@@ -5,7 +5,7 @@
 //! means a job whose worker died mid-run becomes claimable again automatically
 //! once its lease elapses — no recovery scan required.
 
-use redb::{ReadableDatabase, ReadableTable, WriteTransaction};
+use redb::{ReadableTable, WriteTransaction};
 
 use crate::application::ports::JobQueue;
 use crate::domain::job::{backoff_ms, LEASE_MS};
@@ -65,7 +65,7 @@ fn add_index(write: &WriteTransaction, timestamp_ms: u64, id: Id) -> StoreResult
 impl RedbStore {
     /// All job records (diagnostics and tests).
     pub fn all_jobs(&self) -> Result<Vec<Job>> {
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         let table = read.open_table(JOBS)?;
         let mut out = Vec::new();
         for entry in table.iter()? {
@@ -79,7 +79,7 @@ impl RedbStore {
     /// Number of entries in the scheduling index (diagnostics and tests).
     pub fn schedule_index_len(&self) -> Result<u64> {
         use redb::ReadableTableMetadata;
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         let table = read.open_table(JOBS_INDEX)?;
         Ok(table.len()?)
     }
@@ -88,7 +88,21 @@ impl RedbStore {
 impl JobQueue for RedbStore {
     fn enqueue(&self, kind: JobKind, payload: serde_json::Value, now_ms: u64) -> Result<Job> {
         let job = Job::new(self.next_id(), kind, payload, now_ms, now_ms);
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
+        insert_job(&write, &job)?;
+        write.commit()?;
+        Ok(job)
+    }
+
+    fn enqueue_at(
+        &self,
+        kind: JobKind,
+        payload: serde_json::Value,
+        due_at_ms: u64,
+        now_ms: u64,
+    ) -> Result<Job> {
+        let job = Job::new(self.next_id(), kind, payload, due_at_ms, now_ms);
+        let write = self.begin_write()?;
         insert_job(&write, &job)?;
         write.commit()?;
         Ok(job)
@@ -98,7 +112,7 @@ impl JobQueue for RedbStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
 
         // Collect due (timestamp, id) pairs. The upper bound (now, u64::MAX)
         // covers every key with timestamp <= now.
@@ -144,7 +158,7 @@ impl JobQueue for RedbStore {
     }
 
     fn complete(&self, id: Id) -> Result<()> {
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         let Some(mut job) = read_job_txn(&write, id)? else {
             return Err(Error::NotFound(format!("job {id}")));
         };
@@ -157,7 +171,7 @@ impl JobQueue for RedbStore {
     }
 
     fn retry(&self, id: Id, error: &str, now_ms: u64) -> Result<Job> {
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         let Some(mut job) = read_job_txn(&write, id)? else {
             return Err(Error::NotFound(format!("job {id}")));
         };
@@ -178,7 +192,7 @@ impl JobQueue for RedbStore {
     }
 
     fn quarantine(&self, id: Id, error: &str) -> Result<()> {
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         let Some(mut job) = read_job_txn(&write, id)? else {
             return Err(Error::NotFound(format!("job {id}")));
         };
@@ -192,7 +206,7 @@ impl JobQueue for RedbStore {
     }
 
     fn get(&self, id: Id) -> Result<Option<Job>> {
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         let jobs = read.open_table(JOBS)?;
         match jobs.get(id.value())? {
             Some(guard) => Ok(Some(decode(guard.value())?)),

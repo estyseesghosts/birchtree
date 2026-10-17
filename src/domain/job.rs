@@ -30,8 +30,14 @@ pub enum JobKind {
     /// Mark a poll expired once its expiry elapses. Enqueued in the same
     /// transaction as the poll's status; the handler is idempotent.
     PollExpired,
-    /// Placeholder for the media-processing pipeline (Phase 4).
+    /// Finish processing an uploaded attachment whose bytes are already
+    /// staged (decode/preview/blurhash). Enqueued in the same transaction as
+    /// the attachment's metadata; the handler is idempotent.
     ProcessMedia,
+    /// Publish a due scheduled status: destroy the row and replay its params
+    /// through the normal status-creation use case. Enqueued in the same
+    /// transaction as the scheduled row; a replay after deletion is a no-op.
+    PublishScheduledStatus,
     /// Placeholder for outbound federation delivery (Phase 6).
     DeliverActivity,
 }
@@ -45,6 +51,7 @@ impl JobKind {
             JobKind::FanOutNotification => "fan_out_notification",
             JobKind::PollExpired => "poll_expired",
             JobKind::ProcessMedia => "process_media",
+            JobKind::PublishScheduledStatus => "publish_scheduled_status",
             JobKind::DeliverActivity => "deliver_activity",
         }
     }

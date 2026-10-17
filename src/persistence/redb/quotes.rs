@@ -5,7 +5,9 @@
 //! on the `QUOTES` row; the quoted status's `quotes_count` moves in the same
 //! transaction as the transition that changes it (see `birchtree.md` §5).
 
-use redb::{ReadableDatabase, ReadableTable, WriteTransaction};
+use std::collections::HashMap;
+
+use redb::{ReadableTable, WriteTransaction};
 
 use crate::application::ports::{NewQuoteSpec, QuoteStore};
 use crate::domain::{Error, Id, QuoteRecord, QuoteState, Result, Status};
@@ -78,7 +80,7 @@ pub(super) fn attach_quote_txn(
 
 impl QuoteStore for RedbStore {
     fn quote_by_quoting_status(&self, quoting_status_id: Id) -> Result<Option<QuoteRecord>> {
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         let quote_id = {
             let by_quoting = read.open_table(QUOTES_BY_QUOTING)?;
             match by_quoting.get(quoting_status_id.value())? {
@@ -93,6 +95,31 @@ impl QuoteStore for RedbStore {
         }
     }
 
+    fn quotes_by_quoting_ids(&self, ids: &[Id]) -> Result<HashMap<Id, QuoteRecord>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // ONE read transaction: one index get + one row get per quoting status.
+        let read = self.begin_read()?;
+        let by_quoting = read.open_table(QUOTES_BY_QUOTING)?;
+        let quotes = read.open_table(QUOTES)?;
+        let mut out = HashMap::with_capacity(ids.len());
+        for id in ids {
+            if out.contains_key(id) {
+                continue;
+            }
+            let Some(quote_guard) = by_quoting.get(id.value())? else {
+                continue;
+            };
+            let quote_id = Id::new(quote_guard.value());
+            let Some(record) = quotes.get(quote_id.value())? else {
+                continue;
+            };
+            out.insert(*id, decode(record.value())?);
+        }
+        Ok(out)
+    }
+
     fn quotes_of_status(
         &self,
         quoted_status_id: Id,
@@ -104,7 +131,7 @@ impl QuoteStore for RedbStore {
         }
         // The shared status reader accepts a write transaction, so this read
         // holds the writer lock for the (capped) scan; it never commits.
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         let lower = schema::pair_key(quoted_status_id.value(), 0);
         let upper = schema::pair_key(quoted_status_id.value(), u64::MAX);
 
@@ -160,7 +187,7 @@ impl QuoteStore for RedbStore {
         now_ms: u64,
     ) -> Result<QuoteRecord> {
         let _ = now_ms; // The state machine records no transition timestamp.
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         let lookup = schema::pair_key(quoted_status_id.value(), quoting_status_id.value());
         let quote_id = {
             let by_quoted = write.open_table(QUOTES_BY_QUOTED)?;

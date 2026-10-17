@@ -17,6 +17,9 @@ pub mod notification;
 pub mod poll;
 pub mod media;
 pub mod filter;
+pub mod marker;
+pub mod scheduled_status;
+pub mod custom_emoji;
 
 // Re-export commonly used domain types at the crate level.
 pub use error::{Error, Result};
@@ -34,5 +37,10 @@ pub use relationship::{
 pub use notification::{Notification, NotificationType};
 pub use poll::{Poll, PollOption, PollVote};
 pub use quote::{QuoteRecord, QuoteState};
-pub use media::{MediaAttachment, MediaState};
+pub use media::{FocusPoint, MediaAttachment, MediaState};
+pub use filter::{CustomFilter, FilterAction, FilterKeyword, FilterStatus};
+pub use list::{List, ListMembership, RepliesPolicy};
+pub use marker::Marker;
+pub use scheduled_status::ScheduledStatus;
+pub use custom_emoji::CustomEmoji;
 pub use idempotency::IdempotencyRecord;

@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use redb::{ReadableDatabase, ReadableTable, ReadTransaction, WriteTransaction};
+use redb::{ReadableTable, ReadTransaction, WriteTransaction};
 use serde::{Deserialize, Serialize};
 
 use crate::application::notifications::fan_out_payload;
@@ -261,7 +261,7 @@ impl StatusStore for RedbStore {
     fn create_status(&self, input: NewStatus, now_ms: u64) -> Result<CreatedStatus> {
         // ONE transaction: validation, rows, indexes, counters and follow-up
         // jobs all commit (or abort) together.
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
 
         // -- Idempotent replay: a fresh record short-circuits with no writes.
         let replay_id = if let Some(raw) = input.idempotency_key.as_deref() {
@@ -469,12 +469,12 @@ impl StatusStore for RedbStore {
     }
 
     fn status_by_id(&self, id: Id) -> Result<Option<Status>> {
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         Ok(status_at(&read, id)?)
     }
 
     fn statuses_by_ids(&self, ids: &[Id]) -> Result<Vec<Status>> {
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         let table = read.open_table(STATUSES)?;
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
@@ -497,7 +497,7 @@ impl StatusStore for RedbStore {
         update: StatusUpdate,
         now_ms: u64,
     ) -> Result<Option<Status>> {
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
 
         let mut status = read_status_txn(&write, id)?
             .filter(|s| !s.is_deleted() && s.account_id == account_id)
@@ -792,7 +792,7 @@ impl StatusStore for RedbStore {
     }
 
     fn delete_status(&self, id: Id, account_id: Id, now_ms: u64) -> Result<Status> {
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
 
         let snapshot = read_status_txn(&write, id)?
             .filter(|s| !s.is_deleted() && s.account_id == account_id)
@@ -887,7 +887,7 @@ impl StatusStore for RedbStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
 
         // Keys are `(parent || child)` ascending; collect (bounded), then take
         // the newest `limit` below the cursor.
@@ -903,6 +903,7 @@ impl StatusStore for RedbStore {
                     break;
                 }
             }
+            self.note_scanned(ids.len());
         }
         ids.sort_unstable_by(|a, b| b.cmp(a));
         let selected: Vec<Id> = ids
@@ -926,7 +927,7 @@ impl StatusStore for RedbStore {
     }
 
     fn status_versions(&self, status_id: Id) -> Result<Vec<StatusVersion>> {
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         let table = read.open_table(STATUS_VERSIONS)?;
         let lo = schema::pair_key(status_id.value(), 0);
         let hi = schema::pair_key(status_id.value(), u64::MAX);
@@ -947,7 +948,7 @@ impl StatusStore for RedbStore {
         if query.limit == 0 {
             return Ok(Vec::new());
         }
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
 
         if query.pinned_only {
             // Pin records first (pin order, newest pin first), then rows.
@@ -1038,6 +1039,7 @@ impl StatusStore for RedbStore {
                     break;
                 }
             }
+            self.note_scanned(scanned);
         }
         if want_oldest && matched.len() > query.limit {
             matched.drain(..matched.len() - query.limit);
@@ -1050,7 +1052,7 @@ impl StatusStore for RedbStore {
         viewer_id: Id,
         status_ids: &[Id],
     ) -> Result<HashMap<Id, StatusViewFlags>> {
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         let favourites = read.open_table(FAVOURITES)?;
         let bookmarks = read.open_table(BOOKMARKS)?;
         let reblogs = read.open_table(REBLOGS_BY_ACCOUNT)?;
@@ -1078,7 +1080,7 @@ impl StatusStore for RedbStore {
     }
 
     fn favourite_status(&self, account_id: Id, status_id: Id, now_ms: u64) -> Result<Status> {
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
 
         let mut status = read_status_txn(&write, status_id)?
             .filter(|s| !s.is_deleted())
@@ -1135,7 +1137,7 @@ impl StatusStore for RedbStore {
     }
 
     fn unfavourite_status(&self, account_id: Id, status_id: Id, _now_ms: u64) -> Result<Status> {
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
 
         let mut status = read_status_txn(&write, status_id)?
             .filter(|s| !s.is_deleted())
@@ -1170,7 +1172,7 @@ impl StatusStore for RedbStore {
     }
 
     fn bookmark_status(&self, account_id: Id, status_id: Id, now_ms: u64) -> Result<Status> {
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
 
         let status = read_status_txn(&write, status_id)?
             .filter(|s| !s.is_deleted())
@@ -1212,7 +1214,7 @@ impl StatusStore for RedbStore {
     }
 
     fn unbookmark_status(&self, account_id: Id, status_id: Id, _now_ms: u64) -> Result<Status> {
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
 
         let status = read_status_txn(&write, status_id)?
             .filter(|s| !s.is_deleted())
@@ -1249,7 +1251,7 @@ impl StatusStore for RedbStore {
         visibility: Visibility,
         now_ms: u64,
     ) -> Result<Status> {
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
 
         let mut target = read_status_txn(&write, status_id)?
             .filter(|s| !s.is_deleted())
@@ -1344,7 +1346,7 @@ impl StatusStore for RedbStore {
     }
 
     fn unreblog_status(&self, account_id: Id, status_id: Id, now_ms: u64) -> Result<Status> {
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
 
         let mut target = read_status_txn(&write, status_id)?
             .filter(|s| !s.is_deleted())
@@ -1392,7 +1394,7 @@ impl StatusStore for RedbStore {
     }
 
     fn pin_status(&self, account_id: Id, status_id: Id, now_ms: u64) -> Result<Status> {
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
 
         let status = read_status_txn(&write, status_id)?
             .filter(|s| !s.is_deleted())
@@ -1463,7 +1465,7 @@ impl StatusStore for RedbStore {
     }
 
     fn unpin_status(&self, account_id: Id, status_id: Id, _now_ms: u64) -> Result<Status> {
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
 
         let status = read_status_txn(&write, status_id)?
             .ok_or_else(|| Error::NotFound("status".to_string()))?;
@@ -1481,7 +1483,7 @@ impl StatusStore for RedbStore {
     }
 
     fn set_quote_policy(&self, status_id: Id, policy: QuotePolicy) -> Result<Status> {
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
 
         let mut status = read_status_txn(&write, status_id)?
             .filter(|s| !s.is_deleted())
@@ -1508,7 +1510,7 @@ impl StatusStore for RedbStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         let table = read.open_table(FAVOURITES_BY_STATUS)?;
 
         // `(status || favourite_id)` ascending → collect (bounded), reverse
@@ -1544,7 +1546,7 @@ impl StatusStore for RedbStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
 
         // `(status || reblog_id)` ascending → collect (bounded), reverse.
         let reblog_ids: Vec<Id> = {

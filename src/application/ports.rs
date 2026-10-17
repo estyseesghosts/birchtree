@@ -2,9 +2,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::domain::{
-    AccessToken, Account, AccountNote, AccountStats, AuthorizationCode, Block, DomainBlock,
-    Endorsement, Follow, Id, Job, JobKind, LocalUser, LoginSession, MediaAttachment, Mute,
-    Notification, NotificationType, OAuthApplication, Poll, QuotePolicy, QuoteRecord, Result,
+    AccessToken, Account, AccountNote, AccountStats, AuthorizationCode, Block, CustomEmoji,
+    CustomFilter, DomainBlock, Endorsement, FilterKeyword, FilterStatus, Follow, Id, Job, JobKind,
+    List, LocalUser, LoginSession, Marker, MediaAttachment, Mute, Notification, NotificationType,
+    OAuthApplication, Poll, QuotePolicy, QuoteRecord, RepliesPolicy, Result, ScheduledStatus,
     Status, StatusApplication, StatusVersion, Visibility,
 };
 
@@ -115,6 +116,10 @@ pub trait AccountStore: Send + Sync {
 
     fn account_count(&self) -> Result<u64>;
 
+    /// Accounts by id in ONE transaction (page loader; missing ids are
+    /// omitted). Duplicates in `ids` are read once.
+    fn accounts_by_ids(&self, ids: &[Id]) -> Result<HashMap<Id, Account>>;
+
     /// Apply a profile patch, returning the updated account.
     fn update_account_profile(
         &self,
@@ -164,12 +169,38 @@ pub trait MailSender: Send + Sync {
     fn send_confirmation(&self, to: &str, account_id: Id, token: &str) -> Result<()>;
 }
 
+/// Blob/object storage for media bytes and custom emoji images.
+///
+/// File storage cannot participate in a `redb` transaction: bytes are staged
+/// *before* the metadata row commits, and a failed commit leaves only a
+/// bounded orphan for cleanup (`birchtree.md` §5).
+pub trait BlobStore: Send + Sync {
+    /// Stage `bytes` under `key` (creates parents; overwrites).
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<()>;
+    /// Read a blob (`None` when missing).
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
+    /// Delete a blob (idempotent).
+    fn delete(&self, key: &str) -> Result<()>;
+    /// Whether a blob exists.
+    fn exists(&self, key: &str) -> Result<bool>;
+}
+
 /// Durable job queue.
 pub trait JobQueue: Send + Sync {
     fn enqueue(
         &self,
         kind: JobKind,
         payload: serde_json::Value,
+        now_ms: u64,
+    ) -> Result<Job>;
+
+    /// Enqueue a job that becomes claimable at `due_at_ms` (scheduled-status
+    /// publication, delayed retries).
+    fn enqueue_at(
+        &self,
+        kind: JobKind,
+        payload: serde_json::Value,
+        due_at_ms: u64,
         now_ms: u64,
     ) -> Result<Job>;
     /// Claim up to `limit` due jobs under a lease.
@@ -551,6 +582,24 @@ pub trait RelationshipStore: Send + Sync {
 
     /// Account counters (followers/following/statuses/last status/requests).
     fn account_stats(&self, account_id: Id) -> Result<AccountStats>;
+
+    /// Account counters for many accounts in ONE transaction (page loader).
+    fn account_stats_by_ids(&self, ids: &[Id]) -> Result<HashMap<Id, AccountStats>>;
+
+    /// Batched pairwise authorization facts in ONE transaction.
+    ///
+    /// For each `other` the entry is `(incoming, outgoing)` with
+    /// `incoming = pair_state(other, viewer)` (does `other` block/follow/mute
+    /// the viewer?) and `outgoing = pair_state(viewer, other)` (does the
+    /// viewer block/follow/mute `other`?). An entry exists for every `other`
+    /// (no relationship rows yield the default pair state), so callers can
+    /// index without existence checks.
+    fn batch_pair_states(
+        &self,
+        viewer: Id,
+        others: &[Id],
+        now_ms: u64,
+    ) -> Result<HashMap<Id, (PairState, PairState)>>;
 }
 
 /// Why a poll vote was rejected (mapped to Mastodon 422 messages by the use
@@ -570,6 +619,13 @@ pub trait PollStore: Send + Sync {
 
     /// The viewer's ballot on a poll, if any (for `voted`/`own_votes`).
     fn ballot(&self, poll_id: Id, account_id: Id) -> Result<Option<Vec<u64>>>;
+
+    /// Polls by id in ONE transaction (page loader; missing ids omitted).
+    fn polls_by_ids(&self, ids: &[Id]) -> Result<HashMap<Id, Poll>>;
+
+    /// The viewer's ballots for several polls in ONE transaction (page
+    /// loader); polls without a ballot are omitted.
+    fn ballots(&self, poll_ids: &[Id], account_id: Id) -> Result<HashMap<Id, Vec<u64>>>;
 
     /// Cast a ballot in ONE transaction: tallies, ballot row and the
     /// vote-notification job commit together. Mastodon semantics: any second
@@ -592,6 +648,10 @@ pub trait PollStore: Send + Sync {
 pub trait QuoteStore: Send + Sync {
     /// The quote authored by a quoting status, if any.
     fn quote_by_quoting_status(&self, quoting_status_id: Id) -> Result<Option<QuoteRecord>>;
+
+    /// Quote records keyed by quoting status id in ONE transaction (page
+    /// loader; statuses without a quote are omitted).
+    fn quotes_by_quoting_ids(&self, ids: &[Id]) -> Result<HashMap<Id, QuoteRecord>>;
 
     /// Accepted quotes of `quoted_status_id` with their quoting statuses,
     /// newest first (cursor = quoting status id).
@@ -628,6 +688,35 @@ pub trait NotificationStore: Send + Sync {
     /// status)` already exists; returns `None` on a dedup hit. Used by the
     /// `FanOutNotification` job handler, so job retries are harmless.
     fn create_notification(&self, input: NewNotification) -> Result<Option<Notification>>;
+
+    /// One page for the recipient, newest first; cursors exclusive
+    /// (`id < max_id`, `id > since_id`/`id > min_id`), bounded scan.
+    fn notifications_page(
+        &self,
+        recipient_id: Id,
+        limit: usize,
+        max_id: Option<Id>,
+        since_id: Option<Id>,
+        min_id: Option<Id>,
+    ) -> Result<Vec<Notification>>;
+
+    fn notification_by_id(&self, id: Id) -> Result<Option<Notification>>;
+
+    /// Delete one of the recipient's notifications; `false` when missing or
+    /// belonging to someone else.
+    fn delete_notification(&self, recipient_id: Id, id: Id) -> Result<bool>;
+
+    /// Delete every notification of the recipient.
+    fn clear_notifications(&self, recipient_id: Id) -> Result<()>;
+
+    /// Count notifications with `id > floor`, capped by `limit` (the
+    /// marker-based `unread_count`).
+    fn count_notifications_after(
+        &self,
+        recipient_id: Id,
+        floor: Option<Id>,
+        limit: u64,
+    ) -> Result<u64>;
 }
 
 /// Media attachment metadata (bytes/lifecycle are Phase 4).
@@ -639,6 +728,63 @@ pub struct NewMedia {
     pub description: String,
 }
 
+/// An uploaded attachment whose bytes are already staged in the blob store.
+///
+/// The store commits metadata + the `ProcessMedia` job in ONE transaction; the
+/// job finishes processing after commit (`birchtree.md` §5).
+#[derive(Debug, Clone)]
+pub struct NewMediaUpload {
+    pub account_id: Id,
+    /// Wire `type`: `image`/`video`/`audio`/`gifv`.
+    pub r#type: String,
+    pub mime_type: String,
+    pub description: String,
+    pub file_size: u64,
+    /// Blob key of the staged original.
+    pub file_key: String,
+    /// Cover image blob key (video/audio).
+    pub thumbnail_key: Option<String>,
+    /// Focus point (`focus` param).
+    pub focus: Option<crate::domain::FocusPoint>,
+    /// Delayed processing (v2 create for larger formats): the attachment stays
+    /// `Pending` until the `ProcessMedia` job completes.
+    pub delay: bool,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub duration_ms: Option<u64>,
+    pub frame_rate: Option<String>,
+    pub bitrate: Option<u64>,
+}
+
+/// Processing result committed by the `ProcessMedia` job (idempotent).
+#[derive(Debug, Clone)]
+pub struct MediaProcessingResult {
+    /// `Ready` (or `Failed` with `error`).
+    pub state: crate::domain::MediaState,
+    pub r#type: String,
+    pub blurhash: Option<String>,
+    /// Blob key of the generated `small` preview.
+    pub preview_key: Option<String>,
+    pub preview_width: Option<u32>,
+    pub preview_height: Option<u32>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub duration_ms: Option<u64>,
+    pub frame_rate: Option<String>,
+    pub bitrate: Option<u64>,
+    pub error: Option<String>,
+}
+
+/// Owner-scoped media patch (`PUT /api/v1/media/:id`).
+#[derive(Debug, Clone, Default)]
+pub struct MediaPatch {
+    pub description: Option<String>,
+    /// `Some(None)` clears the focus point; `None` leaves it unchanged.
+    pub focus: Option<Option<crate::domain::FocusPoint>>,
+    /// Replace the cover image blob key (`None` leaves it unchanged).
+    pub thumbnail_key: Option<Option<String>>,
+}
+
 pub trait MediaStore: Send + Sync {
     fn create_media(&self, input: NewMedia) -> Result<MediaAttachment>;
     /// The subset of `ids` owned by `owner_id` and unattached (or already
@@ -646,6 +792,323 @@ pub trait MediaStore: Send + Sync {
     fn attachable_media(&self, owner_id: Id, ids: &[Id], status_id: Option<Id>)
     -> Result<Vec<MediaAttachment>>;
     fn media_by_id(&self, id: Id) -> Result<Option<MediaAttachment>>;
+
+    /// Attachments by id in ONE transaction (page loader; missing ids omitted,
+    /// duplicates read once).
+    fn media_by_ids(&self, ids: &[Id]) -> Result<HashMap<Id, MediaAttachment>>;
+
+    /// Insert an uploaded attachment's metadata + `ProcessMedia` job in ONE
+    /// transaction.
+    fn create_media_upload(&self, input: NewMediaUpload, now_ms: u64) -> Result<MediaAttachment>;
+
+    /// The owner's media row (Mastodon `set_media_attachment`: only the
+    /// owner's own, not-yet-attached rows are addressable; others are `None`
+    /// → 404).
+    fn owner_media(&self, account_id: Id, id: Id) -> Result<Option<MediaAttachment>>;
+
+    /// Apply an owner-scoped patch (description/focus/thumbnail).
+    fn update_media(
+        &self,
+        account_id: Id,
+        id: Id,
+        patch: MediaPatch,
+        now_ms: u64,
+    ) -> Result<Option<MediaAttachment>>;
+
+    /// Delete an owner's unattached attachment (bytes are removed by the
+    /// caller after commit). `None` when missing/foreign; the use case
+    /// rejects attached rows with the Mastodon in-usage error.
+    fn delete_media(&self, account_id: Id, id: Id) -> Result<Option<MediaAttachment>>;
+
+    /// Commit a processing result (idempotent; `None` when the row is gone).
+    fn mark_media_processed(
+        &self,
+        id: Id,
+        result: MediaProcessingResult,
+        now_ms: u64,
+    ) -> Result<Option<MediaAttachment>>;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 ports: lists, markers, filters, scheduled statuses, custom emoji,
+// timeline scans. Same invariants as the Phase 3 ports: one `redb`
+// transaction per method, mutating methods commit record + indexes +
+// counters + bounded durable jobs atomically.
+// ---------------------------------------------------------------------------
+
+pub trait ListStore: Send + Sync {
+    /// Create a list for `account_id` (the use case enforces the per-account
+    /// limit and title rules).
+    fn create_list(&self, account_id: Id, title: &str, now_ms: u64) -> Result<List>;
+    fn list_by_id(&self, id: Id) -> Result<Option<List>>;
+    /// The owner's lists (index returns all; no pagination in v4.7.3).
+    fn lists_by_account(&self, account_id: Id) -> Result<Vec<List>>;
+    /// Patch a list the viewer owns; `None` when missing/foreign (404).
+    fn update_list(
+        &self,
+        account_id: Id,
+        id: Id,
+        title: Option<String>,
+        replies_policy: Option<RepliesPolicy>,
+        exclusive: Option<bool>,
+        now_ms: u64,
+    ) -> Result<Option<List>>;
+    /// Delete a list the viewer owns (and its memberships); `None` when
+    /// missing/foreign.
+    fn delete_list(&self, account_id: Id, id: Id) -> Result<bool>;
+
+    /// Add members (must follow, or have a pending request — enforced by the
+    /// use case). Idempotent: existing members are skipped; the returned ids
+    /// are the newly added ones.
+    fn add_list_members(&self, list_id: Id, account_ids: &[Id]) -> Result<Vec<Id>>;
+    /// Remove members (idempotent); returns the removed ids.
+    fn remove_list_members(&self, list_id: Id, account_ids: &[Id]) -> Result<Vec<Id>>;
+    /// Members of a list, newest first (cursor = member account id).
+    fn list_members(&self, list_id: Id, max_id: Option<Id>, limit: usize) -> Result<Vec<Id>>;
+    /// All members of a list (bounded), for the list timeline merge.
+    fn all_list_members(&self, list_id: Id, cap: usize) -> Result<Vec<Id>>;
+}
+
+/// Why a marker update was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerUpdateError {
+    /// Unknown or invalid timeline name.
+    InvalidTimeline,
+    /// `lock_version` did not match (Mastodon answers 409).
+    Stale,
+}
+
+pub trait MarkerStore: Send + Sync {
+    /// The account's markers for `timelines` (missing ones are omitted).
+    fn markers(&self, account_id: Id, timelines: &[&str]) -> Result<Vec<Marker>>;
+    /// Upsert a marker with optimistic locking: when `lock_version` is given
+    /// it must match the stored version, else `Stale`.
+    fn set_marker(
+        &self,
+        account_id: Id,
+        timeline: &str,
+        last_read_id: Id,
+        lock_version: Option<u64>,
+        now_ms: u64,
+    ) -> std::result::Result<Marker, MarkerUpdateError>;
+}
+
+/// A filter to create (v2 record; v1 create wraps exactly one keyword).
+#[derive(Debug, Clone)]
+pub struct NewFilter {
+    pub account_id: Id,
+    pub title: String,
+    pub context: Vec<String>,
+    pub expires_at_ms: Option<u64>,
+    pub action: crate::domain::FilterAction,
+    /// Initial keywords (`v2 keywords_attributes` or the v1 `phrase`).
+    pub keywords: Vec<(String, bool)>,
+}
+
+/// Field-level filter patch; `None` = unchanged.
+#[derive(Debug, Clone, Default)]
+pub struct FilterPatch {
+    pub title: Option<String>,
+    pub context: Option<Vec<String>>,
+    /// `Some(None)` clears the expiry.
+    pub expires_at_ms: Option<Option<u64>>,
+    pub action: Option<crate::domain::FilterAction>,
+    /// Replace keywords wholesale (`v2 keywords_attributes`): `(id, keyword,
+    /// whole_word, destroy)`.
+    pub keywords: Option<Vec<(Option<Id>, String, bool, bool)>>,
+}
+
+/// A filter with its rules, as every filter read returns it.
+#[derive(Debug, Clone)]
+pub struct FilterBundle {
+    pub filter: CustomFilter,
+    pub keywords: Vec<FilterKeyword>,
+    pub statuses: Vec<FilterStatus>,
+}
+
+pub trait FilterStore: Send + Sync {
+    fn create_filter(&self, input: NewFilter, now_ms: u64) -> Result<FilterBundle>;
+    fn filter_by_id(&self, id: Id) -> Result<Option<FilterBundle>>;
+    /// The account's filters (optionally narrowed to a context), bounded.
+    fn filters_by_account(&self, account_id: Id, context: Option<&str>)
+    -> Result<Vec<FilterBundle>>;
+    /// Patch an owned filter; `None` when missing/foreign.
+    fn update_filter(
+        &self,
+        account_id: Id,
+        id: Id,
+        patch: FilterPatch,
+        now_ms: u64,
+    ) -> Result<Option<FilterBundle>>;
+    fn delete_filter(&self, account_id: Id, id: Id) -> Result<bool>;
+
+    fn keyword_by_id(&self, id: Id) -> Result<Option<FilterKeyword>>;
+    /// Add a keyword to an owned filter (id = the v1 "filter" id).
+    fn create_keyword(
+        &self,
+        account_id: Id,
+        filter_id: Id,
+        keyword: &str,
+        whole_word: bool,
+        now_ms: u64,
+    ) -> Result<Option<FilterKeyword>>;
+    fn update_keyword(
+        &self,
+        account_id: Id,
+        id: Id,
+        keyword: Option<&str>,
+        whole_word: Option<bool>,
+        now_ms: u64,
+    ) -> Result<Option<FilterKeyword>>;
+    fn delete_keyword(&self, account_id: Id, id: Id) -> Result<Option<FilterKeyword>>;
+
+    fn filter_statuses(&self, filter_id: Id) -> Result<Vec<FilterStatus>>;
+    fn create_filter_status(
+        &self,
+        account_id: Id,
+        filter_id: Id,
+        status_id: Id,
+        now_ms: u64,
+    ) -> Result<Option<FilterStatus>>;
+    fn delete_filter_status(&self, account_id: Id, id: Id) -> Result<Option<FilterStatus>>;
+}
+
+/// A scheduled status to create in ONE transaction (record + indexes + the
+/// `PublishScheduledStatus` job).
+#[derive(Debug, Clone)]
+pub struct NewScheduledStatus {
+    pub account_id: Id,
+    pub scheduled_at_ms: u64,
+    pub media_ids: Vec<Id>,
+    pub params: serde_json::Value,
+    /// Public URL base, carried into the job payload so the publish handler
+    /// can replay the params through the normal creation use case.
+    pub base_url: String,
+}
+
+pub trait ScheduledStore: Send + Sync {
+    fn create_scheduled(&self, input: NewScheduledStatus, now_ms: u64) -> Result<ScheduledStatus>;
+    fn scheduled_by_id(&self, id: Id) -> Result<Option<ScheduledStatus>>;
+    /// The account's scheduled statuses, id-descending with cursors.
+    fn scheduled_by_account(
+        &self,
+        account_id: Id,
+        max_id: Option<Id>,
+        since_id: Option<Id>,
+        min_id: Option<Id>,
+        limit: usize,
+    ) -> Result<Vec<ScheduledStatus>>;
+    /// Reschedule (only `scheduled_at` is editable); `None` when
+    /// missing/foreign.
+    fn reschedule(
+        &self,
+        account_id: Id,
+        id: Id,
+        scheduled_at_ms: u64,
+        now_ms: u64,
+    ) -> Result<Option<ScheduledStatus>>;
+    /// Delete a scheduled status (publish job payload becomes a no-op).
+    fn delete_scheduled(&self, account_id: Id, id: Id) -> Result<bool>;
+    /// Rows due for publication at `now_ms` (bounded).
+    fn due_scheduled(&self, now_ms: u64, cap: usize) -> Result<Vec<ScheduledStatus>>;
+    /// `(total, today)` counts against Mastodon's 300/25 limits.
+    fn scheduled_counts(&self, account_id: Id, day_start_ms: u64, day_end_ms: u64)
+    -> Result<(usize, usize)>;
+}
+
+pub trait EmojiStore: Send + Sync {
+    /// Create or replace an emoji by shortcode (CLI-managed).
+    fn upsert_emoji(&self, emoji: CustomEmoji) -> Result<CustomEmoji>;
+    fn emoji_by_shortcode(&self, shortcode: &str) -> Result<Option<CustomEmoji>>;
+    fn delete_emoji(&self, shortcode: &str) -> Result<bool>;
+    /// Listed emoji (index endpoint; local + enabled + picker-visible),
+    /// shortcode order, bounded.
+    fn listed_emojis(&self, cap: usize) -> Result<Vec<CustomEmoji>>;
+    /// Emoji whose shortcode is in `shortcodes` (status/account payloads).
+    fn emojis_by_shortcodes(&self, shortcodes: &[String]) -> Result<Vec<CustomEmoji>>;
+}
+
+/// Bounded local search scans backing `GET /api/v2/search`.
+pub trait SearchStore: Send + Sync {
+    /// Accounts whose lowercase handle or display name contains `needle`
+    /// (bounded).
+    fn search_accounts(&self, needle: &str, cap: usize) -> Result<Vec<Account>>;
+
+    /// Distinct hashtags whose normalized name starts with `prefix`
+    /// (bounded; derived from the hashtag index).
+    fn search_tags(&self, prefix: &str, cap: usize) -> Result<Vec<String>>;
+
+    /// Recent statuses (optionally one author's), id-descending with
+    /// cursors, capped (bounded recent scan for text search).
+    fn recent_statuses(
+        &self,
+        account_id: Option<Id>,
+        max_id: Option<Id>,
+        min_id: Option<Id>,
+        cap: usize,
+    ) -> Result<Vec<Status>>;
+}
+
+/// Filters a candidate status through the *viewer's* perspective while a
+/// bounded timeline scan fills a page. Implemented in
+/// `application::timelines` (the policy stays in the application layer); the
+/// store only applies it inside its scan budget.
+pub trait TimelineFilter: Send + Sync {
+    fn include(&self, status: &Status) -> bool;
+}
+
+/// Cursor-bounded timeline query (limit is already endpoint-bounded).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TimelineQuery {
+    pub max_id: Option<Id>,
+    pub since_id: Option<Id>,
+    pub min_id: Option<Id>,
+    pub limit: usize,
+    /// `only_media` (public/tag timelines).
+    pub only_media: bool,
+    /// `local=true` (public/tag timelines).
+    pub local_only: bool,
+    /// `remote=true` (public/tag timelines).
+    pub remote_only: bool,
+}
+
+/// One page of a timeline plus the number of index entries the bounded scan
+/// walked (executed evidence for the no-unbounded-scan tests).
+#[derive(Debug, Clone, Default)]
+pub struct TimelinePage {
+    pub statuses: Vec<Status>,
+    pub scanned: usize,
+}
+
+pub trait TimelineStore: Send + Sync {
+    /// Public timeline: `public`-visibility statuses, newest first. Replies
+    /// (other-than-self) and reblogs are excluded unless the flags say
+    /// otherwise (tag timelines include both).
+    fn public_timeline(
+        &self,
+        query: TimelineQuery,
+        include_replies: bool,
+        include_reblogs: bool,
+        filter: &dyn TimelineFilter,
+    ) -> Result<TimelinePage>;
+
+    /// Hashtag timeline for an already-normalized tag.
+    fn hashtag_timeline(
+        &self,
+        tag: &str,
+        query: TimelineQuery,
+        filter: &dyn TimelineFilter,
+    ) -> Result<TimelinePage>;
+
+    /// Fan-out-on-read merge over `authors` (own + followed accounts for
+    /// home; list members for a list), newest first, with per-author and
+    /// total scan budgets.
+    fn authors_timeline(
+        &self,
+        authors: &[Id],
+        query: TimelineQuery,
+        filter: &dyn TimelineFilter,
+    ) -> Result<TimelinePage>;
 }
 
 /// Bundled persistence surface assembled into a `Context`.
@@ -664,6 +1127,13 @@ pub trait Store:
     + QuoteStore
     + NotificationStore
     + MediaStore
+    + ListStore
+    + MarkerStore
+    + FilterStore
+    + ScheduledStore
+    + EmojiStore
+    + TimelineStore
+    + SearchStore
 {
 }
 impl<T> Store for T where
@@ -678,6 +1148,13 @@ impl<T> Store for T where
         + QuoteStore
         + NotificationStore
         + MediaStore
+        + ListStore
+        + MarkerStore
+        + FilterStore
+        + ScheduledStore
+        + EmojiStore
+        + TimelineStore
+        + SearchStore
 {
 }
 

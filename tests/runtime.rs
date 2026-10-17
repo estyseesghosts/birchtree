@@ -18,7 +18,11 @@ fn app(max_body_size: usize) -> (tempfile::TempDir, axum::Router) {
     let clock: Arc<dyn birchtree::domain::Clock> = Arc::new(SystemClock);
     let ids: Arc<dyn birchtree::domain::IdGenerator> =
         Arc::new(TimestampIdGenerator::new(Box::new(SystemClock)));
-    let context = Arc::new(Context::new(clock, ids, store));
+    let blobs: Arc<birchtree::media::blob_store::FsBlobStore> = Arc::new(
+        birchtree::media::blob_store::FsBlobStore::open(dir.path().join("media"))
+            .expect("open blob store"),
+    );
+    let context = Arc::new(Context::new(clock, ids, store, blobs));
     let router = build_router(ApiState {
         context,
         trusted_proxies: Arc::new(Vec::new()),

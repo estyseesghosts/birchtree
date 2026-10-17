@@ -10,7 +10,6 @@ pub mod accounts;
 pub mod oauth;
 pub mod jobs;
 
-// Planned storage modules (Phase 3+); still empty stubs.
 pub mod statuses;
 pub mod relationships;
 pub mod quotes;
@@ -18,11 +17,22 @@ pub mod polls;
 pub mod media;
 pub mod notifications;
 
+// Phase 4 storage modules: timelines, lists, markers, filters, scheduled
+// statuses and custom emoji.
+pub mod timelines;
+pub mod lists;
+pub mod markers;
+pub mod filters;
+pub mod scheduled;
+pub mod emoji;
+pub mod search;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use redb::Database;
 use redb::ReadableDatabase;
+use redb::WriteTransaction;
 
 use crate::domain::{Clock, Id, IdGenerator};
 
@@ -91,6 +101,32 @@ pub(super) fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> StoreResul
     Ok(serde_json::from_slice(bytes)?)
 }
 
+/// Instrumentation counters (Phase 4: "measure DB transaction/query counts").
+///
+/// Every port method runs inside exactly one read or write transaction, so
+/// transaction counts are the query count at the port boundary: a page loader
+/// that issues one transaction per batched lookup instead of one per status
+/// shows up directly here. Range scans additionally report the number of index
+/// entries they walked through [`MetricsSnapshot::items_scanned`], which the
+/// bounded-scan tests assert against.
+#[derive(Debug, Default)]
+struct Metrics {
+    read_txns: std::sync::atomic::AtomicU64,
+    write_txns: std::sync::atomic::AtomicU64,
+    items_scanned: std::sync::atomic::AtomicU64,
+}
+
+/// A point-in-time copy of [`Metrics`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MetricsSnapshot {
+    /// Read transactions begun since the store opened.
+    pub read_txns: u64,
+    /// Write transactions begun since the store opened.
+    pub write_txns: u64,
+    /// Index entries walked by bounded range scans.
+    pub items_scanned: u64,
+}
+
 /// The process-wide storage handle.
 pub struct RedbStore {
     db: Arc<Database>,
@@ -99,6 +135,7 @@ pub struct RedbStore {
     #[allow(dead_code)]
     clock: Arc<dyn Clock>,
     ids: Arc<dyn IdGenerator>,
+    metrics: Metrics,
 }
 
 impl RedbStore {
@@ -122,7 +159,46 @@ impl RedbStore {
             path,
             clock,
             ids,
+            metrics: Metrics::default(),
         })
+    }
+
+    /// Counted read transaction: increments [`MetricsSnapshot::read_txns`].
+    pub(super) fn begin_read(&self) -> Result<redb::ReadTransaction, redb::TransactionError> {
+        self.metrics
+            .read_txns
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.db.begin_read()
+    }
+
+    /// Counted write transaction: increments [`MetricsSnapshot::write_txns`].
+    pub(super) fn begin_write(&self) -> Result<WriteTransaction, redb::TransactionError> {
+        self.metrics
+            .write_txns
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.db.begin_write()
+    }
+
+    /// Record `n` index entries walked by a range scan.
+    pub(super) fn note_scanned(&self, n: usize) {
+        self.metrics
+            .items_scanned
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Current counter values (tests measure deltas around a workload).
+    pub fn metrics(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            read_txns: self.metrics.read_txns.load(std::sync::atomic::Ordering::Relaxed),
+            write_txns: self
+                .metrics
+                .write_txns
+                .load(std::sync::atomic::Ordering::Relaxed),
+            items_scanned: self
+                .metrics
+                .items_scanned
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
     }
 
     /// Filesystem path of the underlying database, for diagnostics.
@@ -130,11 +206,7 @@ impl RedbStore {
         &self.path
     }
 
-    pub(super) fn db(&self) -> &Database {
-        &self.db
-    }
-
-    #[allow(dead_code)]
+    /// Milliseconds since the Unix epoch from the assembled clock.
     pub(super) fn now_ms(&self) -> u64 {
         self.clock.now_ms()
     }

@@ -68,6 +68,7 @@ pub fn mk_account(store: &RedbStore, username: &str) -> Account {
 pub struct TestServer {
     pub dir: tempfile::TempDir,
     pub store: Arc<RedbStore>,
+    pub blobs: Arc<birchtree::media::blob_store::FsBlobStore>,
     pub router: axum::Router,
 }
 
@@ -83,7 +84,11 @@ impl TestServer {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let ids: Arc<dyn IdGenerator> =
             Arc::new(TimestampIdGenerator::new(Box::new(SystemClock)));
-        let context = Arc::new(Context::new(clock, ids, store.clone()));
+        let blobs: Arc<birchtree::media::blob_store::FsBlobStore> = Arc::new(
+            birchtree::media::blob_store::FsBlobStore::open(dir.path().join("media"))
+                .expect("open blob store"),
+        );
+        let context = Arc::new(Context::new(clock, ids, store.clone(), blobs.clone()));
         let cfg = Config {
             public_url: TEST_PUBLIC_URL.to_string(),
             registration_open,
@@ -96,7 +101,7 @@ impl TestServer {
             max_body_size: 16 * 1024 * 1024,
             server,
         });
-        Self { dir, store, router }
+        Self { dir, store, blobs, router }
     }
 }
 

@@ -898,6 +898,32 @@ fn mention_regex() -> &'static Regex {
     })
 }
 
+/// Normalize a hashtag wire value the way tags are stored (lowercased,
+/// `#`-stripped, invalid characters removed) — mirrors Mastodon's
+/// `HashtagNormalizer` for the local profile.
+pub fn normalize_tag(raw: &str) -> String {
+    raw.trim_start_matches('#')
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_')
+        .collect()
+}
+
+/// Custom-emoji shortcode tokens (`:shortcode:`) referenced by a text.
+///
+/// Mirrors `CustomEmoji.from_text`: the token list drives the payload's
+/// `emojis` array; the text itself keeps the literal tokens (clients
+/// substitute them).
+pub fn extract_emoji_shortcodes(text: &str) -> Vec<String> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r":([A-Za-z0-9_]{2,}):").expect("valid emoji shortcode regex")
+    });
+    re.captures_iter(text)
+        .map(|cap| cap[1].to_string())
+        .collect()
+}
+
 fn language_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {

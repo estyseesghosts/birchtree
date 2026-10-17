@@ -107,26 +107,39 @@ fn status_response(
 }
 
 /// Assemble and render a page of statuses as 200 JSON.
+///
+/// One batched [`StatusViewContext`] page loader for the whole page (Phase 4):
+/// the transaction count is constant in the page size.
 fn status_list_response(
     state: &ApiState,
     viewer: Option<Id>,
     statuses: Vec<Status>,
 ) -> Response {
     let store: &dyn Store = &*state.context.store;
-    let mut array = Vec::with_capacity(statuses.len());
-    for status in statuses {
-        match load_status_view(&state.server, store, viewer, status, state.context.now_ms()) {
-            Ok(view) => array.push(dto::status_json(
-                &state.server,
-                viewer,
-                state.context.now_ms(),
-                &view,
-                StatusSourceMode::Content,
-            )),
-            Err(err) => return err.into_response(),
+    match crate::api::mastodon::status_view::load_status_views(
+        &state.server,
+        store,
+        viewer,
+        statuses,
+        state.context.now_ms(),
+    ) {
+        Ok(views) => {
+            let array: Vec<Value> = views
+                .iter()
+                .map(|view| {
+                    dto::status_json(
+                        &state.server,
+                        viewer,
+                        state.context.now_ms(),
+                        view,
+                        StatusSourceMode::Content,
+                    )
+                })
+                .collect();
+            axum::Json(array).into_response()
         }
+        Err(err) => err.into_response(),
     }
-    axum::Json(array).into_response()
 }
 
 /// `GET /api/v1/statuses` — multi-fetch by `id[]` (max 20, silently omitting
@@ -397,6 +410,48 @@ pub async fn create(
     };
 
     let store: &dyn Store = &*state.context.store;
+
+    // `scheduled_at`: a valid future time (>5 min out) schedules instead of
+    // posting (200 + ScheduledStatusSerializer); a past/blank value posts
+    // immediately; an unparseable value is Mastodon's 422 `Record invalid`.
+    let now_ms = state.context.now_ms();
+    let scheduled_at =
+        match crate::application::scheduled_statuses::parse_scheduled_at(
+            field("scheduled_at").as_deref(),
+            now_ms,
+        ) {
+            Ok(scheduled) => scheduled,
+            Err(_) => {
+                return ApiError::unprocessable("Record invalid").into_response();
+            }
+        };
+    if let Some(scheduled_at_ms) = scheduled_at {
+        return match crate::application::scheduled_statuses::schedule_status(
+            store,
+            &state.server.public_url,
+            now_ms,
+            cmd,
+            scheduled_at_ms,
+        ) {
+            Ok(row) => {
+                let media = store
+                    .attachable_media(row.account_id, &row.media_ids, None)
+                    .unwrap_or_default();
+                axum::Json(dto::scheduled_status_json(
+                    &state.server,
+                    &row,
+                    &media,
+                ))
+                .into_response()
+            }
+            // Validation failures keep the exact 422 bodies (limits, media).
+            Err(DomainError::InvalidInput(message)) => {
+                ApiError::unprocessable(message).into_response()
+            }
+            Err(err) => ApiError::from(err).into_response(),
+        };
+    }
+
     match statuses::create_status(store, &state.server.public_url, state.context.now_ms(), cmd) {
         Ok(created) => status_response(&state, Some(viewer), created.status, StatusSourceMode::Content),
         Err(err) => match err {

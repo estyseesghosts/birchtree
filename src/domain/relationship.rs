@@ -73,7 +73,7 @@ pub struct Endorsement {
 
 /// Per-account counters, updated in the same transaction as the change that
 /// moves them (follows, statuses, follow requests).
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct AccountStats {
     pub followers_count: u64,
     pub following_count: u64,

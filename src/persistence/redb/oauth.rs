@@ -1,6 +1,6 @@
 //! OAuth application and token persistence, and login sessions.
 
-use redb::{ReadableDatabase, ReadableTable};
+use redb::{ReadableTable};
 
 use crate::application::crypto::sha256_hex;
 use crate::application::ports::{
@@ -15,7 +15,7 @@ use super::{decode, encode, RedbStore};
 
 impl OAuthStore for RedbStore {
     fn register_app(&self, input: NewApp) -> Result<OAuthApplication> {
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         {
             let apps = write.open_table(OAUTH_APPS)?;
             if apps.get(input.client_id.as_str())?.is_some() {
@@ -45,7 +45,7 @@ impl OAuthStore for RedbStore {
     }
 
     fn app_by_client_id(&self, client_id: &str) -> Result<Option<OAuthApplication>> {
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         let apps = read.open_table(OAUTH_APPS)?;
         match apps.get(client_id)? {
             Some(guard) => Ok(Some(decode(guard.value())?)),
@@ -56,7 +56,7 @@ impl OAuthStore for RedbStore {
     fn app_by_id(&self, id: Id) -> Result<Option<OAuthApplication>> {
         // Applications are few; a bounded scan is acceptable. (An id index can
         // replace this if the app table ever grows large.)
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         let apps = read.open_table(OAUTH_APPS)?;
         for entry in apps.iter()? {
             let (_key, value) = entry?;
@@ -79,7 +79,7 @@ impl OAuthStore for RedbStore {
             expires_at_ms: input.expires_at_ms,
             revoked: false,
         };
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         {
             let mut tokens = write.open_table(ACCESS_TOKENS)?;
             tokens.insert(token.token_hash.as_str(), encode(&token)?.as_slice())?;
@@ -90,7 +90,7 @@ impl OAuthStore for RedbStore {
 
     fn token_by_plaintext(&self, plaintext: &str) -> Result<Option<AccessToken>> {
         let hash = sha256_hex(plaintext.as_bytes());
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         let tokens = read.open_table(ACCESS_TOKENS)?;
         match tokens.get(hash.as_str())? {
             Some(guard) => Ok(Some(decode(guard.value())?)),
@@ -100,7 +100,7 @@ impl OAuthStore for RedbStore {
 
     fn revoke_token(&self, plaintext: &str) -> Result<bool> {
         let hash = sha256_hex(plaintext.as_bytes());
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         let existing: Option<AccessToken> = {
             let tokens = write.open_table(ACCESS_TOKENS)?;
             match tokens.get(hash.as_str())? {
@@ -134,7 +134,7 @@ impl OAuthStore for RedbStore {
             expires_at_ms: input.now_ms + input.ttl_ms,
             used: false,
         };
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         {
             let mut codes = write.open_table(AUTHORIZATION_CODES)?;
             codes.insert(code.code_hash.as_str(), encode(&code)?.as_slice())?;
@@ -145,7 +145,7 @@ impl OAuthStore for RedbStore {
 
     fn authorization_code_by_plaintext(&self, plaintext: &str) -> Result<Option<AuthorizationCode>> {
         let hash = sha256_hex(plaintext.as_bytes());
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         let codes = read.open_table(AUTHORIZATION_CODES)?;
         match codes.get(hash.as_str())? {
             Some(guard) => Ok(Some(decode(guard.value())?)),
@@ -160,7 +160,7 @@ impl OAuthStore for RedbStore {
         now_ms: u64,
     ) -> Result<AccessToken> {
         let hash = sha256_hex(plaintext.as_bytes());
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
 
         // Read, validate and consume the code inside the same transaction that
         // issues the token, so two concurrent exchanges cannot both succeed.
@@ -208,7 +208,7 @@ impl SessionStore for RedbStore {
             created_at_ms: input.now_ms,
             expires_at_ms: input.now_ms + input.ttl_ms,
         };
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         {
             let mut sessions = write.open_table(SESSIONS)?;
             sessions.insert(session.token_hash.as_str(), encode(&session)?.as_slice())?;
@@ -219,7 +219,7 @@ impl SessionStore for RedbStore {
 
     fn session_by_plaintext(&self, plaintext: &str) -> Result<Option<LoginSession>> {
         let hash = sha256_hex(plaintext.as_bytes());
-        let read = self.db().begin_read()?;
+        let read = self.begin_read()?;
         let sessions = read.open_table(SESSIONS)?;
         match sessions.get(hash.as_str())? {
             Some(guard) => Ok(Some(decode(guard.value())?)),
@@ -229,7 +229,7 @@ impl SessionStore for RedbStore {
 
     fn revoke_session(&self, plaintext: &str) -> Result<bool> {
         let hash = sha256_hex(plaintext.as_bytes());
-        let write = self.db().begin_write()?;
+        let write = self.begin_write()?;
         let existed = {
             let mut sessions = write.open_table(SESSIONS)?;
             sessions.remove(hash.as_str())?.is_some()

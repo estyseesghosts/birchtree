@@ -473,24 +473,101 @@ pub struct StatusView {
     /// Render the nested `quote` shallowly ({state, quoted_status_id}) — set
     /// one level deep inside a quoted status.
     pub shallow_quote: bool,
+    /// `REST::FilterResultSerializer` entries matching this status for the
+    /// viewer (filter v2). Timelines/notifications fill this per page; the
+    /// status DTO never drops or reorders a status because of it (Mastodon
+    /// leaves `hide` enforcement to the client).
+    pub filtered: Vec<Value>,
+    /// Custom emoji referenced by the status text (batch-loaded per page).
+    pub emojis: Vec<Value>,
 }
 
-/// `REST::MediaAttachmentSerializer`. Local Phase 3 attachments carry no
-/// processed bytes yet, so `url`/`preview_url` are `null` (contract-correct
-/// "not processed" shape) until Phase 4.
-pub fn media_attachment_json(media: &MediaAttachment) -> Value {
+/// Local file path of an attachment blob key under the media route.
+pub fn media_file_url(server: &ServerInfo, file_key: &str) -> String {
+    server.asset_url(&format!(
+        "system/media_attachments/files/{file_key}"
+    ))
+}
+
+/// `REST::MediaAttachmentSerializer`.
+///
+/// `url`/`preview_url` are `null` while the attachment is not processed
+/// (queued, in progress or failed — Mastodon's `not_processed?`), matching
+/// the wire contract exactly; the URLs point at this server's file route
+/// (`/system/media_attachments/files/...`, Mastodon's storage path shape).
+/// `remote_url`/`preview_remote_url`/`text_url` stay `null` for local media
+/// (Mastodon assigns no `shortcode` to modern uploads, so `text_url` is
+/// `null` there too).
+pub fn media_attachment_json(server: &ServerInfo, media: &MediaAttachment) -> Value {
+    let processed = media.state == crate::domain::MediaState::Ready && !media.file_key.is_empty();
+    let url = if processed {
+        Value::String(media_file_url(server, &media.file_key))
+    } else {
+        Value::Null
+    };
+    let preview_url = match &media.preview_key {
+        Some(key) if processed => Value::String(media_file_url(server, key)),
+        _ => Value::Null,
+    };
     json!({
         "id": media.id.to_string(),
         "type": media.r#type,
-        "url": media.url,
-        "preview_url": Value::Null,
+        "url": url,
+        "preview_url": preview_url,
         "remote_url": Value::Null,
         "preview_remote_url": Value::Null,
         "text_url": Value::Null,
-        "meta": Value::Null,
-        "description": media.description,
-        "blurhash": media.blurhash.clone().unwrap_or_default(),
+        "meta": media_meta_json(media),
+        "description": if media.description.is_empty() { Value::Null } else { json!(media.description) },
+        "blurhash": media.blurhash.clone().map(Value::String).unwrap_or(Value::Null),
     })
+}
+
+/// The `meta` object: `original` (and `small` when a preview exists) plus
+/// `focus`, mirroring Mastodon's `MediaAttachment#populate_meta` shape.
+fn media_meta_json(media: &MediaAttachment) -> Value {
+    let mut original = Map::new();
+    if let (Some(width), Some(height)) = (media.width, media.height) {
+        original.insert("width".into(), json!(width));
+        original.insert("height".into(), json!(height));
+        original.insert("size".into(), json!("{width}x{height}"));
+        if height > 0 {
+            original.insert("aspect".into(), json!(width as f64 / height as f64));
+        }
+    }
+    if let Some(duration_ms) = media.duration_ms {
+        original.insert("duration".into(), json!(duration_ms as f64 / 1_000.0));
+    }
+    if let Some(frame_rate) = &media.frame_rate {
+        original.insert("frame_rate".into(), json!(frame_rate));
+    }
+    if let Some(bitrate) = media.bitrate {
+        original.insert("bitrate".into(), json!(bitrate));
+    }
+    if original.is_empty() {
+        return Value::Null;
+    }
+    let mut meta = Map::new();
+    meta.insert("original".into(), Value::Object(original));
+    if media.preview_key.is_some()
+        && let (Some(width), Some(height)) = (media.preview_width, media.preview_height)
+    {
+        let mut small = Map::new();
+        small.insert("width".into(), json!(width));
+        small.insert("height".into(), json!(height));
+        small.insert("size".into(), json!("{width}x{height}"));
+        if height > 0 {
+            small.insert("aspect".into(), json!(width as f64 / height as f64));
+        }
+        meta.insert("small".into(), Value::Object(small));
+    }
+    if let Some(focus) = media.focus {
+        meta.insert(
+            "focus".into(),
+            json!({ "x": focus.x, "y": focus.y }),
+        );
+    }
+    Value::Object(meta)
 }
 
 /// `REST::PollSerializer` without viewer ballot context.
@@ -597,7 +674,7 @@ pub fn status_json(
         // complete with its neutral value.
         object.insert("muted".into(), json!(false));
         object.insert("bookmarked".into(), json!(view.flags.bookmarked));
-        object.insert("filtered".into(), json!([]));
+        object.insert("filtered".into(), json!(view.filtered.clone()));
     }
 
     // `pinned` only when pinnable (author, not a reblog, pinnable visibility).
@@ -636,7 +713,11 @@ pub fn status_json(
         "account".into(),
         account_json_with_stats(server, &view.account, view.account_stats.as_ref()),
     );
-    let media: Vec<Value> = view.media.iter().map(media_attachment_json).collect();
+    let media: Vec<Value> = view
+        .media
+        .iter()
+        .map(|attachment| media_attachment_json(server, attachment))
+        .collect();
     object.insert("media_attachments".into(), json!(media));
     let mentions: Vec<Value> = view
         .mentions
@@ -651,7 +732,7 @@ pub fn status_json(
         .map(|tag| tag_json(server, tag, viewer.is_some()))
         .collect();
     object.insert("tags".into(), json!(tags));
-    object.insert("emojis".into(), json!([]));
+    object.insert("emojis".into(), json!(view.emojis.clone()));
     object.insert("tagged_collections".into(), json!([]));
 
     object.insert(
@@ -787,7 +868,10 @@ pub fn status_edit_json(
     media: &[MediaAttachment],
     poll_options: Option<Vec<String>>,
 ) -> Value {
-    let media_json: Vec<Value> = media.iter().map(media_attachment_json).collect();
+    let media_json: Vec<Value> = media
+        .iter()
+        .map(|attachment| media_attachment_json(server, attachment))
+        .collect();
     json!({
         "account": account_json(server, account),
         "content": version.content_html,
@@ -799,5 +883,245 @@ pub fn status_edit_json(
         "poll": poll_options.map(|titles| json!({
             "options": titles.into_iter().map(|title| json!({ "title": title })).collect::<Vec<_>>(),
         })),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 DTOs: notifications, lists, filters, scheduled statuses, markers,
+// custom emoji, hashtags and search.
+// ---------------------------------------------------------------------------
+
+/// `REST::NotificationSerializer`: `{id, type, created_at, group_key,
+/// account, status}`. `status` is present exactly for the status-bearing
+/// types (`mention`, `favourite`, `reblog`, `poll`, `quote`).
+///
+/// `group_key` uses the serializer's `ungrouped-<id>` fallback: this server
+/// does not merge notifications server-side (grouped reads are the v2 API,
+/// out of the Phase 4 profile).
+pub fn notification_json(
+    notification: &crate::domain::Notification,
+    account: Value,
+    status: Option<Value>,
+) -> Value {
+    let mut object = Map::new();
+    object.insert("id".into(), json!(notification.id.to_string()));
+    object.insert("type".into(), json!(notification.r#type.as_str()));
+    object.insert(
+        "created_at".into(),
+        json!(rfc3339_ms(notification.created_at_ms)),
+    );
+    object.insert(
+        "group_key".into(),
+        json!(format!("ungrouped-{}", notification.id)),
+    );
+    object.insert("account".into(), account);
+    object.insert(
+        "status".into(),
+        status.unwrap_or(Value::Null),
+    );
+    Value::Object(object)
+}
+
+/// `REST::ListSerializer`.
+pub fn list_json(list: &crate::domain::List) -> Value {
+    json!({
+        "id": list.id.to_string(),
+        "title": list.title,
+        "replies_policy": list.replies_policy.as_str(),
+        "exclusive": list.exclusive,
+    })
+}
+
+/// `REST::MarkerSerializer` (one timeline entry of the markers map).
+pub fn marker_json(marker: &crate::domain::Marker) -> Value {
+    json!({
+        "last_read_id": marker.last_read_id.to_string(),
+        "version": marker.lock_version,
+        "updated_at": rfc3339_ms(marker.updated_at_ms),
+    })
+}
+
+/// `REST::FilterSerializer` (v2), with `keywords`/`statuses` only when rules
+/// were requested (the CRUD endpoints always request them; status payloads'
+/// `filter` embed never does).
+pub fn filter_json(bundle: &crate::application::ports::FilterBundle, with_rules: bool) -> Value {
+    let mut object = Map::new();
+    object.insert("id".into(), json!(bundle.filter.id.to_string()));
+    object.insert("title".into(), json!(bundle.filter.title));
+    object.insert("context".into(), json!(bundle.filter.context));
+    object.insert(
+        "expires_at".into(),
+        bundle
+            .filter
+            .expires_at_ms
+            .map(rfc3339_ms)
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    object.insert("filter_action".into(), json!(bundle.filter.action.as_str()));
+    if with_rules {
+        let keywords: Vec<Value> = bundle
+            .keywords
+            .iter()
+            .map(|keyword| {
+                json!({
+                    "id": keyword.id.to_string(),
+                    "keyword": keyword.keyword,
+                    "whole_word": keyword.whole_word,
+                })
+            })
+            .collect();
+        let statuses: Vec<Value> = bundle
+            .statuses
+            .iter()
+            .map(|rule| {
+                json!({
+                    "id": rule.id.to_string(),
+                    "status_id": rule.status_id.to_string(),
+                })
+            })
+            .collect();
+        object.insert("keywords".into(), json!(keywords));
+        object.insert("statuses".into(), json!(statuses));
+    }
+    Value::Object(object)
+}
+
+/// `REST::V1::FilterSerializer`: the v1 API projects one *keyword* row (its
+/// `id` is the keyword id) with the parent filter's `context`/`expires_at`
+/// and `irreversible` (`filter_action == hide`).
+pub fn filter_v1_json(
+    keyword: &crate::domain::FilterKeyword,
+    filter: &crate::domain::CustomFilter,
+    status_ids: &[crate::domain::Id],
+) -> Value {
+    json!({
+        "id": keyword.id.to_string(),
+        "phrase": keyword.keyword,
+        "context": filter.context,
+        "whole_word": keyword.whole_word,
+        "expires_at": filter
+            .expires_at_ms
+            .map(rfc3339_ms)
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+        "irreversible": filter.action == crate::domain::FilterAction::Hide,
+        "status_ids": status_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// `REST::FilterResultSerializer` element of a status's `filtered` array.
+pub fn filter_result_json(bundle: &crate::application::ports::FilterBundle, keyword_matches: Vec<String>, status_matches: Vec<crate::domain::Id>) -> Value {
+    let filter = filter_json(bundle, false);
+    json!({
+        "filter": filter,
+        "keyword_matches": keyword_matches,
+        "status_matches": status_matches
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// `REST::ScheduledStatusSerializer`. `params` echoes the replayable
+/// creation params; `quoted_status_id` is stringified and
+/// `quote_approval_policy` is a string (default `nobody`), as in the pinned
+/// serializer.
+pub fn scheduled_status_json(
+    server: &ServerInfo,
+    scheduled: &crate::domain::ScheduledStatus,
+    media: &[MediaAttachment],
+) -> Value {
+    let mut params = scheduled.params.clone();
+    if let Some(object) = params.as_object_mut() {
+        match object.get("quoted_status_id").cloned() {
+            Some(Value::Number(id)) => {
+                object.insert("quoted_status_id".into(), json!(id.to_string()));
+            }
+            Some(Value::Null) | None => {
+                object.insert("quoted_status_id".into(), Value::Null);
+            }
+            Some(other) => {
+                object.insert("quoted_status_id".into(), other);
+            }
+        }
+        object
+            .entry("quote_approval_policy")
+            .or_insert_with(|| json!("nobody"));
+    }
+    let media_json: Vec<Value> = media
+        .iter()
+        .map(|attachment| media_attachment_json(server, attachment))
+        .collect();
+    json!({
+        "id": scheduled.id.to_string(),
+        "scheduled_at": rfc3339_ms(scheduled.scheduled_at_ms),
+        "params": params,
+        "media_attachments": media_json,
+    })
+}
+
+/// `REST::CustomEmojiSerializer`. `category`/`featured` are emitted only for
+/// the index endpoint (`with_category`), matching the association-loaded
+/// conditional in the pinned serializer; payload embeddings omit them.
+pub fn custom_emoji_json(server: &ServerInfo, emoji: &crate::domain::CustomEmoji, with_category: bool) -> Value {
+    let mut object = Map::new();
+    object.insert("shortcode".into(), json!(emoji.shortcode));
+    let partition = crate::application::emoji::emoji_partition(&emoji.shortcode);
+    object.insert(
+        "url".into(),
+        json!(server.asset_url(&format!(
+            "system/custom_emojis/images/{partition}/original/{}.png",
+            emoji.shortcode
+        ))),
+    );
+    object.insert(
+        "static_url".into(),
+        json!(server.asset_url(&format!(
+            "system/custom_emojis/images/{partition}/static/{}.png",
+            emoji.shortcode
+        ))),
+    );
+    object.insert("visible_in_picker".into(), json!(emoji.visible_in_picker));
+    if with_category {
+        object.insert(
+            "category".into(),
+            emoji
+                .category
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+        object.insert("featured".into(), json!(false));
+    }
+    Value::Object(object)
+}
+
+/// `REST::TagSerializer` for search results (`history` is contract-shaped;
+/// this server keeps no per-tag usage history yet, and tag follow/feature is
+/// Phase 7).
+pub fn hashtag_json(server: &ServerInfo, tag: &str, viewer: Option<crate::domain::Id>) -> Value {
+    let _ = viewer;
+    json!({
+        "id": tag,
+        "name": tag,
+        "url": server.asset_url(&format!("tags/{tag}")),
+        "history": [],
+        "following": false,
+        "featuring": false,
+    })
+}
+
+/// `REST::SearchSerializer`: all four keys always present as arrays
+/// (`collections` is always empty — collection objects are out of profile).
+pub fn search_json(accounts: Vec<Value>, statuses: Vec<Value>, hashtags: Vec<Value>) -> Value {
+    json!({
+        "accounts": accounts,
+        "statuses": statuses,
+        "hashtags": hashtags,
+        "collections": [],
     })
 }
