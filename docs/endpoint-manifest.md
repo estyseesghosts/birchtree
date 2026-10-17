@@ -120,25 +120,43 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 | PUT | `/api/v1/media/:id` | user | write | planned (Phase 4) | In | |
 | DELETE | `/api/v1/media/:id` | user | write | planned (Phase 4) | In | |
 | POST | `/api/v2/media` | user | write | planned (Phase 4) | In | media v2 (multipart) |
-| GET | `/api/v1/notifications` | user | read:notifications | planned (Phase 4) | In | records already committed from Phase 3 interactions |
-| GET | `/api/v1/notifications/:id` | user | read:notifications | planned (Phase 4) | In | |
-| POST | `/api/v1/notifications/clear` | user | write | planned (Phase 4) | In | |
-| GET | `/api/v1/notifications/unread_count` | user | read:notifications | planned (Phase 4) | In | |
-| POST | `/api/v1/notifications/:id/dismiss` | user | write | planned (Phase 4) | In | |
+| GET | `/api/v1/notifications` | user | read:notifications | implemented (Phase 4) | In | `limit` 20/max 40 with `limit_param` semantics (`limit=0` → empty page); `types[]`/`exclude_types[]` silently drop unknown values; `group_key` uses the `ungrouped-<id>` fallback (no server-side merging in the v1 profile) |
+| GET | `/api/v1/notifications/:id` | user | read:notifications | implemented (Phase 4) | In | 404 `{"error":"Record not found"}` for foreign/missing |
+| POST | `/api/v1/notifications/clear` | user | write \| write:notifications | implemented (Phase 4) | In | `200 {}` |
+| GET | `/api/v1/notifications/unread_count` | user | read:notifications | implemented (Phase 4) | In | `{"count": N}` = rows newer than the notifications marker (limit default 100, max 1000) |
+| POST | `/api/v1/notifications/:id/dismiss` | user | write \| write:notifications | implemented (Phase 4) | In | `200 {}`; repeat → 404 |
+| GET | `/api/v1/notifications/requests` | user | read:notifications | implemented (Phase 4) | In | always `[]`: this server has no notification-policy filter pipeline yet, so no requests can exist (never fabricated) |
+| GET | `/api/v1/notifications/requests/merged` | user | read:notifications | implemented (Phase 4) | In | `{"merged": true}` (no unmerge work exists) |
+| GET/POST | `/api/v1/markers` | user | read:statuses / write:statuses | implemented (Phase 4) | In | `timeline[]` on GET; `home[last_read_id]`/`notifications[last_read_id]` on POST (query or body); response `{timeline:{last_read_id,version,updated_at}}`; fresh marker reports `version: 1` |
 | GET | `/api/v1/preferences` | user | read \| read:accounts | implemented (Phase 2) | In | incl. quote-policy defaults |
-| GET | `/api/v1/filters` | user | read | planned (Phase 7) | In | was Plan; reclassified as in-profile |
-| POST | `/api/v1/filters` | user | write | planned (Phase 7) | In | |
-| GET | `/api/v1/filters/:id` | user | read | planned (Phase 7) | In | |
-| PUT | `/api/v1/filters/:id` | user | write | planned (Phase 7) | In | |
-| DELETE | `/api/v1/filters/:id` | user | write | planned (Phase 7) | In | |
-| GET | `/api/v1/lists` | user | read | planned (Phase 7) | In | |
-| POST | `/api/v1/lists` | user | write | planned (Phase 7) | In | |
-| GET | `/api/v1/lists/:id` | user | read | planned (Phase 7) | In | |
-| PUT | `/api/v1/lists/:id` | user | write | planned (Phase 7) | In | |
-| DELETE | `/api/v1/lists/:id` | user | write | planned (Phase 7) | In | |
-| GET | `/api/v1/scheduled_statuses` | user | read | planned (Phase 7) | In | |
-| GET | `/api/v1/search` | user | read | planned (Phase 7) | In | |
-| GET | `/api/v2/search` | user | read | planned (Phase 7) | In | |
+| GET | `/api/v1/filters` | user | read \| read:filters | implemented (Phase 4) | In | v1 projection over keyword rows (deprecated upstream since 2022-11-14, but pinned v4.7.3 still serves it); each row's `id` is the keyword id |
+| POST | `/api/v1/filters` | user | write \| write:filters | implemented (Phase 4) | In | creates filter + one keyword in ONE transaction |
+| GET | `/api/v1/filters/:id` | user | read \| read:filters | implemented (Phase 4) | In | |
+| PUT | `/api/v1/filters/:id` | user | write \| write:filters | implemented (Phase 4) | In | multi-keyword parent-attribute guard answers the exact deprecation 422 |
+| DELETE | `/api/v1/filters/:id` | user | write \| write:filters | implemented (Phase 4) | In | deletes the keyword row only (upstream v1 semantics) |
+| GET | `/api/v1/lists` | user | read | implemented (Phase 4) | In | all of the viewer's lists (v4.7.3 does not paginate this route) |
+| POST | `/api/v1/lists` | user | write | implemented (Phase 4) | In | title blank/long and the 50-list limit answer the exact 422 bodies |
+| GET | `/api/v1/lists/:id` | user | read | implemented (Phase 4) | In | foreign/missing → 404 `{"error":"Record not found"}` |
+| PUT | `/api/v1/lists/:id` | user | write | implemented (Phase 4) | In | also PATCH; `replies_policy` validated against the enum |
+| DELETE | `/api/v1/lists/:id` | user | write | implemented (Phase 4) | In | `200 {}` |
+| GET | `/api/v1/lists/:id/accounts` | user | read \| read:lists | implemented (Phase 4) | In | `limit` default 40 (`limit=0` → all), `Link` cursors |
+| POST | `/api/v1/lists/:id/accounts` | user | write \| write:lists | implemented (Phase 4) | In | `account_ids[]`; membership requires the owner's active follow/pending request (422 `Account must be following`), unknown id → 404 |
+| DELETE | `/api/v1/lists/:id/accounts` | user | write \| write:lists | implemented (Phase 4) | In | idempotent `200 {}` |
+| GET | `/api/v2/filters` | user | read \| read:filters | implemented (Phase 4) | In | v2 model with `keywords[]` + `statuses[]` |
+| POST | `/api/v2/filters` | user | write \| write:filters | implemented (Phase 4) | In | `title`/`context[]`/`expires_in`/`filter_action`/`keywords_attributes` |
+| GET | `/api/v2/filters/:id` | user | read \| read:filters | implemented (Phase 4) | In | |
+| PATCH | `/api/v2/filters/:id` | user | write \| write:filters | implemented (Phase 4) | In | indexed `keywords_attributes[N][...]` supported |
+| DELETE | `/api/v2/filters/:id` | user | write \| write:filters | implemented (Phase 4) | In | `200 {}`-equivalent empty payload semantics |
+| GET/POST | `/api/v2/filters/:filter_id/keywords` | user | read/write:filters | implemented (Phase 4) | In | `keyword`, `whole_word` |
+| GET/PATCH/DELETE | `/api/v2/filters/keywords/:id` | user | read/write:filters | implemented (Phase 4) | In | |
+| GET/POST | `/api/v2/filters/:filter_id/statuses` | user | read/write:filters | implemented (Phase 4) | In | `status_id`; not-fetchable → 404 |
+| GET/DELETE | `/api/v2/filters/statuses/:id` | user | read/write:filters | implemented (Phase 4) | In | |
+| GET | `/api/v1/scheduled_statuses` | user | read | implemented (Phase 4) | In | id-desc, `Link` cursors (20/40) |
+| GET | `/api/v1/scheduled_statuses/:id` | user | read | implemented (Phase 4) | In | foreign/missing → 404 `{"error":"Record not found"}` |
+| PUT | `/api/v1/scheduled_statuses/:id` | user | write | implemented (Phase 4) | In | also PATCH; `scheduled_at` only; blank → 422 |
+| DELETE | `/api/v1/scheduled_statuses/:id` | user | write | implemented (Phase 4) | In | `200 {}`; the publish job becomes a no-op |
+| GET | `/api/v1/search` | — | — | out of profile (route absent in v4.7.3) | Out | removed upstream in Mastodon 3.0 (commit `18331fefa2`); only v2 exists in the pinned tag |
+| GET | `/api/v2/search` | optional | read:search | implemented (Phase 4) | In | local corpus only: accounts by handle/display name, hashtags by prefix, statuses by bounded recent scan (authenticated only, like `status_searchable?`); `resolve` without auth → pinned 401; `collections` always `[]` |
 | GET | `/api/v1/streaming` | user | read | planned (Phase 5) | In | SSE/WebSocket |
 | GET | `/api/v1/streaming/(*any)` | user | read | planned (Phase 5) | In | |
 
@@ -146,10 +164,10 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 
 - `GET /api/v1/oembed` — public oEmbed; not in initial profile (record as gap if clients need it).
 - `namespace :v1_alpha` — experimental/legacy (`accounts/collections`, `collections/*`); explicitly **Out**.
-- `annual_reports`, `announcements`, `conversations`, `donation_campaigns`, `suggestions`, `custom_emojis` — **Out** until scoped (custom emoji may be needed for account/status serialization; revisit).
+- `annual_reports`, `announcements`, `conversations`, `donation_campaigns`, `suggestions` — **Out** until scoped.
+- `GET /api/v1/custom_emojis` — **implemented (Phase 4)**: public index over local + enabled + picker-visible emoji (CLI-managed; no admin API in this milestone). Emoji embedding in status payloads is implemented; account-payload emoji remain `[]` (Phase 7).
 - `GET /api/v1/blocks`, `GET /api/v1/mutes`, `GET /api/v1/favourites`, `GET /api/v1/bookmarks` — relation collection reads; **planned (Phase 7)**.
 - `POST /api/v1/reports` — moderation; **Out** (admin/moderation excluded).
-- `notifications/requests` (follow-request notifications groupings) — **planned (Phase 4)**.
 - `accounts/familiar_followers`, `identity_proofs`, `featured_tags`, `email_subscriptions`, `collections`, `tags` follow/feature, `followed_tags` — **planned (Phase 7)**.
 - `namespace :admin` (all `admin/*` routes) — **Out** explicitly; moderation/security operations excluded from public-client milestone.
 - `v2` admin accounts, `push/*`, `web/*` — **Out** unless scoped later.

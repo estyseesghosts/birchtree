@@ -93,3 +93,66 @@ create leaves neither), notification-fanout job idempotence (dedup), natural
 interaction idempotence (repeat favourite → one row/one job), `Idempotency-Key`
 replay within the hour, and reopen-after-crash durability of an interaction +
 job with post-restart job completion producing exactly one notification.
+
+## Implementation notes (Phase 4 — schema v4)
+
+The v4 migration adds these tables and, crucially, **backfills** the timeline
+ranges from existing statuses (public + not deleted → `timeline_public`;
+author account `local` → `timeline_local`; bounded by the pre-v4 status count
+and idempotent):
+
+- **Records:** `lists`, `list_members`, `markers`, `filters`,
+  `filter_keywords`, `filter_statuses`, `scheduled_statuses`,
+  `custom_emoji`.
+- **Indexes:** `lists_by_account` (`account || desc(list)`),
+  `memberships_by_account` (reverse, for unfollow/block cleanup),
+  `filters_by_account`, `filter_keywords_by_filter` /
+  `filter_statuses_by_filter`, `scheduled_by_account` (`account || desc(id)`),
+  `timeline_public` / `timeline_local` (`desc(id) → ()`).
+- **Timeline index maintenance:** `write_status_txn` (the single row writer
+  used by create, reblog, edit, counter bumps and tombstones) keeps
+  `timeline_public`/`timeline_local` in step: public non-deleted statuses
+  join both ranges when the author account is local (localness read from
+  `accounts` inside the same transaction); tombstones and non-public
+  visibilities remove the entries. Every step is idempotent.
+- **Follow cascade:** `unfollow`, `remove_follower` and `block` drop the
+  affected `list_members` rows (`lists::retain_membership_txn`) in the same
+  transaction as the follow removal — mirroring upstream's
+  `list_accounts.follow_id ON DELETE CASCADE`.
+- **Media lifecycle:** `create_media_upload` commits metadata + owner index +
+  the `ProcessMedia` job in ONE transaction (bytes are staged in the
+  `BlobStore` *before* commit); `mark_media_processed` commits the
+  processing result idempotently; `delete_media` drops row + owner index
+  (bytes are removed by the use case after commit).
+- **Scheduled statuses:** `create_scheduled` commits row + account index +
+  the `PublishScheduledStatus` job (due at `scheduled_at`) in ONE
+  transaction; publishing destroys the row *before* replaying params, so a
+  crash mid-publish never republishes (replay after deletion is a no-op).
+- **Markers:** optimistic `lock_version` checked inside the write
+  transaction; a stale version rejects with `MarkerUpdateError::Stale`
+  (409 on the wire).
+
+### Documented scan caps (bounded reads)
+
+| Path | Cap |
+|---|---|
+| public/tag timeline index walk | 2 000 entries |
+| hashtag timeline index walk | 2 000 entries |
+| home/list k-way merge | 512 entries/author, 5 000 total, 500 authors |
+| notification page / clear / count | 1 000 entries (clear 10 000) |
+| account lists scan | 100 |
+| list members scan | 2 000 (timeline member list 500) |
+| filters per account / rules per filter | 500 / 1 000 |
+| scheduled rows per account / table sweep | 320 / 1 000 |
+| account search (handle index) | 5 000 |
+| tag search (hashtag index) | 5 000 entries / 1 000 distinct |
+| recent-status search | `cap` entries (4× rows) |
+| emoji index | 1 000 |
+
+### Instrumentation
+
+`RedbStore` counts `read_txns`, `write_txns` and `items_scanned` (exposed via
+`RedbStore::metrics()`); every counted `begin_read`/`begin_write` and every
+bounded range scan increments them. The Phase 4 suites assert page-level
+bounds (e.g. one home page ≤ 5 000 scanned entries) and use the deltas as
+executed evidence for the no-unbounded-scan rule.

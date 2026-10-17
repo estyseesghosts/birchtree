@@ -577,12 +577,38 @@ pub fn filter_results(
     context: &str,
     now_ms: u64,
 ) -> Result<HashMap<Id, Vec<serde_json::Value>>> {
+    filter_results_scoped(store, viewer, statuses, Some(context), now_ms)
+}
+
+/// Payload-shaped matching: EVERY active filter, regardless of `context`.
+///
+/// Mirrors Mastodon's `CustomFilter.apply_cached_filters`, which the status
+/// relationships presenter uses for the `filtered` array — the `context`
+/// field survives in the API for clients but does not narrow server-side
+/// annotation (`app/presenters/status_relationships_presenter.rb` +
+/// `custom_filter.rb:97` at the pinned tag).
+pub fn filter_results_unscoped(
+    store: &dyn Store,
+    viewer: Id,
+    statuses: &[Status],
+    now_ms: u64,
+) -> Result<HashMap<Id, Vec<serde_json::Value>>> {
+    filter_results_scoped(store, viewer, statuses, None, now_ms)
+}
+
+fn filter_results_scoped(
+    store: &dyn Store,
+    viewer: Id,
+    statuses: &[Status],
+    context: Option<&str>,
+    now_ms: u64,
+) -> Result<HashMap<Id, Vec<serde_json::Value>>> {
     let mut out: HashMap<Id, Vec<serde_json::Value>> = HashMap::new();
     if statuses.is_empty() {
         return Ok(out);
     }
     let bundles: Vec<FilterBundle> = store
-        .filters_by_account(viewer, Some(context))?
+        .filters_by_account(viewer, context)?
         .into_iter()
         .filter(|bundle| {
             !bundle

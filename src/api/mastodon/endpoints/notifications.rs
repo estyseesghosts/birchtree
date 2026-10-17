@@ -162,7 +162,27 @@ fn render_notifications(
 
     let status_ids: Vec<Id> = notifications.iter().filter_map(|n| n.status_id).collect();
     let statuses = store.statuses_by_ids(&status_ids)?;
-    let views = load_status_views(&state.server, store, Some(recipient), statuses, state.context.now_ms())?;
+    let mut views = load_status_views(
+        &state.server,
+        store,
+        Some(recipient),
+        statuses,
+        state.context.now_ms(),
+    )?;
+    // `filtered` annotation (filter v2): one batched match per page, every
+    // active filter — matching Mastodon's relationships presenter.
+    let page: Vec<crate::domain::Status> = views.iter().map(|view| view.status.clone()).collect();
+    let matches = crate::application::filters::filter_results_unscoped(
+        store,
+        recipient,
+        &page,
+        state.context.now_ms(),
+    )?;
+    for view in &mut views {
+        if let Some(entries) = matches.get(&view.status.id) {
+            view.filtered = entries.clone();
+        }
+    }
     let status_json: Vec<(Id, Value)> = views
         .into_iter()
         .map(|view| {

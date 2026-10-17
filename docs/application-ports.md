@@ -80,3 +80,40 @@ Implemented by `persistence::redb::RedbStore` and bundled into `Store`:
 `ActivityDedup`, `BlobStore`, `StreamingSink`, `FederationHttp` remain to be
 implemented in their phases; `NotificationStore`'s read surface (index,
 grouping) is Phase 4.
+
+## Implementation status (Phase 4)
+
+New ports in `application::ports`, implemented by `persistence::redb::RedbStore`
+and bundled into `Store`:
+
+- `BlobStore` (filesystem `media::blob_store::FsBlobStore`, traversal-checked
+  keys) — staged bytes before every media/emoji metadata commit.
+- `MediaStore` additions — `create_media_upload` (row + owner index +
+  `ProcessMedia` job in ONE transaction), `owner_media`, `update_media`,
+  `delete_media`, `mark_media_processed`, and the batched `media_by_ids`.
+- `ListStore` — list CRUD (ownership 404s inside the store), membership add/
+  remove with the owner-follow validation, member listings (cursor + full),
+  and the unfollow/block cascade helper used by `RelationshipStore`.
+- `MarkerStore` — marker reads and the optimistic-locked upsert
+  (`MarkerUpdateError::{Stale, InvalidTimeline}`).
+- `FilterStore` — v2 filter CRUD with keyword/status rule sub-resources; the
+  v1 API projects keyword rows (one stored representation).
+- `ScheduledStore` — schedule (row + index + `PublishScheduledStatus` job),
+  cursor listing, reschedule, delete, due-sweep and the `(total, today)`
+  counts behind Mastodon's 300/25 limits.
+- `EmojiStore` — shortcode-keyed upsert/delete, listed index (bounded) and
+  shortcode batch lookup for payload embeddings.
+- `TimelineStore` — `public_timeline`, `hashtag_timeline`, `authors_timeline`
+  (fan-out-on-read k-way merge): each returns `TimelinePage { statuses,
+  scanned }` after applying the caller's `TimelineFilter` *inside* its bounded
+  scan (policy stays in `application::timelines`).
+- `SearchStore` — bounded `search_accounts` / `search_tags` / `recent_statuses`
+  scans behind `GET /api/v2/search`.
+- `JobQueue::enqueue_at` — due-time scheduling for `PublishScheduledStatus`.
+- `NotificationStore` read surface — `notifications_page` (cursors, bounded),
+  `notification_by_id`, `delete_notification`, `clear_notifications`,
+  `count_notifications_after` (marker-based `unread_count`).
+- Page-loader batches (used by `StatusViewContext`): `AccountStore::
+  accounts_by_ids`, `RelationshipStore::{account_stats_by_ids,
+  batch_pair_states}`, `PollStore::{polls_by_ids, ballots}`,
+  `QuoteStore::quotes_by_quoting_ids`.
