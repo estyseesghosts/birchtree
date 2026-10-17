@@ -8,6 +8,8 @@
 //! [`TimelineFilter`] as the page fills. Each method reports the number of
 //! index entries it walked so the bounded-scan tests can assert it.
 
+use std::collections::BinaryHeap;
+
 use redb::{ReadableTable, ReadTransaction};
 
 use crate::application::ports::{TimelineFilter, TimelinePage, TimelineQuery, TimelineStore};
@@ -16,19 +18,27 @@ use crate::domain::{Id, Result, Status};
 use super::schema::{
     self, HASHTAG_INDEX, STATUSES, STATUS_AUTHOR_INDEX, TIMELINE_LOCAL, TIMELINE_PUBLIC,
 };
+
+/// Status id of an author-index key `(author_be || desc(id)_be)`.
+fn merged_id(key: &[u8]) -> Id {
+    Id::new(u64::MAX - u64::from_be_bytes(key[8..].try_into().unwrap()))
+}
 use super::{decode, RedbStore};
 
 /// Index entries walked per public/tag timeline call.
 const PUBLIC_SCAN_CAP: usize = 2_000;
 /// Index entries walked per hashtag timeline call.
 const HASHTAG_SCAN_CAP: usize = 2_000;
-/// Per-author window in a home/list merge (entries, not rows).
-const AUTHOR_WINDOW: usize = 512;
-/// Total index entries a single home/list merge may walk.
-const AUTHORS_MERGE_CAP: usize = 5_000;
+/// Total index entries a single home/list merge may walk, counting the head
+/// of every author cursor. Sized so a home request at the follow cap stays
+/// within 5 000 `items_scanned` in the worst case: the follow scan adds up to
+/// 1 000 entries of its own.
+const AUTHORS_MERGE_CAP: usize = 4_000;
 /// Authors merged per call (the application passes already-bounded lists;
-/// this is the store-level backstop).
-const AUTHORS_CAP: usize = 500;
+/// this is the store-level backstop). One above the home cap: the viewer plus
+/// `HOME_AUTHOR_CAP` follows (Phase 4.1). A smaller value silently drops the
+/// oldest follows from the merge.
+const AUTHORS_CAP: usize = 1_001;
 
 /// Read a non-deleted status row.
 fn status_at(read: &ReadTransaction, id: Id) -> Result<Option<Status>> {
@@ -275,15 +285,19 @@ impl TimelineStore for RedbStore {
             .or(query.min_id)
             .map(|x| schema::desc_id(x.value()));
 
-        // K-way merge: a bounded window per author, merged by id descending.
-        let window = AUTHOR_WINDOW.max(query.limit);
-        let mut merged: Vec<Id> = Vec::new();
+        // Lazy k-way merge, newest first: one cursor per author, and a heap of
+        // each cursor's head entry. Only the entries the page needs are walked,
+        // so the order of `authors` never decides which posts are reached: a
+        // new post from the oldest follow is found at the top of the feed. The
+        // walk is bounded by `AUTHORS_MERGE_CAP` entries, counting the head of
+        // every cursor.
+        let want_oldest = query.min_id.is_some() && query.since_id.is_none();
+        let mut cursors = Vec::with_capacity(authors.len().min(AUTHORS_CAP));
+        let mut heads: BinaryHeap<(Id, usize)> = BinaryHeap::new();
         let mut scanned = 0usize;
         for author in authors.iter().take(AUTHORS_CAP) {
-            let lo = schema::pair_key(author.value(), lower);
-            let range_start: [u8; 16] = lo;
-            let mut take = 0usize;
-            let entries = match upper_exclusive {
+            let range_start: [u8; 16] = schema::pair_key(author.value(), lower);
+            let mut entries = match upper_exclusive {
                 Some(upper) => {
                     let hi = schema::pair_key(author.value(), upper);
                     index.range(range_start.as_slice()..hi.as_slice())?
@@ -293,30 +307,23 @@ impl TimelineStore for RedbStore {
                     index.range(range_start.as_slice()..=hi.as_slice())?
                 }
             };
-            for entry in entries {
+            if let Some(entry) = entries.next() {
                 let (key, _value) = entry?;
                 scanned += 1;
-                let desc = u64::from_be_bytes(key.value()[8..].try_into().unwrap());
-                merged.push(Id::new(u64::MAX - desc));
-                take += 1;
-                if take >= window || scanned >= AUTHORS_MERGE_CAP {
-                    break;
+                heads.push((merged_id(key.value()), cursors.len()));
+            }
+            cursors.push(entries);
+        }
+
+        let mut matched: Vec<Status> = Vec::new();
+        while let Some((id, cursor)) = heads.pop() {
+            if scanned < AUTHORS_MERGE_CAP {
+                if let Some(entry) = cursors[cursor].next() {
+                    let (key, _value) = entry?;
+                    scanned += 1;
+                    heads.push((merged_id(key.value()), cursor));
                 }
             }
-            if scanned >= AUTHORS_MERGE_CAP {
-                break;
-            }
-        }
-        merged.sort_unstable_by(|a, b| b.cmp(a));
-        merged.dedup();
-        if merged.len() > AUTHORS_MERGE_CAP {
-            merged.truncate(AUTHORS_MERGE_CAP);
-        }
-        self.note_scanned(scanned);
-
-        let want_oldest = query.min_id.is_some() && query.since_id.is_none();
-        let mut matched: Vec<Status> = Vec::new();
-        for id in merged {
             let Some(status) = status_at(&read, id)? else {
                 continue;
             };
@@ -327,6 +334,7 @@ impl TimelineStore for RedbStore {
                 break;
             }
         }
+        self.note_scanned(scanned);
         if want_oldest && matched.len() > query.limit {
             matched.drain(..matched.len() - query.limit);
         }

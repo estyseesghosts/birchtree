@@ -22,14 +22,16 @@ pub const DEFAULT_LIMIT: usize = 20;
 pub const MAX_LIMIT: usize = 40;
 
 /// Most recent active follows a home feed reads. Follows beyond this are not
-/// considered; the manifest records the bound as a deviation.
-const HOME_AUTHOR_CAP: usize = 500;
+/// considered; the manifest records the bound as a deviation (D10a).
+const HOME_AUTHOR_CAP: usize = 1000;
 /// Members a list feed reads.
 const LIST_MEMBER_CAP: usize = 500;
 /// Distinct accounts (and reblog targets) one request may resolve. Past the
 /// cap an unresolved account fails closed: its statuses are excluded, never
-/// shown. This keeps public scans bounded without leaking.
-const ACCOUNT_CACHE_CAP: usize = 500;
+/// shown. This keeps public scans bounded without leaking. Sized above
+/// `HOME_AUTHOR_CAP`: the home follows fill the cache first, and reblog
+/// targets and reply parents from other accounts need room after them.
+const ACCOUNT_CACHE_CAP: usize = 2000;
 
 /// Viewer-side facts about one account, from a single `relationships` row.
 #[derive(Debug, Clone, Copy)]
@@ -52,6 +54,9 @@ struct ViewerScope<'a> {
     now_ms: u64,
     facts: Mutex<HashMap<Id, Option<Facts>>>,
     reblog_authors: Mutex<HashMap<Id, Option<Id>>>,
+    /// Accounts on one of the viewer's exclusive lists, among the home
+    /// authors (loaded by [`ViewerScope::seed_exclusive`]).
+    exclusive: Mutex<HashSet<Id>>,
     error: Mutex<Option<Error>>,
 }
 
@@ -63,8 +68,29 @@ impl<'a> ViewerScope<'a> {
             now_ms,
             facts: Mutex::new(HashMap::new()),
             reblog_authors: Mutex::new(HashMap::new()),
+            exclusive: Mutex::new(HashSet::new()),
             error: Mutex::new(None),
         }
+    }
+
+    /// Load which of `ids` sit on one of the viewer's exclusive lists. Home
+    /// only: list timelines never consult this (upstream's `timeline_type !=
+    /// :list` guard).
+    fn seed_exclusive(&self, ids: &[Id]) -> Result<()> {
+        let Some(viewer) = self.viewer else {
+            return Ok(());
+        };
+        let found = self.store.exclusive_list_members(viewer, ids)?;
+        *lock(&self.exclusive) = found;
+        Ok(())
+    }
+
+    /// Upstream's `FeedManager#filter_from_home` `:skip_home` rule: an account
+    /// on one of the viewer's exclusive lists is kept off the home feed. The
+    /// viewer's own statuses are never checked here (`HomeFilter` returns
+    /// first), and list timelines do not apply the rule.
+    fn on_exclusive_list(&self, account: Id) -> bool {
+        lock(&self.exclusive).contains(&account)
     }
 
     /// Load facts for a known author set in two store calls.
@@ -228,6 +254,9 @@ impl TimelineFilter for HomeFilter<'_> {
         if author == self.viewer {
             return true;
         }
+        if self.scope.on_exclusive_list(author) {
+            return false;
+        }
         if !self.scope.follows(author) || !self.scope.author_allowed(author) {
             return false;
         }
@@ -327,7 +356,8 @@ impl TimelineFilter for ListFilter<'_> {
 }
 
 /// Home timeline: the viewer's own statuses and their active follows, newest
-/// first. Only the most recent [`HOME_AUTHOR_CAP`] follows are read.
+/// first. Only the most recent [`HOME_AUTHOR_CAP`] follows are read. Members
+/// of the viewer's exclusive lists are left out (upstream `:skip_home`).
 pub fn home(
     store: &dyn Store,
     viewer: Id,
@@ -337,6 +367,7 @@ pub fn home(
     let follows = store.following(viewer, None, HOME_AUTHOR_CAP)?;
     let scope = ViewerScope::new(store, Some(viewer), now_ms);
     scope.seed(&follows)?;
+    scope.seed_exclusive(&follows)?;
     let mut authors = Vec::with_capacity(follows.len() + 1);
     authors.push(viewer);
     authors.extend_from_slice(&follows);

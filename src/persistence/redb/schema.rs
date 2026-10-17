@@ -105,6 +105,12 @@ pub const BLOCKS_BY_BLOCKED: TableDefinition<&[u8], ()> = TableDefinition::new("
 /// Domain blocks: `(account_id_be || 0xFF || domain)` -> JSON domain block.
 pub const DOMAIN_BLOCKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("domain_blocks");
 
+/// Domain blocks by row id: `(account_id_be || desc(id)_be)` -> JSON domain
+/// block. Ascending key order is newest first, which gives Mastodon's
+/// `max_id`/`since_id` paging over the account's block list.
+pub const DOMAIN_BLOCKS_BY_ID: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("domain_blocks_by_id");
+
 /// Mutes: `(muter_id_be || muted_id_be)` -> JSON mute (expiry + notify flag).
 pub const MUTES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mutes");
 
@@ -238,7 +244,7 @@ pub const CUSTOM_EMOJI: TableDefinition<&str, &[u8]> = TableDefinition::new("cus
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// Current schema version. Bump with a new migration step.
-pub const SCHEMA_VERSION: u64 = 4;
+pub const SCHEMA_VERSION: u64 = 5;
 
 /// All table names, for diagnostics and migration verification.
 pub const TABLE_NAMES: &[&str] = &[
@@ -268,6 +274,7 @@ pub const TABLE_NAMES: &[&str] = &[
     "blocks",
     "blocks_by_blocked",
     "domain_blocks",
+    "domain_blocks_by_id",
     "mutes",
     "mutes_by_muted",
     "account_notes",

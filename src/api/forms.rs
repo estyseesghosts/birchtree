@@ -3,7 +3,10 @@
 //! Mastodon clients send form-encoded bodies (and the OAuth endpoints use
 //! them exclusively). The std/`axum` form extractors lose repeated keys and do
 //! not handle both `key` and `key[]` conventions, so we parse the raw body into
-//! an ordered list of key/value pairs.
+//! an ordered list of key/value pairs. JSON bodies are flattened into the same
+//! pairs by [`crate::api::json_body`].
+
+use crate::api::json_body;
 
 /// Parse a form body into ordered key/value pairs (percent- and `+`-decoded).
 pub fn parse(body: &[u8]) -> Vec<(String, String)> {
@@ -106,18 +109,20 @@ mod tests {
 // Axum extractor.
 // ---------------------------------------------------------------------------
 
-/// A form body extractor that tolerates absent or empty bodies.
+/// A body extractor for form or JSON parameters that tolerates absent or
+/// empty bodies.
 ///
 /// Mastodon endpoints like `POST /api/v1/statuses/:id/reblog` or
 /// `POST /api/v1/accounts/:id/follow` accept requests with no body at all;
 /// axum's [`axum::extract::RawForm`] rejects those with `415`. This extractor
-/// parses whatever bytes are present as `application/x-www-form-urlencoded`
-/// (an empty body yields no pairs). JSON request bodies are not accepted —
-/// recorded as a compatibility gap in `docs/endpoint-manifest.md`.
+/// parses whatever bytes are present: a JSON body (`application/json`) is
+/// flattened by [`json_body::body_pairs`], anything else as
+/// `application/x-www-form-urlencoded` (an empty body yields no pairs).
 pub struct LenientForm(pub Vec<(String, String)>);
 
 /// Cap for a manually read body (the router's `DefaultBodyLimit` applies to
-/// the request as a whole; this is a second, explicit bound).
+/// the request as a whole; this is a second, explicit bound). JSON bodies
+/// above it are refused by [`json_body::guard`] before this runs.
 const MAX_FORM_BODY: usize = 1024 * 1024;
 
 impl<S> axum::extract::FromRequest<S> for LenientForm
@@ -130,10 +135,40 @@ where
         req: axum::extract::Request,
         _state: &S,
     ) -> Result<Self, Self::Rejection> {
-        let (_parts, body) = req.into_parts();
+        let (parts, body) = req.into_parts();
         let bytes = axum::body::to_bytes(body, MAX_FORM_BODY)
             .await
             .unwrap_or_default();
-        Ok(LenientForm(parse(&bytes)))
+        Ok(LenientForm(json_body::body_pairs(&parts.headers, &bytes)))
+    }
+}
+
+/// Like [`LenientForm`], for handlers that refuse other content types: a body
+/// that is neither form nor JSON gets axum's `RawForm` rejection (`415`).
+pub struct FormBody(pub Vec<(String, String)>);
+
+impl<S> axum::extract::FromRequest<S> for FormBody
+where
+    S: Send + Sync,
+{
+    type Rejection = axum::response::Response;
+
+    async fn from_request(
+        req: axum::extract::Request,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        use axum::response::IntoResponse;
+
+        if json_body::is_json(req.headers()) {
+            let (parts, body) = req.into_parts();
+            let bytes = axum::body::to_bytes(body, MAX_FORM_BODY)
+                .await
+                .unwrap_or_default();
+            return Ok(FormBody(json_body::body_pairs(&parts.headers, &bytes)));
+        }
+        let axum::extract::RawForm(bytes) = axum::extract::RawForm::from_request(req, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        Ok(FormBody(parse(&bytes)))
     }
 }

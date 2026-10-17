@@ -9,7 +9,8 @@ use redb::{Database, ReadableDatabase};
 
 use super::schema::{
     self, ACCESS_TOKENS, ACCOUNTS, ACCOUNT_NOTES, ACCOUNT_STATS, AUTHORIZATION_CODES, BLOCKS,
-    BLOCKS_BY_BLOCKED, BOOKMARKS, BOOKMARKS_BY_STATUS, CUSTOM_EMOJI, DOMAIN_BLOCKS, ENDORSEMENTS,
+    BLOCKS_BY_BLOCKED, BOOKMARKS, BOOKMARKS_BY_STATUS, CUSTOM_EMOJI, DOMAIN_BLOCKS,
+    DOMAIN_BLOCKS_BY_ID, ENDORSEMENTS,
     ENDORSEMENTS_BY_ENDORSED, FAVOURITES, FAVOURITES_BY_STATUS, FILTERS, FILTER_KEYWORDS,
     FILTER_KEYWORDS_BY_FILTER, FILTER_STATUSES, FILTER_STATUSES_BY_FILTER, FILTERS_BY_ACCOUNT,
     FOLLOWS, FOLLOWS_BY_FOLLOWED, HANDLE_INDEX, HASHTAG_INDEX, IDEMPOTENCY, JOBS, JOBS_INDEX,
@@ -189,6 +190,88 @@ pub fn apply(db: &Database) -> Result<u64, StoreError> {
             }
         }
 
+        // Step v5: domain blocks get a numeric row id (Mastodon's paging
+        // cursor) and an id index. A pre-v5 row has no id, so it is assigned
+        // `created_at_ms << 16 | r`, where `r` numbers the account's rows that
+        // share a creation millisecond, in domain order. Ids stay increasing
+        // with creation time, and rows that already carry an id are kept, so
+        // the step is idempotent. The scan is bounded by the pre-v5 block count.
+        if current < 5 {
+            use redb::ReadableTable;
+            use crate::domain::{DomainBlock, Id};
+
+            #[derive(serde::Deserialize)]
+            struct LegacyDomainBlock {
+                account_id: Id,
+                domain: String,
+                created_at_ms: u64,
+            }
+
+            // Same layout as the timestamp id generator (16 sequence bits).
+            const SEQUENCE_BITS: u32 = 16;
+
+            let raw: Vec<(Vec<u8>, Vec<u8>)> = {
+                let blocks = write.open_table(DOMAIN_BLOCKS)?;
+                let mut raw = Vec::new();
+                for entry in blocks.iter()? {
+                    let (key, value) = entry?;
+                    raw.push((key.value().to_vec(), value.value().to_vec()));
+                }
+                raw
+            };
+
+            // (key, row, needs_id) for every row.
+            let mut rows: Vec<(Vec<u8>, DomainBlock, bool)> = Vec::with_capacity(raw.len());
+            for (key, value) in raw {
+                match super::decode::<DomainBlock>(&value) {
+                    Ok(block) => rows.push((key, block, false)),
+                    Err(_) => {
+                        let legacy: LegacyDomainBlock = super::decode(&value)?;
+                        rows.push((
+                            key,
+                            DomainBlock {
+                                id: Id::new(0),
+                                account_id: legacy.account_id,
+                                domain: legacy.domain,
+                                created_at_ms: legacy.created_at_ms,
+                            },
+                            true,
+                        ));
+                    }
+                }
+            }
+
+            let mut order: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].2).collect();
+            order.sort_by(|&a, &b| {
+                let (x, y) = (&rows[a].1, &rows[b].1);
+                (x.account_id.value(), x.created_at_ms, &x.domain)
+                    .cmp(&(y.account_id.value(), y.created_at_ms, &y.domain))
+            });
+            let mut last: Option<(u64, u64)> = None;
+            let mut rank = 0u64;
+            for i in order {
+                let account = rows[i].1.account_id.value();
+                let created = rows[i].1.created_at_ms;
+                rank = if last == Some((account, created)) { rank + 1 } else { 0 };
+                last = Some((account, created));
+                rows[i].1.id = Id::new((created << SEQUENCE_BITS) | rank);
+            }
+
+            let mut blocks = write.open_table(DOMAIN_BLOCKS)?;
+            let mut by_id = write.open_table(DOMAIN_BLOCKS_BY_ID)?;
+            for (key, block, assigned) in &rows {
+                let encoded = super::encode(block)?;
+                if *assigned {
+                    blocks.insert(key.as_slice(), encoded.as_slice())?;
+                }
+                by_id.insert(
+                    schema::pair_key(block.account_id.value(), schema::desc_id(block.id.value()))
+                        .as_slice(),
+                    encoded.as_slice(),
+                )?;
+            }
+        }
+
         {
             let mut meta = write.open_table(META)?;
             meta.insert(
@@ -269,6 +352,71 @@ mod tests {
             assert!(read.open_table(schema::FOLLOWS).is_ok());
             assert!(read.open_table(schema::QUOTES).is_ok());
         }
+    }
+
+    #[test]
+    fn upgrades_v4_database_backfills_domain_block_ids() {
+        let (_dir, db) = temp_db();
+        // A pre-v5 database: legacy domain-block rows (no id), stamped v4.
+        {
+            let write = db.begin_write().unwrap();
+            {
+                let mut blocks = write.open_table(schema::DOMAIN_BLOCKS).unwrap();
+                let rows = [
+                    (7u64, "b.example", 1_000u64),
+                    (7, "a.example", 1_000),
+                    (7, "c.example", 2_000),
+                    (8, "x.example", 1_000),
+                ];
+                for (account, domain, created) in rows {
+                    let key = schema::domain_block_key(account, domain);
+                    let legacy = serde_json::json!({
+                        "account_id": account,
+                        "domain": domain,
+                        "created_at_ms": created,
+                    });
+                    blocks
+                        .insert(key.as_slice(), serde_json::to_vec(&legacy).unwrap().as_slice())
+                        .unwrap();
+                }
+            }
+            {
+                let mut meta = write.open_table(schema::META).unwrap();
+                meta.insert(schema::SCHEMA_VERSION_KEY, 4u64.to_be_bytes().as_slice())
+                    .unwrap();
+            }
+            write.commit().unwrap();
+        }
+
+        assert_eq!(apply(&db).unwrap(), target_version());
+
+        let read = db.begin_read().unwrap();
+        let blocks = read.open_table(schema::DOMAIN_BLOCKS).unwrap();
+        let by_id = read.open_table(schema::DOMAIN_BLOCKS_BY_ID).unwrap();
+        let block_at = |account: u64, domain: &str| -> crate::domain::DomainBlock {
+            let key = schema::domain_block_key(account, domain);
+            let guard = blocks.get(key.as_slice()).unwrap().expect("row kept");
+            serde_json::from_slice(guard.value()).unwrap()
+        };
+        // Within one millisecond, the rank follows domain order; a later
+        // millisecond always has the larger id.
+        assert_eq!(block_at(7, "a.example").id.value(), 1_000u64 << 16);
+        assert_eq!(block_at(7, "b.example").id.value(), (1_000u64 << 16) | 1);
+        assert_eq!(block_at(7, "c.example").id.value(), 2_000u64 << 16);
+        assert_eq!(block_at(8, "x.example").id.value(), 1_000u64 << 16);
+
+        // The id index is newest first, and per account.
+        let mut domains = Vec::new();
+        for entry in by_id
+            .range(schema::pair_key(7, 0).as_slice()..schema::pair_key(7, u64::MAX).as_slice())
+            .unwrap()
+        {
+            let (_key, value) = entry.unwrap();
+            let block: crate::domain::DomainBlock =
+                serde_json::from_slice(value.value()).unwrap();
+            domains.push(block.domain);
+        }
+        assert_eq!(domains, ["c.example", "b.example", "a.example"]);
     }
 
     #[test]

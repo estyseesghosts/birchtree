@@ -138,7 +138,7 @@ and idempotent):
 |---|---|
 | public/tag timeline index walk | 2 000 entries |
 | hashtag timeline index walk | 2 000 entries |
-| home/list k-way merge | 512 entries/author, 5 000 total, 500 authors |
+| home/list k-way merge | lazy merge: one cursor per author and a heap of cursor heads; 5 000 index entries per call, cursor heads counted; 1001 authors (viewer + 1000 home follows, Phase 4.1) |
 | notification page / clear / count | 1 000 entries (clear 10 000) |
 | account lists scan | 100 |
 | list members scan | 2 000 (timeline member list 500) |

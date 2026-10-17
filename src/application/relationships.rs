@@ -206,11 +206,24 @@ pub fn set_account_note(
     store.set_account_note(viewer_id, target_id, comment, now_ms)
 }
 
+/// The 422 message for an input that `normalize_domain` rejects: upstream's
+/// `AccountDomainBlock` presence and `DomainValidator` messages, as the
+/// `RecordInvalid` error renders them.
+fn invalid_domain_message(raw: &str) -> &'static str {
+    let stripped = raw.trim().trim_start_matches('@').trim();
+    if stripped.is_empty() {
+        "Validation failed: Domain can't be blank"
+    } else {
+        "Validation failed: Domain is invalid"
+    }
+}
+
 /// Block a domain (`POST /api/v1/domain_blocks`).
 ///
 /// The domain is normalized (trim, strip one leading `@`, lowercase) before
-/// it is stored; blank or malformed input (scheme, port, path, spaces) ->
-/// 422 `Domain cannot be blank`.
+/// it is stored. Blank input -> 422 `Validation failed: Domain can't be
+/// blank`; malformed input (scheme, port, path, spaces) -> 422 `Validation
+/// failed: Domain is invalid`.
 pub fn domain_block(
     store: &dyn Store,
     account_id: Id,
@@ -218,7 +231,7 @@ pub fn domain_block(
     now_ms: u64,
 ) -> Result<DomainBlock> {
     let domain = normalize_domain(domain)
-        .ok_or_else(|| Error::InvalidInput("Domain cannot be blank".into()))?;
+        .ok_or_else(|| Error::InvalidInput(invalid_domain_message(domain).into()))?;
     store.domain_block(account_id, &domain, now_ms)
 }
 
@@ -234,15 +247,15 @@ pub fn unblock_domain(store: &dyn Store, account_id: Id, domain: &str) -> Result
     store.unblock_domain(account_id, &domain)
 }
 
-/// Blocked domains, newest first, cursor-bounded by domain
-/// (`GET /api/v1/domain_blocks`).
+/// Blocked domains, newest first, paged by row id (`GET /api/v1/domain_blocks`).
 pub fn list_domain_blocks(
     store: &dyn Store,
     account_id: Id,
-    max_domain: Option<&str>,
+    max_id: Option<Id>,
+    since_id: Option<Id>,
     limit: usize,
 ) -> Result<Vec<DomainBlock>> {
-    store.domain_blocks(account_id, max_domain, limit)
+    store.domain_blocks(account_id, max_id, since_id, limit)
 }
 
 /// Endorse (pin) an account you follow (`POST /api/v1/accounts/:id/pin`).

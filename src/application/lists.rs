@@ -24,8 +24,17 @@ pub fn index(store: &dyn Store, viewer: Id) -> Result<Vec<List>> {
     store.lists_by_account(viewer)
 }
 
-/// `POST /api/v1/lists` — create a list.
-pub fn create(store: &dyn Store, viewer: Id, title: &str, now_ms: u64) -> Result<List> {
+/// `POST /api/v1/lists` — create a list. `replies_policy` and `exclusive` are
+/// accepted at creation as upstream's `list_params` does (default `list` and
+/// `false`).
+pub fn create(
+    store: &dyn Store,
+    viewer: Id,
+    title: &str,
+    replies_policy: Option<String>,
+    exclusive: Option<bool>,
+    now_ms: u64,
+) -> Result<List> {
     let title = title.trim();
     if title.is_empty() {
         return Err(Error::InvalidInput(ERR_TITLE_BLANK.into()));
@@ -33,11 +42,22 @@ pub fn create(store: &dyn Store, viewer: Id, title: &str, now_ms: u64) -> Result
     if title.chars().count() > List::TITLE_LENGTH_LIMIT {
         return Err(Error::InvalidInput(ERR_TITLE_TOO_LONG.into()));
     }
+    let policy = parse_policy(replies_policy)?.unwrap_or_default();
     let existing = store.lists_by_account(viewer)?;
     if existing.len() >= List::PER_ACCOUNT_LIMIT {
         return Err(Error::InvalidInput(ERR_LIMIT.into()));
     }
-    store.create_list(viewer, title, now_ms)
+    store.create_list(viewer, title, policy, exclusive.unwrap_or(false), now_ms)
+}
+
+/// The wire `replies_policy`, validated; `None` when absent.
+fn parse_policy(raw: Option<String>) -> Result<Option<RepliesPolicy>> {
+    match raw {
+        None => Ok(None),
+        Some(raw) => RepliesPolicy::from_wire(&raw)
+            .map(Some)
+            .ok_or_else(|| Error::InvalidInput(ERR_POLICY.into())),
+    }
 }
 
 /// `GET /api/v1/lists/:id` — the viewer's list, or a Mastodon 404.
@@ -58,12 +78,7 @@ pub fn update(
     // Ownership is checked first (Mastodon's `set_list` 404s before
     // validation).
     owned_list(store, viewer, id)?;
-    let policy = match replies_policy {
-        None => None,
-        Some(raw) => Some(RepliesPolicy::from_wire(&raw).ok_or_else(|| {
-            Error::InvalidInput(ERR_POLICY.into())
-        })?),
-    };
+    let policy = parse_policy(replies_policy)?;
     let title = title.map(|title| {
         let trimmed = title.trim().to_string();
         if trimmed.is_empty() {

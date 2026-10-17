@@ -13,6 +13,7 @@ use axum::routing::{delete, get, patch, post, put};
 use tower_http::trace::TraceLayer;
 
 use super::{ApiState, endpoints, rate_limits};
+use crate::api::json_body;
 use crate::api::oauth::{authorization, token};
 
 /// Build the application router.
@@ -129,15 +130,12 @@ pub fn build_router(state: ApiState) -> Router {
             "/api/v1/follow_requests/{id}/reject",
             post(endpoints::relationships::reject_request),
         )
-        // Domain blocks.
+        // Domain blocks (upstream shape: the domain is a parameter, not a path segment).
         .route(
             "/api/v1/domain_blocks",
             get(endpoints::relationships::domain_blocks_index)
-                .put(endpoints::relationships::domain_blocks_create),
-        )
-        .route(
-            "/api/v1/domain_blocks/{domain}",
-            delete(endpoints::relationships::domain_blocks_delete),
+                .post(endpoints::relationships::domain_blocks_create)
+                .delete(endpoints::relationships::domain_blocks_delete),
         )
         // Preferences.
         .route("/api/v1/preferences", get(endpoints::preferences::index))
@@ -390,6 +388,10 @@ pub fn build_router(state: ApiState) -> Router {
             post(endpoints::filters::statuses_create),
         )
         .with_state(state)
+        // Malformed JSON is refused before any handler runs (Rails parses
+        // params before the action); this sits inside the rate limiter, which
+        // runs first, as Rack::Attack does upstream.
+        .layer(middleware::from_fn(json_body::guard))
         .layer(middleware::from_fn(rate_limits::middleware))
         .layer(middleware::from_fn(vary_authorization))
         .layer(DefaultBodyLimit::max(max_body))

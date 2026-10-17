@@ -4,7 +4,7 @@ birchtree is a Mastodon 4.7.3-compatible ActivityPub/SNS server written in Rust.
 
 ## Compatibility goal
 
-A progressively tested drop-in replacement for Mastodon clients, targeting the v4.7.3 / API v7 contract; not a claim of complete API parity on day one.
+The bar: an unmodified Mastodon client connects to a birchtree instance and has an identical experience to connecting to Mastodon v4.7.3, measured at 98% or better, with the core flows matching in full. Deliberate differences are listed in the deviation register (`docs/compatibility-profile.md`). Parity is built up phase by phase, not claimed on day one.
 
 ## Initial deployment
 
@@ -15,7 +15,9 @@ A progressively tested drop-in replacement for Mastodon clients, targeting the v
 
 ## Frontend
 
-No application UI. A minimal server-rendered login/consent flow is required for Mastodon-compatible OAuth authorization. The first administrator account is bootstrapped by CLI.
+birchtree has no frontend source code in this repository. A minimal server-rendered login/consent flow is required for Mastodon-compatible OAuth authorization. The first administrator account is bootstrapped by CLI.
+
+**keystodon** is the frontend, developed in a separate project in parallel. It runs in two modes. As the **first-party client**, birchtree serves its built bundle and keystodon uses birchtree's browser session with CSRF for `/api/web/*`. As a **third-party client**, keystodon authenticates against any host, including birchtree, through OAuth. keystodon is not on the development machine yet. It is the planned interoperability target for both modes.
 
 ## How to run
 
@@ -28,7 +30,7 @@ cargo test
 ./scripts/smoke-all.sh
 ```
 
-The server binary serves the Phase 2 OAuth, registration and read APIs plus the CLI (`create-account`); see `docs/wiki/Current-State.md` for what is implemented.
+The server binary serves the OAuth, registration, read, status, relationship, media, timeline and notification APIs (Phases 2–4) plus the CLI (`create-account`); see `docs/wiki/Current-State.md` for what is implemented.
 
 ## Design sources
 

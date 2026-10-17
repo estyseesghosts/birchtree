@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::domain::{
@@ -548,11 +548,13 @@ pub trait RelationshipStore: Send + Sync {
 
     fn domain_block(&self, account_id: Id, domain: &str, now_ms: u64) -> Result<DomainBlock>;
     fn unblock_domain(&self, account_id: Id, domain: &str) -> Result<Option<DomainBlock>>;
-    /// Blocked domains, newest first, cursor-bounded (cursor = domain).
+    /// Blocked domains, newest first. `max_id` and `since_id` are exclusive
+    /// numeric row-id cursors (Mastodon's `paginate_by_max_id`).
     fn domain_blocks(
         &self,
         account_id: Id,
-        max_domain: Option<&str>,
+        max_id: Option<Id>,
+        since_id: Option<Id>,
         limit: usize,
     ) -> Result<Vec<DomainBlock>>;
 
@@ -839,7 +841,14 @@ pub trait MediaStore: Send + Sync {
 pub trait ListStore: Send + Sync {
     /// Create a list for `account_id` (the use case enforces the per-account
     /// limit and title rules).
-    fn create_list(&self, account_id: Id, title: &str, now_ms: u64) -> Result<List>;
+    fn create_list(
+        &self,
+        account_id: Id,
+        title: &str,
+        replies_policy: RepliesPolicy,
+        exclusive: bool,
+        now_ms: u64,
+    ) -> Result<List>;
     fn list_by_id(&self, id: Id) -> Result<Option<List>>;
     /// The owner's lists (index returns all; no pagination in v4.7.3).
     fn lists_by_account(&self, account_id: Id) -> Result<Vec<List>>;
@@ -867,6 +876,11 @@ pub trait ListStore: Send + Sync {
     fn list_members(&self, list_id: Id, max_id: Option<Id>, limit: usize) -> Result<Vec<Id>>;
     /// All members of a list (bounded), for the list timeline merge.
     fn all_list_members(&self, list_id: Id, cap: usize) -> Result<Vec<Id>>;
+    /// The `candidates` that belong to one of `owner`'s lists with
+    /// `exclusive = true` (upstream's `exclusive_list_users`, which hides them
+    /// from home). One read transaction; no scan cap, because the cost is the
+    /// owner's exclusive lists times the candidates.
+    fn exclusive_list_members(&self, owner: Id, candidates: &[Id]) -> Result<HashSet<Id>>;
 }
 
 /// Why a marker update was rejected.

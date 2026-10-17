@@ -69,8 +69,17 @@ pub async fn create(State(state): State<ApiState>, auth: Auth, LenientForm(body)
         Err(err) => return err.into_response(),
     };
     let title = forms::get(&body, "title").unwrap_or("");
+    let replies_policy = forms::get(&body, "replies_policy").map(str::to_string);
+    let exclusive = forms::get(&body, "exclusive").map(bool_cast);
     let store: &dyn Store = &*state.context.store;
-    match lists::create(store, viewer, title, state.context.now_ms()) {
+    match lists::create(
+        store,
+        viewer,
+        title,
+        replies_policy,
+        exclusive,
+        state.context.now_ms(),
+    ) {
         Ok(list) => axum::Json(dto::list_json(&list)).into_response(),
         Err(err) => list_error(err).into_response(),
     }

@@ -2,9 +2,9 @@
 
 **Revised:** 2026-10-16  
 **Reference release:** Mastodon **4.7.3** (released 2026-10-01)  
-**Compatibility goal:** a progressively tested drop-in replacement for Mastodon clients, targeting the v4.7.3 / API v7 contract; not a claim of complete API parity on day one  
+**Compatibility bar:** an unmodified Mastodon client connects to a birchtree instance and has an identical experience to connecting to Mastodon v4.7.3 (API v7 contract). Parity is built up phase by phase, with deliberate differences listed in the deviation register (`docs/compatibility-profile.md`); it is not claimed on day one  
 **Initial deployment:** one Rust process, `redb`, local media storage, in-process durable-job workers  
-**Frontend:** no application UI. A minimal server-rendered login/consent flow is required for Mastodon-compatible OAuth authorization.
+**Frontend:** birchtree has no frontend source code in this repository. It requires a minimal server-rendered login/consent flow for Mastodon-compatible OAuth authorization, and it serves **keystodon**, the frontend developed in parallel in a separate project. keystodon runs in two modes. As the **first-party client**, birchtree serves its built bundle and keystodon authenticates with birchtree's browser session plus CSRF on `/api/web/*` (§7 Phase 7). As a **third-party client**, keystodon authenticates against any host, including birchtree, through OAuth (§6.3). keystodon is not on the development machine yet. It is the planned interoperability target for both modes (§8).
 
 This plan is based on Pinetree’s latest repository state and a source-level review of Mastodon v4.7.3. The pinned Mastodon tag is the compatibility authority; `main` and unversioned documentation are useful for detecting later changes, not for silently changing this target. [v4.7.3 changelog](https://github.com/mastodon/mastodon/blob/v4.7.3/CHANGELOG.md) · [release list](https://github.com/mastodon/mastodon/releases)
 
@@ -19,10 +19,15 @@ Build a **separate Rust project**. Carry over Pinetree’s architectural rules a
 - **Mastodon-compatible decimal IDs.** Implement a 64-bit timestamp-oriented ID generator and serialize IDs as decimal strings, matching the numeric ID shape and ordering assumptions in Mastodon. Do not expose UUIDs or Pinetree’s AIDX format. Keep comparisons numeric internally; never order decimal IDs lexicographically.
 - **Contract first.** Pin endpoints, methods, request encodings, scopes, response fields/nullability, status codes, headers, cursor semantics, streaming events, and unsupported behavior in a manifest backed by tests.
 - **No “success-shaped stubs.”** An unimplemented endpoint must be explicitly out of profile and return an appropriate error, not fabricated data.
+- **Declared profile scope.** The declared profile includes the admin/moderation API, reports, Web Push subscriptions, conversations, suggestions, announcements, trends, annual reports, donation campaigns, and the `/api/web/*` routes. Each has a planned phase in §7 (Phases 7–7.3). Out of profile: the server-rendered admin dashboard, the Mastodon web app (`/web/*`), and `GET /api/v1/search`, which does not exist at v4.7.3.
 
 ### What “drop-in” means here
 
-“Drop-in” is an end state, not the first milestone. Define the intended client profile and test it against actual Mastodon-compatible clients. A server that implements posting and timelines but lacks scope semantics, media processing, account registration, streaming, or federation is **not** a drop-in replacement.
+### The compatibility bar
+
+**An unmodified Mastodon client connects to a birchtree instance and has an identical experience to connecting to Mastodon v4.7.3, measured at 98% or better.** This is the bar for every phase. The aim is identical behaviour: the same requests are accepted; the same response bodies, status codes, headers and pagination come back; the same streaming events arrive; and the same errors are shown. The bar is a measured target, not a claim of 100%. birchtree must match at least 98% of the observations in the parity suite (§8 item 11), and the core client flows (sign-in, compose, timelines, notifications, media) must match in full (proposed). Each place where birchtree deliberately differs must appear in the deviation register in `docs/compatibility-profile.md`, with its reason and whether the operator accepted it. A difference that is not in the register is a bug.
+
+“Drop-in” is an end state, not the first milestone. Test the bar against real unmodified clients, chosen in Phase 0. keystodon is one of them, in both its first-party and third-party modes, once it is available on the development machine. A server that implements posting and timelines but lacks scope semantics, media processing, account registration, streaming, or federation is **not** a drop-in replacement.
 
 Track three separately reported outcomes:
 
@@ -168,6 +173,7 @@ mastodon-rs/
       filters/
       instance/
       scheduled_statuses/
+      admin/                      # Phase 7.3: roles, moderation, trends approval, metrics
     api/
       mastodon/
         router.rs
@@ -194,6 +200,17 @@ mastodon-rs/
           preferences.rs
           scheduled_statuses.rs
           streaming_discovery.rs
+          conversations.rs
+          suggestions.rs
+          announcements.rs
+          donation_campaigns.rs
+          push.rs
+          web.rs                    # /api/web/* (session + CSRF)
+          web_client.rs             # Phase 7: serves keystodon's built first-party bundle
+          trends.rs
+          reports.rs
+          annual_reports.rs
+          admin/
       oauth/
         authorization.rs
         token.rs
@@ -215,6 +232,7 @@ mastodon-rs/
       retry.rs
       dedup.rs
       remote_media.rs
+    search/                       # Phase 7.2: embedded search backend behind a port (derived, rebuildable index)
     streaming/
       hub.rs
       auth.rs
@@ -231,6 +249,7 @@ mastodon-rs/
       blob_store.rs
       processing.rs
       remote_cache.rs
+      transcode.rs                # Phase 7.1: post-commit ffmpeg job (GIF and video → WebM/VP9; images → WebP)
     persistence/
       redb/
         mod.rs
@@ -277,7 +296,7 @@ Status must carry author, source text, sanitized/rendered HTML, created/edited/d
 
 - Preserve original source separately from rendered `content`; expose source endpoints/fields where the Mastodon API requires them.
 - Replies form parent-child edges. Implement a direct-child index, cursor-bounded children reads, and exact reply counters. Mastodon’s context endpoint must return the expected ancestors/descendants representation; do not substitute Pinetree’s API shape.
-- A remote reply with an unknown parent stays unresolved; never silently promote it to a root. Persist bounded parent-resolution jobs and withhold it from ordinary reads until linking succeeds, unless the pinned Mastodon behavior demands a different explicit projection.
+- A remote reply with an unknown parent stays unresolved; never silently promote it to a root. The unresolved state is **temporary**: persisted, bounded parent-resolution jobs actively fetch the missing parent (Phase 6, “Remote thread completion”, `docs/federation-contract.md`), one hop per job. The existing safety rules still apply: never promote to root; bounded work per chain (a hop cap and a per-trigger fetch budget); no unbounded recursion; respect blocks, domain blocks, suspended actors and visibility when fetching and when linking; every hop goes through the safe fetch client with its size, time and redirect limits. A reply whose parent cannot be fetched (not found, blocked, unsafe, budget exhausted) stays unresolved and its job terminates. Until linking succeeds, withhold it from ordinary reads, as Mastodon does for home and list feed insertion (`FeedManager#filter_from_home`), unless the pinned Mastodon behavior demands a different explicit projection.
 - Reblogs are separate status records referencing the original status, with author and visibility constraints. Do not collapse reblogs and quote statuses into the same operation.
 - Editing stores edit history and updates media/poll/content as an atomic use case plus durable notifications/distribution jobs.
 - Status creation needs per-account `Idempotency-Key` support for the documented one-hour retention, including key lookup, result replay, and prevention of duplicate status/outbox work.
@@ -334,6 +353,12 @@ For status create/update/delete, follow/unfollow, favourite/bookmark, poll vote,
 
 Do not put media bytes, HTTP calls, follower lists, or unbounded fan-out into a transaction. File/object storage cannot participate in a `redb` transaction: stage incoming bytes, validate/process them, commit metadata last, and run bounded orphan cleanup after crash. Keep the authoritative media state explicit (`pending`, `processing`, `ready`, `failed`) so the API can return Mastodon-compatible processing status.
 
+### Media transcoding (Phase 7.1)
+
+Transcoding is post-processing, not part of the upload request. An upload commits its metadata in the existing `pending`/`processing` lifecycle. A durable transcode job then runs ffmpeg through a configured binary path, outside any transaction, writes derived blobs to staging, and commits the derived-blob references and the resulting state last. A crash leaves at most orphaned staged blobs, which bounded cleanup removes.
+
+Transcoding covers three inputs. GIFs convert to **WebM with VP9** and are typed `video`. Video converts to WebM with VP9 and Opus audio, except that a file already in VP9 WebM within the upload size limit passes through unchanged. Still images convert to **WebP**, except an image already in WebP, which passes through unchanged. The server never strips or rewrites EXIF or other metadata (§7 Phase 7.1). Upstream converts animated GIF to MP4 and reports `type: gifv` (`lib/paperclip/gif_transcoder.rb` at v4.7.3). birchtree never produces `gifv`. That is a deliberate deviation, recorded in `docs/endpoint-manifest.md`. ffmpeg is an external runtime dependency: when transcoding is enabled, a missing or non-working ffmpeg is a startup configuration error, never a silent pass-through. Each transcode job runs under wall-time, output-size and memory limits.
+
 ### Timeline strategy: explicit trade-off
 
 Mastodon relies on Redis-backed feed materialization and background distribution. The first Rust implementation should **not** rebuild that architecture by stealth or make an unbounded fan-out-on-read query. Start with bounded indexed reads and a k-way merge over relevant followed-account ranges, with explicit scan budgets and page-level preload. Benchmark with high-follow-count accounts and sparse/filtered posts. If it fails the latency target, add a durable, rebuildable `redb` home/list feed index populated by outbox jobs; keep its semantics and recovery contract identical to fan-out-on-read. This is a performance milestone, not permission to weaken compatibility.
@@ -370,6 +395,7 @@ The v4.7.3 [`Doorkeeper configuration`](https://github.com/mastodon/mastodon/blo
 - Support authorization-code flow with **PKCE S256**; verify exact redirect URI matching, state, one-time code use, short-lived authorization codes, allowed scopes, app/client identity and safe redirect handling.
 - Match Mastodon’s token-lifetime configuration instead of arbitrarily expiring all tokens or assuming refresh tokens are enabled. In v4.7.3, access tokens have no default expiration; refresh tokens are not enabled by default. Revocation is still required.
 - Enforce documented scopes centrally, including broad and granular scopes such as `read`, `write`, `follow`, `push`, `profile`, and endpoint-level `read:statuses`, `write:statuses`, `read:accounts`, `read:notifications`, etc. App-only/client-credentials tokens are not user tokens; endpoint authorization must distinguish them.
+- Phase 7.3 adds the `admin:read` and `admin:write` scope families and their per-resource sub-scopes (for example `admin:read:reports`), which the pinned Doorkeeper configuration registers as optional scopes. Birchtree's scope registry does not list them yet. Admin routes also require a moderator-or-admin role (Mastodon's `Admin::PermissionsConcern`). Birchtree has no role model, and its `create-account` CLI creates accounts without roles. Phase 7.3 adds two roles, `admin` and `moderator`, with CLI-managed grants (decided 2026-10-17; the permission split is in Phase 7.3). Admin routes are absent (404) until then.
 - Do not invent OAuth metadata or userinfo endpoints unless verified in the pinned route/config and needed by the target clients.
 - The authorization code flow needs an authenticated browser session and authorization/consent UI. Since this project has no full frontend, render a minimal safe login/consent page on the server; bootstrap the initial local account by CLI. This is protocol support, not an application frontend.
 
@@ -377,7 +403,7 @@ Source: [`OAuth::AuthorizationsController`](https://github.com/mastodon/mastodon
 
 ### 6.4 Response packing
 
-Create stable DTO packers for Status, Account, Relationship, Notification, Poll, MediaAttachment, ScheduledStatus, Instance and Quote. Preserve per-viewer flags and source/normal modes. Include exact behavior for unavailable accounts, deleted statuses, embedded reblog objects, accepted/pending/rejected/revoked/deleted quotes, custom emoji, edited-at fields, poll totals, and `null` URLs while media is processing. Avoid one universal packer whose behavior silently changes according to whichever endpoint calls it; share low-level pack functions and pass explicit view context.
+Create stable DTO packers for Status, Account, Relationship, Notification, Poll, MediaAttachment, ScheduledStatus, Instance and Quote. Preserve per-viewer flags and source/normal modes. Include exact behavior for unavailable accounts, deleted statuses, embedded reblog objects, accepted/pending/rejected/revoked/deleted quotes, custom emoji, edited-at fields, poll totals, and `null` URLs while media is processing. Phase 7.1 changes the media packer: `type` (`gifv` versus `image`), `url`, `preview_url` and `meta` depend on which derived blobs exist, and a derived blob can be pending, which shows as a `null` URL (§5 “Media transcoding”). Avoid one universal packer whose behavior silently changes according to whichever endpoint calls it; share low-level pack functions and pass explicit view context.
 
 ## 7. Implementation phases and exit gates
 
@@ -421,6 +447,7 @@ Implement vertical slices end-to-end, each through domain → application → pe
 3. Poll creation/voting/expiry, media attachment relations/order, sensitive/CW/language, application metadata, status counts and per-viewer relationship flags.
 4. Quote API and state machine: policy defaults; `quoted_status_id`/`quote_approval_policy`; quote DTO/count; list/revoke; interaction policy endpoint; safe previews; structured/textual fallback. Add local quote authorization before federated quote request handling.
 5. Idempotent commands: repeated API retries must not duplicate status, interaction, notification or durable job.
+6. Correction (2026-10-17): the domain-block endpoints follow upstream v4.7.3's shape. `GET /api/v1/domain_blocks` pages newest first with numeric `max_id`/`since_id` row-id cursors (limit 100, maximum 200). `POST /api/v1/domain_blocks` and `DELETE /api/v1/domain_blocks` take the `domain` parameter, from the form body or query string. Blank or malformed domains return upstream's `Validation failed` messages. Schema v5 adds the id index and backfills existing rows (executed evidence: `docs/logs/2026-10-17-domain-blocks-correction.md`).
 
 **Exit:** tests cover local flows, privacy boundaries, relationship races, exact DTOs, counters and idempotency; crash after commit still completes follow-up work; a client can perform the core social loop without federation.
 
@@ -434,6 +461,17 @@ Implement vertical slices end-to-end, each through domain → application → pe
 
 **Exit:** real client media/post/timeline/notification workflows pass; visibility parity is asserted across every read surface; large-page and sparse-filter tests do not scan without bound; `202`/processing behavior and all documented headers match.
 
+### Phase 4.1 — Parity gap closure (before Phase 5)
+
+Moved up on 2026-10-17. These gaps break the compatibility bar for ordinary clients, and streaming is a larger surface that should not start on top of them. Register entries: D10a, D10b, D11 (`docs/compatibility-profile.md`).
+
+- **JSON request bodies (D11).** Accept `application/json` on every write endpoint, alongside the form encodings. Flatten a JSON body into the key model `src/api/forms.rs` already uses, so every handler sees one shape: nested objects become `a[b]` keys, arrays become repeated `a[]` keys, numbers and booleans become their decimal and `true`/`false` strings, and `null` is absent, as Rails' form encoding renders it. Malformed JSON answers the error body upstream produces; the implementer confirms that body against upstream's parameter-parse handling before writing the test. Form bodies and query strings keep working unchanged.
+- **Exclusive lists on home (D10b).** Match upstream's `FeedManager#filter_from_home`. A status from an account that belongs to one of the viewer's exclusive lists is left out of the home feed. Three exact rules: the viewer's own statuses are never left out (upstream returns before the check); list timelines are unaffected (upstream applies the rule only when the timeline type is not `list`); and only lists with `exclusive=true` count.
+- **Home follow cap 1000 (D10a).** Raise `HOME_AUTHOR_CAP` from 500 to 1000 (`src/application/timelines.rs`). This is an accepted deviation: an account that follows more than 1000 accounts still misses posts from its older follows. The per-request account cache (`ACCOUNT_CACHE_CAP`, 500 in `src/application/timelines.rs`) also applies to home authors. It must be raised to at least 1000 in the same change, or the extra follows fail closed and their posts are dropped. The Phase 4 bounded-scan limits (`items_scanned <= 5000`, `read_txns <= 600`) must still hold with the new cap. If they do not, the implementer keeps 500 and reports the failing measurement.
+- **Tag feed reblogs (D10c): closed, no change.** Upstream's `ReblogService` creates reblog rows with no tag rows, so the tag feed excludes reblog wrappers there too.
+
+**Exit:** every write endpoint has a JSON-and-form parity test with identical results; an exclusive-list member is hidden from home, still visible on the list timeline, and the viewer's own posts still show; the home cap is 1000 and the Phase 4 bounded-scan tests pass; the parity suite (§8 item 11) covers the Phase 0–4.1 surfaces, or the evidence states which surfaces it does not yet cover.
+
 ### Phase 5 — Streaming
 
 - Implement SSE and WebSocket server in Rust and Mastodon’s event envelopes: status `update`, `delete`, `status.update`, `notification`, and supported stream-specific events/payloads.
@@ -446,29 +484,85 @@ Implement vertical slices end-to-end, each through domain → application → pe
 ### Phase 6 — ActivityPub federation
 
 - WebFinger (`acct:` resolution), NodeInfo, actor and key documents, inbox/shared inbox/outbox, object dereferencing, HTTP signatures and digest, signed outbound requests, JSON-LD/ActivityStreams parsing, and canonical URI mapping.
-- Initial activity set: Create/Note, Update, Delete, Follow/Accept/Reject/Undo, Like/Undo, Announce/Undo, Block, and quote request/accept/reject/revoke behavior required by Mastodon 4.7.3 interop. Add `Flag`/report behavior if the selected profile includes it.
+- Initial activity set: Create/Note, Update, Delete, Follow/Accept/Reject/Undo, Like/Undo, Announce/Undo, Block, and quote request/accept/reject/revoke behavior required by Mastodon 4.7.3 interop. Flag send and receive, which reports (Phase 7.3) require.
 - Durable per-destination delivery with retry/backoff, failure cooldown, terminal quarantine and replay/dedup. Remote fetches resolve through a safe HTTP client with DNS/IP SSRF defenses, redirect/time/size limits and content validation.
 - Inbound activity handling shares local application operations for follow, status, favourite, reblog, delete and quote. Federation failures must not roll back committed local actions.
 - Fetch remote media asynchronously; track remote account/status/key cache freshness and safe refresh behavior.
+- **Remote thread completion** (`docs/federation-contract.md`, “Remote thread completion”):
+  - ingest-time parent resolution: a persisted job per unresolved reply fetches the parent, one hop per job, bounded by a hop cap and a per-trigger fetch budget. It never promotes a reply to root;
+  - read-time descendant completion for authenticated `GET /api/v1/statuses/:id/context`: a durable crawl of the remote `replies` collection, announced with `Mastodon-Async-Refresh`, with cooldown, deduplication, and page, item and fetch caps;
+  - read-time ancestor completion, for logged-in viewers only (decided 2026-10-17). Mastodon does not do this, so it is deviation D5 in the register (`docs/compatibility-profile.md`). Ancestors and descendants are both completed on the same authenticated context read.
+- **Signed fetch.** Outbound dereferences and crawl fetches are signed with the instance actor's key by default. Mastodon's `fetch_resource_without_id_validation` falls back to `Account.representative` when no actor is passed. Birchtree needs an instance-actor keypair before thread completion ships. When authorized fetch is enabled, birchtree's own replies, context and collection endpoints require an HTTP signature (Mastodon: `require_account_signature!` on those controllers).
+- Crawl fetches pass the same SSRF, size, time and redirect rules as every other remote fetch. The crawl follows replies on any host, as upstream's all-replies crawl does. The inline reply path's same-host filter (`FetchRepliesService#filter_replies`) does not apply to the crawl. The count caps in `docs/federation-contract.md` bound its cost.
 
-**Exit:** two-instance interop tests pass for both directions, including follow lifecycle, posts, edits, deletes, replies, media, reactions, boosts, quotes and retries; duplicate activity delivery is harmless; SSRF/signature/body-limit security tests pass.
+**Exit:** two-instance interop tests pass for both directions, including follow lifecycle, posts, edits, deletes, replies, media, reactions, boosts, quotes and retries; remote thread completion passes its interop cases in `docs/federation-contract.md` (parent chain, hop cap, read-time descendant crawl, authorized fetch); duplicate activity delivery is harmless; SSRF/signature/body-limit security tests pass.
 
 ### Phase 7 — Broader 4.7.3 public API parity
 
-Complete the route manifest systematically: remaining account APIs, polls, search, lists, filters, tag/emoji/trending and suggestion endpoints, markers/preferences, scheduled status operations, push notifications if in scope, directory/collections where part of the target, and the long tail of user-facing endpoints. Keep admin API, moderation dashboard, and full Mastodon web UI explicitly excluded until separately scoped; do not let exclusions imply that ordinary client endpoints are implemented.
+Complete the route manifest systematically: remaining account APIs, tag and emoji endpoints, relation collection reads, markers/preferences, directory/collections where part of the target, and the long tail of user-facing endpoints.
+
+In profile, client-facing groups (each route is a row in `docs/endpoint-manifest.md`):
+
+- **Accounts:** `GET /api/v1/accounts?id[]=…`, a multi-fetch of up to 40 ids (`id[]` upstream, `422` above the limit). Unapproved and pending-deletion accounts are omitted. Lookup and search go in the same phase.
+- **Conversations:** `GET /api/v1/conversations`, `DELETE /api/v1/conversations/:id`, `POST …/read`, `POST …/unread`, and conversation mutes (`POST /api/v1/statuses/:id/mute|unmute`, `write:mutes`). Remote direct messages wait for Phase 6.
+- **Suggestions:** `/api/v1/suggestions` (deprecated upstream since 2021-05-16; the response carries the `Deprecation` header) and `/api/v2/suggestions`. FASP-sourced entries stay out of profile until a FASP integration exists, and are never fabricated.
+- **Announcements:** list, dismiss, and reactions. Announcements are authored through the CLI, so no admin API is needed for them.
+- **Donation campaigns:** `GET /api/v1/donation_campaigns` returns `204` unless the operator configures a campaign API URL.
+- **Web Push:** `/api/v1/push/subscription` (`push` scope). VAPID keys come from configuration. Delivery is a post-commit job (§5), and the push-service HTTP client follows the outbound safety rules.
+- **First-party client (keystodon):** `/api/web/*` (embeds, settings, web push subscriptions) is in profile. Upstream guards these routes with the Devise session and CSRF (`protect_from_forgery with: :exception`), not OAuth bearer tokens, and birchtree's plan does the same. Phase 7 adds the prerequisites: a first-party session login (reusing the Phase 2 login session), CSRF tokens for state-changing `/api/web/*` requests, and serving keystodon's built bundle from birchtree (artifact source and mount path fixed when the bundle exists). Proposed default: keystodon's first-party mode uses OAuth bearer tokens for every `/api/v1/*` call, issued to a first-party application, and the session covers login, consent and `/api/web/*` only. That keeps one auth path for the API. Confirm before implementation.
+- **Third-party client (keystodon):** OAuth only, against any host. Birchtree's contract for it is §6.3 and Phase 2.
+
+Keep the server-rendered admin dashboard and the Mastodon web app explicitly excluded. Admin API routes move to Phase 7.3. Do not let exclusions imply that ordinary client endpoints are implemented.
 
 Prioritize by actual client usage and contract dependencies, but every skipped route remains an explicit compatibility gap. Repeat endpoint inventory whenever upgrading the target release. Do not silently mix v4.7.3 behavior with `main`.
 
-**Exit:** every endpoint in the declared compatibility profile has a matching request/response/auth/error test; target client smoke suite passes; remaining exclusions are published and obvious.
+**Exit:** every endpoint in the Phase 7 client-facing groups has a matching request/response/auth/error test; the target client smoke suite passes (keystodon, once it is available); remaining exclusions are published and obvious. Phases 7.1–7.3 have their own exits.
+
+### Phase 7.1 — Media transcoding
+
+- Durable transcode job per media attachment that needs derived blobs (§5 "Media transcoding"), with explicit `pending`, `processing`, `ready` and `failed` states.
+- **Decided (2026-10-17):**
+  - **GIF** (animated or not) → WebM with VP9, typed `video`. `gifv` is never produced (D1, D2).
+  - **Video** → WebM with VP9 and Opus audio (D3). **Passthrough:** a file that is already VP9 video in a WebM container, with Opus audio or no audio, and within the upload size limit (`max_file_size`, 16 MB by default), is stored unchanged. Any other video is transcoded to WebM/VP9.
+  - **Still images** (JPEG, HEIC, HEIF, PNG, TIFF and others) → WebP (D4). An image already in WebP is passed through unchanged. The `small` preview is WebP too.
+  - **Metadata:** the server never strips, rewrites or adds EXIF or any other metadata. Conversions carry the metadata through where the target format can hold it (`ffmpeg -map_metadata 0` is one way). Orientation is not applied to the pixels: the orientation tag is kept and clients apply it. Location metadata therefore stays on the server unless the client removes it before upload. The client does that, by decision.
+  - **Stored blobs (proposed default, taken):** a successful transcode replaces the original with the derived blob. The original is deleted once the metadata that points at the derived blob has committed, which keeps it crash-safe under §5. Passthrough keeps the original, which is already the stored blob.
+  - **API lifecycle:** `POST /api/v1/media` transcodes inline before it responds, with `200` and the final `url`, within the request time limit. Upstream's v1 also processes inline. `POST /api/v2/media` returns `202` for transcoded types, and the job finishes them: `GET /api/v1/media/:id` answers `206` until the blob is ready and `200` after. This matches today's video behaviour. A transcode that exceeds its time or size limit ends in `failed`, which `GET /api/v1/media/:id` answers with `422`.
+  - **Startup validation:** when transcoding is enabled, startup checks that the ffmpeg binary runs, that the VP9 and Opus encoders are present, and that the decoders needed for HEIC, HEIF and TIFF are present. A missing component stops startup. There is no silent pass-through.
+  - **Limits:** wall-time, output-size and memory limits per job.
+- Open implementation settings, chosen when the phase starts and recorded as configuration defaults: WebP and VP9 quality; the `meta` values for converted blobs (dimensions must match the stored pixels; the orientation rule above applies).
+
+**Exit:** fixture tests for each input class (JPEG, HEIC, PNG, TIFF, GIF, VP9 WebM passthrough, non-VP9 video, VP9 video over the size limit); a metadata test that the EXIF payload survives conversion where the target format holds it; v1 `200` and v2 `202` lifecycle tests; startup-validation tests; crash tests for partial derived blobs.
+
+### Phase 7.2 — Search engine
+
+- Status search uses an **embedded** full-text library behind a search backend port. It is not Elasticsearch and not an external service. The library is chosen at scoping time; candidates such as Tantivy are to be evaluated for license, maintenance, and fit with an in-process Rust design.
+- Optional, as upstream and Pleroma both allow. Selection is a configuration value with three modes: `embedded` (the library above, **on by default**, decided 2026-10-17; an administrator can switch it off); `database` (the bounded scan that exists today, which is Pleroma's default backend); and `off` (status results are empty, matching Mastodon with Elasticsearch disabled). All three keep the same response contract.
+- Index scope follows Pleroma's `indexable?` rule, tightened: only public and unlisted statuses are indexed. Private and direct statuses are never indexed, so they never appear in search results and never leave the database through the index.
+- Indexing is a post-commit durable job for create, edit, delete and visibility change, as in Pleroma's `SearchIndexingWorker`. A bounded, restartable backfill builds the index for existing statuses, with a resume cursor as in Pleroma's `Search.Backfill`. The index is derived state, rebuilt from durable records, and never the authoritative store.
+- Accounts stay on the database path, as upstream does (`account_search?`). Whether hashtag search uses the engine is checked when the phase is scoped.
+- `GET /api/v2/search` keeps its contract (`resolve` behavior, `collections`). `GET /api/v1/search` stays out of profile because it does not exist in v4.7.3.
+
+**Exit:** search parity fixtures for statuses in all three modes and for accounts; index consistency under edit, delete and visibility change; backfill resume and crash tests; the `database` mode matches the Phase 4 interim behavior.
+
+### Phase 7.3 — Administration, moderation, trends and analytics
+
+- **Roles (decided 2026-10-17):** two roles on local users, `admin` and `moderator`, granted through CLI commands that extend `create-account`. Proposed permission split, to confirm against upstream's permission set when this phase is scoped: `moderator` covers reports and account actions (the `admin:*:reports` and `admin:*:accounts` routes, read and write); `admin` covers every admin route. Also required: registration approval modes (a Phase 2 gap) for the `approve` and `reject` routes; account suspension, silence and sensitive state; server-level domain allow and block rules; email-domain and canonical email blocks (both need email confirmation, a Phase 2 gap); IP block enforcement in the request path (trusted-proxy client IP, Phase 1); an audit trail for admin actions (proposed default: on, one record per admin write).
+- **Admin API** (`/api/v1/admin/*` and `/api/v2/admin/accounts`): accounts, reports, domain allows and blocks, email-domain blocks, IP blocks, canonical email blocks, tags, trend approvals, and measures, dimensions and retention. Upstream uses the `admin:read` and `admin:write` scope families with per-resource sub-scopes. Some POST routes that only read data (`measures`, `dimensions`, `retention`, `canonical_email_blocks/test`) take read scopes upstream, and birchtree keeps that.
+- **Reports:** `POST /api/v1/reports` (`write:reports`) and the moderator queue. Remote forwarding (Flag) waits for Phase 6.
+- **Trends:** public `GET /api/v1/trends`, `/tags`, `/links` and `/statuses` return only admin-approved items. Upstream paginates them with `offset` and `limit`, and `/api/v1/trends` is a deprecated alias of `/tags`. Link trends need link-preview crawling through the safe client.
+- **Annual reports:** generation is a durable job; the reads use `read:accounts` and the generate and read-marking writes use `write:accounts`.
+
+**Exit:** role-gated tests match the upstream forbidden response for a user without the role; scope tests cover each admin family; every admin route has a fixture-backed test or an explicit planned-gap entry; approval-workflow tests for trends; the operator can grant roles through the CLI.
 
 ### Phase 8 — Performance qualification and optional feed materialization
 
 - Benchmark **release builds**, not only debug builds, with representative account graphs, post counts, remote actors, attachments and client concurrency. Report p50/p95 latency, throughput, memory, read/write contention, index size and background queue delay.
-- Include status create/edit/delete, account lookup, page packing, home/public/list/tag timelines, relationships, quote listing, notification reads, media upload, streaming fan-out and federation enqueue/worker delivery.
+- Include status create/edit/delete, account lookup, page packing, home/public/list/tag timelines, relationships, quote listing, notification reads, media upload, streaming fan-out and federation enqueue/worker delivery. Add transcoding throughput (Phase 7.1), index build and query latency (Phase 7.2), and admin list paging (Phase 7.3).
 - Compare current fan-out-on-read against a bounded durable `redb` materialized-feed index using identical result fixtures. Adopt materialization only when measurements justify its write amplification and migration complexity.
 - Test process restart, abrupt kill, partial media files, index rebuild, job replay, lease expiry, queue poisoning and high-degree accounts.
 
-**Exit:** published results and regression thresholds; no unsupported performance claims; the chosen feed strategy meets agreed latency and resource targets on defined hardware.
+**Exit:** published results covering every surface in Phases 0–7.3, with regression thresholds; no unsupported performance claims; the chosen feed strategy meets agreed latency and resource targets on defined hardware.
 
 ## 8. Contract and interoperability test matrix
 
@@ -482,21 +576,23 @@ Required suites:
 6. **Crash tests:** kill before/after commit and during each worker; assert status/relationship + jobs are jointly durable and replay does not duplicate side effects.
 7. **Federation fixtures/interop:** Mastodon v4.7.3 fixtures and at least one additional ActivityPub implementation. Test signatures, audience, visibility, actor lookup, unknown reply parents, quote request decisions, redelivery and remote object refresh.
 8. **Streaming:** auth, channel/stream names, event envelopes, heartbeats, backpressure, disconnects, access revocation and live policy changes.
-9. **Client tests:** automate a real Mastodon-compatible client where practical; test registration, OAuth, profile, compose/edit/delete, follow, timeline, favourite/boost/bookmark, media, polls, quotes, notifications and streaming.
+9. **Client tests:** automate a real Mastodon-compatible client where practical; keystodon is the planned first target once it is available on this machine, tested in both its first-party mode (session and CSRF on `/api/web/*`, OAuth on `/api/v1/*` under the proposed default) and its third-party mode (OAuth only). Test registration, OAuth, profile, compose/edit/delete, follow, timeline, favourite/boost/bookmark, media, polls, quotes, notifications, streaming, and the Phase 7 groups (conversations, suggestions, announcements, Web Push).
 10. **Performance and abuse:** high-degree graph, huge sparse indexes, repeated pagination, large/malformed bodies, upload exhaustion, remote redirects/DNS rebinding, invalid signatures, slow hosts and retry storms.
+
+11. **Unmodified-client parity (the compatibility bar):** run the same client flows against birchtree and against a pinned Mastodon v4.7.3 instance, using unmodified clients. Compare what the client sees: request acceptance, response bodies, status codes, headers the client reads, pagination, streaming events and error text. Score the suite as the share of observations that match upstream. The bar is at least 98% overall, and 100% on the core flows (proposed). Every non-matching observation must be in the deviation register. Run this suite at every phase exit from Phase 3 on, and extend it for each phase.
 
 Use source-level fixtures and docs as a starting point, not the sole oracle. A passing internal mock does not prove client compatibility.
 
 ## 9. Non-goals and unresolved risks
 
-- No React, Electron, separate client app, full web UI, or admin dashboard in the initial plan.
+- No React, Electron, or frontend source code in this repository. birchtree serves keystodon's built first-party bundle (Phase 7) but does not contain keystodon's source, which is developed in a separate project. No server-rendered admin dashboard (`config/routes/admin.rb`): operators use the admin API (Phase 7.3) and the CLI.
 - No PostgreSQL, Redis, or separate broker. If later measurements prove a hard limitation, revisit the design as an explicit decision rather than quietly adding infrastructure.
 - No multi-node mode until its storage adapter, media arrangement, ownership/routing and the shared conformance suite are implemented and tested.
 - No promise that a single-node `redb` setup will match Mastodon’s high-degree home-feed performance. Mastodon’s Redis-backed home/list feed materialization is a major architectural difference that requires measurement.
 - No blind copying of the Rails data model, cache keys, callbacks or Sidekiq job names. Translate externally visible outcomes into Rust contracts.
-- No full administrative compatibility in the public-client milestone. Moderation/security operations and registration policies must still have operator controls even without a web admin UI.
+- Admin API compatibility is in profile (Phase 7.3), but it does not ship before its prerequisites: a role model, CLI role grants, registration approval modes, and the enforcement points listed in Phase 7.3. Until then admin routes are absent (404), never success-shaped. Registration policy and moderation keep operator controls (CLI and configuration), and the admin API does not imply a web admin UI.
 
-Open decisions to resolve in Phase 0 rather than leave implicit: supported signup/verification modes; exact target clients; whether push notifications and collections are in the declared profile; policy for search indexing without Elasticsearch; maximum status/media limits; local-only or closed-registration default; whether public web/ActivityPub object routes are part of the first federation milestone; and latency/resource acceptance thresholds.
+Open decisions, each to be resolved in the phase named rather than left implicit: supported signup/verification modes (Phase 2 gaps; needed by the Phase 7.3 approval routes); exact target clients (keystodon, in both modes, once it is available on this machine; client smoke tests wait for it); whether collections are in the declared profile (push is in, Phase 7); the embedded search library (Phase 7.2); the image target format and the other Phase 7.1 sub-decisions; keystodon's bundle mount path and artifact source, and whether first-party `/api/v1/*` calls use OAuth (proposed) or the session (Phase 7); the admin permission split and audit trail (Phase 7.3; proposed defaults in Phase 7.3);  maximum status/media limits; local-only or closed-registration default; whether public web/ActivityPub object routes are part of the first federation milestone (Phase 6); and latency/resource acceptance thresholds (Phase 8). Decided 2026-10-17 and no longer open: read-time ancestor completion for logged-in viewers (deviation D5); admin and moderator roles; the domain-block correction; search on by default with an administrator switch (D6); JSON request bodies moved up to Phase 4.1; the 98% bar; video as VP9 WebM with passthrough, GIF as VP9 WebM, and still images as WebP (D2–D4); the home follow cap at 1000 (D10a); exclusive lists matching upstream (D10b); no `206` for the home feed (D9).
 
 ## 10. Source files and current public contracts reviewed
 
@@ -513,6 +609,13 @@ Pinned Mastodon v4.7.3 sources reviewed for this revision:
 - [Feed manager](https://github.com/mastodon/mastodon/blob/v4.7.3/app/lib/feed_manager.rb), [home timeline controller](https://github.com/mastodon/mastodon/blob/v4.7.3/app/controllers/api/v1/timelines/home_controller.rb), [streaming redirect controller](https://github.com/mastodon/mastodon/blob/v4.7.3/app/controllers/api/v1/streaming_controller.rb)
 - [ActivityPub activity dispatcher](https://github.com/mastodon/mastodon/blob/v4.7.3/app/lib/activitypub/activity.rb), [remote status parser](https://github.com/mastodon/mastodon/blob/v4.7.3/app/lib/activitypub/parser/status_parser.rb), [delivery worker](https://github.com/mastodon/mastodon/blob/v4.7.3/app/workers/activitypub/delivery_worker.rb)
 - [Doorkeeper configuration](https://github.com/mastodon/mastodon/blob/v4.7.3/config/initializers/doorkeeper.rb), [media v1 endpoint](https://github.com/mastodon/mastodon/blob/v4.7.3/app/controllers/api/v1/media_controller.rb), [media v2 endpoint](https://github.com/mastodon/mastodon/blob/v4.7.3/app/controllers/api/v2/media_controller.rb)
+
+Pinned sources added by the 2026-10-17 re-scope (Phase 6 and Phases 7–7.3):
+
+- Routes and controllers: [admin API](https://github.com/mastodon/mastodon/tree/v4.7.3/app/controllers/api/v1/admin), [v2 admin](https://github.com/mastodon/mastodon/tree/v4.7.3/app/controllers/api/v2/admin), [admin permissions concern](https://github.com/mastodon/mastodon/blob/v4.7.3/app/controllers/concerns/admin/permissions_concern.rb), [reports](https://github.com/mastodon/mastodon/blob/v4.7.3/app/controllers/api/v1/reports_controller.rb), [trends](https://github.com/mastodon/mastodon/tree/v4.7.3/app/controllers/api/v1/trends), [push subscriptions](https://github.com/mastodon/mastodon/tree/v4.7.3/app/controllers/api/v1/push), [web routes](https://github.com/mastodon/mastodon/tree/v4.7.3/app/controllers/api/web), [conversations](https://github.com/mastodon/mastodon/blob/v4.7.3/app/controllers/api/v1/conversations_controller.rb), [suggestions](https://github.com/mastodon/mastodon/blob/v4.7.3/app/controllers/api/v2/suggestions_controller.rb), [announcements](https://github.com/mastodon/mastodon/blob/v4.7.3/app/controllers/api/v1/announcements_controller.rb), [donation campaigns](https://github.com/mastodon/mastodon/blob/v4.7.3/app/controllers/api/v1/donation_campaigns_controller.rb)
+- Remote threads: [context controller](https://github.com/mastodon/mastodon/blob/v4.7.3/app/controllers/api/v1/statuses/contexts_controller.rb), [thread resolve worker](https://github.com/mastodon/mastodon/blob/v4.7.3/app/workers/thread_resolve_worker.rb), [fetch-all-replies worker](https://github.com/mastodon/mastodon/blob/v4.7.3/app/workers/activitypub/fetch_all_replies_worker.rb), [fetch-all-replies service](https://github.com/mastodon/mastodon/blob/v4.7.3/app/services/activitypub/fetch_all_replies_service.rb), [fetch-replies service](https://github.com/mastodon/mastodon/blob/v4.7.3/app/services/activitypub/fetch_replies_service.rb), [fetch-replies concern](https://github.com/mastodon/mastodon/blob/v4.7.3/app/models/concerns/status/fetch_replies_concern.rb), [Create activity](https://github.com/mastodon/mastodon/blob/v4.7.3/app/lib/activitypub/activity/create.rb), [remote status service](https://github.com/mastodon/mastodon/blob/v4.7.3/app/services/activitypub/fetch_remote_status_service.rb), [JSON-LD helper](https://github.com/mastodon/mastodon/blob/v4.7.3/app/helpers/json_ld_helper.rb)
+- Search, media and feeds: [search service](https://github.com/mastodon/mastodon/blob/v4.7.3/app/services/search_service.rb), [GIF transcoder](https://github.com/mastodon/mastodon/blob/v4.7.3/lib/paperclip/gif_transcoder.rb), [media attachment model](https://github.com/mastodon/mastodon/blob/v4.7.3/app/models/media_attachment.rb), [feed manager](https://github.com/mastodon/mastodon/blob/v4.7.3/app/lib/feed_manager.rb), [domain blocks controller](https://github.com/mastodon/mastodon/blob/v4.7.3/app/controllers/api/v1/domain_blocks_controller.rb), [accounts controller](https://github.com/mastodon/mastodon/blob/v4.7.3/app/controllers/api/v1/accounts_controller.rb)
+- Optional-search reference (a design reference, not the compatibility authority): Pleroma `lib/pleroma/search/` (`search_backend.ex`, `database_search.ex`, `meilisearch.ex`, `parade_db.ex`, `qdrant_search.ex`, `backfill.ex`) and `lib/pleroma/search.ex`, from the reference checkout `~/fedifedifedi/pleroma` (commit `687fa6e1b`, `develop`).
 
 Public docs used to verify wire contracts:
 

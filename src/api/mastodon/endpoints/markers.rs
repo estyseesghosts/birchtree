@@ -6,11 +6,12 @@
 //! please try again"}`.
 
 use axum::extract::State;
-use axum::http::Uri;
+use axum::http::{HeaderMap, Uri};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Map, Value};
 
 use crate::api::forms;
+use crate::api::json_body;
 use crate::api::mastodon::auth::{Auth, OptionalAuth};
 use crate::api::mastodon::dto;
 use crate::api::mastodon::errors::ApiError;
@@ -58,6 +59,7 @@ pub async fn create(
     State(state): State<ApiState>,
     auth: Auth,
     uri: Uri,
+    headers: HeaderMap,
     request_body: axum::body::Body,
 ) -> Response {
     if let Err(err) = auth.0.require_scopes(&["write", "write:statuses"]) {
@@ -74,7 +76,7 @@ pub async fn create(
         None => Vec::new(),
     };
     if let Ok(body) = axum::body::to_bytes(request_body, 64 * 1024).await {
-        pairs.extend(forms::parse(&body));
+        pairs.extend(json_body::body_pairs(&headers, &body));
     }
     let mut updates: Vec<(String, Id, Option<u64>)> = Vec::new();
     for timeline in Marker::TIMELINES {

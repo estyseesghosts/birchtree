@@ -4,11 +4,11 @@
 //! `CredentialApplicationSerializer` body including the one-time client secret.
 //! Registration is unauthenticated.
 
-use axum::extract::{RawForm, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
-use crate::api::forms;
+use crate::api::forms::{self, FormBody};
 use crate::api::mastodon::ApiState;
 use crate::api::mastodon::dto;
 use crate::api::mastodon::errors::{ApiError, ApiResult};
@@ -20,16 +20,14 @@ use crate::application::ports::Store;
 const DEFAULT_SCOPES: &str = scopes::DEFAULT_SCOPE;
 
 /// `POST /api/v1/apps`.
-pub async fn create_app(State(state): State<ApiState>, RawForm(body): RawForm) -> Response {
-    match create(&state, &body) {
+pub async fn create_app(State(state): State<ApiState>, FormBody(pairs): FormBody) -> Response {
+    match create(&state, &pairs) {
         Ok(value) => (StatusCode::OK, axum::Json(value)).into_response(),
         Err(err) => err.into_response(),
     }
 }
 
-fn create(state: &ApiState, body: &[u8]) -> ApiResult<serde_json::Value> {
-    let pairs = forms::parse(body);
-
+fn create(state: &ApiState, pairs: &[(String, String)]) -> ApiResult<serde_json::Value> {
     let name = forms::get(&pairs, "client_name").unwrap_or("").trim();
     if name.is_empty() {
         return Err(ApiError::unprocessable(

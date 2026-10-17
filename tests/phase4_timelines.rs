@@ -461,7 +461,7 @@ async fn domain_blocked_authors_are_excluded_for_the_viewer_only() {
 
     let (status, _h, body) = send_form(
         &srv,
-        "PUT",
+        "POST",
         "/api/v1/domain_blocks",
         "domain=example.social",
         &alice,

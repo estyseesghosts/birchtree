@@ -75,17 +75,38 @@ pub fn link_header(
     next_max_id: Option<Id>,
     prev_min_id: Option<Id>,
 ) -> Option<String> {
+    link_header_with(base, &["max_id", "min_id"], next_max_id, "min_id", prev_min_id)
+}
+
+/// `Link` header for descending `max_id`/`since_id` lists (Mastodon's
+/// `paginate_by_max_id`, used by `GET /api/v1/domain_blocks`): `next` pages
+/// with `max_id`, `prev` with `since_id`. Either may be `None`.
+pub fn link_header_desc(
+    base: &Uri,
+    next_max_id: Option<Id>,
+    prev_since_id: Option<Id>,
+) -> Option<String> {
+    link_header_with(base, &["max_id", "since_id"], next_max_id, "since_id", prev_since_id)
+}
+
+fn link_header_with(
+    base: &Uri,
+    drop: &[&str],
+    next_max_id: Option<Id>,
+    prev_key: &str,
+    prev_id: Option<Id>,
+) -> Option<String> {
     let mut links = Vec::new();
     if let Some(id) = next_max_id {
         links.push(format!(
             "<{}>; rel=\"next\"",
-            with_query_param(base, "max_id", &id.to_string())
+            with_query_param(base, drop, "max_id", &id.to_string())
         ));
     }
-    if let Some(id) = prev_min_id {
+    if let Some(id) = prev_id {
         links.push(format!(
             "<{}>; rel=\"prev\"",
-            with_query_param(base, "min_id", &id.to_string())
+            with_query_param(base, drop, prev_key, &id.to_string())
         ));
     }
     if links.is_empty() {
@@ -95,8 +116,8 @@ pub fn link_header(
     }
 }
 
-/// Return `base` with `max_id`/`min_id` removed and `key=value` appended.
-fn with_query_param(base: &Uri, key: &str, value: &str) -> String {
+/// Return `base` with the `drop` parameters removed and `key=value` appended.
+fn with_query_param(base: &Uri, drop: &[&str], key: &str, value: &str) -> String {
     let path = base.path();
     let kept: Vec<(String, String)> = base
         .query()
@@ -105,7 +126,7 @@ fn with_query_param(base: &Uri, key: &str, value: &str) -> String {
                 .filter(|pair| !pair.is_empty())
                 .filter_map(|pair| {
                     let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-                    if k == "max_id" || k == "min_id" {
+                    if drop.contains(&k) {
                         None
                     } else {
                         Some((k.to_string(), v.to_string()))

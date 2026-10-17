@@ -8,6 +8,8 @@
 
 use redb::{ReadableTable, WriteTransaction};
 
+use std::collections::HashSet;
+
 use crate::application::ports::ListStore;
 use crate::domain::{Error, Follow, FollowState, Id, List, RepliesPolicy, Result};
 
@@ -68,14 +70,21 @@ pub(super) fn retain_membership_txn(
 }
 
 impl ListStore for RedbStore {
-    fn create_list(&self, account_id: Id, title: &str, now_ms: u64) -> Result<List> {
+    fn create_list(
+        &self,
+        account_id: Id,
+        title: &str,
+        replies_policy: RepliesPolicy,
+        exclusive: bool,
+        now_ms: u64,
+    ) -> Result<List> {
         let write = self.begin_write()?;
         let list = List {
             id: self.next_id(),
             account_id,
             title: title.to_string(),
-            replies_policy: RepliesPolicy::default(),
-            exclusive: false,
+            replies_policy,
+            exclusive,
             created_at_ms: now_ms,
         };
         {
@@ -315,5 +324,35 @@ impl ListStore for RedbStore {
         }
         self.note_scanned(ids.len());
         Ok(ids)
+    }
+
+    fn exclusive_list_members(&self, owner: Id, candidates: &[Id]) -> Result<HashSet<Id>> {
+        let read = self.begin_read()?;
+        let index = read.open_table(LISTS_BY_ACCOUNT)?;
+        let lists = read.open_table(LISTS)?;
+        let members = read.open_table(LIST_MEMBERS)?;
+        let lo = schema::pair_key(owner.value(), 0);
+        let hi = schema::pair_key(owner.value(), u64::MAX);
+        let mut exclusive: Vec<Id> = Vec::new();
+        for entry in index.range(lo.as_slice()..=hi.as_slice())? {
+            let (key, _value) = entry?;
+            let list_id = Id::new(u64::from_be_bytes(key.value()[8..].try_into().unwrap()));
+            if let Some(guard) = lists.get(list_id.value())? {
+                let list: List = decode(guard.value())?;
+                if list.exclusive {
+                    exclusive.push(list_id);
+                }
+            }
+        }
+        let mut found = HashSet::new();
+        for list_id in exclusive {
+            for candidate in candidates {
+                let key = schema::pair_key(list_id.value(), candidate.value());
+                if members.get(key.as_slice())?.is_some() {
+                    found.insert(*candidate);
+                }
+            }
+        }
+        Ok(found)
     }
 }

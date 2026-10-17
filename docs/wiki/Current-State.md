@@ -1,6 +1,6 @@
 # Current state
 
-Status: 2026-10-17, Phase 4 (media, timelines, notifications, client usability)
+Status: 2026-10-17, Phase 4.1 (parity gap closure) implemented; Phase 5 (streaming) is next
 implemented (gate green); Phase 5 (streaming) next.
 
 ## Implemented
@@ -21,7 +21,8 @@ Runtime (Phase 1):
 - CLI: `serve`, `create-account` (plus test-only `crash-harness`)
 - Mastodon-shaped snowflake IDs (numeric ordering, decimal-string wire) and a
   monotonic `Clock`
-- Versioned `redb` schema + migration runner (now at **v4**: Phase 4 timeline
+- Versioned `redb` schema + migration runner (now at **v5**: domain-block row ids
+  and id index (2026-10-17); v4 added Phase 4 timeline
   index + backfill), narrow
   persistence ports, atomic mutation + job commits, durable job queue with
   lease/backoff/quarantine, in-process worker
@@ -48,7 +49,8 @@ Local statuses, relationships, interactions (Phase 3):
   direct with blocks, follows and mentions; privacy-matrix tested
 - **Relationships:** follow (locked → follow requests with list/authorize/
   reject), unfollow, remove-from-followers, blocks (mutual unfollow +
-  endorsement cleanup), domain blocks, mutes with duration/notifications,
+  endorsement cleanup), domain blocks (upstream shape since 2026-10-17:
+  newest first, row-id paging), mutes with duration/notifications,
   account notes, endorsements, follower/following lists, real
   `REST::RelationshipSerializer` aggregates, per-account counters
   (`account_stats`) updated atomically
@@ -89,7 +91,9 @@ Media, timelines, notifications, client usability (Phase 4):
 
 Tests:
 
-- `cargo test` — **219 passed, 0 failed** (includes 23 `phase4_timelines`)
+- `cargo test` — **221 passed, 0 failed** (includes 23 `phase4_timelines`; the
+  2026-10-17 domain-block correction adds two tests; evidence in
+  `docs/logs/2026-10-17-domain-blocks-correction.md`)
 - `cargo check --all-targets` — zero warnings
 - `scripts/smoke-phase1.sh` → `SMOKE_OK`; `scripts/smoke-phase2.sh` →
   `SMOKE_PHASE2_OK`; `scripts/smoke-phase3.sh` → `SMOKE_PHASE3_OK`;
@@ -97,14 +101,29 @@ Tests:
 - `bash scripts/smoke-all.sh` → `smoke-all: green`
 - Full Phase 4 verification output: `docs/logs/2026-10-17-phase-4-verification.md`
 
+## Phase 4.1 (parity gap closure, implemented 2026-10-17)
+
+- JSON request bodies (`application/json`) on every REST write endpoint that
+  reads a body; flattened into the form key model; malformed JSON answered as
+  upstream does (D11). `POST /oauth/authorize` stays form-only (browser consent).
+- Exclusive-list members are left out of home; the viewer's own statuses and
+  list timelines are unaffected (D10b).
+- Home reads the 1000 most recent follows; account cache 2000; the store's
+  author cap is 1001. The home merge is now a lazy k-way merge, which fixed
+  a silent drop of the oldest follows' posts that the 1000 cap exposed (D10a).
+- `POST /api/v1/lists` accepts `replies_policy` and `exclusive`, as upstream does.
+- Evidence: `docs/logs/2026-10-17-phase-4-1-verification.md`.
+
 ## Not yet implemented
 
 - Phase 4 open items: see Known gaps below
-- Phase 5 streaming; Phase 6 federation (incl. remote quote requests and
-  remote statuses)
-- Phase 7: account lookup/search, relation collection reads
-  (`blocks`/`mutes`/`favourites`/`bookmarks`), JSON request bodies, tags;
-  Phase 8 metrics
+- Phase 5 streaming; Phase 6 federation (incl. remote quote requests, remote
+  statuses, and remote thread completion)
+- Phase 7: account multi-fetch (`GET /api/v1/accounts`), account lookup/search,
+  relation collection reads (`blocks`/`mutes`/`favourites`/`bookmarks`), tags, conversations, suggestions, announcements, donation
+  campaigns, Web Push, first-party client (`/api/web/*`, keystodon bundle)
+- Phase 7.1 media transcoding (GIF and video → WebM/VP9; stills → WebP); Phase 7.2 search engine;
+  Phase 7.3 admin/moderation API, reports, trends, annual reports; Phase 8 metrics
 - Every unimplemented route is explicitly absent (404), never a
   success-shaped stub — see `docs/endpoint-manifest.md`
 
@@ -115,21 +134,19 @@ Tests:
   `locale`/`time_zone`/`date_of_birth` ignored
 - Profile `discoverable`/`indexable`/`hide_collections`/`fields_attributes`
   accepted but not persisted
-- Tag DTOs use the tag name as `id`; conversation mutes out of profile;
+- Tag DTOs use the tag name as `id`; conversation mutes planned with conversations (Phase 7);
   `application` always shown (preference not stored)
 - Phase 4 open items:
   - Cross-surface visibility parity is not one suite (per-surface coverage)
   - Wall time of page loaders is not measured (transaction/item counts only)
-  - Exclusive lists are not applied to the home feed
-  - Home reads only the 500 most recent follows
-  - Tag feed excludes reblog wrappers; open question against v4.7.3, pinned
-    by test
+  - Home reads only the 1000 most recent follows (D10a, accepted; raised from 500 in Phase 4.1)
+  - Tag feed excludes reblog wrappers, matching upstream (closed 2026-10-17)
   - `remote=true` is empty until federation (Phase 6)
   - No `206 Mastodon-Async-Refresh` regeneration for timelines (fan-out on read)
   - Notification requests always `[]`; notification-policy filter pipeline later
   - Account-payload emoji arrays are `[]` until Phase 7
-  - Pending doc decisions, not code gaps: transcoding, search-engine choice,
-    admin scope
+  - Planned, not code gaps: transcoding (Phase 7.1), search engine (Phase 7.2),
+    admin/moderation API (Phase 7.3)
 - Details and the full deferral lists: `docs/phase-4-exit-criteria.md`,
   `docs/phase-3-exit-criteria.md` (plus `phase-2-exit-criteria.md`,
   `phase-1-exit-criteria.md`, and the still-open route-inventory review in

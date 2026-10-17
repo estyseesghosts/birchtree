@@ -9,12 +9,12 @@
 //! Errors use Doorkeeper's OAuth error body (`error` + `error_description`)
 //! rather than the Mastodon REST `{ "error": ... }` shape.
 
-use axum::extract::{RawForm, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Map, Value, json};
 
-use crate::api::forms;
+use crate::api::forms::{self, FormBody};
 use crate::api::mastodon::ApiState;
 use crate::api::mastodon::dto;
 use crate::api::oauth::scopes;
@@ -114,9 +114,8 @@ fn authenticate_client(
 pub async fn token(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    RawForm(body): RawForm,
+    FormBody(pairs): FormBody,
 ) -> Response {
-    let pairs = forms::parse(&body);
     let grant_type = forms::get(&pairs, "grant_type").unwrap_or("");
 
     let app = match authenticate_client(&state, &headers, &pairs) {
@@ -212,9 +211,8 @@ fn client_credentials(
 pub async fn revoke(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    RawForm(body): RawForm,
+    FormBody(pairs): FormBody,
 ) -> Response {
-    let pairs = forms::parse(&body);
     let token = forms::get(&pairs, "token").unwrap_or("");
     if token.trim().is_empty() {
         return json_ok(json!({}));

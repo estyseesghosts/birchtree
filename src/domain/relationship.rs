@@ -20,8 +20,12 @@ pub struct Block {
 }
 
 /// A domain block row (viewer hides an entire domain).
+///
+/// `id` is the row's numeric id: the `max_id`/`since_id` pagination cursor of
+/// `GET /api/v1/domain_blocks` (Mastodon's `AccountDomainBlock` id).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DomainBlock {
+    pub id: Id,
     pub account_id: Id,
     pub domain: String,
     pub created_at_ms: u64,

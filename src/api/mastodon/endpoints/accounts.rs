@@ -6,12 +6,12 @@
 //! endpoints accept `read`/`read:accounts`; `verify_credentials` and
 //! `update_credentials` require a user token.
 
-use axum::extract::{Path, RawForm, RawQuery, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
-use crate::api::forms;
+use crate::api::forms::{self, FormBody};
 use crate::api::mastodon::auth::Auth;
 use crate::api::mastodon::dto;
 use crate::api::mastodon::errors::ApiError;
@@ -48,7 +48,7 @@ fn bool_cast(value: &str) -> bool {
 pub async fn register(
     State(state): State<ApiState>,
     auth: Auth,
-    RawForm(body): RawForm,
+    FormBody(pairs): FormBody,
 ) -> Response {
     if let Err(err) = auth.0.require_scopes(WRITE_SCOPES) {
         return err.into_response();
@@ -66,7 +66,6 @@ pub async fn register(
         return ApiError::forbidden("Forbidden").into_response();
     }
 
-    let pairs = forms::parse(&body);
     let field = |key: &str| forms::get(&pairs, key).map(str::to_string);
     let username = field("username").unwrap_or_default();
     let email = field("email").unwrap_or_default();
@@ -154,7 +153,7 @@ pub async fn verify_credentials(State(state): State<ApiState>, auth: Auth) -> Re
 pub async fn update_credentials(
     State(state): State<ApiState>,
     auth: Auth,
-    RawForm(body): RawForm,
+    FormBody(pairs): FormBody,
 ) -> Response {
     if let Err(err) = auth.0.require_scopes(WRITE_SCOPES) {
         return err.into_response();
@@ -164,7 +163,6 @@ pub async fn update_credentials(
         Err(err) => return err.into_response(),
     };
 
-    let pairs = forms::parse(&body);
     let field = |key: &str| forms::get(&pairs, key);
 
     let display_name = field("display_name").map(str::to_string);

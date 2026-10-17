@@ -804,6 +804,19 @@ async fn endorsement_requires_follow_and_lists_work() {
     assert_eq!(endorsements(&srv, &alice).await.as_array().unwrap().len(), 0);
 }
 
+/// The value of `key` in the `rel` entry of a `Link` header (`None` when the
+/// relation is absent).
+fn link_cursor(link: &str, rel: &str, key: &str) -> Option<String> {
+    let entry = link
+        .split(", ")
+        .find(|part| part.ends_with(&format!("rel=\"{rel}\"")))?;
+    let url = entry.split(';').next()?.trim().trim_start_matches('<').trim_end_matches('>');
+    let (_, query) = url.split_once('?')?;
+    query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix(&format!("{key}=")).map(str::to_string))
+}
+
 #[tokio::test]
 async fn domain_blocks_crud_and_relationship_flag() {
     let srv = TestServer::new(true);
@@ -813,31 +826,16 @@ async fn domain_blocks_crud_and_relationship_flag() {
     let target = common::mk_account(&srv.store, "domtarget");
     let target_id = target.id.to_string();
 
-    // PUT answers `200 {}`; the list is the string array, sorted ascending.
-    let (status, _h, bytes) = send(
-        &srv.router,
-        form_request(
-            "PUT",
-            "/api/v1/domain_blocks",
-            "domain=zeta.social",
-            Some(&alice),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
-    assert_eq!(json(&bytes), serde_json::json!({}));
-    let (status, _h, bytes) = send(
-        &srv.router,
-        form_request(
-            "PUT",
-            "/api/v1/domain_blocks",
-            "domain=example.social",
-            Some(&alice),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
-    assert_eq!(json(&bytes), serde_json::json!({}));
+    // POST (upstream shape) answers `200 {}`; the list is newest first.
+    for domain in ["zeta.social", "example.social"] {
+        let (status, _h, bytes) = send(
+            &srv.router,
+            form_request("POST", "/api/v1/domain_blocks", &format!("domain={domain}"), Some(&alice)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+        assert_eq!(json(&bytes), serde_json::json!({}));
+    }
     let (status, _h, bytes) = send(
         &srv.router,
         get_request("/api/v1/domain_blocks", Some(&alice), None),
@@ -852,15 +850,10 @@ async fn domain_blocks_crud_and_relationship_flag() {
     // Bob did not block the domain: his flag stays false.
     assert_eq!(relationship(&srv, &bob, &target_id).await["domain_blocking"], false);
 
-    // DELETE answers `200 {}` and clears the flag (idempotent on repeats).
+    // DELETE takes the domain as a query parameter and answers `200 {}`.
     let (status, _h, bytes) = send(
         &srv.router,
-        form_request(
-            "DELETE",
-            "/api/v1/domain_blocks/example.social",
-            "",
-            Some(&alice),
-        ),
+        form_request("DELETE", "/api/v1/domain_blocks?domain=example.social", "", Some(&alice)),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
@@ -873,35 +866,47 @@ async fn domain_blocks_crud_and_relationship_flag() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json(&bytes), serde_json::json!(["zeta.social"]));
+
+    // DELETE is idempotent; the domain may also come from a form body.
     let (status, _h, bytes) = send(
         &srv.router,
-        form_request(
-            "DELETE",
-            "/api/v1/domain_blocks/example.social",
-            "",
-            Some(&alice),
-        ),
+        form_request("DELETE", "/api/v1/domain_blocks?domain=example.social", "", Some(&alice)),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
-
-    // Empty and malformed domains are 422 with the pinned message.
     let (status, _h, bytes) = send(
         &srv.router,
-        form_request("PUT", "/api/v1/domain_blocks", "domain=", Some(&alice)),
+        form_request("DELETE", "/api/v1/domain_blocks", "domain=zeta.social", Some(&alice)),
     )
     .await;
-    assert_eq!(
-        status,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "{}",
-        String::from_utf8_lossy(&bytes)
-    );
-    assert_eq!(json(&bytes)["error"], "Domain cannot be blank");
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    let (_s, _h, bytes) = send(
+        &srv.router,
+        get_request("/api/v1/domain_blocks", Some(&alice), None),
+    )
+    .await;
+    assert_eq!(json(&bytes), serde_json::json!([]));
+
+    // Blank or missing domains are 422 with upstream's RecordInvalid message.
+    for body in ["domain=", ""] {
+        let (status, _h, bytes) = send(
+            &srv.router,
+            form_request("POST", "/api/v1/domain_blocks", body, Some(&alice)),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert_eq!(json(&bytes)["error"], "Validation failed: Domain can't be blank");
+    }
+    // Malformed domains are 422 "Domain is invalid".
     let (status, _h, bytes) = send(
         &srv.router,
         form_request(
-            "PUT",
+            "POST",
             "/api/v1/domain_blocks",
             "domain=https%3A%2F%2Fnope.example%2Fpath",
             Some(&alice),
@@ -914,7 +919,69 @@ async fn domain_blocks_crud_and_relationship_flag() {
         "{}",
         String::from_utf8_lossy(&bytes)
     );
-    assert_eq!(json(&bytes)["error"], "Domain cannot be blank");
+    assert_eq!(json(&bytes)["error"], "Validation failed: Domain is invalid");
+
+    // The old shape is gone: PUT and DELETE-by-path are not routed.
+    let (status, _h, _b) = send(
+        &srv.router,
+        form_request("PUT", "/api/v1/domain_blocks", "domain=gone.example", Some(&alice)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn domain_blocks_page_by_row_id_like_upstream() {
+    let srv = TestServer::new(true);
+    let app = register_app(&srv, ALL_SCOPES).await;
+    let (alice, _b) = register_account(&srv, &app, "pagealice").await;
+    for domain in ["a.one", "b.two", "c.three"] {
+        let (status, _h, bytes) = send(
+            &srv.router,
+            form_request("POST", "/api/v1/domain_blocks", &format!("domain={domain}"), Some(&alice)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    }
+
+    // A full page of two: newest first, `next` = the oldest id on the page.
+    let (status, headers, bytes) = send(
+        &srv.router,
+        get_request("/api/v1/domain_blocks?limit=2", Some(&alice), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(json(&bytes), serde_json::json!(["c.three", "b.two"]));
+    let link = headers
+        .get("link")
+        .expect("full page has a Link header")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let next = link_cursor(&link, "next", "max_id").expect("next carries max_id");
+    assert!(link_cursor(&link, "prev", "since_id").is_some(), "prev carries since_id");
+    assert!(link_cursor(&link, "prev", "min_id").is_none(), "no min_id on this endpoint");
+
+    // max_id is exclusive: the rest of the list.
+    let (status, headers, bytes) = send(
+        &srv.router,
+        get_request(&format!("/api/v1/domain_blocks?limit=2&max_id={next}"), Some(&alice), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(json(&bytes), serde_json::json!(["a.one"]));
+    assert!(headers.get("link").is_some_and(|h| {
+        !h.to_str().unwrap().contains("rel=\"next\"")
+    }), "a short page has no next link");
+
+    // since_id is exclusive: blocks strictly newer than the oldest id on page one.
+    let (status, _h, bytes) = send(
+        &srv.router,
+        get_request(&format!("/api/v1/domain_blocks?since_id={next}"), Some(&alice), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(json(&bytes), serde_json::json!(["c.three"]));
 }
 
 #[tokio::test]

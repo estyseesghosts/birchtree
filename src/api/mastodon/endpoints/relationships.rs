@@ -486,7 +486,11 @@ pub async fn reject_request(
     }
 }
 
-/// `GET /api/v1/domain_blocks` — the viewer's blocked domains (strings).
+/// `GET /api/v1/domain_blocks` — the viewer's blocked domains, newest first.
+///
+/// Paged like Mastodon's `paginate_by_max_id`: `max_id`/`since_id` are
+/// exclusive row-id cursors, the limit defaults to 100 and is capped at 200,
+/// `next` is present on a full page and `prev` on a non-empty page.
 pub async fn domain_blocks_index(
     State(state): State<ApiState>,
     auth: OptionalAuth,
@@ -503,75 +507,37 @@ pub async fn domain_blocks_index(
         Err(err) => return err.into_response(),
     };
     let store: &dyn Store = &*state.context.store;
-    // Cursor semantics: `max_id` is the last domain of the previous page; the
-    // store returns the domains sorted ascending after that bound.
-    let max_domain = page.max_id.map(|id| id.to_string());
     let blocks = match relationships::list_domain_blocks(
         store,
         viewer,
-        max_domain.as_deref(),
+        page.max_id,
+        page.since_id,
         page.limit,
     ) {
         Ok(blocks) => blocks,
         Err(err) => return ApiError::from(err).into_response(),
     };
-    let domains: Vec<String> = blocks.iter().map(|b| b.domain.clone()).collect();
-    let full = domains.len() == page.limit;
-    let mut links = Vec::new();
-    if full {
-        if let Some(last) = domains.last() {
-            links.push(format!(
-                "<{}>; rel=\"next\"",
-                swap_query_param(&uri, "max_id", last)
-            ));
-        }
-    }
-    if let Some(first) = domains.first() {
-        links.push(format!(
-            "<{}>; rel=\"prev\"",
-            swap_query_param(&uri, "min_id", first)
-        ));
-    }
+    let full = blocks.len() == page.limit;
+    let next = if full { blocks.last().map(|b| b.id) } else { None };
+    let prev = blocks.first().map(|b| b.id);
+    let domains: Vec<String> = blocks.into_iter().map(|b| b.domain).collect();
     let mut response = axum::Json(domains).into_response();
-    if !links.is_empty() {
-        if let Ok(value) = header::HeaderValue::from_str(&links.join(", ")) {
+    if let Some(value) = pagination::link_header_desc(&uri, next, prev) {
+        if let Ok(value) = header::HeaderValue::from_str(&value) {
             response.headers_mut().insert(header::LINK, value);
         }
     }
     response
 }
 
-/// Rebuild `uri` with `key` replaced by `value` (domain-string cursors).
-fn swap_query_param(uri: &Uri, key: &str, value: &str) -> String {
-    let path = uri.path();
-    let kept: Vec<String> = uri
-        .query()
-        .map(|q| {
-            q.split('&')
-                .filter(|pair| !pair.is_empty())
-                .filter_map(|pair| {
-                    let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-                    if k == key || k == "max_id" || k == "min_id" || k == "limit" {
-                        None
-                    } else {
-                        Some(format!("{k}={v}"))
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut all = kept;
-    if let Some(limit) = forms::get(&forms::parse(uri.query().unwrap_or("").as_bytes()), "limit") {
-        all.push(format!("limit={limit}"));
-    }
-    all.push(format!("{key}={value}"));
-    format!("{path}?{}", all.join("&"))
-}
-
-/// `PUT /api/v1/domain_blocks` — block a domain (`200 {}`).
+/// `POST /api/v1/domain_blocks` — block a domain (`200 {}`). The `domain`
+/// parameter comes from the form body or the query string, as Rails merges
+/// them. A missing or blank domain is a 422 `Validation failed: Domain can't
+/// be blank`.
 pub async fn domain_blocks_create(
     State(state): State<ApiState>,
     auth: Auth,
+    uri: Uri,
     LenientForm(body): LenientForm,
 ) -> Response {
     if let Err(err) = auth.0.require_scopes(&["follow", "write", "write:blocks"]) {
@@ -581,11 +547,11 @@ pub async fn domain_blocks_create(
         Ok(id) => id,
         Err(err) => return err.into_response(),
     };
-    let pairs = body;
-    let Some(domain) = forms::get(&pairs, "domain").map(str::to_string) else {
-        return ApiError::bad_request("param is missing or the value is empty: domain")
-            .into_response();
-    };
+    let query = forms::parse(uri.query().unwrap_or("").as_bytes());
+    let domain = forms::get(&body, "domain")
+        .or_else(|| forms::get(&query, "domain"))
+        .unwrap_or("")
+        .to_string();
     let store: &dyn Store = &*state.context.store;
     match relationships::domain_block(store, viewer, &domain, state.context.now_ms()) {
         Ok(_) => axum::Json(serde_json::json!({})).into_response(),
@@ -593,11 +559,13 @@ pub async fn domain_blocks_create(
     }
 }
 
-/// `DELETE /api/v1/domain_blocks/{domain}` (`200 {}`, idempotent).
+/// `DELETE /api/v1/domain_blocks` — unblock a domain (`200 {}`, idempotent).
+/// The `domain` parameter comes from the query string or the form body.
 pub async fn domain_blocks_delete(
     State(state): State<ApiState>,
     auth: Auth,
-    Path(domain): Path<String>,
+    uri: Uri,
+    LenientForm(body): LenientForm,
 ) -> Response {
     if let Err(err) = auth.0.require_scopes(&["follow", "write", "write:blocks"]) {
         return err.into_response();
@@ -606,8 +574,12 @@ pub async fn domain_blocks_delete(
         Ok(id) => id,
         Err(err) => return err.into_response(),
     };
+    let query = forms::parse(uri.query().unwrap_or("").as_bytes());
+    let domain = forms::get(&body, "domain")
+        .or_else(|| forms::get(&query, "domain"))
+        .unwrap_or("");
     let store: &dyn Store = &*state.context.store;
-    match relationships::unblock_domain(store, viewer, &domain) {
+    match relationships::unblock_domain(store, viewer, domain) {
         Ok(_) => axum::Json(serde_json::json!({})).into_response(),
         Err(err) => ApiError::from(err).into_response(),
     }

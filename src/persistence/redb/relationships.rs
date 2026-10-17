@@ -21,7 +21,8 @@ use crate::domain::{
 };
 
 use super::schema::{
-    self, ACCOUNT_NOTES, ACCOUNT_STATS, BLOCKS, BLOCKS_BY_BLOCKED, DOMAIN_BLOCKS, ENDORSEMENTS,
+    self, ACCOUNT_NOTES, ACCOUNT_STATS, BLOCKS, BLOCKS_BY_BLOCKED, DOMAIN_BLOCKS,
+    DOMAIN_BLOCKS_BY_ID, ENDORSEMENTS,
     ENDORSEMENTS_BY_ENDORSED, FOLLOWS, FOLLOWS_BY_FOLLOWED, MUTES, MUTES_BY_MUTED,
 };
 use super::{decode, encode, RedbStore, StoreResult};
@@ -638,15 +639,26 @@ impl RelationshipStore for RedbStore {
             let blocks = write.open_table(DOMAIN_BLOCKS)?;
             json_at(&blocks, key.as_slice())?
         };
-        // Re-blocking keeps the original creation time.
-        let block = DomainBlock {
-            account_id,
-            domain: domain.to_string(),
-            created_at_ms: existing.map_or(now_ms, |b| b.created_at_ms),
+        // Re-blocking keeps the row's id and creation time.
+        let block = match existing {
+            Some(block) => block,
+            None => DomainBlock {
+                id: self.next_id(),
+                account_id,
+                domain: domain.to_string(),
+                created_at_ms: now_ms,
+            },
         };
         {
             let mut blocks = write.open_table(DOMAIN_BLOCKS)?;
             blocks.insert(key.as_slice(), encode(&block)?.as_slice())?;
+        }
+        {
+            let mut by_id = write.open_table(DOMAIN_BLOCKS_BY_ID)?;
+            by_id.insert(
+                schema::pair_key(account_id.value(), schema::desc_id(block.id.value())).as_slice(),
+                encode(&block)?.as_slice(),
+            )?;
         }
         write.commit()?;
         Ok(block)
@@ -666,6 +678,12 @@ impl RelationshipStore for RedbStore {
             let mut blocks = write.open_table(DOMAIN_BLOCKS)?;
             blocks.remove(key.as_slice())?;
         }
+        {
+            let mut by_id = write.open_table(DOMAIN_BLOCKS_BY_ID)?;
+            by_id.remove(
+                schema::pair_key(account_id.value(), schema::desc_id(existing.id.value())).as_slice(),
+            )?;
+        }
         write.commit()?;
         Ok(Some(existing))
     }
@@ -673,34 +691,30 @@ impl RelationshipStore for RedbStore {
     fn domain_blocks(
         &self,
         account_id: Id,
-        max_domain: Option<&str>,
+        max_id: Option<Id>,
+        since_id: Option<Id>,
         limit: usize,
     ) -> Result<Vec<DomainBlock>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         let read = self.begin_read()?;
-        let blocks = read.open_table(DOMAIN_BLOCKS)?;
-        let prefix = schema::domain_block_key(account_id.value(), "");
-        // Keys ascend by domain. A `max_domain` cursor starts strictly after
-        // its own key: appending 0x00 (domains cannot contain NUL) skips
-        // `domain == max_domain` while staying below every larger domain.
-        let start = match max_domain {
-            Some(domain) => {
-                let mut start = schema::domain_block_key(account_id.value(), domain);
-                start.push(0x00);
-                start
-            }
-            None => prefix.clone(),
-        };
+        let by_id = read.open_table(DOMAIN_BLOCKS_BY_ID)?;
+        let account = account_id.value();
+        // Keys hold `desc(id)`, so ascending key order is newest first.
+        // `max_id` is exclusive: the scan starts just after desc(max_id).
+        // `since_id` is exclusive: the scan stops before desc(since_id).
+        let start = max_id.map_or(0, |max| schema::desc_id(max.value()).saturating_add(1));
+        let end = since_id.map_or(u64::MAX, |since| schema::desc_id(since.value()));
+        if start >= end {
+            return Ok(Vec::new());
+        }
+        let start_key = schema::pair_key(account, start);
+        let end_key = schema::pair_key(account, end);
 
-        // Ascending by domain: the endpoint exposes domain cursors.
         let mut out: Vec<DomainBlock> = Vec::new();
-        for entry in blocks.range(start.as_slice()..)? {
-            let (key, value) = entry?;
-            if !key.value().starts_with(&prefix) {
-                break; // Past this account's block list.
-            }
+        for entry in by_id.range(start_key.as_slice()..end_key.as_slice())? {
+            let (_key, value) = entry?;
             out.push(decode(value.value())?);
             if out.len() >= limit {
                 break;

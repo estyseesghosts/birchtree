@@ -335,9 +335,9 @@ REVOKED="$(curl -fsS -X POST "$BASE/api/v1/statuses/$STATUS_ID/quotes/$QUOTE_ID/
 jassert "$REVOKED" "quote.state" "revoked" "revoke state"
 
 echo "==> domain blocks"
-curl -fsS -X PUT "$BASE/api/v1/domain_blocks" -H "Authorization: Bearer $BOB" --data-urlencode "domain=remote.example" >/dev/null
+curl -fsS -X POST "$BASE/api/v1/domain_blocks" -H "Authorization: Bearer $BOB" --data-urlencode "domain=remote.example" >/dev/null
 curl -fsS "$BASE/api/v1/domain_blocks" -H "Authorization: Bearer $BOB" | python3 -c 'import sys,json; a=json.load(sys.stdin); assert a==["remote.example"], a'
-curl -fsS -X DELETE "$BASE/api/v1/domain_blocks/remote.example" -H "Authorization: Bearer $BOB" >/dev/null
+curl -fsS -X DELETE "$BASE/api/v1/domain_blocks?domain=remote.example" -H "Authorization: Bearer $BOB" >/dev/null
 [ "$(curl -fsS "$BASE/api/v1/domain_blocks" -H "Authorization: Bearer $BOB")" = "[]" ]
 
 echo "==> delete returns source and 404s afterwards"
