@@ -57,3 +57,39 @@ users, OAuth apps/tokens, sessions, jobs + scheduling index) across 10 tests:
 - `kill -9` durability is proven by `tests/crash_recovery.rs` against the real
   binary (`crash-harness` mode): a committed account + its job survive; an
   aborted open leaves no partial state.
+
+## Implementation notes (Phase 3 — schema v3)
+
+The v3 migration adds (one write transaction per migration step, restartable):
+
+- **Records:** `statuses`, `status_versions`, `status_pins`, `polls`,
+  `poll_votes`, `quotes`, `notifications`, `favourites`, `bookmarks`,
+  `follows`, `blocks`, `domain_blocks`, `mutes`, `account_notes`,
+  `endorsements`, `idempotency`, `account_stats`, `media`.
+- **Indexes:** `status_author_index` (`author_be || desc(id)` for
+  descending scans), `status_parent_index`, `status_reblog_index`,
+  `reblogs_by_account`, `poll_by_status`, `quotes_by_quoted` /
+  `quotes_by_quoting`, `favourites_by_status` / `bookmarks_by_status`
+  (`status || interaction_id` for cursor order), `follows_by_followed`,
+  `blocks_by_blocked`, `mutes_by_muted`, `endorsements_by_endorsed`,
+  `mentions_by_account`, `hashtag_index` (`tag || 0xFF || status`),
+  `notifications_by_recipient` (`recipient || desc(id)`),
+  `notification_dedup` (40-byte interaction-instance key), `media_by_owner`.
+- Composite keys are fixed-width big-endian pairs built by
+  `schema::pair_key`/`desc_id`; `domain_block_key` separates the account
+  prefix from the domain with `0xFF` (never present in a domain). Ordering is
+  numeric everywhere — decimal IDs are never compared lexicographically.
+- Counters live on the record they describe (`Status.*_count`,
+  `Poll.votes/voters_count`) or in `account_stats`, and are written inside the
+  same transaction as the row that changes them, so reads cannot observe a
+  counter/row disagreement.
+- Idempotency records (`idempotency`, 24-byte `account || sha256` key,
+  1-hour TTL enforced at read) commit in the same transaction as the status
+  they protect.
+
+Conformance tests added with Phase 3 (in `tests/persistence_conformance.rs`):
+status create commits record + indexes + jobs atomically (and an aborted
+create leaves neither), notification-fanout job idempotence (dedup), natural
+interaction idempotence (repeat favourite → one row/one job), `Idempotency-Key`
+replay within the hour, and reopen-after-crash durability of an interaction +
+job with post-restart job completion producing exactly one notification.

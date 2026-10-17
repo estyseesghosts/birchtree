@@ -17,4 +17,7 @@ bash scripts/smoke-phase1.sh
 echo "==> scripts/smoke-phase2.sh"
 bash scripts/smoke-phase2.sh
 
+echo "==> scripts/smoke-phase3.sh"
+bash scripts/smoke-phase3.sh
+
 echo "smoke-all: green"

@@ -7,4 +7,7 @@
 pub mod accounts;
 pub mod apps;
 pub mod instance;
+pub mod polls;
 pub mod preferences;
+pub mod relationships;
+pub mod statuses;

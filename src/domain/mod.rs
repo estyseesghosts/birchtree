@@ -1,6 +1,7 @@
 pub mod account;
 pub mod error;
 pub mod id;
+pub mod idempotency;
 pub mod job;
 pub mod oauth;
 pub mod visibility;
@@ -9,8 +10,6 @@ pub mod user;
 pub mod quote;
 pub mod relationship;
 pub mod follow;
-pub mod block;
-pub mod mute;
 pub mod favourite;
 pub mod bookmark;
 pub mod list;
@@ -23,8 +22,17 @@ pub mod filter;
 pub use error::{Error, Result};
 pub use id::{Clock, Id, IdGenerator, SystemClock, TimestampIdGenerator};
 pub use visibility::{QuotePolicy, Visibility};
-pub use status::Status;
+pub use status::{Status, StatusApplication, StatusVersion};
 pub use account::Account;
 pub use oauth::{AccessToken, AuthorizationCode, OAuthApplication};
 pub use user::{LocalUser, LoginSession};
 pub use job::{Job, JobKind, JobState};
+pub use follow::{Follow, FollowState};
+pub use relationship::{
+    AccountNote, AccountStats, Block, DomainBlock, Endorsement, Mute,
+};
+pub use notification::{Notification, NotificationType};
+pub use poll::{Poll, PollOption, PollVote};
+pub use quote::{QuoteRecord, QuoteState};
+pub use media::{MediaAttachment, MediaState};
+pub use idempotency::IdempotencyRecord;

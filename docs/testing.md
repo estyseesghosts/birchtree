@@ -17,7 +17,9 @@ Required suites:
 9. Client tests — real Mastodon-compatible client automation where practical.
 10. Performance and abuse — high-degree graphs, sparse indexes, large/malformed bodies, upload exhaustion, slow hosts, retry storms.
 
-Gate: `bash scripts/smoke-all.sh` (`cargo check --all-targets` + `cargo test` + `scripts/smoke-phase1.sh`) green before claiming phase completion.
+Gate: `bash scripts/smoke-all.sh` (`cargo check --all-targets` + `cargo test` +
+`scripts/smoke-phase1.sh` + `scripts/smoke-phase2.sh` +
+`scripts/smoke-phase3.sh`) green before claiming phase completion.
 
 ## Implemented suites (Phase 1)
 

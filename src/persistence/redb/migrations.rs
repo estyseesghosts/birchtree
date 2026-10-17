@@ -8,8 +8,14 @@
 use redb::{Database, ReadableDatabase};
 
 use super::schema::{
-    self, ACCESS_TOKENS, ACCOUNTS, AUTHORIZATION_CODES, HANDLE_INDEX, JOBS, JOBS_INDEX, LOCAL_USERS,
-    META, OAUTH_APPS, SESSIONS,
+    self, ACCESS_TOKENS, ACCOUNTS, ACCOUNT_NOTES, ACCOUNT_STATS, AUTHORIZATION_CODES, BLOCKS,
+    BLOCKS_BY_BLOCKED, BOOKMARKS, BOOKMARKS_BY_STATUS, DOMAIN_BLOCKS, ENDORSEMENTS,
+    ENDORSEMENTS_BY_ENDORSED, FAVOURITES, FAVOURITES_BY_STATUS, FOLLOWS, FOLLOWS_BY_FOLLOWED,
+    HANDLE_INDEX, HASHTAG_INDEX, IDEMPOTENCY, JOBS, JOBS_INDEX, LOCAL_USERS, MEDIA, MEDIA_BY_OWNER,
+    MENTIONS_BY_ACCOUNT, META, MUTES, MUTES_BY_MUTED, NOTIFICATIONS, NOTIFICATIONS_BY_RECIPIENT,
+    NOTIFICATION_DEDUP, OAUTH_APPS, POLL_BY_STATUS, POLLS, POLL_VOTES, QUOTES, QUOTES_BY_QUOTED,
+    QUOTES_BY_QUOTING, REBLOGS_BY_ACCOUNT, SESSIONS, STATUSES, STATUS_AUTHOR_INDEX,
+    STATUS_PARENT_INDEX, STATUS_PINS, STATUS_REBLOG_INDEX, STATUS_VERSIONS,
 };
 use super::StoreError;
 
@@ -74,6 +80,47 @@ pub fn apply(db: &Database) -> Result<u64, StoreError> {
             let _ = write.open_table(AUTHORIZATION_CODES)?;
         }
 
+        // Step v3: statuses, relationships, interactions, polls, quotes and
+        // their indexes (Phase 3).
+        if current < 3 {
+            let _ = write.open_table(STATUSES)?;
+            let _ = write.open_table(STATUS_AUTHOR_INDEX)?;
+            let _ = write.open_table(STATUS_PARENT_INDEX)?;
+            let _ = write.open_table(STATUS_REBLOG_INDEX)?;
+            let _ = write.open_table(REBLOGS_BY_ACCOUNT)?;
+            let _ = write.open_table(STATUS_VERSIONS)?;
+            let _ = write.open_table(STATUS_PINS)?;
+            let _ = write.open_table(FAVOURITES)?;
+            let _ = write.open_table(FAVOURITES_BY_STATUS)?;
+            let _ = write.open_table(BOOKMARKS)?;
+            let _ = write.open_table(BOOKMARKS_BY_STATUS)?;
+            let _ = write.open_table(FOLLOWS)?;
+            let _ = write.open_table(FOLLOWS_BY_FOLLOWED)?;
+            let _ = write.open_table(BLOCKS)?;
+            let _ = write.open_table(BLOCKS_BY_BLOCKED)?;
+            let _ = write.open_table(DOMAIN_BLOCKS)?;
+            let _ = write.open_table(MUTES)?;
+            let _ = write.open_table(MUTES_BY_MUTED)?;
+            let _ = write.open_table(ACCOUNT_NOTES)?;
+            let _ = write.open_table(ENDORSEMENTS)?;
+            let _ = write.open_table(ENDORSEMENTS_BY_ENDORSED)?;
+            let _ = write.open_table(POLLS)?;
+            let _ = write.open_table(POLL_BY_STATUS)?;
+            let _ = write.open_table(POLL_VOTES)?;
+            let _ = write.open_table(QUOTES)?;
+            let _ = write.open_table(QUOTES_BY_QUOTED)?;
+            let _ = write.open_table(QUOTES_BY_QUOTING)?;
+            let _ = write.open_table(NOTIFICATIONS)?;
+            let _ = write.open_table(NOTIFICATIONS_BY_RECIPIENT)?;
+            let _ = write.open_table(NOTIFICATION_DEDUP)?;
+            let _ = write.open_table(IDEMPOTENCY)?;
+            let _ = write.open_table(ACCOUNT_STATS)?;
+            let _ = write.open_table(MEDIA)?;
+            let _ = write.open_table(MEDIA_BY_OWNER)?;
+            let _ = write.open_table(MENTIONS_BY_ACCOUNT)?;
+            let _ = write.open_table(HASHTAG_INDEX)?;
+        }
+
         {
             let mut meta = write.open_table(META)?;
             meta.insert(
@@ -116,6 +163,43 @@ mod tests {
             let db = Database::create(&path).unwrap();
             // Re-applying is a no-op returning the current version.
             assert_eq!(apply(&db).unwrap(), target_version());
+        }
+    }
+
+    #[test]
+    fn upgrades_v2_database_to_v3() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.redb");
+        {
+            // Simulate a Phase 2 database: v1+v2 tables present, version 2.
+            let db = Database::create(&path).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let _ = write.open_table(META).unwrap();
+                let _ = write.open_table(ACCOUNTS).unwrap();
+                let _ = write.open_table(HANDLE_INDEX).unwrap();
+                let _ = write.open_table(LOCAL_USERS).unwrap();
+                let _ = write.open_table(OAUTH_APPS).unwrap();
+                let _ = write.open_table(ACCESS_TOKENS).unwrap();
+                let _ = write.open_table(SESSIONS).unwrap();
+                let _ = write.open_table(JOBS).unwrap();
+                let _ = write.open_table(JOBS_INDEX).unwrap();
+                let _ = write.open_table(schema::AUTHORIZATION_CODES).unwrap();
+                let mut meta = write.open_table(META).unwrap();
+                meta.insert(schema::SCHEMA_VERSION_KEY, 2u64.to_be_bytes().as_slice())
+                    .unwrap();
+            }
+            write.commit().unwrap();
+        }
+        {
+            let db = Database::create(&path).unwrap();
+            assert_eq!(applied_version(&db).unwrap(), 2);
+            assert_eq!(apply(&db).unwrap(), target_version());
+            // The Phase 3 tables exist after the upgrade.
+            let read = db.begin_read().unwrap();
+            assert!(read.open_table(schema::STATUSES).is_ok());
+            assert!(read.open_table(schema::FOLLOWS).is_ok());
+            assert!(read.open_table(schema::QUOTES).is_ok());
         }
     }
 

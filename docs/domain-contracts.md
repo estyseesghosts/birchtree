@@ -74,3 +74,38 @@ Internal normalized quote representation for FEP-044f, Mastodon quote activities
   `JobKind::SendConfirmationEmail` is committed with public registration.
 - Status/relationship/quote/poll/notification types remain the Phase 0 shapes
   and are refined as their phases are implemented.
+
+## Implementation status (Phase 3)
+
+- **Statuses.** `domain::status::Status` carries the wire contract directly:
+  `uri`/`url`, raw `source_text` + rendered `content_html`, created/edited/
+  tombstone times, language, visibility, sensitive/spoiler, reply parent +
+  parent author, reblog target, ordered `media_ids`, poll id, quote policy,
+  resolved `mentions` + `silent_mentions` (visibility-only), lowercased
+  `tags`, posting `application`, and the four counters
+  (`replies/reblogs/favourites/quotes`). Edit history is
+  `domain::status::StatusVersion` (version 0 = pre-edit snapshot at creation;
+  later versions appended per edit; snapshots carry source/content/spoiler/
+  sensitive/media/poll-titles).
+- **Idempotency.** `domain::idempotency::IdempotencyRecord` (scope +
+  result id, `IDEMPOTENCY_TTL_MS` = 1 hour) — Mastodon's `Idempotency-Key`
+  replay for `POST /api/v1/statuses`.
+- **Relationships.** `Follow` gained `FollowState {Active, Pending}` +
+  `created_at_ms`; `Block`/`DomainBlock`/`Mute` (expiry + notify flag,
+  `is_active_at`/`hides_notifications_at`)/`AccountNote`/`Endorsement` all
+  serde-persisted. `AccountStats` holds followers/following/statuses/
+  last-status/follow-request counters, mutated only inside relationship and
+  status transactions.
+- **Polls.** `Poll` embeds options + per-option tallies + voters/votes counts
+  (single-get reads, atomic vote updates) with a sticky `expired` flag;
+  `PollVote` stores the ballot's choice indices.
+- **Quotes.** `QuoteRecord` implements the pinned five-state machine
+  (`pending/accepted/rejected/revoked/deleted`) with both account ids;
+  local quotes are accepted at creation.
+- **Notifications.** `Notification` gained `created_at_ms` and the `Quote`
+  kind; wire forms via `NotificationType::as_str()`. Records are created by
+  the deduplicated `FanOutNotification` job after commit — never inside the
+  request transaction, never duplicated by a retry.
+- **Visibility/quote policy wire parsing** lives in `domain::visibility`
+  (`Visibility::from_wire/as_str`, `QuotePolicy::from_wire/as_str`,
+  `Default = Public`).

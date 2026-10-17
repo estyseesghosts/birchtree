@@ -2,117 +2,171 @@
 
 Status: Draft
 
-Route inventory from Mastodon v4.7.3 `config/routes/api.rb` (commit `8ff11c2b`), cross-checked against the public API docs where practical. One manifest row per method/path. Profile column: `In` = in the declared Phase 0/1+ compatibility profile, `Out` = explicitly excluded (admin/moderation, legacy, experimental, or not yet scoped), `Plan` = planned for a later phase.
+Route inventory from Mastodon v4.7.3 `config/routes/api.rb` (commit `8ff11c2b`), cross-checked against the public API docs where practical. One manifest row per method/path. Profile column: `In` = in the declared Phase 0/1+ compatibility profile, `Out` = explicitly excluded (admin/moderation, legacy, experimental, or not yet scoped), `Plan` = planned for a later phase. Status column: `implemented (Phase N)` = route exists with contract tests; `planned (Phase N)` = in profile but intentionally absent (404) until that phase — never a success-shaped stub.
 
-Auth scopes are Mastodon conventions from the source/docs. They are enforced centrally (Phase 2) at the route boundary: a missing/invalid token yields `401 {"error":"The access token is invalid"}`, an insufficient scope yields `403 {"error":"This action is outside the authorized scopes"}`, and a user endpoint reached with an app-only token yields `422 {"error":"This method requires an authenticated user"}` (or `403 {"error":"This method requires an client credentials authentication"}` for the reverse case on registration).
+Auth scopes are Mastodon conventions from the source/docs. They are enforced centrally (Phase 2) at the route boundary: a missing/invalid token yields `401 {"error":"The access token is invalid"}`, an insufficient scope yields `403 {"error":"This action is outside the authorized scopes"}`, and a user endpoint reached with an app-only token yields `422 {"error":"This method requires an authenticated user"}` (or `403 {"error":"This method requires an client credentials authentication"}` for the reverse case on registration). Scope lists are "any-of" (broad OR granular), matching Doorkeeper's `any?`.
 
 ## OAuth / discovery (public, not in config/routes/api.rb)
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| GET | `/.well-known/webfinger` | none | — | planned | Plan | WebFinger `acct:` resolution (Phase 6) |
-| GET | `/.well-known/nodeinfo` | none | — | planned | Plan | NodeInfo discovery (Phase 6) |
-| GET | `/nodeinfo/2.0` | none | — | planned | Plan | NodeInfo 2.0 document (Phase 6) |
-| GET/POST | `/oauth/authorize` | session | — | implemented | In | Doorkeeper authorize; login + consent rendered server-side (Phase 2) |
-| POST | `/oauth/token` | basic/client | — | implemented | In | `authorization_code` (PKCE S256) + `client_credentials` (Phase 2) |
-| POST | `/oauth/revoke` | basic/client | — | implemented | In | Always `200 {}`; wrong client `403 unauthorized_client` (Phase 2) |
+| GET | `/.well-known/webfinger` | none | — | planned (Phase 6) | Plan | WebFinger `acct:` resolution |
+| GET | `/.well-known/nodeinfo` | none | — | planned (Phase 6) | Plan | NodeInfo discovery |
+| GET | `/nodeinfo/2.0` | none | — | planned (Phase 6) | Plan | NodeInfo 2.0 document |
+| GET/POST | `/oauth/authorize` | session | — | implemented (Phase 2) | In | Doorkeeper authorize; login + consent rendered server-side |
+| POST | `/oauth/token` | basic/client | — | implemented (Phase 2) | In | `authorization_code` (PKCE S256) + `client_credentials` |
+| POST | `/oauth/revoke` | basic/client | — | implemented (Phase 2) | In | Always `200 {}`; wrong client `403 unauthorized_client` |
 
 ## v1 REST API (from `config/routes/api.rb`)
 
+### Instances, applications, accounts
+
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| GET | `/api/v1/instance` | none | — | implemented | In | instance discovery, `REST::V1::InstanceSerializer` (Phase 2) |
-| GET | `/api/v2/instance` | none | — | implemented | In | instance discovery v2, `REST::InstanceSerializer` (Phase 2) |
-| POST | `/api/v1/accounts` | app | write \| write:accounts | implemented | In | registration; returns a user token (Phase 2) |
-| GET | `/api/v1/accounts/verify_credentials` | user | profile \| read \| read:accounts | implemented | In | `CredentialAccountSerializer` (Phase 2) |
-| PATCH | `/api/v1/accounts/update_credentials` | user | write \| write:accounts | implemented | In | incl. `source[quote_policy]` (Phase 2) |
-| GET | `/api/v1/accounts/lookup` | user | read | stubbed | In | acct → account resolution |
-| GET | `/api/v1/accounts/search` | user | read | stubbed | In | |
-| GET | `/api/v1/accounts/relationships` | user | read \| read:follows | implemented | In | Phase 2 (neutral defaults) |
-| GET | `/api/v1/accounts/:id` | none | — | implemented | In | public profile (Phase 2) |
-| GET | `/api/v1/accounts/:id/statuses` | optional | read | stubbed | In | |
-| GET | `/api/v1/accounts/:id/followers` | optional | read | stubbed | In | |
-| GET | `/api/v1/accounts/:id/following` | optional | read | stubbed | In | |
-| POST | `/api/v1/accounts/:id/follow` | user | follow | stubbed | In | |
-| POST | `/api/v1/accounts/:id/unfollow` | user | follow | stubbed | In | |
-| POST | `/api/v1/accounts/:id/block` | user | write | stubbed | In | |
-| POST | `/api/v1/accounts/:id/unblock` | user | write | stubbed | In | |
-| POST | `/api/v1/accounts/:id/mute` | user | write | stubbed | In | |
-| POST | `/api/v1/accounts/:id/unmute` | user | write | stubbed | In | |
-| POST | `/api/v1/accounts/:id/remove_from_followers` | user | write | stubbed | In | |
-| POST | `/api/v1/apps` | none | — | implemented | In | app registration; returns `client_secret` once (Phase 2) |
-| GET | `/api/v1/apps/verify_credentials` | app | — | stubbed | In | |
-| GET | `/api/v1/statuses/:id` | optional | read | stubbed | In | |
-| POST | `/api/v1/statuses` | user | write | stubbed | In | incl. `quoted_status_id`/`quote_approval_policy` |
-| PUT | `/api/v1/statuses/:id` | user | write | stubbed | In | edit (history + follow-up jobs) |
-| DELETE | `/api/v1/statuses/:id` | user | write | stubbed | In | |
-| GET | `/api/v1/statuses/:id/source` | optional | read | stubbed | In | source/raw-text mode |
-| GET | `/api/v1/statuses/:id/context` | optional | read | stubbed | In | ancestors/descendants |
-| GET | `/api/v1/statuses/:id/history` | optional | read | stubbed | In | edit history |
-| PUT | `/api/v1/statuses/:id/interaction_policy` | user | write | stubbed | In | |
-| POST | `/api/v1/statuses/:id/favourite` | user | write | stubbed | In | |
-| POST | `/api/v1/statuses/:id/unfavourite` | user | write | stubbed | In | |
-| POST | `/api/v1/statuses/:id/bookmark` | user | write | stubbed | In | |
-| POST | `/api/v1/statuses/:id/unbookmark` | user | write | stubbed | In | |
-| POST | `/api/v1/statuses/:id/reblog` | user | write | stubbed | In | |
-| POST | `/api/v1/statuses/:id/unreblog` | user | write | stubbed | In | |
-| POST | `/api/v1/statuses/:id/mute` | user | write | stubbed | In | |
-| POST | `/api/v1/statuses/:id/unmute` | user | write | stubbed | In | |
-| POST | `/api/v1/statuses/:id/pin` | user | write | stubbed | In | |
-| POST | `/api/v1/statuses/:id/unpin` | user | write | stubbed | In | |
-| GET | `/api/v1/statuses/:id/quotes` | optional | read | stubbed | In | quote listing |
-| POST | `/api/v1/statuses/:id/quotes/:quoting_status_id/revoke` | user | write | stubbed | In | quote revocation |
-| GET | `/api/v1/timelines/home` | user | read | stubbed | In | |
-| GET | `/api/v1/timelines/public` | optional | read | stubbed | In | |
-| GET | `/api/v1/timelines/tag` | optional | read | stubbed | In | |
-| GET | `/api/v1/timelines/list` | user | read | stubbed | In | |
-| GET | `/api/v1/timelines/link` | optional | read | stubbed | In | |
-| GET | `/api/v1/media/:id` | optional | read | stubbed | In | |
-| POST | `/api/v1/media` | user | write | stubbed | In | media v1 (multipart) |
-| PUT | `/api/v1/media/:id` | user | write | stubbed | In | |
-| DELETE | `/api/v1/media/:id` | user | write | stubbed | In | |
-| POST | `/api/v2/media` | user | write | stubbed | In | media v2 (multipart) |
-| GET | `/api/v1/notifications` | user | read:notifications | stubbed | In | |
-| GET | `/api/v1/notifications/:id` | user | read:notifications | stubbed | In | |
-| POST | `/api/v1/notifications/clear` | user | write | stubbed | In | |
-| GET | `/api/v1/notifications/unread_count` | user | read:notifications | stubbed | In | |
-| POST | `/api/v1/notifications/:id/dismiss` | user | write | stubbed | In | |
-| GET | `/api/v1/preferences` | user | read \| read:accounts | implemented | In | incl. quote-policy defaults (Phase 2) |
-| GET | `/api/v1/filters` | user | read | stubbed | Plan | Phase 7 |
-| POST | `/api/v1/filters` | user | write | stubbed | Plan | Phase 7 |
-| GET | `/api/v1/filters/:id` | user | read | stubbed | Plan | Phase 7 |
-| PUT | `/api/v1/filters/:id` | user | write | stubbed | Plan | Phase 7 |
-| DELETE | `/api/v1/filters/:id` | user | write | stubbed | Plan | Phase 7 |
-| GET | `/api/v1/lists` | user | read | stubbed | Plan | Phase 7 |
-| POST | `/api/v1/lists` | user | write | stubbed | Plan | Phase 7 |
-| GET | `/api/v1/lists/:id` | user | read | stubbed | Plan | Phase 7 |
-| PUT | `/api/v1/lists/:id` | user | write | stubbed | Plan | Phase 7 |
-| DELETE | `/api/v1/lists/:id` | user | write | stubbed | Plan | Phase 7 |
-| GET | `/api/v1/polls/:id` | optional | read | stubbed | Plan | Phase 7 |
-| POST | `/api/v1/polls/:id/votes` | user | write | stubbed | Plan | Phase 7 |
-| GET | `/api/v1/scheduled_statuses` | user | read | stubbed | Plan | Phase 7 |
-| GET | `/api/v1/search` | user | read | stubbed | Plan | Phase 7 |
-| GET | `/api/v2/search` | user | read | stubbed | Plan | Phase 7 |
-| GET | `/api/v1/streaming` | user | read | stubbed | Plan | Phase 5 (SSE/WebSocket) |
-| GET | `/api/v1/streaming/(*any)` | user | read | stubbed | Plan | Phase 5 |
+| GET | `/api/v1/instance` | none | — | implemented (Phase 2) | In | instance discovery, `REST::V1::InstanceSerializer` |
+| GET | `/api/v2/instance` | none | — | implemented (Phase 2) | In | instance discovery v2, `REST::InstanceSerializer` |
+| POST | `/api/v1/accounts` | app | write \| write:accounts | implemented (Phase 2) | In | registration; returns a user token |
+| GET | `/api/v1/accounts/verify_credentials` | user | profile \| read \| read:accounts | implemented (Phase 2) | In | `CredentialAccountSerializer` (real counters) |
+| PATCH | `/api/v1/accounts/update_credentials` | user | write \| write:accounts | implemented (Phase 2) | In | incl. `source[quote_policy]` |
+| GET | `/api/v1/accounts/lookup` | user | read | planned (Phase 7) | In | acct → account resolution |
+| GET | `/api/v1/accounts/search` | user | read | planned (Phase 7) | In | |
+| GET | `/api/v1/accounts/relationships` | user | read \| read:follows | implemented (Phase 2, real data Phase 3) | In | real per-viewer relationship aggregates |
+| GET | `/api/v1/accounts/:id` | none | — | implemented (Phase 2, real counters Phase 3) | In | public profile |
+| GET | `/api/v1/accounts/:id/statuses` | optional | read | implemented (Phase 3) | In | `pinned`/`exclude_replies`/`exclude_reblogs` filters, `Link` cursors |
+| GET | `/api/v1/accounts/:id/followers` | optional | read | implemented (Phase 3) | In | `REST::AccountSerializer[]`, `Link` cursors |
+| GET | `/api/v1/accounts/:id/following` | optional | read | implemented (Phase 3) | In | |
+| POST | `/api/v1/accounts/:id/follow` | user | follow \| write \| write:follows | implemented (Phase 3) | In | locked target → `requested:true` |
+| POST | `/api/v1/accounts/:id/unfollow` | user | follow \| write \| write:follows | implemented (Phase 3) | In | also cancels pending requests; drops endorsements |
+| POST | `/api/v1/accounts/:id/block` | user | follow \| write \| write:blocks | implemented (Phase 3) | In | mutual unfollow + endorsement cleanup |
+| POST | `/api/v1/accounts/:id/unblock` | user | follow \| write \| write:blocks | implemented (Phase 3) | In | |
+| POST | `/api/v1/accounts/:id/mute` | user | follow \| write \| write:mutes | implemented (Phase 3) | In | `duration` seconds (0 = permanent), `notifications` |
+| POST | `/api/v1/accounts/:id/unmute` | user | follow \| write \| write:mutes | implemented (Phase 3) | In | |
+| POST | `/api/v1/accounts/:id/remove_from_followers` | user | follow \| write \| write:follows | implemented (Phase 3) | In | idempotent 200 |
+| POST | `/api/v1/accounts/:id/note` | user | write \| write:accounts | implemented (Phase 3) | In | `comment` ≤2000; blank deletes |
+| POST | `/api/v1/accounts/:id/pin` | user | write \| write:accounts | implemented (Phase 3) | In | endorsement (alias `/endorse`); requires active follow |
+| POST | `/api/v1/accounts/:id/endorse` | user | write \| write:accounts | implemented (Phase 3) | In | alias of `pin` |
+| POST | `/api/v1/accounts/:id/unpin` | user | write \| write:accounts | implemented (Phase 3) | In | alias `/unendorse` |
+| POST | `/api/v1/accounts/:id/unendorse` | user | write \| write:accounts | implemented (Phase 3) | In | |
+| GET | `/api/v1/accounts/:id/endorsements` | optional | read \| read:accounts | implemented (Phase 3) | In | empty array for unknown accounts |
+| GET | `/api/v1/endorsements` | user | read \| read:accounts | implemented (Phase 3) | In | own endorsed accounts |
+| POST | `/api/v1/apps` | none | — | implemented (Phase 2) | In | app registration; returns `client_secret` once |
+| GET | `/api/v1/apps/verify_credentials` | app | — | planned (Phase 7) | In | |
+
+### Follow requests
+
+| Method | Path | Auth | Scope | Status | Profile | Notes |
+|---|---|---|---|---|---|---|
+| GET | `/api/v1/follow_requests` | user | follow \| read \| read:follows | implemented (Phase 3) | In | `REST::AccountSerializer[]` (requesters) |
+| POST | `/api/v1/follow_requests/:id/authorize` | user | follow \| write \| write:follows | implemented (Phase 3) | In | 200 relationship of viewer → requester |
+| POST | `/api/v1/follow_requests/:id/reject` | user | follow \| write \| write:follows | implemented (Phase 3) | In | |
+
+### Domain blocks
+
+| Method | Path | Auth | Scope | Status | Profile | Notes |
+|---|---|---|---|---|---|---|
+| GET | `/api/v1/domain_blocks` | user | follow \| read \| read:blocks | implemented (Phase 3) | In | domain strings, ascending; domain-string cursors |
+| PUT | `/api/v1/domain_blocks` | user | follow \| write \| write:blocks | implemented (Phase 3) | In | `200 {}` |
+| DELETE | `/api/v1/domain_blocks/:domain` | user | follow \| write \| write:blocks | implemented (Phase 3) | In | `200 {}`, idempotent |
+
+### Statuses
+
+| Method | Path | Auth | Scope | Status | Profile | Notes |
+|---|---|---|---|---|---|---|
+| GET | `/api/v1/statuses` | optional | read \| read:statuses | implemented (Phase 3) | In | multi-fetch `id[]` (≤20, else 422 `Mastodon::ValidationError`); invisible ids silently omitted; id-desc |
+| GET | `/api/v1/statuses/:id` | optional | read \| read:statuses | implemented (Phase 3) | In | 404 `{"error":"Not Found"}` |
+| POST | `/api/v1/statuses` | user | write \| write:statuses | implemented (Phase 3) | In | `quoted_status_id`/`quote_approval_policy`, `poll[...]`, `media_ids[]`, `Idempotency-Key` (1h replay) |
+| PUT | `/api/v1/statuses/:id` | user | write \| write:statuses | implemented (Phase 3) | In | edit; no-op edit still 200 without bumping `edited_at` |
+| PATCH | `/api/v1/statuses/:id` | user | write \| write:statuses | implemented (Phase 3) | In | alias of PUT |
+| DELETE | `/api/v1/statuses/:id` | user | write \| write:statuses | implemented (Phase 3) | In | 200 pre-deletion body in source mode (`text`, no `content`) |
+| GET | `/api/v1/statuses/:id/source` | user | read \| read:statuses | implemented (Phase 3) | In | 401 without token; `{id,text,spoiler_text}` |
+| GET | `/api/v1/statuses/:id/context` | optional | read \| read:statuses | implemented (Phase 3) | In | 4096/4096 caps authenticated; 40/60 + depth 20 anonymous |
+| GET | `/api/v1/statuses/:id/history` | user | read \| read:statuses | implemented (Phase 3) | In | 401 without token; `REST::StatusEditSerializer[]` |
+| PUT | `/api/v1/statuses/:id/interaction_policy` | user | write \| write:statuses | implemented (Phase 3) | In | `quote_approval_policy` only (`public\|followers\|nobody`) |
+| PATCH | `/api/v1/statuses/:id/interaction_policy` | user | write \| write:statuses | implemented (Phase 3) | In | alias of PUT |
+| POST | `/api/v1/statuses/:id/favourite` | user | write \| write:favourites | implemented (Phase 3) | In | idempotent; 200 status |
+| POST | `/api/v1/statuses/:id/unfavourite` | user | write \| write:favourites | implemented (Phase 3) | In | 200 no-op when not favourited |
+| POST | `/api/v1/statuses/:id/bookmark` | user | write \| write:bookmarks | implemented (Phase 3) | In | |
+| POST | `/api/v1/statuses/:id/unbookmark` | user | write \| write:bookmarks | implemented (Phase 3) | In | 200 no-op |
+| POST | `/api/v1/statuses/:id/reblog` | user | write \| write:statuses | implemented (Phase 3) | In | 200 NEW reblog record; idempotent |
+| POST | `/api/v1/statuses/:id/unreblog` | user | write \| write:statuses | implemented (Phase 3) | In | 200 ORIGINAL; 200 no-op when not reblogged |
+| POST | `/api/v1/statuses/:id/pin` | user | write \| write:accounts | implemented (Phase 3) | In | limit 5; four exact 422 messages |
+| POST | `/api/v1/statuses/:id/unpin` | user | write \| write:accounts | implemented (Phase 3) | In | 200 no-op when not pinned |
+| GET | `/api/v1/statuses/:id/favourited_by` | optional | read \| read:accounts | implemented (Phase 3) | In | accounts; cursor = favourite id (hidden in `Link`) |
+| GET | `/api/v1/statuses/:id/reblogged_by` | optional | read \| read:accounts | implemented (Phase 3) | In | accounts; cursor = reblog id |
+| GET | `/api/v1/statuses/:id/quotes` | user | read \| read:statuses | implemented (Phase 3) | In | 401 without token; accepted quotes only; cursor = quoting status id |
+| POST | `/api/v1/statuses/:id/quotes/:quoting_status_id/revoke` | user | write \| write:statuses | implemented (Phase 3) | In | quoted author only; 200 = quoting status |
+| POST | `/api/v1/statuses/:id/mute` | user | write:mutes | out of profile (Phase 3) | Out | conversation mute; `conversations` excluded |
+| POST | `/api/v1/statuses/:id/unmute` | user | write:mutes | out of profile (Phase 3) | Out | as above |
+| POST | `/api/v1/statuses/:id/translate` | — | — | out of profile | Out | translation provider not configured |
+
+### Polls
+
+| Method | Path | Auth | Scope | Status | Profile | Notes |
+|---|---|---|---|---|---|---|
+| GET | `/api/v1/polls/:id` | optional | read \| read:statuses | implemented (Phase 3) | In | 404 when missing/invisible |
+| POST | `/api/v1/polls/:id/votes` | user | write \| write:statuses | implemented (Phase 3) | In | `choices[]` required (else 400); single-choice re-vote 422 |
+
+### Timelines, media, notifications, discovery (later phases)
+
+| Method | Path | Auth | Scope | Status | Profile | Notes |
+|---|---|---|---|---|---|---|
+| GET | `/api/v1/timelines/home` | user | read | planned (Phase 4) | In | |
+| GET | `/api/v1/timelines/public` | optional | read | planned (Phase 4) | In | |
+| GET | `/api/v1/timelines/tag` | optional | read | planned (Phase 4) | In | |
+| GET | `/api/v1/timelines/list` | user | read | planned (Phase 4) | In | |
+| GET | `/api/v1/timelines/link` | optional | read | planned (Phase 7) | In | |
+| GET | `/api/v1/media/:id` | optional | read | planned (Phase 4) | In | |
+| POST | `/api/v1/media` | user | write | planned (Phase 4) | In | media v1 (multipart) |
+| PUT | `/api/v1/media/:id` | user | write | planned (Phase 4) | In | |
+| DELETE | `/api/v1/media/:id` | user | write | planned (Phase 4) | In | |
+| POST | `/api/v2/media` | user | write | planned (Phase 4) | In | media v2 (multipart) |
+| GET | `/api/v1/notifications` | user | read:notifications | planned (Phase 4) | In | records already committed from Phase 3 interactions |
+| GET | `/api/v1/notifications/:id` | user | read:notifications | planned (Phase 4) | In | |
+| POST | `/api/v1/notifications/clear` | user | write | planned (Phase 4) | In | |
+| GET | `/api/v1/notifications/unread_count` | user | read:notifications | planned (Phase 4) | In | |
+| POST | `/api/v1/notifications/:id/dismiss` | user | write | planned (Phase 4) | In | |
+| GET | `/api/v1/preferences` | user | read \| read:accounts | implemented (Phase 2) | In | incl. quote-policy defaults |
+| GET | `/api/v1/filters` | user | read | planned (Phase 7) | In | was Plan; reclassified as in-profile |
+| POST | `/api/v1/filters` | user | write | planned (Phase 7) | In | |
+| GET | `/api/v1/filters/:id` | user | read | planned (Phase 7) | In | |
+| PUT | `/api/v1/filters/:id` | user | write | planned (Phase 7) | In | |
+| DELETE | `/api/v1/filters/:id` | user | write | planned (Phase 7) | In | |
+| GET | `/api/v1/lists` | user | read | planned (Phase 7) | In | |
+| POST | `/api/v1/lists` | user | write | planned (Phase 7) | In | |
+| GET | `/api/v1/lists/:id` | user | read | planned (Phase 7) | In | |
+| PUT | `/api/v1/lists/:id` | user | write | planned (Phase 7) | In | |
+| DELETE | `/api/v1/lists/:id` | user | write | planned (Phase 7) | In | |
+| GET | `/api/v1/scheduled_statuses` | user | read | planned (Phase 7) | In | |
+| GET | `/api/v1/search` | user | read | planned (Phase 7) | In | |
+| GET | `/api/v2/search` | user | read | planned (Phase 7) | In | |
+| GET | `/api/v1/streaming` | user | read | planned (Phase 5) | In | SSE/WebSocket |
+| GET | `/api/v1/streaming/(*any)` | user | read | planned (Phase 5) | In | |
 
 ### Explicitly excluded / out of profile (admin, moderation, legacy, experimental)
 
 - `GET /api/v1/oembed` — public oEmbed; not in initial profile (record as gap if clients need it).
 - `namespace :v1_alpha` — experimental/legacy (`accounts/collections`, `collections/*`); explicitly **Out**.
 - `annual_reports`, `announcements`, `conversations`, `donation_campaigns`, `suggestions`, `custom_emojis` — **Out** until scoped (custom emoji may be needed for account/status serialization; revisit).
-- `GET /api/v1/blocks`, `GET /api/v1/mutes`, `GET /api/v1/favourites`, `GET /api/v1/bookmarks`, `GET /api/v1/endorsements` — relation collection reads; **Plan** (Phase 7).
+- `GET /api/v1/blocks`, `GET /api/v1/mutes`, `GET /api/v1/favourites`, `GET /api/v1/bookmarks` — relation collection reads; **planned (Phase 7)**.
 - `POST /api/v1/reports` — moderation; **Out** (admin/moderation excluded).
-- `follow_requests` index/authorize/reject — **Plan** (locked accounts; Phase 3+).
-- `notifications/requests` (follow-request notifications) — **Plan** (Phase 3+).
-- `accounts/familiar_followers`, `identity_proofs`, `featured_tags`, `email_subscriptions`, `collections`, `tags` follow/feature, `followed_tags` — **Plan** (Phase 7).
+- `notifications/requests` (follow-request notifications groupings) — **planned (Phase 4)**.
+- `accounts/familiar_followers`, `identity_proofs`, `featured_tags`, `email_subscriptions`, `collections`, `tags` follow/feature, `followed_tags` — **planned (Phase 7)**.
 - `namespace :admin` (all `admin/*` routes) — **Out** explicitly; moderation/security operations excluded from public-client milestone.
 - `v2` admin accounts, `push/*`, `web/*` — **Out** unless scoped later.
 - `translate` (statuses) — **Out** unless a translation provider is configured.
 
 ## Non-route contract items tracked separately
 
-- IDs: decimal strings on wire, numeric ordering internally (§4 of `birchtree.md`).
-- Pagination: `Link` `next`/`prev` headers; cursor bounds inclusive/exclusive per endpoint.
-- Error shapes: `{"error": "..."}`; statuses 202/204/206/401/403/404/422 where applicable.
-- Rate-limit headers, idempotency (`Idempotency-Key`, 1-hour retention), streaming event envelopes.
+- IDs: decimal strings on the wire, numeric ordering internally (§4 of `birchtree.md`).
+- Pagination: `Link` `next`/`prev` headers; cursors numeric `Id`s (status/account/interaction ids) except domain blocks (domain-string cursors). Cursor values are opaque to clients; they are swapped in place and other query params are preserved.
+- Error shapes: `{"error": "..."}`; statuses 200/400/401/403/404/405?/422/429 where applicable. Two 404 bodies exist and are reproduced: `Not Found` (explicit `not_found`, status sub-routes) and `Record not found` (unrescued lookup, update/delete).
+- Rate-limit headers, streaming event envelopes (Phase 5).
+- Idempotency: `Idempotency-Key` header on `POST /api/v1/statuses` only (1-hour retention, per-account scoping — matches Mastodon's `SETEX 3600` namespace). Other write endpoints are naturally idempotent (unique rows) instead.
+
+## Known Phase 3 deviations / gaps (honesty list)
+
+- **JSON request bodies are not accepted** on REST write endpoints (form-urlencoded or empty bodies only; axum's `RawForm` 415 replaced by a lenient form parser). Mastodon accepts JSON parameter bodies. Planned with the Phase 7 request-parser sweep.
+- **Tag objects** in status payloads use the tag name as `id` (no tag table yet); `history`/`following`/`featuring` are contract-shaped defaults. Real tag rows land with the Phase 7 tag surface.
+- **Conversation mutes** (`POST /api/v1/statuses/:id/mute|unmute`) are out of profile with `conversations`; the status DTO's `muted` flag is emitted with its neutral `false` for authenticated viewers.
+- **`application` on statuses** is shown whenever present (Mastodon's `user_shows_application?` preference defaults to true and is not stored yet).
+- Media attachment DTOs render `url`/`preview_url` as `null` until media processing lands (Phase 4) — contract-correct "not processed" state, but no upload endpoint exists yet.

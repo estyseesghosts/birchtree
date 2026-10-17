@@ -20,6 +20,7 @@ use crate::application::accounts::{self, RegisterAccountCommand};
 use crate::application::ports::{
     AccountProfileUpdate, Store, UserSettingsUpdate,
 };
+use crate::application::relationships;
 use crate::domain::Error as DomainError;
 
 /// Scope alternatives accepted by the write endpoints.
@@ -124,7 +125,13 @@ pub async fn show(State(state): State<ApiState>, Path(id): Path<String>) -> Resp
     let store: &dyn Store = &*state.context.store;
     match store.account_by_id(id) {
         Ok(Some(account)) => {
-            axum::Json(dto::account_json(&state.server, &account)).into_response()
+            let stats = store.account_stats(id).ok();
+            axum::Json(dto::account_json_with_stats(
+                &state.server,
+                &account,
+                stats.as_ref(),
+            ))
+            .into_response()
         }
         Ok(None) => ApiError::not_found().into_response(),
         Err(err) => ApiError::from(err).into_response(),
@@ -218,24 +225,32 @@ pub async fn relationships(
     if let Err(err) = auth.0.require_scopes(&["read", "read:follows"]) {
         return err.into_response();
     }
-    if let Err(err) = auth.0.require_user() {
-        return err.into_response();
-    }
+    let viewer_id = match auth.0.require_user() {
+        Ok(id) => id,
+        Err(err) => return err.into_response(),
+    };
 
     let pairs = forms::parse(query.unwrap_or_default().as_bytes());
     let store: &dyn Store = &*state.context.store;
-    let mut out: Vec<Value> = Vec::new();
+
+    // Resolve targets in request order; unknown ids are silently skipped
+    // (Mastodon skips deleted/suspended accounts).
+    let mut target_ids: Vec<crate::domain::Id> = Vec::new();
     for raw in forms::all(&pairs, "id") {
         let Ok(id) = raw.parse::<crate::domain::Id>() else {
             continue;
         };
-        match store.account_by_id(id) {
-            Ok(Some(_)) => out.push(dto::relationship_json(id)),
-            Ok(None) => {}
-            Err(err) => return ApiError::from(err).into_response(),
+        if store.account_by_id(id).ok().flatten().is_some() {
+            target_ids.push(id);
         }
     }
-    axum::Json(out).into_response()
+    match relationships::relationships_for(store, viewer_id, &target_ids, state.context.now_ms()) {
+        Ok(relations) => {
+            let out: Vec<Value> = relations.iter().map(dto::relationship_json).collect();
+            axum::Json(out).into_response()
+        }
+        Err(err) => ApiError::from(err).into_response(),
+    }
 }
 
 /// Build the `CredentialAccountSerializer` body for `account_id`.
@@ -247,7 +262,14 @@ fn credential_response(state: &ApiState, account_id: crate::domain::Id) -> Respo
         Err(err) => return ApiError::from(err).into_response(),
     };
     let user = store.user_by_account_id(account_id).ok().flatten();
-    axum::Json(dto::credential_account_json(&state.server, &account, user.as_ref())).into_response()
+    let stats = store.account_stats(account_id).ok();
+    axum::Json(dto::credential_account_json_with_stats(
+        &state.server,
+        &account,
+        user.as_ref(),
+        stats.as_ref(),
+    ))
+    .into_response()
 }
 
 /// 422 with Mastodon's `ValidationErrorFormatter` shape.

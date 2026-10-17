@@ -37,7 +37,7 @@ pub async fn run(
             Ok(jobs) => {
                 tracing::debug!(count = jobs.len(), "claimed jobs");
                 for job in jobs {
-                    match handlers::handle(&job, &*mailer) {
+                    match handlers::handle(&job, &*store, &*mailer) {
                         Ok(()) => {
                             if let Err(err) = store.complete(job.id) {
                                 tracing::error!(job = %job.id, error = %err, "complete failed");

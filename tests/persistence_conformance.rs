@@ -10,11 +10,17 @@ use std::sync::Arc;
 
 use birchtree::application::auth;
 use birchtree::application::ports::{
-    AccountStore, JobQueue, OAuthStore, SessionStore,
+    AccountStore, JobQueue, NewNotification, NewPollSpec, NewQuoteSpec, NewStatus,
+    NotificationStore, OAuthStore, PollStore, QuoteStore, RelationshipStore, SessionStore,
+    StatusStore,
 };
 use birchtree::application::crypto;
-use birchtree::domain::{JobKind, JobState, LocalUser};
+use birchtree::domain::{
+    Id, JobKind, JobState, LocalUser, NotificationType, QuotePolicy, QuoteState, Visibility,
+};
 use birchtree::domain::job::LEASE_MS;
+use birchtree::jobs::handlers;
+use birchtree::mail::LoggingMailSender;
 
 use common::{mk_account, open_store, temp_store, T0};
 
@@ -392,4 +398,340 @@ fn crypto_helpers_reject_tampered_hash() {
     let hash = crypto::hash_password("hunter2hunter2").unwrap();
     assert!(crypto::verify_password(&hash, "hunter2hunter2"));
     assert!(!crypto::verify_password("not-a-phc-string", "hunter2hunter2"));
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: status/interaction atomicity, idempotency and durability.
+// ---------------------------------------------------------------------------
+
+/// A minimal public status input for direct `StatusStore::create_status` use.
+fn new_status(account_id: Id, text: &str) -> NewStatus {
+    NewStatus {
+        account_id,
+        uri_base: "https://example.social/users/test/statuses".to_string(),
+        url_base: "https://example.social/@test".to_string(),
+        source_text: text.to_string(),
+        content_html: format!("<p>{text}</p>"),
+        visibility: Visibility::Public,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn status_create_commits_notification_and_poll_jobs_atomically() {
+    let (_dir, store) = temp_store();
+    let alice = mk_account(&store, "alice");
+    let bob = mk_account(&store, "bob");
+    let carol = mk_account(&store, "carol");
+    let now = T0 + 1_000;
+
+    // alice's parent status, quoted by the reply below.
+    let parent = store
+        .create_status(new_status(alice.id, "root post"), now)
+        .unwrap()
+        .status;
+
+    // ONE transaction: reply + mention + poll + quote all commit together.
+    let mut reply = new_status(bob.id, "@carol reply with poll and quote");
+    reply.in_reply_to_id = Some(parent.id);
+    reply.in_reply_to_account_id = Some(parent.account_id);
+    reply.mentions = vec![carol.id];
+    reply.poll = Some(NewPollSpec {
+        multiple: false,
+        hide_totals: false,
+        expires_at_ms: now + 3_600_000,
+        options: vec!["tea".to_string(), "coffee".to_string()],
+    });
+    reply.quote = Some(NewQuoteSpec {
+        quoted_status_id: parent.id,
+        quoted_account_id: parent.account_id,
+        approval_policy: QuotePolicy::Public,
+    });
+    let created = store.create_status(reply, now + 1).unwrap();
+    assert!(!created.replayed);
+    let reply_id = created.status.id;
+
+    // Read-after-commit: every mutation of the transaction is visible.
+    let row = store.status_by_id(reply_id).unwrap().unwrap();
+    assert_eq!(row.account_id, bob.id);
+    assert_eq!(row.replies_count, 0);
+
+    let parent_row = store.status_by_id(parent.id).unwrap().unwrap();
+    assert_eq!(parent_row.replies_count, 1, "parent counter bumped");
+
+    let poll = store.poll_by_status(reply_id).unwrap().unwrap();
+    assert_eq!(poll.status_id, reply_id);
+    assert_eq!(poll.options.len(), 2);
+    assert_eq!(store.poll_by_id(poll.id).unwrap().unwrap().id, poll.id);
+
+    let quote = store.quote_by_quoting_status(reply_id).unwrap().unwrap();
+    assert_eq!(quote.state, QuoteState::Accepted);
+    assert_eq!(quote.quoted_status_id, parent.id);
+    assert_eq!(
+        store.status_by_id(parent.id).unwrap().unwrap().quotes_count,
+        1,
+        "quoted counter bumped"
+    );
+
+    let stats = store.account_stats(bob.id).unwrap();
+    assert_eq!(stats.statuses_count, 1);
+    assert_eq!(stats.last_status_at_ms, Some(now + 1));
+
+    // The follow-up jobs committed WITH the mutation: one PollExpired and one
+    // FanOutNotification per (reply parent, mention, quote) — exactly the
+    // expected kinds, no more.
+    let jobs = store.all_jobs().unwrap();
+    let follow_ups: Vec<JobKind> = jobs
+        .iter()
+        .map(|j| j.kind)
+        .filter(|k| *k != JobKind::UserCreated)
+        .collect();
+    assert_eq!(
+        follow_ups
+            .iter()
+            .filter(|k| **k == JobKind::PollExpired)
+            .count(),
+        1
+    );
+    assert_eq!(
+        follow_ups
+            .iter()
+            .filter(|k| **k == JobKind::FanOutNotification)
+            .count(),
+        3,
+        "parent-mention + explicit mention + quote"
+    );
+    let poll_job = jobs
+        .iter()
+        .find(|j| j.kind == JobKind::PollExpired)
+        .unwrap();
+    assert_eq!(
+        poll_job.payload.get("poll_id").unwrap().as_u64().unwrap(),
+        poll.id.value()
+    );
+
+    // A BAD input aborts the whole transaction: no status row AND no jobs.
+    let jobs_before = store.all_jobs().unwrap().len();
+    let mut bad = new_status(bob.id, "media not found");
+    bad.media_ids = vec![Id::new(424_242)];
+    assert!(store.create_status(bad, now + 2).is_err());
+    assert_eq!(
+        store.statuses_by_account(
+            bob.id,
+            birchtree::application::ports::AccountStatusesQuery {
+                max_id: None,
+                since_id: None,
+                min_id: None,
+                limit: 20,
+                pinned_only: false,
+                exclude_replies: false,
+                exclude_reblogs: false,
+            }
+        )
+        .unwrap()
+        .len(),
+        1,
+        "aborted create leaves no status row"
+    );
+    assert_eq!(store.all_jobs().unwrap().len(), jobs_before, "no jobs either");
+    assert_eq!(store.account_stats(bob.id).unwrap().statuses_count, 1);
+}
+
+#[test]
+fn fan_out_notification_job_is_idempotent() {
+    let (_dir, store) = temp_store();
+    let alice = mk_account(&store, "alice");
+    let bob = mk_account(&store, "bob");
+    let status = store
+        .create_status(new_status(alice.id, "favourite me"), T0)
+        .unwrap()
+        .status;
+
+    let payload = birchtree::application::notifications::fan_out_payload(
+        alice.id,
+        NotificationType::Favourite,
+        Some(bob.id),
+        Some(status.id),
+        T0 + 5,
+    );
+    let job = birchtree::domain::Job::new(
+        Id::new(9_999),
+        JobKind::FanOutNotification,
+        payload,
+        T0 + 5,
+        T0 + 5,
+    );
+    let mail = LoggingMailSender::default();
+
+    // Running the SAME job twice (a retried lease) creates one row: the
+    // dedup index refuses the second insert.
+    handlers::handle(&job, &*store, &mail).unwrap();
+    handlers::handle(&job, &*store, &mail).unwrap();
+
+    let probe = store
+        .create_notification(NewNotification {
+            recipient_id: alice.id,
+            r#type: NotificationType::Favourite,
+            actor_id: Some(bob.id),
+            status_id: Some(status.id),
+            created_at_ms: T0 + 5,
+        })
+        .unwrap();
+    assert!(probe.is_none(), "retried fan-out must not duplicate a row");
+
+    // A NEW interaction (different created_at_ms) notifies again.
+    let fresh = store
+        .create_notification(NewNotification {
+            recipient_id: alice.id,
+            r#type: NotificationType::Favourite,
+            actor_id: Some(bob.id),
+            status_id: Some(status.id),
+            created_at_ms: T0 + 6,
+        })
+        .unwrap();
+    assert!(fresh.is_some(), "a fresh interaction must create a row");
+}
+
+#[test]
+fn interaction_replay_does_not_duplicate_rows_or_jobs() {
+    let (_dir, store) = temp_store();
+    let alice = mk_account(&store, "alice");
+    let bob = mk_account(&store, "bob");
+    let status = store
+        .create_status(new_status(alice.id, "interact with me"), T0)
+        .unwrap()
+        .status;
+
+    let fan_out_jobs = |store: &birchtree::persistence::redb::RedbStore| {
+        store
+            .all_jobs()
+            .unwrap()
+            .into_iter()
+            .filter(|j| j.kind == JobKind::FanOutNotification)
+            .collect::<Vec<_>>()
+    };
+
+    // Favourite twice: one row, count 1, exactly one fan-out job.
+    store.favourite_status(bob.id, status.id, T0 + 10).unwrap();
+    store.favourite_status(bob.id, status.id, T0 + 11).unwrap();
+    assert_eq!(store.favourited_by(status.id, None, 10).unwrap().len(), 1);
+    assert_eq!(
+        store.status_by_id(status.id).unwrap().unwrap().favourites_count,
+        1
+    );
+    assert_eq!(fan_out_jobs(&store).len(), 1, "idempotent replay adds no job");
+
+    // Unfavourite + favourite again: a FRESH interaction notifies again, but
+    // the row stays unique (pair-keyed) and the counter never over-counts.
+    store.unfavourite_status(bob.id, status.id, T0 + 20).unwrap();
+    store.favourite_status(bob.id, status.id, T0 + 30).unwrap();
+    assert_eq!(store.favourited_by(status.id, None, 10).unwrap().len(), 1);
+    assert_eq!(
+        store.status_by_id(status.id).unwrap().unwrap().favourites_count,
+        1
+    );
+    let jobs = fan_out_jobs(&store);
+    assert_eq!(jobs.len(), 2, "fresh interaction enqueues a second job");
+    let created: Vec<u64> = jobs
+        .iter()
+        .map(|j| j.payload.get("created_at_ms").unwrap().as_u64().unwrap())
+        .collect();
+    assert_eq!(created, vec![T0 + 10, T0 + 30]);
+}
+
+#[test]
+fn status_idempotency_record_replays_within_hour() {
+    let (_dir, store) = temp_store();
+    let alice = mk_account(&store, "alice");
+    let bob = mk_account(&store, "bob");
+    let now = T0 + 1_000;
+
+    let make = |text: &str, now: u64| {
+        let mut input = new_status(alice.id, text);
+        input.mentions = vec![bob.id];
+        input.idempotency_key = Some("retry-42".to_string());
+        store.create_status(input, now).unwrap()
+    };
+
+    let first = make("first text", now);
+    assert!(!first.replayed);
+
+    // A replay with the SAME key returns the ORIGINAL status, one hour later.
+    let replay = make("different text", now + 3_599_000);
+    assert!(replay.replayed);
+    assert_eq!(replay.status.id, first.status.id);
+    assert_eq!(replay.status.source_text, "first text");
+
+    // Only ONE set of jobs exists (the replay enqueues nothing) and the
+    // author's counters were bumped exactly once.
+    let fan_outs = store
+        .all_jobs()
+        .unwrap()
+        .into_iter()
+        .filter(|j| j.kind == JobKind::FanOutNotification)
+        .count();
+    assert_eq!(fan_outs, 1, "replay must not duplicate follow-up jobs");
+    let stats = store.account_stats(alice.id).unwrap();
+    assert_eq!(stats.statuses_count, 1);
+    assert_eq!(stats.last_status_at_ms, Some(now));
+}
+
+#[test]
+fn interaction_and_job_survive_store_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let now = T0 + 100;
+
+    // Commit an interaction (and its fan-out job), then "crash" before the
+    // worker ever ran by dropping the store.
+    let (alice_id, bob_id, status_id) = {
+        let store = open_store(dir.path());
+        let alice = mk_account(&store, "alice");
+        let bob = mk_account(&store, "bob");
+        let status = store
+            .create_status(new_status(alice.id, "durable post"), now)
+            .unwrap()
+            .status;
+        store.favourite_status(bob.id, status.id, now + 10).unwrap();
+        (alice.id, bob.id, status.id)
+    };
+
+    // Reopen: the status row, the favourite row, the counter and the PENDING
+    // job all survived.
+    let store = open_store(dir.path());
+    let status = store.status_by_id(status_id).unwrap().unwrap();
+    assert_eq!(status.favourites_count, 1);
+    assert_eq!(store.favourited_by(status_id, None, 10).unwrap().len(), 1);
+    let pending = store
+        .all_jobs()
+        .unwrap()
+        .into_iter()
+        .filter(|j| j.kind == JobKind::FanOutNotification)
+        .collect::<Vec<_>>();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].state, JobState::Pending);
+
+    // Simulate the worker: claim, run, complete — and run the handler a
+    // SECOND time (a crash between handler and completion would replay it).
+    let claimed = store.claim_due(now + 20, 10).unwrap();
+    let job = claimed
+        .into_iter()
+        .find(|j| j.kind == JobKind::FanOutNotification)
+        .expect("fan-out job claimable");
+    let mail = LoggingMailSender::default();
+    handlers::handle(&job, &store, &mail).unwrap();
+    store.complete(job.id).unwrap();
+    handlers::handle(&job, &store, &mail).unwrap();
+    assert_eq!(store.get(job.id).unwrap().unwrap().state, JobState::Succeeded);
+
+    // Exactly ONE notification row exists after running the handler twice.
+    let probe = store
+        .create_notification(NewNotification {
+            recipient_id: alice_id,
+            r#type: NotificationType::Favourite,
+            actor_id: Some(bob_id),
+            status_id: Some(status_id),
+            created_at_ms: now + 10,
+        })
+        .unwrap();
+    assert!(probe.is_none(), "replayed handler must not duplicate a row");
 }

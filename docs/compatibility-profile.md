@@ -27,9 +27,23 @@ Mastodon **4.7.3** (API v7), commit `8ff11c2b`. The pinned tag and its changelog
   `GET /api/v1/accounts/relationships`.
 - **Discovery/settings:** `GET /api/v1/instance`, `GET /api/v2/instance`,
   `GET /api/v1/preferences`.
-- Not yet implemented (documented exclusions, see `phase-2-exit-criteria.md`):
-  email-confirmation enforcement, invite/approval registration modes,
-  account lookup/search, paginated reads, media serving, metrics.
+- **Statuses (Phase 3):** `GET /api/v1/statuses` (multi-fetch), create,
+  show, edit (`PUT`/`PATCH`), delete, `source`, `context`, `history`,
+  `interaction_policy`, favourite/unfavourite, bookmark/unbookmark,
+  reblog/unreblog, pin/unpin, `favourited_by`, `reblogged_by`,
+  `quotes` + quote revoke, `GET /api/v1/accounts/{id}/statuses` (incl.
+  `?pinned=true`).
+- **Relationships (Phase 3):** follow/unfollow, remove-from-followers,
+  block/unblock, mute/unmute (`duration`, `notifications`), account notes,
+  endorsements (`pin`/`endorse` + both list endpoints), follow requests
+  (index/authorize/reject), domain blocks (index/create/destroy),
+  followers/following lists, and real per-viewer
+  `GET /api/v1/accounts/relationships`.
+- **Polls (Phase 3):** `GET /api/v1/polls/{id}`, `POST /api/v1/polls/{id}/votes`.
+- Not yet implemented (documented exclusions, see `phase-2-exit-criteria.md`
+  and `phase-3-exit-criteria.md`): email-confirmation enforcement,
+  invite/approval registration modes, account lookup/search, timelines,
+  notification read surface, media serving, JSON request bodies, metrics.
 
 ## Exclusions (explicit, not implied gaps)
 

@@ -47,3 +47,36 @@ Phase 2 additions to the narrow ports:
   `SendConfirmationEmail` job in the account transaction.
 - `UserSettingsUpdate` / `AccountProfileUpdate` carry `PATCH
   update_credentials` patches; `None` fields are left unchanged.
+
+## Implementation status (Phase 3)
+
+Implemented by `persistence::redb::RedbStore` and bundled into `Store`:
+
+- `StatusStore` — create (record + poll/quote + indexes + counters +
+  idempotency record + follow-up jobs in ONE transaction), read, edit
+  (versioned snapshots), tombstone, thread children, per-account/pinned
+  listings, batch viewer flags, and the interactions (favourite, bookmark,
+  reblog, pin, quote-policy update), each ONE transaction with counters and a
+  `FanOutNotification` job where applicable. `NewStatus.idempotency_key`
+  implements Mastodon's `Idempotency-Key` (1-hour replay).
+- `RelationshipStore` — follow/follow-request state machine, unfollow,
+  remove-follower, blocks (mutual unfollow + endorsement cleanup in one
+  transaction), domain blocks, mutes with duration, account notes,
+  endorsements (follow required), follower/following lists, the
+  `Relationship` aggregate, `pair_state` for the policy module, and
+  `account_stats`.
+- `PollStore` — poll reads, `vote_poll` (validation inside the transaction:
+  expiry, self-vote, choices, single-choice re-vote), ballot lookup,
+  `mark_poll_expired` (job handler, idempotent).
+- `QuoteStore` — quote lookup, accepted-quote listing, revoke state machine
+  (accepted → revoked with quoted-counter decrement, else rejected) in one
+  transaction.
+- `NotificationStore::create_notification` — insert-with-dedup: the 40-byte
+  key `(recipient, type, actor, status, created_at)` deduplicates replays of
+  one interaction while allowing a fresh interaction to notify again.
+- `MediaStore` — attachment metadata rows + ownership/attachment validation
+  used by status create/edit (bytes remain Phase 4).
+
+`ActivityDedup`, `BlobStore`, `StreamingSink`, `FederationHttp` remain to be
+implemented in their phases; `NotificationStore`'s read surface (index,
+grouping) is Phase 4.

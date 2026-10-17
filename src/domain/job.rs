@@ -22,6 +22,14 @@ pub enum JobKind {
     /// adapter. Enqueued atomically with public registration; never sent inside
     /// the request transaction.
     SendConfirmationEmail,
+    /// Create a notification record for the recipient, if not already present
+    /// (deduplicated through the notification dedup index, so a replayed or
+    /// retried job never duplicates a notification). Enqueued in the same
+    /// transaction as the interaction that produced it.
+    FanOutNotification,
+    /// Mark a poll expired once its expiry elapses. Enqueued in the same
+    /// transaction as the poll's status; the handler is idempotent.
+    PollExpired,
     /// Placeholder for the media-processing pipeline (Phase 4).
     ProcessMedia,
     /// Placeholder for outbound federation delivery (Phase 6).
@@ -34,6 +42,8 @@ impl JobKind {
         match self {
             JobKind::UserCreated => "user_created",
             JobKind::SendConfirmationEmail => "send_confirmation_email",
+            JobKind::FanOutNotification => "fan_out_notification",
+            JobKind::PollExpired => "poll_expired",
             JobKind::ProcessMedia => "process_media",
             JobKind::DeliverActivity => "deliver_activity",
         }

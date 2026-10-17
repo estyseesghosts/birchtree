@@ -6,11 +6,12 @@
 //! remaining kinds become reachable as their phases land.
 
 use crate::application::crypto;
-use crate::application::ports::MailSender;
-use crate::domain::{Error, Id, Job, JobKind, Result};
+use crate::application::ports::{MailSender, Store};
+use crate::application::notifications;
+use crate::domain::{Error, Id, Job, JobKind, NotificationType, Result};
 
 /// Execute a claimed job.
-pub fn handle(job: &Job, mailer: &dyn MailSender) -> Result<()> {
+pub fn handle(job: &Job, store: &dyn Store, mailer: &dyn MailSender) -> Result<()> {
     match job.kind {
         JobKind::UserCreated => {
             let account_id = job
@@ -39,6 +40,22 @@ pub fn handle(job: &Job, mailer: &dyn MailSender) -> Result<()> {
             let token = crypto::sha256_hex(format!("confirmation:{}", job.id).as_bytes());
             mailer.send_confirmation(email, account_id, &token)
         }
+        JobKind::FanOutNotification => {
+            // Idempotent: the notification store dedups by
+            // (recipient, type, actor, status), so retries are harmless.
+            notifications::fan_out_from_payload(store, &job.payload)
+        }
+        JobKind::PollExpired => {
+            let poll_id = job
+                .payload
+                .get("poll_id")
+                .and_then(|v| v.as_u64())
+                .map(Id::new)
+                .ok_or_else(|| Error::Internal("poll_expired: missing poll_id".into()))?;
+            // Sticky flag: repeating the call is a no-op.
+            store.mark_poll_expired(poll_id, job.due_at_ms)?;
+            Ok(())
+        }
         JobKind::ProcessMedia => Err(Error::Internal(
             "process_media handler arrives in Phase 4".into(),
         )),
@@ -46,4 +63,14 @@ pub fn handle(job: &Job, mailer: &dyn MailSender) -> Result<()> {
             "deliver_activity handler arrives in Phase 6".into(),
         )),
     }
+}
+
+/// Parse a `FanOutNotification` payload (used by tests and the handler).
+pub fn notification_payload(
+    recipient_id: Id,
+    kind: NotificationType,
+    actor_id: Option<Id>,
+    status_id: Option<Id>,
+) -> serde_json::Value {
+    notifications::fan_out_payload(recipient_id, kind, actor_id, status_id, 0)
 }
