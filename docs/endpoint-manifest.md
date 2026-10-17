@@ -110,10 +110,10 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| GET | `/api/v1/timelines/home` | user | read | planned (Phase 4) | In | |
-| GET | `/api/v1/timelines/public` | optional | read | planned (Phase 4) | In | |
-| GET | `/api/v1/timelines/tag` | optional | read | planned (Phase 4) | In | |
-| GET | `/api/v1/timelines/list` | user | read | planned (Phase 4) | In | |
+| GET | `/api/v1/timelines/home` | user | read \| read:statuses | implemented (Phase 4) | In | own statuses + the most recent 500 active follows; `limit` 20/max 40 (`limit=0`/non-numeric → empty, no `Link`); `local` accepted and ignored (as upstream v4.7.3); app-only token → 422; `Cache-Control: private, no-store` |
+| GET | `/api/v1/timelines/public` | optional | read \| read:statuses | implemented (Phase 4) | In | public visibility only; self-replies kept, replies to others and reblogs dropped; `local`/`remote`/`only_media`; anonymous → `max-age=15, public, stale-while-revalidate=30, stale-if-error=86400`, authenticated → `private, no-store` |
+| GET | `/api/v1/timelines/tag/{tag}` | optional | read \| read:statuses | implemented (Phase 4) | In | tag normalized (case-insensitive, leading `#` stripped); unknown or empty tag → `200 []` with no `Link`; public visibility only; replies kept; reblog wrappers not indexed (open, see deviations); `local`/`remote`/`only_media`; cache header as `public` above |
+| GET | `/api/v1/timelines/list/{id}` | user | read \| read:lists | implemented (Phase 4) | In | members' statuses under the home gates; the list's `replies_policy` (`list`/`followed`/`none`) governs replies; not owned or unparsable id → 404 `{"error":"Record not found"}`; app-only token → 422; `Cache-Control: private, no-store` |
 | GET | `/api/v1/timelines/link` | optional | read | planned (Phase 7) | In | |
 | GET | `/api/v1/media/:id` | user | write \| write:media | implemented (Phase 4) | In | 206 while unprocessed; 422 on processing failure (Mastodon's controller authorizes write on every action, `show` included) |
 | POST | `/api/v1/media` | user | write \| write:media | implemented (Phase 4) | In | media v1 (multipart, inline processing → 200) |
@@ -197,3 +197,17 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 - **The upload size cap equals the multipart body limit** (`ApiState` carries no `Config`); `Config::validate` enforces `max_file_size ≤ max_body_size`, so the effective cap matches the default 16 MB. The 422 message formats the cap like Rails `number_to_human_size` ("16 MB", "1 KB", …).
 - **A non-numeric `focus` param answers `422 Validation failed: Focus is invalid`** instead of Ruby's `Float()` coercion to `0.0`; a blank focus is ignored (upload) or clears the point (update).
 - **An image upload carrying a thumbnail answers "Thumbnail must be blank"** before the thumbnail's own content-type/size checks (Mastodon's model validates the thumbnail's content type first); the pinned messages are otherwise exact.
+
+## Known Phase 4 timelines deviations (honesty list)
+
+- **No `206 Mastodon-Async-Refresh` regeneration.** Timelines are fan-out-on-read (`birchtree.md` §2.6): nothing is materialized, so there is no feed to regenerate and the upstream 206 path never applies. Architectural difference, not a gap.
+- **`Link` echoes the whole query minus the cursors** (`max_id`, `since_id`, `min_id`). Upstream echoes only its permitted parameters. Clients that follow the `Link` URL get the same page either way.
+- **Authenticated public and tag responses are `private, no-store`**, not the public `max-age=15` header. They carry viewer-specific data (`filtered`, favourited/reblogged flags), so a shared cache must not store them. Anonymous responses keep the documented public header. The plan's literal table said `public` for every public/tag response; this is a deliberate narrowing.
+- **Home reads the 500 most recent active follows** (`HOME_AUTHOR_CAP`). Older follows are not shown. Bounded scan; not parity with an unbounded fan-out.
+- **Exclusive lists are not applied to home.** `exclusive=true` is stored and round-trips, but members are not yet hidden from the home feed.
+- **Own statuses always show in the viewer's own home feed**, including direct statuses and replies to strangers. The policy exempts the viewer's own statuses from the home gates.
+- **Tag feed excludes reblog wrappers.** Wrappers carry no hashtags of their own, so the hashtag index does not hold them. Open question against upstream behavior; pinned by `tag_timeline_normalizes_case_and_keeps_replies` and to be settled before Phase 4 sign-off.
+- **Public feed keeps self-replies by policy, not by the store**: the store scans replies and the filter keeps only self-replies and originals.
+- **Per-request account facts are capped at 500 distinct accounts** (and 500 reblog targets). Past the cap, an unresolved account fails closed: its statuses are excluded, never shown.
+- **Remote accounts do not exist yet** (federation is Phase 6). `remote=true` is therefore only exercised as empty, and the domain-block rule is exercised through the local domain.
+- **`replies_policy=none` on lists** keeps only self-replies and replies to the viewer; `followed` keeps replies to followed parents; `list` keeps replies to members. Replies to the viewer pass under every policy.

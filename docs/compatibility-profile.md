@@ -42,8 +42,8 @@ Mastodon **4.7.3** (API v7), commit `8ff11c2b`. The pinned tag and its changelog
 - **Polls (Phase 3):** `GET /api/v1/polls/{id}`, `POST /api/v1/polls/{id}/votes`.
 - Not yet implemented (documented exclusions, see `phase-2-exit-criteria.md`
   and `phase-3-exit-criteria.md`): email-confirmation enforcement,
-  invite/approval registration modes, account lookup/search, timelines,
-  notification read surface, media serving, JSON request bodies, metrics.
+  invite/approval registration modes, account lookup/search, JSON request
+  bodies, metrics.
 
 ## Implemented surface (Phase 4)
 
@@ -66,7 +66,33 @@ Mastodon **4.7.3** (API v7), commit `8ff11c2b`. The pinned tag and its changelog
 - **Search:** `GET /api/v2/search` over the local corpus (v1 does not exist
   in v4.7.3). **Custom emoji:** public `GET /api/v1/custom_emojis` +
   image serving + status-payload `emojis` arrays (CLI-managed).
-- **Timelines:** home/public/tag/list — see `phase-4-exit-criteria.md`.
+- **Timelines:** `GET /api/v1/timelines/home` (user token; `read`/`read:statuses`;
+  app-only → 422; no token → 401), `/public` (optional auth; `local`, `remote`,
+  `only_media`), `/tag/:tag` (optional auth; unknown or empty tag → `200 []`),
+  `/list/:id` (user token; `read`/`read:lists`; not owned or unparsable id →
+  404 `{"error":"Record not found"}`).
+  - Paging: `limit` absent → 20, otherwise min(|n|, 40); non-numeric or `0` →
+    empty page with no `Link`. `max_id`/`since_id`/`min_id` are exclusive numeric
+    cursors; non-numeric → 400 `Invalid cursor value`. `Link` `rel="next"` is the
+    `max_id` of the oldest item and `rel="prev"` the `min_id` of the newest item,
+    present only for a non-empty page.
+  - Headers: anonymous public and tag → `Cache-Control: max-age=15, public,
+    stale-while-revalidate=30, stale-if-error=86400`. Any authenticated timeline
+    response, and home and list always, → `private, no-store`. This deviates from
+    the plan's literal table: authenticated public bodies are viewer-specific.
+  - Feed rules: public = public visibility only, self-replies kept, replies to
+    others dropped, no reblogs. Tag = public visibility only, replies kept; reblog
+    wrappers are not in the tag feed (open question, see below). Home = own
+    statuses + active follows (most recent 500), direct only to mentioned viewers,
+    private only from followed authors, reply rules by parent, `show_reblogs`
+    respected. List = members' statuses, `replies_policy` (`list`/`followed`/
+    `none`), `show_reblogs` respected. Blocks (both directions), mutes (viewer →
+    author) and domain blocks apply to the viewer; anonymous viewers are unaffected.
+  - Open / deviations: exclusive lists are not applied to home; home reads only
+    the 500 most recent follows; tag-feed reblogs unsettled against v4.7.3;
+    `remote=true` is empty until federation (Phase 6); no
+    `206 Mastodon-Async-Refresh` regeneration (fan-out on read). Evidence:
+    `tests/phase4_timelines.rs` (23) and `docs/phase-4-exit-criteria.md`.
 
 ## Exclusions (explicit, not implied gaps)
 

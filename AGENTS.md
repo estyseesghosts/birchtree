@@ -16,15 +16,14 @@ Source of truth: `birchtree.md` (revised plan, pinned to Mastodon **v4.7.3**, co
 
 ActivityPub federation is delegated to the `activitypub-federation-rust` crate rather than hand-rolled. Add it as a dependency when federation work (Phase 6) begins; until then the `federation/` module is a thin port/adaptation layer, not a custom ActivityPub implementation.
 
-## Current phase: Phase 3 — Local statuses, relationships and interaction semantics
+## Current phase: Phase 5 — streaming
 
-Exit: tests cover local flows, privacy boundaries, relationship races, exact
-DTOs, counters and idempotency; crash after commit still completes follow-up
-work; a client can perform the core social loop without federation.
-Implemented and green — see `docs/phase-3-exit-criteria.md` (with explicit
-deferrals: media bytes/serving, timelines, notification read surface → Phase 4;
-JSON request bodies, relation collection reads → Phase 7). Phases 1–2 remain
-green (`docs/phase-1-exit-criteria.md`, `docs/phase-2-exit-criteria.md`). The
+Exit: `birchtree.md` §7 (Phase 5).
+Phase 4 is complete and green — see `docs/phase-4-exit-criteria.md` (Phase 4
+exit; open items listed there: cross-surface visibility parity suite,
+wall-time measurement, exclusive lists on home, tag-feed reblogs question).
+Phases 1–3 remain green (`docs/phase-1-exit-criteria.md`,
+`docs/phase-2-exit-criteria.md`, `docs/phase-3-exit-criteria.md`). The
 Phase 0 route-inventory review against the Mastodon v4.7.3 source remains open
 (`docs/phase-0-exit-criteria.md`).
 

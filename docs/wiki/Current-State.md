@@ -1,7 +1,7 @@
 # Current state
 
-Status: 2026-10-17, Phase 3 (local statuses, relationships, interaction
-semantics) implemented; Phase 4 next.
+Status: 2026-10-17, Phase 4 (media, timelines, notifications, client usability)
+implemented (gate green); Phase 5 (streaming) next.
 
 ## Implemented
 
@@ -9,7 +9,7 @@ Repository and contracts:
 
 - Repository layout per `birchtree.md` §3 (one Cargo package, `domain` ← `application` ← adapters)
 - `AGENTS.md`, `docs/` contracts, `docs/wiki/`, append-only `state/logs/` and `docs/logs/`
-- `scripts/smoke-all.sh` full gate (check + test + phase1/2/3 smokes);
+- `scripts/smoke-all.sh` full gate (check + test + phase1/2/3/4 smokes);
   `.github/workflows/ci.yml` release-build CI
 
 Runtime (Phase 1):
@@ -21,7 +21,8 @@ Runtime (Phase 1):
 - CLI: `serve`, `create-account` (plus test-only `crash-harness`)
 - Mastodon-shaped snowflake IDs (numeric ordering, decimal-string wire) and a
   monotonic `Clock`
-- Versioned `redb` schema + migration runner (now at **v3**), narrow
+- Versioned `redb` schema + migration runner (now at **v4**: Phase 4 timeline
+  index + backfill), narrow
   persistence ports, atomic mutation + job commits, durable job queue with
   lease/backoff/quarantine, in-process worker
 
@@ -61,31 +62,49 @@ Local statuses, relationships, interactions (Phase 3):
   quote list, `quote_approval_policy` + interaction-policy endpoint,
   `quote_approval {automatic, manual, current_user}`
 - **Notifications:** records created by deduplicated `FanOutNotification`
-  jobs committed with their interaction (read surface Phase 4)
+  jobs committed with their interaction (read surface: Phase 4)
 - **Media relations:** attachment metadata + order validated, `url:null`
-  while unprocessed (bytes Phase 4)
+  while unprocessed (bytes served in Phase 4)
 - Schema **v3**: statuses/versions/pins/favourites/bookmarks/follows/blocks/
   domain-blocks/mutes/notes/endorsements/polls/quotes/notifications/
   idempotency/stats/media/mentions/hashtag tables + bounded composite indexes
 
+Media, timelines, notifications, client usability (Phase 4):
+
+- **Media:** v1 and v2 multipart upload (MIME sniffing → 422, description/focus),
+  v2 video/audio `202` with a `ProcessMedia` job (`206` → `200`),
+  `GET`/`PUT`/`PATCH`/`DELETE /api/v1/media/:id`, stored bytes served with the
+  sniffed content type
+- **Timelines:** home, public (`local`/`remote`/`only_media`), tag and list
+  reads; exclusive `max_id`/`since_id`/`min_id` cursors, `Link` headers,
+  `limit` clamped to 40; viewer-aware filtering; bounded index scans (sparse-filter
+  test: 286 index entries walked, 13 read transactions for a page of 20)
+- **Notifications:** index with `types[]`/`exclude_types[]`, show, clear,
+  dismiss, `unread_count`, markers (`GET`/`POST /api/v1/markers`);
+  `requests` always `[]`
+- **Lists, filters, search, custom emoji, scheduled statuses:** see
+  `docs/compatibility-profile.md` (Phase 4 section)
+- **Client usability:** `scripts/smoke-phase4.sh` drives the workflow over HTTP
+  with curl (not a third-party Mastodon client)
+
 Tests:
 
-- `cargo test` — **138 passed, 0 failed** (51 unit + 3 `crash_recovery` + 18
-  `persistence_conformance` + 13 `phase2_api` + 13 `phase2_oauth` + 8
-  `phase3_interactions` + 13 `phase3_relationships` + 13 `phase3_status` + 3
-  `runtime` + 3 `secret_handling`)
+- `cargo test` — **219 passed, 0 failed** (includes 23 `phase4_timelines`)
+- `cargo check --all-targets` — zero warnings
 - `scripts/smoke-phase1.sh` → `SMOKE_OK`; `scripts/smoke-phase2.sh` →
-  `SMOKE_PHASE2_OK`; `scripts/smoke-phase3.sh` → `SMOKE_PHASE3_OK`
+  `SMOKE_PHASE2_OK`; `scripts/smoke-phase3.sh` → `SMOKE_PHASE3_OK`;
+  `scripts/smoke-phase4.sh` → `SMOKE_PHASE4_OK`
 - `bash scripts/smoke-all.sh` → `smoke-all: green`
+- Full Phase 4 verification output: `docs/logs/2026-10-17-phase-4-verification.md`
 
 ## Not yet implemented
 
-- Phase 4: media bytes/upload/serving, timelines, notification read surface
-  (records exist), `StatusViewContext` page-loader measurements
-- Phase 5 streaming; Phase 6 federation (incl. remote quote requests)
+- Phase 4 open items: see Known gaps below
+- Phase 5 streaming; Phase 6 federation (incl. remote quote requests and
+  remote statuses)
 - Phase 7: account lookup/search, relation collection reads
-  (`blocks`/`mutes`/`favourites`/`bookmarks`), JSON request bodies, lists/
-  filters/search/tags; Phase 8 metrics
+  (`blocks`/`mutes`/`favourites`/`bookmarks`), JSON request bodies, tags;
+  Phase 8 metrics
 - Every unimplemented route is explicitly absent (404), never a
   success-shaped stub — see `docs/endpoint-manifest.md`
 
@@ -98,6 +117,20 @@ Tests:
   accepted but not persisted
 - Tag DTOs use the tag name as `id`; conversation mutes out of profile;
   `application` always shown (preference not stored)
-- Details and the full deferral list: `docs/phase-3-exit-criteria.md`
-  (plus `phase-2-exit-criteria.md`, `phase-1-exit-criteria.md`, and the
-  still-open route-inventory review in `phase-0-exit-criteria.md`)
+- Phase 4 open items:
+  - Cross-surface visibility parity is not one suite (per-surface coverage)
+  - Wall time of page loaders is not measured (transaction/item counts only)
+  - Exclusive lists are not applied to the home feed
+  - Home reads only the 500 most recent follows
+  - Tag feed excludes reblog wrappers; open question against v4.7.3, pinned
+    by test
+  - `remote=true` is empty until federation (Phase 6)
+  - No `206 Mastodon-Async-Refresh` regeneration for timelines (fan-out on read)
+  - Notification requests always `[]`; notification-policy filter pipeline later
+  - Account-payload emoji arrays are `[]` until Phase 7
+  - Pending doc decisions, not code gaps: transcoding, search-engine choice,
+    admin scope
+- Details and the full deferral lists: `docs/phase-4-exit-criteria.md`,
+  `docs/phase-3-exit-criteria.md` (plus `phase-2-exit-criteria.md`,
+  `phase-1-exit-criteria.md`, and the still-open route-inventory review in
+  `phase-0-exit-criteria.md`)
