@@ -85,6 +85,32 @@ fn optional_scopes(auth: &OptionalAuth, required: &[&str]) -> Result<(), ApiErro
     }
 }
 
+/// Fill `view.filtered` with the batched filter matches for the page
+/// (every active filter, like Mastodon's relationships presenter).
+fn apply_filter_results(
+    state: &ApiState,
+    store: &dyn Store,
+    viewer: Option<Id>,
+    views: &mut [crate::api::mastodon::dto::StatusView],
+) -> Result<(), ApiError> {
+    let Some(viewer) = viewer else {
+        return Ok(()); // Anonymous payloads carry no `filtered` entries.
+    };
+    let page: Vec<Status> = views.iter().map(|view| view.status.clone()).collect();
+    let matches = crate::application::filters::filter_results_unscoped(
+        store,
+        viewer,
+        &page,
+        state.context.now_ms(),
+    )?;
+    for view in views.iter_mut() {
+        if let Some(entries) = matches.get(&view.status.id) {
+            view.filtered = entries.clone();
+        }
+    }
+    Ok(())
+}
+
 /// Assemble and render one status as 200 JSON.
 fn status_response(
     state: &ApiState,
@@ -94,14 +120,20 @@ fn status_response(
 ) -> Response {
     let store: &dyn Store = &*state.context.store;
     match load_status_view(&state.server, store, viewer, status, state.context.now_ms()) {
-        Ok(view) => axum::Json(dto::status_json(
-            &state.server,
-            viewer,
-            state.context.now_ms(),
-            &view,
-            source,
-        ))
-        .into_response(),
+        Ok(mut view) => {
+            if let Err(err) = apply_filter_results(state, store, viewer, std::slice::from_mut(&mut view))
+            {
+                return err.into_response();
+            }
+            axum::Json(dto::status_json(
+                &state.server,
+                viewer,
+                state.context.now_ms(),
+                &view,
+                source,
+            ))
+            .into_response()
+        }
         Err(err) => err.into_response(),
     }
 }
@@ -123,7 +155,10 @@ fn status_list_response(
         statuses,
         state.context.now_ms(),
     ) {
-        Ok(views) => {
+        Ok(mut views) => {
+            if let Err(err) = apply_filter_results(state, store, viewer, &mut views) {
+                return err.into_response();
+            }
             let array: Vec<Value> = views
                 .iter()
                 .map(|view| {

@@ -18,8 +18,7 @@ Required suites:
 10. Performance and abuse — high-degree graphs, sparse indexes, large/malformed bodies, upload exhaustion, slow hosts, retry storms.
 
 Gate: `bash scripts/smoke-all.sh` (`cargo check --all-targets` + `cargo test` +
-`scripts/smoke-phase1.sh` + `scripts/smoke-phase2.sh` +
-`scripts/smoke-phase3.sh`) green before claiming phase completion.
+`scripts/smoke-phase{1,2,3,4}.sh`) green before claiming phase completion.
 
 ## Implemented suites (Phase 1)
 
@@ -31,3 +30,27 @@ Gate: `bash scripts/smoke-all.sh` (`cargo check --all-targets` + `cargo test` +
 | Runtime | `tests/runtime.rs` | `/health`, `/ready`, unknown-route 404 |
 | Secret handling | `tests/secret_handling.rs` | no plaintext password/token/session in the DB file; token record serialization; header redaction |
 | Smoke | `scripts/smoke-phase1.sh` | live binary: probes, graceful SIGTERM, CLI create-account, restart durability → `SMOKE_OK` |
+
+## Implemented suites (Phase 2/3)
+
+| Suite | File | Covers |
+|---|---|---|
+| Phase 2 API | `tests/phase2_api.rs` | instance/account DTO snapshots, registration policy, credentials/relationships reads |
+| Phase 2 OAuth | `tests/phase2_oauth.rs` | PKCE S256, code replay/expiry, redirect matching, scopes, revocation, client credentials |
+| Phase 3 status | `tests/phase3_status.rs` | status CRUD/source/context/history, replies/reblogs, validation strings, DTO key sets |
+| Phase 3 relationships | `tests/phase3_relationships.rs` | follow lifecycle, blocks/mutes/notes/endorsements, relationship DTO, races |
+| Phase 3 interactions | `tests/phase3_interactions.rs` | favourites/bookmarks/reblogs/pins/polls/quotes, counters, idempotency |
+| Smoke | `scripts/smoke-phase2.sh`, `scripts/smoke-phase3.sh` | live-binary OAuth/registration and the core social loop |
+
+## Implemented suites (Phase 4)
+
+| Suite | File | Covers |
+|---|---|---|
+| Page loader + metrics | unit in `src/api/mastodon/status_view.rs` + assertions in Phase 4 suites | batched `StatusViewContext` (constant transaction count per page), store read/write/scan counters |
+| Lists | `tests/phase4_lists.rs` | CRUD key sets, exact 422 bodies (blank/long title, 50-list limit, replies_policy), ownership 404s, membership follow requirement + idempotent add/remove, unfollow cascade, scopes |
+| Notifications + markers | `tests/phase4_notifications.rs` | index shape (`group_key` fallback) + `Link` cursors, `types[]`/`exclude_types[]`, `limit=0`, show/dismiss/clear/`unread_count`, marker versions + marker-based counts, honest empty `requests`, scope/app-token matrix |
+| Scheduled statuses | `tests/phase4_scheduled.rs` | `scheduled_at` scheduling shape, past→immediate, `Record invalid`, 5-minute floor message, CRUD + foreign 404s, durable publish (row destroyed first, replay no-op) |
+| Search + emoji | `tests/phase4_search_emoji.rs` | v2 search messages (missing `q`, anonymous pagination/resolve 401s, negative limit 400), accounts/hashtags/statuses results, unknown type → empty arrays, public emoji index + image serving + CLI validation |
+| Media | `tests/phase4_media.rs` (+ unit tests in `src/media/*`, `application/media.rs`) | multipart v1/v2 flows, 200/202/206/422/404 semantics, exact error bodies, processing lifecycle via the real job handler, byte-exact file serving, description/focus updates, in-usage delete |
+| Filters | `tests/phase4_filters.rs` | v1/v2 CRUD key sets, exact 422 bodies, multi-keyword deprecation guard, keyword/status sub-resources, `filter_results` matching (whole_word, expiry, context narrowing) |
+| Smoke | `scripts/smoke-phase4.sh` | live binary: media upload → post → timelines (Link + cache headers) → notifications + markers → lists → scheduled → search → emoji → `Vary: Authorization` → `SMOKE_PHASE4_OK` |

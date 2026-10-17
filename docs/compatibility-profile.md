@@ -45,6 +45,29 @@ Mastodon **4.7.3** (API v7), commit `8ff11c2b`. The pinned tag and its changelog
   invite/approval registration modes, account lookup/search, timelines,
   notification read surface, media serving, JSON request bodies, metrics.
 
+## Implemented surface (Phase 4)
+
+- **Media:** `POST /api/v1/media` (inline processing → 200),
+  `POST /api/v2/media` (video/audio delayed → 202), `GET`/`PUT`/`PATCH`/
+  `DELETE /api/v1/media/:id` (200/206/422/404 semantics), local file serving
+  at `/system/media_attachments/files/...` with real `url`/`preview_url`/
+  `meta`/`blurhash`.
+- **Notifications:** index (with `types[]`/`exclude_types[]` + `Link`
+  cursors), show, clear, dismiss, `unread_count` (marker-based), the
+  always-honest `requests` surface; **markers** `GET`/`POST /api/v1/markers`.
+- **Lists:** full CRUD + membership (`/api/v1/lists` and
+  `/:id/accounts`), with the unfollow→membership cascade.
+- **Filters:** v1 (synthesized from keyword rows) + full v2 CRUD with
+  keyword/status sub-resources; payload `filtered` annotation matches every
+  active filter like `CustomFilter.apply_cached_filters`.
+- **Scheduled statuses:** `scheduled_at` on `POST /api/v1/statuses`
+  (past → posts immediately; unparseable → 422 `Record invalid`; <5 min →
+  pinned 422) + index/show/update/delete + durable publish job.
+- **Search:** `GET /api/v2/search` over the local corpus (v1 does not exist
+  in v4.7.3). **Custom emoji:** public `GET /api/v1/custom_emojis` +
+  image serving + status-payload `emojis` arrays (CLI-managed).
+- **Timelines:** home/public/tag/list — see `phase-4-exit-criteria.md`.
+
 ## Exclusions (explicit, not implied gaps)
 
 - Admin API, moderation dashboard, and full Mastodon web UI: explicitly out of scope until separately scoped.

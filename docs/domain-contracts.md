@@ -109,3 +109,33 @@ Internal normalized quote representation for FEP-044f, Mastodon quote activities
 - **Visibility/quote policy wire parsing** lives in `domain::visibility`
   (`Visibility::from_wire/as_str`, `QuotePolicy::from_wire/as_str`,
   `Default = Public`).
+
+## Phase 4 types (media, timelines, lists, filters, markers, scheduling, emoji)
+
+- **`MediaAttachment`** gained (all `serde(default)` so Phase 3 rows decode):
+  `file_key`/`preview_key`/`thumbnail_key` (blob keys; empty while
+  unprocessed), `mime_type`, `file_size`, `width`/`height`,
+  `preview_width`/`preview_height`, `duration_ms`/`frame_rate`/`bitrate`
+  (video/audio metadata), `focus` (`FocusPoint {x, y}`, the wire `x,y`
+  param), `created_at_ms`/`updated_at_ms`, `error` (failure reason).
+  `MediaState {Pending, Processing, Ready, Failed}` drives the wire contract:
+  `not_processed()` ⇔ Mastodon's `processing != complete` (202/206/`url:null`).
+- **`List`/`ListMembership`/`RepliesPolicy`** — title ≤256, ≤50 lists per
+  owner, `replies_policy ∈ {list, followed, none}` (default `list`),
+  `exclusive` flag; membership rows carry `via_request`.
+- **`Marker`** — `timeline ∈ {home, notifications}`, `last_read_id`,
+  optimistic `lock_version` (fresh marker reports 1), `updated_at_ms`.
+  Mastodon has no per-notification read flag: this is the only read state.
+- **`CustomFilter`/`FilterKeyword`/`FilterStatus`/`FilterAction`** — the
+  v2 model is the single stored representation; the v1 API projects keyword
+  rows. Contexts `home|notifications|public|account_list`, actions
+  `warn|hide|blur`, title ≤256, keyword ≤500.
+- **`ScheduledStatus`** — replayable `params` + `media_ids` +
+  `scheduled_at_ms`; `TOTAL_LIMIT` 300, `DAILY_LIMIT` 25,
+  `MINIMUM_OFFSET_MS` 5 min (all pinned Mastodon values).
+- **`CustomEmoji`** — shortcode `[A-Za-z0-9_]{2,128}` (unique key),
+  image/static blob keys, `visible_in_picker`, `disabled`, `category`;
+  `listed()` mirrors `CustomEmoji.listed`.
+- **Timeline query types** — `TimelineQuery` (cursors + `only_media`/
+  `local_only`/`remote_only`), `TimelinePage {statuses, scanned}`,
+  `TimelineFilter` (the policy-facing predicate the bounded scans apply).
