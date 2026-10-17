@@ -169,7 +169,7 @@ MEDIA_JSON="$(curl -fsS -X POST "$BASE/api/v1/media" \
   -F "file=@$DATA_DIR/smoke.png;type=image/png" \
   --form-string "description=a smoke png" \
   --form-string "focus=0.25,0.75")"
-jassert "$MEDIA_JSON" "id" "" "media id present" >/dev/null 2>&1 || true
+[ -n "$(printf '%s' "$MEDIA_JSON" | json_get id)" ] || { echo "media id missing" >&2; exit 1; }
 MEDIA_ID="$(printf '%s' "$MEDIA_JSON" | json_get id)"
 MEDIA_URL="$(printf '%s' "$MEDIA_JSON" | json_get url)"
 MEDIA_PREVIEW="$(printf '%s' "$MEDIA_JSON" | json_get preview_url)"
@@ -180,7 +180,7 @@ case "$MEDIA_URL" in
 esac
 [ -n "$MEDIA_PREVIEW" ]
 jassert "$MEDIA_JSON" "description" "a smoke png" "media description"
-jassert "$MEDIA_JSON" "blurhash" "" "blurhash non-empty placeholder" >/dev/null || true
+[ -n "$(printf '%s' "$MEDIA_JSON" | json_get blurhash)" ] || { echo "blurhash missing" >&2; exit 1; }
 BLURHASH="$(printf '%s' "$MEDIA_JSON" | json_get blurhash)"
 [ -n "$BLURHASH" ]
 jassert "$MEDIA_JSON" "meta.focus.x" "0.25" "focus x"
@@ -214,7 +214,16 @@ V2_JSON="$(curl -fsS -X POST "$BASE/api/v2/media" \
   -F "file=@$DATA_DIR/smoke.mp4;type=video/mp4")"
 V2_ID="$(printf '%s' "$V2_JSON" | json_get id)"
 jassert "$V2_JSON" "url" "null" "delayed upload url is null"
-assert_code GET "/api/v1/media/$V2_ID" "$ALICE" 206
+# The worker polls every 250ms and may finish before this read: a 206 must
+# carry a null url, a 200 means it already finished, anything else fails.
+V2_GET="$(curl -s -w '\n%{http_code}' -H "Authorization: Bearer $ALICE" "$BASE/api/v1/media/$V2_ID")"
+V2_CODE="${V2_GET##*$'\n'}"
+V2_BODY="${V2_GET%$'\n'*}"
+case "$V2_CODE" in
+  206) jassert "$V2_BODY" "url" "null" "processing media has a null url" ;;
+  200) ;;
+  *) echo "ASSERT FAILED: GET /api/v1/media/$V2_ID while processing -> $V2_CODE" >&2; exit 1 ;;
+esac
 # The ProcessMedia job finishes it; poll until 200.
 for _ in $(seq 1 50); do
   [ "$(code GET "/api/v1/media/$V2_ID" "$ALICE")" = "200" ] && break
