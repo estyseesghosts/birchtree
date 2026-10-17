@@ -115,11 +115,6 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 | GET | `/api/v1/timelines/tag` | optional | read | planned (Phase 4) | In | |
 | GET | `/api/v1/timelines/list` | user | read | planned (Phase 4) | In | |
 | GET | `/api/v1/timelines/link` | optional | read | planned (Phase 7) | In | |
-| GET | `/api/v1/media/:id` | optional | read | planned (Phase 4) | In | |
-| POST | `/api/v1/media` | user | write | planned (Phase 4) | In | media v1 (multipart) |
-| PUT | `/api/v1/media/:id` | user | write | planned (Phase 4) | In | |
-| DELETE | `/api/v1/media/:id` | user | write | planned (Phase 4) | In | |
-| POST | `/api/v2/media` | user | write | planned (Phase 4) | In | media v2 (multipart) |
 | GET | `/api/v1/notifications` | user | read:notifications | implemented (Phase 4) | In | `limit` 20/max 40 with `limit_param` semantics (`limit=0` → empty page); `types[]`/`exclude_types[]` silently drop unknown values; `group_key` uses the `ungrouped-<id>` fallback (no server-side merging in the v1 profile) |
 | GET | `/api/v1/notifications/:id` | user | read:notifications | implemented (Phase 4) | In | 404 `{"error":"Record not found"}` for foreign/missing |
 | POST | `/api/v1/notifications/clear` | user | write \| write:notifications | implemented (Phase 4) | In | `200 {}` |
@@ -187,4 +182,14 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 - **Tag objects** in status payloads use the tag name as `id` (no tag table yet); `history`/`following`/`featuring` are contract-shaped defaults. Real tag rows land with the Phase 7 tag surface.
 - **Conversation mutes** (`POST /api/v1/statuses/:id/mute|unmute`) are out of profile with `conversations`; the status DTO's `muted` flag is emitted with its neutral `false` for authenticated viewers.
 - **`application` on statuses** is shown whenever present (Mastodon's `user_shows_application?` preference defaults to true and is not stored yet).
-- Media attachment DTOs render `url`/`preview_url` as `null` until media processing lands (Phase 4) — contract-correct "not processed" state, but no upload endpoint exists yet.
+- Media attachment DTOs render `url`/`preview_url` as `null` until the attachment is processed (Phase 4 upload + processing lifecycle are live) — contract-correct "not processed" state for queued/in-progress/failed rows.
+- Media file serving (`GET /system/media_attachments/files/{*path}`) serves the blob bytes with the sniffed content type and `Cache-Control: max-age=86400, public`.
+
+## Known Phase 4 media deviations / gaps (honesty list)
+
+- **No transcoding toolchain (no ffmpeg)**: animated GIF uploads keep the wire type `image` (Mastodon would produce `gifv` + mp4); video/audio keep their original bytes untouched; `meta.small`/`preview_url` exist only when an image preview was generated; duration/frame rate/bitrate stay `null` (MP4 `tkhd` dimensions are read when present).
+- **Blob keys are sharded by a per-upload random 16-hex name** (`{aa}/{bb}/{random16}/original.{ext}`), not the attachment id: bytes must be staged *before* the id-minting commit (`birchtree.md` §5), so the id cannot appear in its own key. The wire URLs are unaffected.
+- **The upload size cap equals the multipart body limit** (`ApiState` carries no `Config`); `Config::validate` enforces `max_file_size ≤ max_body_size`, so the effective cap matches the default 16 MB. The 422 message formats the cap like Rails `number_to_human_size` ("16 MB", "1 KB", …).
+- **`meta.original.size` currently renders the literal string `{width}x{height}`** — a pre-existing `dto.rs` bug outside the media slice's file set; flagged for the Phase 4 integration pass.
+- **A non-numeric `focus` param answers `422 Validation failed: Focus is invalid`** instead of Ruby's `Float()` coercion to `0.0`; a blank focus is ignored (upload) or clears the point (update).
+- **An image upload carrying a thumbnail answers "Thumbnail must be blank"** before the thumbnail's own content-type/size checks (Mastodon's model validates the thumbnail's content type first); the pinned messages are otherwise exact.

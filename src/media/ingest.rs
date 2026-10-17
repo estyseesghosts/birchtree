@@ -132,6 +132,46 @@ pub fn sniff(bytes: &[u8]) -> Option<Sniffed> {
     None
 }
 
+/// MIME types Mastodon accepts for uploads, restricted to what the sniffer
+/// (and the pure-Rust decoders) actually support: the intersection of
+/// `MediaAttachment::IMAGE_MIME_TYPES`, `VIDEO_MIME_TYPES` and
+/// `AUDIO_MIME_TYPES` with the formats handled here. Note the ISO-BMFF
+/// sniffer classifies by major brand only, so a QuickTime `.mov` (brand
+/// `qt  `) reports `video/mp4` and is accepted as an mp4 container
+/// (documented; no separate `video/quicktime` decoder exists).
+pub const ACCEPTED_MIME_TYPES: &[&str] = &[
+    "image/jpeg",
+    "image/png",
+    "image/gif",
+    "image/webp",
+    "image/bmp",
+    "video/mp4",
+    "video/webm",
+    "audio/ogg",
+    "audio/mpeg",
+    "audio/wav",
+    "audio/flac",
+    "audio/mp4",
+];
+
+/// True when a sniffed upload sits inside Mastodon's accepted lists (the
+/// upload use case answers the content-type 422 otherwise).
+pub fn validate(sniffed: Sniffed) -> bool {
+    ACCEPTED_MIME_TYPES.contains(&sniffed.mime_type)
+}
+
+/// True for video/audio attachments: the only classes allowed to carry an
+/// operator-supplied `thumbnail` and the only ones eligible for delayed (v2)
+/// processing.
+pub fn is_large_format(sniffed: Sniffed) -> bool {
+    matches!(sniffed.r#type, "video" | "audio")
+}
+
+/// True for image attachments (a `thumbnail` must be blank).
+pub fn is_image(sniffed: Sniffed) -> bool {
+    sniffed.r#type == "image"
+}
+
 /// Custom-emoji images are restricted to PNG/GIF/WebP (Mastodon's
 /// `CustomEmoji` content types), sniffed from content.
 pub fn is_emoji_image(bytes: &[u8]) -> bool {
@@ -185,5 +225,66 @@ mod tests {
         assert!(sniff(b"tiny").is_none());
         assert!(!is_emoji_image(b"plain text not an upload at all"));
         assert!(is_emoji_image(&png()));
+    }
+
+    #[test]
+    fn accepted_list_matches_the_pinned_upload_mime_types() {
+        // Every accepted type is something the sniffer can produce.
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend_from_slice(&[0; 8]);
+        let webp = b"RIFF\x00\x00\x00\x00WEBPVP8 ".to_vec();
+        let mut bmp = b"BM".to_vec();
+        bmp.extend_from_slice(&[0; 16]);
+        let mut mp4 = vec![0u8, 0, 0, 0x18];
+        mp4.extend_from_slice(b"ftypisom");
+        mp4.extend_from_slice(&[0; 8]);
+        let mut webm = vec![0x1A, 0x45, 0xDF, 0xA3, 0, 0, 0, 0, 0, 0, 0, 0];
+        webm.extend_from_slice(&[0; 8]);
+        let mut ogg = b"OggS".to_vec();
+        ogg.extend_from_slice(&[0; 8]);
+        let mut wav = b"RIFF\x00\x00\x00\x00WAVE".to_vec();
+        wav.extend_from_slice(&[0; 8]);
+        let mut flac = b"fLaC".to_vec();
+        flac.extend_from_slice(&[0; 8]);
+        let mut mp3 = b"ID3".to_vec();
+        mp3.extend_from_slice(&[0; 9]);
+        let mut m4a = vec![0u8, 0, 0, 0x18];
+        m4a.extend_from_slice(b"ftypM4A ");
+        m4a.extend_from_slice(&[0; 8]);
+
+        for bytes in [
+            &png()[..],
+            &jpeg(),
+            &gif,
+            &webp,
+            &bmp,
+            &mp4,
+            &webm,
+            &ogg,
+            &wav,
+            &flac,
+            &mp3,
+            &m4a,
+        ] {
+            let sniffed = sniff(bytes).expect("sniffable fixture");
+            assert!(
+                validate(sniffed),
+                "{} should be accepted",
+                sniffed.mime_type
+            );
+        }
+
+        // Class guards drive the thumbnail and delay rules.
+        assert!(is_image(sniff(&png()).unwrap()));
+        assert!(!is_large_format(sniff(&png()).unwrap()));
+        assert!(is_large_format(sniff(&mp4).unwrap()));
+        assert!(is_large_format(sniff(&mp3).unwrap()));
+        assert!(!is_image(sniff(&mp4).unwrap()));
+    }
+
+    fn jpeg() -> Vec<u8> {
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        jpeg.extend_from_slice(&[0; 8]);
+        jpeg
     }
 }
