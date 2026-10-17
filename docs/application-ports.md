@@ -81,6 +81,15 @@ Implemented by `persistence::redb::RedbStore` and bundled into `Store`:
 implemented in their phases; `NotificationStore`'s read surface (index,
 grouping) is Phase 4.
 
+## Implementation status (Phase 5)
+
+- `StreamingSink` (`application::ports`) is implemented by `streaming::Hub`. It is one method, `publish(StreamEvent)`, non-blocking: events go to the hub's fan-out thread through a bounded queue, and an overflow closes every stream. The event type is `application::streaming::StreamEvent` (`StatusCreated`, `StatusEdited`, `StatusDeleted` with pre-deletion snapshots, `Notification`, `PolicyChanged`, `Retract`, `TokenRevoked`). `Context` carries the sink as `streaming`. Adapters publish after a use case returns `Ok`; the job handler publishes after its own commit. No use case publishes inside a transaction.
+- `StatusStore::delete_status` returns `DeletedStatus { status, reblogs }`: the pre-deletion status and every reblog wrapper the cascade tombstoned (for `delete` events). Previously it returned the status alone.
+- `StatusStore::own_reblog(account_id, status_id)`: the viewer's live reblog wrapper of a status (for the unreblog and repeat-reblog decisions).
+- `NoStreaming` is a sink that discards events, for code paths with no hub.
+- Stream gates (read-only, in `application::timelines`): `home_includes`, `public_stream_includes`, `tag_stream_includes`, `list_stream_includes`, and `retraction_candidates` (run before a block or mute commits). They reuse `ViewerScope` and the timeline filters; streaming adds no policy of its own.
+- `jobs::handlers::handle` and `jobs::worker::run` take the sink. `fan_out_from_payload` and `publish_scheduled_job` return the id they created, so the handler publishes it once.
+
 ## Implementation status (Phase 4)
 
 New ports in `application::ports`, implemented by `persistence::redb::RedbStore`

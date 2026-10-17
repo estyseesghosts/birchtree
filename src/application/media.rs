@@ -716,7 +716,13 @@ mod tests {
         let jobs = store.claim_due(1_800_000_000_000, 10).expect("claim");
         assert_eq!(jobs.len(), 1);
         let mail = LoggingMailSender;
-        crate::jobs::handlers::handle(&jobs[0], &*store, &mail as &dyn MailSender, &blobs)
+        crate::jobs::handlers::handle(
+            &jobs[0],
+            &*store,
+            &mail as &dyn MailSender,
+            &blobs,
+            &crate::application::ports::NoStreaming,
+        )
             .expect("handle");
         let processed = store.media_by_id(media.id).unwrap().unwrap();
         assert_eq!(processed.state, MediaState::Ready);

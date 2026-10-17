@@ -75,7 +75,7 @@ fn drain_jobs(srv: &TestServer) {
     let mail = birchtree::mail::LoggingMailSender::default();
     // A far-future clock claims every due job (the lease math needs headroom).
     for job in srv.store.claim_due(4_000_000_000_000, 64).unwrap() {
-        handlers::handle(&job, &*srv.store, &mail, &*srv.blobs).unwrap();
+        handlers::handle(&job, &*srv.store, &mail, &*srv.blobs, &birchtree::application::ports::NoStreaming).unwrap();
         srv.store.complete(job.id).unwrap();
     }
 }

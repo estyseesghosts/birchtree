@@ -28,6 +28,12 @@ pub struct Config {
     pub site_contact_email: String,
     /// Contact account handle (`username`, local), if configured.
     pub site_contact_username: Option<String>,
+    /// Streaming API base URL (`ws`, `wss`, `http` or `https`), advertised as
+    /// `urls.streaming`. Unset: streams are served from the public host and
+    /// advertised as its `ws`/`wss` form. Set to another host: requests to the
+    /// streaming paths on this host answer `301` to that host (upstream's
+    /// `StreamingController`).
+    pub streaming_api_base_url: Option<String>,
 }
 
 impl Default for Config {
@@ -45,6 +51,7 @@ impl Default for Config {
             site_description: "A Mastodon-compatible server".to_string(),
             site_contact_email: "admin@localhost".to_string(),
             site_contact_username: None,
+            streaming_api_base_url: None,
         }
     }
 }
@@ -72,6 +79,16 @@ impl Config {
         }
         if self.worker_poll_interval.is_zero() {
             return Err("worker_poll_interval must be > 0".to_string());
+        }
+        if let Some(base) = &self.streaming_api_base_url {
+            let valid = ["ws://", "wss://", "http://", "https://"]
+                .iter()
+                .any(|scheme| base.starts_with(scheme) && base.len() > scheme.len());
+            if !valid {
+                return Err(
+                    "--streaming-url must start with ws://, wss://, http:// or https://".to_string(),
+                );
+            }
         }
         Ok(())
     }

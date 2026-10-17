@@ -21,6 +21,7 @@ use crate::api::oauth::scopes;
 use crate::application::auth::{self, CodeExchange};
 use crate::application::crypto;
 use crate::application::ports::Store;
+use crate::application::streaming::StreamEvent;
 use crate::domain::OAuthApplication;
 
 /// Doorkeeper-style OAuth error response.
@@ -224,7 +225,8 @@ pub async fn revoke(
     };
 
     let store: &dyn Store = &*state.context.store;
-    if let Some(existing) = store.token_by_plaintext(token).ok().flatten() {
+    let existing = store.token_by_plaintext(token).ok().flatten();
+    if let Some(existing) = &existing {
         if existing.app_id != app.id {
             return oauth_error(
                 StatusCode::FORBIDDEN,
@@ -233,6 +235,13 @@ pub async fn revoke(
             );
         }
     }
-    let _ = store.revoke_token(token);
+    if let Ok(true) = store.revoke_token(token) {
+        // Upstream's `kill`: the token's open streams close.
+        if let Some(existing) = existing {
+            state.context.streaming.publish(StreamEvent::TokenRevoked {
+                token_id: existing.id,
+            });
+        }
+    }
     json_ok(json!({}))
 }

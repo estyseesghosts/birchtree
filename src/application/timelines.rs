@@ -438,3 +438,167 @@ pub fn list(
     filter.scope.finish()?;
     Ok(page)
 }
+
+// ---------------------------------------------------------------------------
+// Streaming gates (Phase 5). The same `ViewerScope` facts and filters as the
+// REST timelines, applied to one status for one subscriber. Streaming adds no
+// policy of its own (`birchtree.md` §4.3).
+// ---------------------------------------------------------------------------
+
+/// Upstream's streaming-side block and mute check on a status's mentions (the
+/// author is covered by `author_allowed`): the viewer blocks or mutes one of
+/// them. Upstream applies it to public and hashtag streams only.
+fn mentions_blocked_or_muted(scope: &ViewerScope<'_>, status: &Status) -> bool {
+    scope.viewer.is_some()
+        && status
+            .mentions
+            .iter()
+            .any(|mention| scope.facts(*mention).is_some_and(|f| f.pair.blocking || f.pair.muting))
+}
+
+/// Home stream gate: whether `viewer`'s home feed would carry `status`.
+pub fn home_includes(store: &dyn Store, viewer: Id, status: &Status, now_ms: u64) -> Result<bool> {
+    let scope = ViewerScope::new(store, Some(viewer), now_ms);
+    scope.seed_exclusive(&[status.account_id])?;
+    let filter = HomeFilter { scope, viewer };
+    let kept = filter.include(status);
+    filter.scope.finish()?;
+    Ok(kept)
+}
+
+/// Public stream gate (`public`, `public:local`, ...): public, not a reblog,
+/// the public feed's reply rule, plus the streaming block and mute checks for
+/// logged-in viewers. The caller applies the local/remote and media selectors.
+pub fn public_stream_includes(
+    store: &dyn Store,
+    viewer: Option<Id>,
+    status: &Status,
+    now_ms: u64,
+) -> Result<bool> {
+    if status.is_reblog() {
+        return Ok(false);
+    }
+    let filter = PublicFilter {
+        scope: ViewerScope::new(store, viewer, now_ms),
+    };
+    let mut kept = filter.include(status);
+    if kept {
+        kept = !mentions_blocked_or_muted(&filter.scope, status);
+    }
+    filter.scope.finish()?;
+    Ok(kept)
+}
+
+/// Hashtag stream gate: public, not a reblog, and the streaming block and mute
+/// checks. Replies are kept, as upstream's hashtag streams keep them. The
+/// caller checks that `status` carries the tag.
+pub fn tag_stream_includes(
+    store: &dyn Store,
+    viewer: Option<Id>,
+    status: &Status,
+    now_ms: u64,
+) -> Result<bool> {
+    if status.is_reblog() || status.visibility != Visibility::Public {
+        return Ok(false);
+    }
+    let scope = ViewerScope::new(store, viewer, now_ms);
+    let kept = scope.author_allowed(status.account_id) && !mentions_blocked_or_muted(&scope, status);
+    scope.finish()?;
+    Ok(kept)
+}
+
+/// List stream gate: whether the list `list_id` owned by `owner` would carry
+/// `status`. A list the owner does not own gates everything out.
+pub fn list_stream_includes(
+    store: &dyn Store,
+    owner: Id,
+    list_id: Id,
+    status: &Status,
+    now_ms: u64,
+) -> Result<bool> {
+    let Some(list) = store.list_by_id(list_id)? else {
+        return Ok(false);
+    };
+    if list.account_id != owner {
+        return Ok(false);
+    }
+    let members = store.all_list_members(list_id, LIST_MEMBER_CAP)?;
+    let scope = ViewerScope::new(store, Some(owner), now_ms);
+    scope.seed(&members)?;
+    let filter = ListFilter {
+        scope,
+        viewer: owner,
+        members: members.iter().copied().collect(),
+        policy: list.replies_policy,
+    };
+    let kept = filter.include(status);
+    filter.scope.finish()?;
+    Ok(kept)
+}
+
+/// Cap on the statuses one retraction sends (block or mute).
+const RETRACT_LIMIT: usize = 200;
+
+/// Statuses a block or mute of `target` removes from `viewer`'s open streams.
+///
+/// Upstream's `FeedManager#clear_from_home` and `clear_from_lists` rule: the
+/// statuses by `target`, reblogs by `target`, reblogs of `target`'s statuses,
+/// and statuses mentioning `target`, from the viewer's home authors and list
+/// members. Call this BEFORE the block or mute commits: a block unfollows, so
+/// the home author set would no longer include `target`'s statuses afterwards.
+pub fn retraction_candidates(store: &dyn Store, viewer: Id, target: Id) -> Result<Vec<Status>> {
+    let matcher = RetractMatcher {
+        store,
+        target,
+        reblog_authors: Mutex::new(HashMap::new()),
+    };
+    let query = TimelineQuery {
+        limit: RETRACT_LIMIT,
+        ..TimelineQuery::default()
+    };
+    let mut authors = store.following(viewer, None, HOME_AUTHOR_CAP)?;
+    authors.push(viewer);
+    let mut found = store.authors_timeline(&authors, query, &matcher)?.statuses;
+    for list in store.lists_by_account(viewer)? {
+        let members = store.all_list_members(list.id, LIST_MEMBER_CAP)?;
+        found.extend(store.authors_timeline(&members, query, &matcher)?.statuses);
+    }
+    let mut seen = HashSet::new();
+    found.retain(|status| seen.insert(status.id));
+    Ok(found)
+}
+
+/// Matches the retraction rule. The reblog-author lookup is cached per call.
+struct RetractMatcher<'a> {
+    store: &'a dyn Store,
+    target: Id,
+    reblog_authors: Mutex<HashMap<Id, Option<Id>>>,
+}
+
+impl TimelineFilter for RetractMatcher<'_> {
+    fn include(&self, status: &Status) -> bool {
+        if status.account_id == self.target || status.mentions.contains(&self.target) {
+            return true;
+        }
+        let Some(original) = status.reblog_of_id else {
+            return false;
+        };
+        let author = {
+            let mut cache = lock(&self.reblog_authors);
+            match cache.get(&original).copied() {
+                Some(known) => known,
+                None => {
+                    let loaded = self
+                        .store
+                        .status_by_id(original)
+                        .ok()
+                        .flatten()
+                        .map(|s| s.account_id);
+                    cache.insert(original, loaded);
+                    loaded
+                }
+            }
+        };
+        author == Some(self.target)
+    }
+}

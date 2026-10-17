@@ -567,8 +567,8 @@ fn fan_out_notification_job_is_idempotent() {
 
     // Running the SAME job twice (a retried lease) creates one row: the
     // dedup index refuses the second insert.
-    handlers::handle(&job, &*store, &mail, &blobs).unwrap();
-    handlers::handle(&job, &*store, &mail, &blobs).unwrap();
+    handlers::handle(&job, &*store, &mail, &blobs, &birchtree::application::ports::NoStreaming).unwrap();
+    handlers::handle(&job, &*store, &mail, &blobs, &birchtree::application::ports::NoStreaming).unwrap();
 
     let probe = store
         .create_notification(NewNotification {
@@ -722,9 +722,9 @@ fn interaction_and_job_survive_store_reopen() {
     let mail = LoggingMailSender::default();
     let blob_dir = tempfile::tempdir().unwrap();
     let blobs = birchtree::media::blob_store::FsBlobStore::open(blob_dir.path()).unwrap();
-    handlers::handle(&job, &store, &mail, &blobs).unwrap();
+    handlers::handle(&job, &store, &mail, &blobs, &birchtree::application::ports::NoStreaming).unwrap();
     store.complete(job.id).unwrap();
-    handlers::handle(&job, &store, &mail, &blobs).unwrap();
+    handlers::handle(&job, &store, &mail, &blobs, &birchtree::application::ports::NoStreaming).unwrap();
     assert_eq!(store.get(job.id).unwrap().unwrap().state, JobState::Succeeded);
 
     // Exactly ONE notification row exists after running the handler twice.

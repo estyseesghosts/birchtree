@@ -21,6 +21,7 @@ use crate::api::mastodon::pagination;
 use crate::api::mastodon::status_view::load_status_view;
 use crate::api::mastodon::ApiState;
 use crate::application::ports::{AccountStatusesQuery, Store};
+use crate::application::streaming::StreamEvent;
 use crate::application::statuses::{
     self, CreateStatusCommand, PollCommand, UpdateStatusCommand,
 };
@@ -488,7 +489,15 @@ pub async fn create(
     }
 
     match statuses::create_status(store, &state.server.public_url, state.context.now_ms(), cmd) {
-        Ok(created) => status_response(&state, Some(viewer), created.status, StatusSourceMode::Content),
+        Ok(created) => {
+            // An idempotent replay committed nothing new, so nothing streams.
+            if !created.replayed {
+                state.context.streaming.publish(StreamEvent::StatusCreated {
+                    status_id: created.status.id,
+                });
+            }
+            status_response(&state, Some(viewer), created.status, StatusSourceMode::Content)
+        }
         Err(err) => match err {
             // Reply/quote misses keep their exact custom messages.
             DomainError::NotFound(msg) if msg.contains("does not appear to exist") => {
@@ -581,7 +590,12 @@ pub async fn update(
         Ok(maybe_status) => {
             // No changes: reload and answer 200 with the unchanged status.
             let status = match maybe_status {
-                Some(status) => status,
+                Some(status) => {
+                    state.context.streaming.publish(StreamEvent::StatusEdited {
+                        status_id: status.id,
+                    });
+                    status
+                }
                 None => match store.status_by_id(status_id) {
                     Ok(Some(status)) => status,
                     _ => return ApiError::not_found().into_response(),
@@ -612,7 +626,13 @@ pub async fn destroy(
     };
     let store: &dyn Store = &*state.context.store;
     match statuses::delete_status(store, viewer, status_id, state.context.now_ms()) {
-        Ok(status) => status_response(&state, Some(viewer), status, StatusSourceMode::Source),
+        Ok(deleted) => {
+            state.context.streaming.publish(StreamEvent::StatusDeleted {
+                status: deleted.status.clone(),
+                reblogs: deleted.reblogs,
+            });
+            status_response(&state, Some(viewer), deleted.status, StatusSourceMode::Source)
+        }
         Err(err) => ApiError::from(err).into_response(),
     }
 }
@@ -685,6 +705,13 @@ pub async fn reblog(
     let pairs = body;
     let visibility = forms::get(&pairs, "visibility").map(str::to_string);
     let store: &dyn Store = &*state.context.store;
+    // A repeat reblog returns the existing wrapper and creates nothing, so only
+    // a fresh wrapper streams (upstream's `ReblogService` returns early too).
+    let target = match store.status_by_id(status_id) {
+        Ok(Some(status)) => status.reblog_of_id.unwrap_or(status_id),
+        _ => status_id,
+    };
+    let existed = store.own_reblog(viewer, target).ok().flatten().is_some();
     match crate::application::interactions::reblog(
         store,
         viewer,
@@ -692,21 +719,57 @@ pub async fn reblog(
         visibility.as_deref(),
         state.context.now_ms(),
     ) {
-        Ok(status) => status_response(&state, Some(viewer), status, StatusSourceMode::Content),
+        Ok(status) => {
+            if !existed {
+                // The wrapper is what followers' home streams carry.
+                state.context.streaming.publish(StreamEvent::StatusCreated {
+                    status_id: status.id,
+                });
+            }
+            status_response(&state, Some(viewer), status, StatusSourceMode::Content)
+        }
         Err(err) => status_error(err).into_response(),
     }
 }
 
 /// `POST /api/v1/statuses/{id}/unreblog` — answers 200 with the ORIGINAL.
+///
+/// The viewer's wrapper is read before the unreblog, so its `delete` can be
+/// published after the commit.
 pub async fn unreblog(
     State(state): State<ApiState>,
     auth: Auth,
     Path(raw): Path<String>,
 ) -> Response {
-    status_interaction(&state, &auth, raw, WRITE_SCOPES, |store, viewer, id, now| {
-        crate::application::interactions::unreblog(store, viewer, id, now)
-    })
-    .await
+    if let Err(err) = auth.0.require_scopes(WRITE_SCOPES) {
+        return err.into_response();
+    }
+    let viewer = match auth.0.require_user() {
+        Ok(id) => id,
+        Err(err) => return err.into_response(),
+    };
+    let Ok(status_id) = raw.parse::<Id>() else {
+        return ApiError::new(axum::http::StatusCode::NOT_FOUND, "Not Found").into_response();
+    };
+    let store: &dyn Store = &*state.context.store;
+    // The unreblog takes the original's id; a wrapper id resolves to its target.
+    let target = match store.status_by_id(status_id) {
+        Ok(Some(status)) => status.reblog_of_id.unwrap_or(status_id),
+        _ => status_id,
+    };
+    let wrapper = store.own_reblog(viewer, target).ok().flatten();
+    match crate::application::interactions::unreblog(store, viewer, status_id, state.context.now_ms()) {
+        Ok(status) => {
+            if let Some(wrapper) = wrapper {
+                state.context.streaming.publish(StreamEvent::StatusDeleted {
+                    status: wrapper,
+                    reblogs: Vec::new(),
+                });
+            }
+            status_response(&state, Some(viewer), status, StatusSourceMode::Content)
+        }
+        Err(err) => status_error(err).into_response(),
+    }
 }
 
 /// `POST /api/v1/statuses/{id}/pin`.

@@ -64,6 +64,8 @@ fn parse_args(cfg: &mut Config) -> Args {
             cfg.site_description = v.to_string();
         } else if let Some(v) = arg.strip_prefix("--site-contact-email=") {
             cfg.site_contact_email = v.to_string();
+        } else if let Some(v) = arg.strip_prefix("--streaming-url=") {
+            cfg.streaming_api_base_url = Some(v.trim_end_matches('/').to_string());
         } else if let Some(v) = arg.strip_prefix("--site-contact-username=") {
             cfg.site_contact_username = Some(v.trim_start_matches('@').to_string());
         } else if arg == "--registration-open" {
@@ -206,13 +208,28 @@ async fn serve(cfg: Config) {
                 eprintln!("open blob store: {err}");
                 std::process::exit(1);
             }));
-    let context = Arc::new(Context::new(clock.clone(), ids, store.clone(), blobs.clone()));
     let server = Arc::new(ServerInfo::from_config(&cfg));
+    let streams = birchtree::streaming::Hub::new(
+        store.clone(),
+        clock.clone(),
+        server.clone(),
+        birchtree::streaming::Limits::default(),
+    );
+    let streaming: Arc<dyn birchtree::application::ports::StreamingSink> =
+        Arc::new(streams.clone());
+    let context = Arc::new(Context::new(
+        clock.clone(),
+        ids,
+        store.clone(),
+        blobs.clone(),
+        streaming.clone(),
+    ));
     let state = ApiState {
         context,
         trusted_proxies: Arc::new(cfg.trusted_proxies.clone()),
         max_body_size: cfg.max_body_size,
         server,
+        streams,
     };
     let app = build_router(state);
     let mailer: Arc<dyn MailSender> = Arc::new(LoggingMailSender);
@@ -237,6 +254,7 @@ async fn serve(cfg: Config) {
         clock.clone(),
         mailer,
         blobs,
+        streaming,
         cfg.worker_poll_interval,
         jobs::worker::DEFAULT_BATCH,
         shutdown_rx,

@@ -1,6 +1,6 @@
 # Roadmap
 
-Per `birchtree.md` §7. Phases 0–4 and 4.1 are implemented (Phase 0's route-inventory review is still open; the §8 item 11 parity harness is not built). Phase 5 is next. Every phase is measured against the compatibility bar: an unmodified Mastodon client has an identical experience to Mastodon v4.7.3 at 98% or better, and every deliberate difference is in the deviation register (`docs/compatibility-profile.md`).
+Per `birchtree.md` §7. Phases 0–5 (including 4.1) are implemented (Phase 0's route-inventory review is still open; the §8 item 11 parity harness is not built or run). Phase 6 is next. Every phase is measured against the compatibility bar: an unmodified Mastodon client has an identical experience to Mastodon v4.7.3 at 98% or better, and every deliberate difference is in the deviation register (`docs/compatibility-profile.md`).
 
 | Phase | Focus | Status |
 |---|---|---|
@@ -10,7 +10,7 @@ Per `birchtree.md` §7. Phases 0–4 and 4.1 are implemented (Phase 0's route-in
 | 3 | Local statuses, relationships, interaction semantics | implemented (gate green) |
 | 4 | Media, timelines, notifications, client usability | implemented (gate green) |
 | 4.1 | Parity gap closure: JSON request bodies on write endpoints; exclusive lists hidden from home; home follow cap 1000 | implemented (2026-10-17; parity evidence source-derived, see `docs/logs/2026-10-17-phase-4-1-verification.md`) |
-| 5 | Streaming (SSE + WebSocket) | planned |
+| 5 | Streaming (SSE + WebSocket): declared streams, event envelopes, live policy, bounds, host redirect | implemented (2026-10-17; parity harness not run; direct and public:remote silent until Phases 7 and 6; see `docs/phase-5-exit-criteria.md`) |
 | 6 | ActivityPub federation; remote thread completion; Flag | planned |
 | 7 | Broader 4.7.3 public API parity: account multi-fetch, conversations, suggestions, announcements, donation campaigns, Web Push, first-party client (`/api/web/*`, keystodon bundle) | planned |
 | 7.1 | Media transcoding: GIF and video → WebM/VP9 (video passthrough when already VP9 WebM within the size limit); still images → WebP; no `gifv`; the server never strips EXIF | planned |

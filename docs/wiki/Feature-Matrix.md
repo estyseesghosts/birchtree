@@ -1,6 +1,6 @@
 # Feature matrix
 
-Status: in progress (filled in as phases exit). Phases 1–4 and 4.1 (runtime/`redb`/IDs/bootstrap, OAuth/registration/read APIs, local statuses/relationships/interactions, media/timelines/notifications/client usability, parity gap closure) landed; later-phase user-facing rows stay `planned` until their phase. Rows added by the 2026-10-17 scope expansion are `planned` only.
+Status: in progress (filled in as phases exit). Phases 1–5 and 4.1 (runtime/`redb`/IDs/bootstrap, OAuth/registration/read APIs, local statuses/relationships/interactions, media/timelines/notifications/client usability, parity gap closure, streaming) landed; later-phase user-facing rows stay `planned` until their phase. Rows added by the 2026-10-17 scope expansion are `planned` only.
 
 | Feature | Mastodon 4.7.3 | birchtree | Status |
 |---|---|---|---|
@@ -17,7 +17,7 @@ Status: in progress (filled in as phases exit). Phases 1–4 and 4.1 (runtime/`r
 | Timelines: home/public/local/hashtag/list | yes | partial | implemented (Phase 4; Phase 4.1: exclusive-list members hidden from home (D10b), home reads the 1000 most recent follows (D10a); open: `remote=true` empty until Phase 6; tag feed excludes reblog wrappers, matching upstream) |
 | JSON request bodies on REST write endpoints | yes | yes | implemented (Phase 4.1, D11; `POST /oauth/authorize` consent form stays form-only; parity source-derived) |
 | Notifications: records and read surface | yes | partial | implemented (Phase 3 deduplicated records via jobs; Phase 4 index, show, clear, dismiss, `unread_count`, markers; `requests` always `[]`) |
-| Streaming: SSE + WebSocket | yes | — | planned (Phase 5) |
+| Streaming: SSE + WebSocket | yes | partial | implemented (Phase 5: `user`, `user:notification`, `public` and variants, `hashtag`, `list` with live policy and retraction; `direct` and `public:remote` silent until Phases 7 and 6; upstream's parity not run, see the Phase 5 exit criteria) |
 | Federation: WebFinger, inbox, signed delivery, activities | yes | — | planned (Phase 6) |
 | Remote thread completion (ancestors at ingest and on logged-in context reads, deviation D5; descendants on authenticated context reads; crawl across hosts as upstream) | yes | — | planned (Phase 6; see `docs/federation-contract.md`) |
 | Account multi-fetch `GET /api/v1/accounts?id[]`, lookup, search | yes | — | planned (Phase 7; multi-fetch up to 40 ids) |
@@ -35,5 +35,5 @@ Status: in progress (filled in as phases exit). Phases 1–4 and 4.1 (runtime/`r
 | Trends: public reads and admin approval | yes | — | planned (Phase 7.3) |
 | Admin metrics: measures, dimensions, retention | yes | — | planned (Phase 7.3) |
 | Annual reports | yes | — | planned (Phase 7.3) |
-| Unmodified-client parity suite (identical client experience, the compatibility bar) | yes | — | planned (`birchtree.md` §8 item 11; run at each phase exit from Phase 3) |
+| Unmodified-client parity suite (identical client experience, the compatibility bar) | yes | — | planned (`birchtree.md` §8 item 11; run at each phase exit from Phase 3; not run for Phases 0–5, escalation E1 in `docs/phase-5-exit-criteria.md`) |
 | `redb` single-node storage | n/a (Mastodon uses PostgreSQL+Redis) | — | partial (Phase 1 schema/ports/atomicity/crash tests; Phase 3 schema v3 status/relationship/poll/quote tables) |

@@ -23,4 +23,7 @@ bash scripts/smoke-phase3.sh
 echo "==> scripts/smoke-phase4.sh"
 bash scripts/smoke-phase4.sh
 
+echo "==> scripts/smoke-phase5.sh"
+bash scripts/smoke-phase5.sh
+
 echo "smoke-all: green"

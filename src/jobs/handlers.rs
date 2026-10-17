@@ -6,16 +6,19 @@
 //! remaining kinds become reachable as their phases land.
 
 use crate::application::crypto;
-use crate::application::ports::{BlobStore, MailSender, Store};
 use crate::application::notifications;
+use crate::application::ports::{BlobStore, MailSender, Store, StreamingSink};
+use crate::application::streaming::StreamEvent;
 use crate::domain::{Error, Id, Job, JobKind, NotificationType, Result};
 
-/// Execute a claimed job.
+/// Execute a claimed job. Streaming publication happens here, after the job's
+/// own commit: a create that returns an id publishes it once.
 pub fn handle(
     job: &Job,
     store: &dyn Store,
     mailer: &dyn MailSender,
     blobs: &dyn BlobStore,
+    streaming: &dyn StreamingSink,
 ) -> Result<()> {
     match job.kind {
         JobKind::UserCreated => {
@@ -47,8 +50,12 @@ pub fn handle(
         }
         JobKind::FanOutNotification => {
             // Idempotent: the notification store dedups by
-            // (recipient, type, actor, status), so retries are harmless.
-            notifications::fan_out_from_payload(store, &job.payload)
+            // (recipient, type, actor, status), so retries are harmless. A
+            // dedup hit creates nothing and publishes nothing.
+            if let Some(notification_id) = notifications::fan_out_from_payload(store, &job.payload)? {
+                streaming.publish(StreamEvent::Notification { notification_id });
+            }
+            Ok(())
         }
         JobKind::PollExpired => {
             let poll_id = job
@@ -85,9 +92,12 @@ pub fn handle(
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            crate::application::scheduled_statuses::publish_scheduled_job(
+            if let Some(status_id) = crate::application::scheduled_statuses::publish_scheduled_job(
                 store, scheduled_id, &base_url, job.due_at_ms,
-            )
+            )? {
+                streaming.publish(StreamEvent::StatusCreated { status_id });
+            }
+            Ok(())
         }
         JobKind::DeliverActivity => Err(Error::Internal(
             "deliver_activity handler arrives in Phase 6".into(),

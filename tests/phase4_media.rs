@@ -502,7 +502,7 @@ async fn v2_mp4_upload_is_delayed_then_processed_by_the_job() {
         .into_iter()
         .find(|job| job.kind == JobKind::ProcessMedia)
         .expect("process media job");
-    handlers::handle(&job, &*srv.store, &LoggingMailSender, &*srv.blobs).expect("handle");
+    handlers::handle(&job, &*srv.store, &LoggingMailSender, &*srv.blobs, &birchtree::application::ports::NoStreaming).expect("handle");
 
     // The attachment is now Ready: 200 with a fetchable url (original bytes,
     // no transcoding; dimensions stay None without a tkhd box).
@@ -530,7 +530,7 @@ async fn v2_mp4_upload_is_delayed_then_processed_by_the_job() {
     assert_eq!(bytes, mp4_bytes());
 
     // Replaying the handler is a no-op (idempotent lifecycle).
-    handlers::handle(&job, &*srv.store, &LoggingMailSender, &*srv.blobs).expect("replay");
+    handlers::handle(&job, &*srv.store, &LoggingMailSender, &*srv.blobs, &birchtree::application::ports::NoStreaming).expect("replay");
     let (status, _h, _bytes) = send(
         &srv.router,
         get_request(&format!("/api/v1/media/{id}"), Some(&token), None),

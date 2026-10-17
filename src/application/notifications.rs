@@ -46,11 +46,13 @@ pub fn fan_out_payload(
 /// Execute a `FanOutNotification` job payload against the store.
 ///
 /// Self-notifications are skipped; deduplication happens inside the store.
-pub fn fan_out_from_payload(store: &dyn Store, payload: &Value) -> Result<()> {
+/// Returns the id of a newly created notification (`None` on a dedup hit or a
+/// skipped payload), so the caller can publish it once.
+pub fn fan_out_from_payload(store: &dyn Store, payload: &Value) -> Result<Option<Id>> {
     let get_u64 = |key: &str| payload.get(key).and_then(|v| v.as_u64());
     let recipient_id = match get_u64("recipient_id") {
         Some(id) => Id::new(id),
-        None => return Ok(()),
+        None => return Ok(None),
     };
     let kind = payload
         .get("type")
@@ -65,22 +67,22 @@ pub fn fan_out_from_payload(store: &dyn Store, payload: &Value) -> Result<()> {
             "quote" => Some(NotificationType::Quote),
             _ => None,
         });
-    let Some(kind) = kind else { return Ok(()) };
+    let Some(kind) = kind else { return Ok(None) };
     let actor_id = get_u64("actor_id").map(Id::new);
     let status_id = get_u64("status_id").map(Id::new);
     let created_at_ms = get_u64("created_at_ms").unwrap_or_default();
 
     if actor_id == Some(recipient_id) {
-        return Ok(());
+        return Ok(None);
     }
-    store.create_notification(NewNotification {
+    let created = store.create_notification(NewNotification {
         recipient_id,
         r#type: kind,
         actor_id,
         status_id,
         created_at_ms,
     })?;
-    Ok(())
+    Ok(created.map(|notification| notification.id))
 }
 
 // ---------------------------------------------------------------------------

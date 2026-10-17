@@ -333,6 +333,9 @@ pub fn build_router(state: ApiState) -> Router {
             "/api/v1/scheduled_statuses/{id}",
             delete(endpoints::scheduled_statuses::destroy),
         )
+        // Streaming (Phase 5): SSE and WebSocket share one handler.
+        .route("/api/v1/streaming", get(crate::streaming::http::endpoint))
+        .route("/api/v1/streaming/{*any}", get(crate::streaming::http::endpoint))
         // Search (Phase 4: v2 only; v1 was removed upstream in Mastodon 3.0).
         .route("/api/v2/search", get(endpoints::search::index))
         // Custom emoji (Phase 4: public index).

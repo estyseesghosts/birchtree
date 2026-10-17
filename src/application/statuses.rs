@@ -14,7 +14,8 @@ use regex::Regex;
 
 use crate::application::accounts::host_from_url;
 use crate::application::ports::{
-    AccountStatusesQuery, NewPollSpec, NewQuoteSpec, NewStatus, PairState, StatusUpdate, Store,
+    AccountStatusesQuery, DeletedStatus, NewPollSpec, NewQuoteSpec, NewStatus, PairState,
+    StatusUpdate, Store,
 };
 use crate::application::policy;
 use crate::domain::account::normalize_username;
@@ -660,7 +661,12 @@ pub fn update_status(
 /// `DELETE /api/v1/statuses/:id` — tombstone a status, returning the
 /// pre-deletion record. Ownership lives in the store: missing, deleted and
 /// non-owned all answer `NotFound`.
-pub fn delete_status(store: &dyn Store, viewer: Id, status_id: Id, now_ms: u64) -> Result<Status> {
+pub fn delete_status(
+    store: &dyn Store,
+    viewer: Id,
+    status_id: Id,
+    now_ms: u64,
+) -> Result<DeletedStatus> {
     store.delete_status(status_id, viewer, now_ms)
 }
 

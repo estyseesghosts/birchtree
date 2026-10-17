@@ -19,7 +19,9 @@ use crate::api::mastodon::pagination;
 use crate::api::mastodon::ApiState;
 use crate::application::ports::Store;
 use crate::application::relationships;
-use crate::domain::{Account, AccountStats, Id};
+use crate::application::streaming::StreamEvent;
+use crate::application::timelines;
+use crate::domain::{Account, AccountStats, Id, Status};
 
 /// Scope alternatives for follow/unfollow/follow-request writes.
 const FOLLOW_SCOPES: &[&str] = &["follow", "write", "write:follows"];
@@ -113,7 +115,12 @@ pub async fn unfollow(
         Err(err) => return err.into_response(),
     };
     match relationships::unfollow(store, viewer, target.id, state.context.now_ms()) {
-        Ok(_) => relationship_response(&state, viewer, target.id),
+        Ok(removed) => {
+            if removed.is_some() {
+                publish_policy(&state, vec![viewer], None);
+            }
+            relationship_response(&state, viewer, target.id)
+        }
         Err(err) => ApiError::from(err).into_response(),
     }
 }
@@ -137,8 +144,44 @@ pub async fn remove_from_followers(
         Err(err) => return err.into_response(),
     };
     match relationships::remove_follower(store, viewer, follower.id, state.context.now_ms()) {
-        Ok(_) => relationship_response(&state, viewer, follower.id),
+        Ok(removed) => {
+            // The follower's home stream loses the viewer's statuses.
+            if removed.is_some() {
+                publish_policy(&state, vec![follower.id], None);
+            }
+            relationship_response(&state, viewer, follower.id)
+        }
         Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
+/// Publish a live policy change after its commit (see `StreamEvent::PolicyChanged`).
+/// A retraction follows the policy event, so its frames carry the new epoch.
+fn publish_policy(state: &ApiState, viewers: Vec<Id>, retraction: Option<(Id, Vec<Status>)>) {
+    state
+        .context
+        .streaming
+        .publish(StreamEvent::PolicyChanged { viewers });
+    if let Some((viewer, statuses)) = retraction {
+        if !statuses.is_empty() {
+            state
+                .context
+                .streaming
+                .publish(StreamEvent::Retract { viewer, statuses });
+        }
+    }
+}
+
+/// Statuses a block or mute of `target` removes from `viewer`'s open streams,
+/// read before the commit. A read error skips the retraction: the stale ids
+/// stay until the client reconnects; no new status is exposed.
+fn retractions(store: &dyn Store, viewer: Id, target: Id) -> Option<(Id, Vec<Status>)> {
+    match timelines::retraction_candidates(store, viewer, target) {
+        Ok(statuses) => Some((viewer, statuses)),
+        Err(err) => {
+            tracing::warn!(error = ?err, "retraction candidates unavailable");
+            None
+        }
     }
 }
 
@@ -169,15 +212,36 @@ async fn relationship_write(
 }
 
 /// `POST /api/v1/accounts/{id}/block`.
+///
+/// Live policy: the block unfollows both ways, so both sides' open streams drop
+/// the other's statuses. The blocker's open streams also drop the statuses a
+/// block removes from their feeds (upstream `clear_from_home`).
 pub async fn block(
     State(state): State<ApiState>,
     auth: Auth,
     Path(target): Path<String>,
 ) -> Response {
-    relationship_write(&state, auth, target, BLOCK_SCOPES, |store, viewer, target, now| {
-        relationships::block(store, viewer, target, now).map(|_| ())
-    })
-    .await
+    if let Err(err) = auth.0.require_scopes(BLOCK_SCOPES) {
+        return err.into_response();
+    }
+    let viewer = match auth.0.require_user() {
+        Ok(id) => id,
+        Err(err) => return err.into_response(),
+    };
+    let store: &dyn Store = &*state.context.store;
+    let target = match require_account(store, &target) {
+        Ok(account) => account,
+        Err(err) => return err.into_response(),
+    };
+    // Before the commit: the block unfollows, so the feed's authors change.
+    let retraction = retractions(store, viewer, target.id);
+    match relationships::block(store, viewer, target.id, state.context.now_ms()) {
+        Ok(_) => {
+            publish_policy(&state, vec![viewer, target.id], retraction);
+            relationship_response(&state, viewer, target.id)
+        }
+        Err(err) => ApiError::from(err).into_response(),
+    }
 }
 
 /// `POST /api/v1/accounts/{id}/unblock`.
@@ -218,6 +282,8 @@ pub async fn mute(
         .and_then(|raw| raw.parse::<u64>().ok())
         .unwrap_or(0);
     let hide_notifications = !forms::get(&pairs, "notifications").is_some_and(bool_cast);
+    // Before the commit, as for block.
+    let retraction = retractions(store, viewer, target.id);
     match relationships::mute(
         store,
         viewer,
@@ -226,7 +292,10 @@ pub async fn mute(
         hide_notifications,
         state.context.now_ms(),
     ) {
-        Ok(_) => relationship_response(&state, viewer, target.id),
+        Ok(_) => {
+            publish_policy(&state, vec![viewer], retraction);
+            relationship_response(&state, viewer, target.id)
+        }
         Err(err) => ApiError::from(err).into_response(),
     }
 }
@@ -554,7 +623,10 @@ pub async fn domain_blocks_create(
         .to_string();
     let store: &dyn Store = &*state.context.store;
     match relationships::domain_block(store, viewer, &domain, state.context.now_ms()) {
-        Ok(_) => axum::Json(serde_json::json!({})).into_response(),
+        Ok(_) => {
+            publish_policy(&state, vec![viewer], None);
+            axum::Json(serde_json::json!({})).into_response()
+        }
         Err(err) => ApiError::from(err).into_response(),
     }
 }

@@ -160,8 +160,8 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 | DELETE | `/api/v1/scheduled_statuses/:id` | user | write | implemented (Phase 4) | In | `200 {}`; the publish job becomes a no-op |
 | GET | `/api/v1/search` | — | — | out of profile (route absent in v4.7.3) | Out | removed upstream in Mastodon 3.0 (commit `18331fefa2`); only v2 exists in the pinned tag |
 | GET | `/api/v2/search` | optional | read:search | implemented (Phase 4) | In | local corpus only: accounts by handle/display name, hashtags by prefix, statuses by bounded recent scan (authenticated only, like `status_searchable?`); `resolve` without auth → pinned 401; `collections` always `[]`. Interim until the Phase 7.2 engine (see Search deviations) |
-| GET | `/api/v1/streaming` | user | read | planned (Phase 5) | In | SSE/WebSocket |
-| GET | `/api/v1/streaming/(*any)` | user | read | planned (Phase 5) | In | |
+| GET | `/api/v1/streaming` | user | read \| read:statuses (user:notification: read \| read:notifications) | implemented (Phase 5) | In | WebSocket upgrade (subscribe by `?stream=` or message; any path under the prefix). Without an upgrade, `/api/v1/streaming` alone has no channel and answers `400 Unknown channel requested`. Host redirect when `--streaming-url` names another host (`301`). Contract: `docs/streaming-contract.md` |
+| GET | `/api/v1/streaming/(*any)` | user | read \| read:statuses (user:notification: read \| read:notifications) | implemented (Phase 5) | In | SSE for `user`, `user/notification`, `public`, `public/local`, `public/remote` (`?only_media=true` for media), `hashtag`, `hashtag/local` (`?tag=`), `direct`, `list` (`?list=`); `GET …/health` answers `OK` unauthenticated. Refusals and texts: the contract. `direct` and `public/remote` are silent until Phases 7 and 6 (D18, D19) |
 
 ### Conversations (Phase 7)
 
@@ -366,7 +366,7 @@ Removed from this section in the 2026-10-17 re-scope: `annual_reports`, `announc
 - IDs: decimal strings on the wire, numeric ordering internally (§4 of `birchtree.md`).
 - Pagination: `Link` `next`/`prev` headers; cursors numeric `Id`s (status, account, interaction and domain-block row ids). Cursor values are opaque to clients; they are swapped in place and other query params are preserved. Trends use `offset`/`limit` instead (Phase 7.3).
 - Error shapes: `{"error": "..."}`; statuses 200/400/401/403/404/405?/422/429 where applicable. Two 404 bodies exist and are reproduced: `Not Found` (explicit `not_found`, status sub-routes) and `Record not found` (unrescued lookup, update/delete).
-- Rate-limit headers, streaming event envelopes (Phase 5).
+- Rate-limit headers. Streaming event envelopes (Phase 5, implemented): `event:`/`data:` over SSE, `{"stream","event","payload"}` over WebSocket; see `docs/streaming-contract.md`.
 - Deprecation headers: `Deprecation` (`@<unix timestamp>`) and, where upstream sets it, `Sunset`. Applies to `GET /api/v1/suggestions` and `GET /api/v1/trends` (Phase 7 / 7.3).
 - Async-refresh header: `Mastodon-Async-Refresh: id="…", retry=3[, result_count=N]` (Phase 6 remote thread completion; Phase 7 suggestions FASP path).
 - Idempotency: `Idempotency-Key` header on `POST /api/v1/statuses` only (1-hour retention, per-account scoping — matches Mastodon's `SETEX 3600` namespace). Other write endpoints are naturally idempotent (unique rows) instead.
@@ -428,6 +428,13 @@ Implemented 2026-10-17 (D10a, D10b, D11). Evidence: `tests/phase4_1_json_parity.
 - **Per-request account facts are capped at 2000 distinct accounts** (`ACCOUNT_CACHE_CAP`; was 500). The home follows fill the first 1000 entries, and reblog targets and reply parents use the rest, so a viewer at the home cap still sees reblogs of strangers. Past the cap, an unresolved account fails closed: its statuses are excluded, never shown. The store's author cap is 1001 (the viewer plus 1000 follows; was 500, which silently dropped the oldest follows).
 - **Remote accounts do not exist yet** (federation is Phase 6). `remote=true` is therefore only exercised as empty, and the domain-block rule is exercised through the local domain.
 - **`replies_policy=none` on lists** keeps only self-replies and replies to the viewer; `followed` keeps replies to followed parents; `list` keeps replies to members. Replies to the viewer pass under every policy.
+
+## Phase 5: streaming (honesty list)
+
+- **Source-derived, not run against upstream.** The stream names, scope rules, refusal texts, envelopes, heartbeat and redirect come from the pinned source (`streaming/index.js`, `streaming_controller.rb`, the fan-out and feed services at `8ff11c2b`). No live v4.7.3 instance was run: see the Phase 5 verification log.
+- **Birchtree-only refusals:** `429 Too many streaming connections for this token`, `503 Too many streaming connections`, `429 Too many streaming subscriptions` (D14).
+- **Not emitted:** `conversation`, `announcement`, `announcement.reaction`, `announcement.delete` (Phase 7), `notifications_merged` (D20), and `kill` on suspension or disablement (D24). `filters_changed` is never transmitted, as upstream never transmits it (no payload).
+- **Silent by design until their phases:** `direct` (D18), `public:remote` and `public:remote:media` (D19).
 
 ## Route inventory discrepancies and gaps (found 2026-10-17)
 

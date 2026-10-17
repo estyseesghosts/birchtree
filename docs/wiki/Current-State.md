@@ -1,7 +1,6 @@
 # Current state
 
-Status: 2026-10-17, Phase 4.1 (parity gap closure) implemented; Phase 5 (streaming) is next
-implemented (gate green); Phase 5 (streaming) next.
+Status: 2026-10-17, Phase 5 (streaming) implemented; Phase 6 (federation) is next. The §8 item 11 parity harness is not built or run (see `docs/phase-5-exit-criteria.md`, escalation E1).
 
 ## Implemented
 
@@ -114,10 +113,18 @@ Tests:
 - `POST /api/v1/lists` accepts `replies_policy` and `exclusive`, as upstream does.
 - Evidence: `docs/logs/2026-10-17-phase-4-1-verification.md`.
 
+## Phase 5 (streaming, implemented 2026-10-17)
+
+- SSE (`GET /api/v1/streaming/{channel}`) and WebSocket (any path under `/api/v1/streaming`, subscribe by `?stream=` or message) for `user`, `user:notification`, `public` (local, remote and media variants), `hashtag`, `hashtag:local`, `list`, and `direct` (accepted; silent until Phase 7). Events `update`, `status.update`, `delete`, `notification`.
+- Gates are the REST timeline policies (`application::timelines`), so streams and timelines share one policy. Live changes apply: block and mute retract the blocker's home and list statuses; block, mute, unfollow, remove-follower and domain block drop in-flight frames (policy epochs).
+- Bounds (D14): 512 connections (`503`), 16 per token (`429`), 16 subscriptions per WebSocket, 256 frames or 1 MiB per connection, a 30 s stall timeout, fail-closed overflow. Heartbeats: SSE `:thump` every 15 s, WebSocket ping every 30 s.
+- Host discovery: `urls.streaming` from the public URL, or `--streaming-url` (a `301` to a different configured host, D16).
+- Contract: `docs/streaming-contract.md`. Evidence: `docs/logs/2026-10-17-phase-5-verification.md`. Tests: `tests/phase5_streaming.rs` (31), `scripts/smoke-phase5.sh`.
+
 ## Not yet implemented
 
 - Phase 4 open items: see Known gaps below
-- Phase 5 streaming; Phase 6 federation (incl. remote quote requests, remote
+- Phase 6 federation (incl. remote quote requests, remote
   statuses, and remote thread completion)
 - Phase 7: account multi-fetch (`GET /api/v1/accounts`), account lookup/search,
   relation collection reads (`blocks`/`mutes`/`favourites`/`bookmarks`), tags, conversations, suggestions, announcements, donation
@@ -147,6 +154,8 @@ Tests:
   - Account-payload emoji arrays are `[]` until Phase 7
   - Planned, not code gaps: transcoding (Phase 7.1), search engine (Phase 7.2),
     admin/moderation API (Phase 7.3)
+- Phase 5 open items (register rows): `direct` and `public:remote` silent until Phases 7 and 6 (D18, D19); `notifications_merged` never sent (D20); `chosen_languages` filter not applied (D21); no `kill` on suspension until Phase 7.3 (D24)
+- Policy gaps shared with REST, escalated (decision needed): home ignores blocks and mutes on mentions (D22) and follow languages (D23); notifications from blocked or muted accounts are created (D26); hashtag normalization differs from upstream for accented tags (D25)
 - Details and the full deferral lists: `docs/phase-4-exit-criteria.md`,
   `docs/phase-3-exit-criteria.md` (plus `phase-2-exit-criteria.md`,
   `phase-1-exit-criteria.md`, and the still-open route-inventory review in

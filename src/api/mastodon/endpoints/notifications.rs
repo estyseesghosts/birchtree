@@ -14,7 +14,7 @@ use crate::api::mastodon::dto;
 use crate::api::mastodon::errors::ApiError;
 use crate::api::mastodon::pagination;
 use crate::api::mastodon::status_view::load_status_views;
-use crate::api::mastodon::ApiState;
+use crate::api::mastodon::{ApiState, ServerInfo};
 use crate::application::notifications::{
     self, COUNT_DEFAULT_LIMIT, COUNT_MAX_LIMIT, DEFAULT_LIMIT, MAX_LIMIT, NotificationQuery,
 };
@@ -124,7 +124,7 @@ pub async fn index(State(state): State<ApiState>, auth: Auth, uri: Uri) -> Respo
     }
     notifications.retain(|n| !excluded.contains(&n.r#type));
 
-    match render_notifications(&state, recipient, notifications) {
+    match render_notifications(&state.server, store, state.context.now_ms(), recipient, notifications) {
         Ok((body, first, last)) => {
             let mut response = axum::Json(body).into_response();
             if let Some(link) = pagination::link_header(&uri, last, first) {
@@ -142,13 +142,15 @@ pub async fn index(State(state): State<ApiState>, auth: Auth, uri: Uri) -> Respo
     }
 }
 
-/// Serialize a page of notifications (batched accounts + status views).
-fn render_notifications(
-    state: &ApiState,
+/// Render a page of notifications for `recipient` (shared by the REST index
+/// and the notification streams, so both show the same payloads).
+pub fn render_notifications(
+    server: &ServerInfo,
+    store: &dyn Store,
+    now_ms: u64,
     recipient: Id,
     notifications: Vec<crate::domain::Notification>,
 ) -> Result<(Vec<Value>, Option<Id>, Option<Id>), ApiError> {
-    let store: &dyn Store = &*state.context.store;
     let first = notifications.first().map(|n| n.id);
     let last = notifications.last().map(|n| n.id);
 
@@ -163,11 +165,11 @@ fn render_notifications(
     let status_ids: Vec<Id> = notifications.iter().filter_map(|n| n.status_id).collect();
     let statuses = store.statuses_by_ids(&status_ids)?;
     let mut views = load_status_views(
-        &state.server,
+        server,
         store,
         Some(recipient),
         statuses,
-        state.context.now_ms(),
+        now_ms,
     )?;
     // `filtered` annotation (filter v2): one batched match per page, every
     // active filter — matching Mastodon's relationships presenter.
@@ -176,7 +178,7 @@ fn render_notifications(
         store,
         recipient,
         &page,
-        state.context.now_ms(),
+        now_ms,
     )?;
     for view in &mut views {
         if let Some(entries) = matches.get(&view.status.id) {
@@ -188,9 +190,9 @@ fn render_notifications(
         .map(|view| {
             let id = view.status.id;
             let json = dto::status_json(
-                &state.server,
+                server,
                 Some(recipient),
-                state.context.now_ms(),
+                now_ms,
                 &view,
                 dto::StatusSourceMode::Content,
             );
@@ -203,7 +205,7 @@ fn render_notifications(
         let actor = notification.actor_id;
         let account = match actor.and_then(|actor| accounts.get(&actor)) {
             Some(account) => dto::account_json_with_stats(
-                &state.server,
+                server,
                 account,
                 actor.and_then(|actor| stats.get(&account_id_of(actor))),
             ),
@@ -238,7 +240,13 @@ pub async fn show(
     let store: &dyn Store = &*state.context.store;
     match notifications::show(store, recipient, id) {
         Ok(notification) => {
-            match render_notifications(&state, recipient, vec![notification]) {
+            match render_notifications(
+                &state.server,
+                store,
+                state.context.now_ms(),
+                recipient,
+                vec![notification],
+            ) {
                 Ok((mut body, _, _)) => axum::Json(body.pop().unwrap_or(Value::Null)).into_response(),
                 Err(err) => err.into_response(),
             }

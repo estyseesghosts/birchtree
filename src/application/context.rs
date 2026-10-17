@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::application::ports::{BlobStore, ContextDeps, Ports, Store};
+use crate::application::ports::{BlobStore, ContextDeps, Ports, Store, StreamingSink};
 use crate::domain::{Clock, IdGenerator};
 
 /// Dependency assembly only. No business logic lives here; use cases live in
@@ -12,6 +12,8 @@ pub struct Context {
     pub store: Arc<dyn Store>,
     /// Blob/object storage for media bytes and emoji images (Phase 4).
     pub blobs: Arc<dyn BlobStore>,
+    /// Post-commit publication to open streams (Phase 5).
+    pub streaming: Arc<dyn StreamingSink>,
 }
 
 impl Context {
@@ -20,11 +22,13 @@ impl Context {
         ids: Arc<dyn IdGenerator>,
         store: Arc<dyn Store>,
         blobs: Arc<dyn BlobStore>,
+        streaming: Arc<dyn StreamingSink>,
     ) -> Self {
         Self {
             deps: ContextDeps { clock, ids },
             store,
             blobs,
+            streaming,
         }
     }
 

@@ -134,9 +134,9 @@ pub fn publish_scheduled_job(
     scheduled_id: Id,
     base_url: &str,
     now_ms: u64,
-) -> Result<()> {
+) -> Result<Option<Id>> {
     let Some(row) = store.scheduled_by_id(scheduled_id)? else {
-        return Ok(()); // Already published (or deleted): no-op.
+        return Ok(None); // Already published (or deleted): no-op.
     };
     if row.scheduled_at_ms > now_ms {
         // Rescheduled after this job was armed: re-arm under a fresh job id.
@@ -149,7 +149,7 @@ pub fn publish_scheduled_job(
             row.scheduled_at_ms,
             now_ms,
         )?;
-        return Ok(());
+        return Ok(None);
     }
     // Mastodon destroys the row BEFORE publishing, so a crash mid-publish
     // never republishes; the media detach follows the same rule.
@@ -159,15 +159,15 @@ pub fn publish_scheduled_job(
         Ok(cmd) => cmd,
         Err(err) => {
             tracing::warn!(scheduled = %row.id, error = %err, "scheduled publish params invalid");
-            return Ok(());
+            return Ok(None);
         }
     };
     match statuses::create_status(store, base_url, now_ms, cmd) {
-        Ok(_) => Ok(()),
+        Ok(created) => Ok(Some(created.status.id)),
         Err(err) => {
             // `PublishScheduledStatusWorker` swallows validation failures.
             tracing::warn!(scheduled = %row.id, error = %err, "scheduled publish dropped");
-            Ok(())
+            Ok(None)
         }
     }
 }

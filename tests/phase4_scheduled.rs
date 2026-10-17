@@ -77,7 +77,7 @@ async fn user_token(srv: &TestServer, username: &str) -> String {
 fn run_jobs(srv: &TestServer, at_ms: u64) {
     let mail = birchtree::mail::LoggingMailSender::default();
     for job in srv.store.claim_due(at_ms, 64).unwrap() {
-        birchtree::jobs::handlers::handle(&job, &*srv.store, &mail, &*srv.blobs).unwrap();
+        birchtree::jobs::handlers::handle(&job, &*srv.store, &mail, &*srv.blobs, &birchtree::application::ports::NoStreaming).unwrap();
         srv.store.complete(job.id).unwrap();
     }
 }

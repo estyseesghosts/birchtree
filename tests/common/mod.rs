@@ -11,6 +11,7 @@ use birchtree::application::context::Context;
 use birchtree::config::Config;
 use birchtree::domain::{Account, Clock, IdGenerator, SystemClock, TimestampIdGenerator};
 use birchtree::persistence::redb::RedbStore;
+use birchtree::streaming::{Hub, Limits};
 use tower::ServiceExt;
 
 /// The public URL used by tests, so DTOs are deterministic.
@@ -69,6 +70,8 @@ pub struct TestServer {
     pub dir: tempfile::TempDir,
     pub store: Arc<RedbStore>,
     pub blobs: Arc<birchtree::media::blob_store::FsBlobStore>,
+    /// The streaming hub the router publishes to (also `context.streaming`).
+    pub streams: Hub,
     pub router: axum::Router,
 }
 
@@ -76,11 +79,22 @@ impl TestServer {
     /// Open a fresh server with the given registration policy.
     pub fn new(registration_open: bool) -> Self {
         let (dir, store) = temp_store();
-        let server = Self::assemble(dir, store, registration_open);
-        server
+        Self::assemble(dir, store, registration_open, Limits::default())
     }
 
-    fn assemble(dir: tempfile::TempDir, store: Arc<RedbStore>, registration_open: bool) -> Self {
+    /// Open a fresh server whose streaming hub uses `limits` (streaming tests
+    /// shorten the heartbeat and stall timers and tighten the caps).
+    pub fn with_limits(limits: Limits) -> Self {
+        let (dir, store) = temp_store();
+        Self::assemble(dir, store, false, limits)
+    }
+
+    fn assemble(
+        dir: tempfile::TempDir,
+        store: Arc<RedbStore>,
+        registration_open: bool,
+        limits: Limits,
+    ) -> Self {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let ids: Arc<dyn IdGenerator> =
             Arc::new(TimestampIdGenerator::new(Box::new(SystemClock)));
@@ -88,20 +102,34 @@ impl TestServer {
             birchtree::media::blob_store::FsBlobStore::open(dir.path().join("media"))
                 .expect("open blob store"),
         );
-        let context = Arc::new(Context::new(clock, ids, store.clone(), blobs.clone()));
         let cfg = Config {
             public_url: TEST_PUBLIC_URL.to_string(),
             registration_open,
             ..Config::default()
         };
         let server = Arc::new(ServerInfo::from_config(&cfg));
+        let streams = Hub::new(store.clone(), clock.clone(), server.clone(), limits);
+        let context = Arc::new(Context::new(
+            clock,
+            ids,
+            store.clone(),
+            blobs.clone(),
+            Arc::new(streams.clone()),
+        ));
         let router = build_router(ApiState {
             context,
             trusted_proxies: Arc::new(Vec::new()),
             max_body_size: 16 * 1024 * 1024,
             server,
+            streams: streams.clone(),
         });
-        Self { dir, store, blobs, router }
+        Self {
+            dir,
+            store,
+            blobs,
+            streams,
+            router,
+        }
     }
 }
 

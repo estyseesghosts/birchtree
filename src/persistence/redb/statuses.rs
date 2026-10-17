@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::application::notifications::fan_out_payload;
 use crate::application::ports::{
-    AccountStatusesQuery, CreatedStatus, NewStatus, StatusStore, StatusUpdate, StatusViewFlags,
+    AccountStatusesQuery, CreatedStatus, DeletedStatus, NewStatus, StatusStore, StatusUpdate,
+    StatusViewFlags,
 };
 use crate::domain::bookmark::Bookmark;
 use crate::domain::favourite::Favourite;
@@ -827,7 +828,7 @@ impl StatusStore for RedbStore {
         Ok(Some(status))
     }
 
-    fn delete_status(&self, id: Id, account_id: Id, now_ms: u64) -> Result<Status> {
+    fn delete_status(&self, id: Id, account_id: Id, now_ms: u64) -> Result<DeletedStatus> {
         let write = self.begin_write()?;
 
         let snapshot = read_status_txn(&write, id)?
@@ -848,7 +849,9 @@ impl StatusStore for RedbStore {
         }
 
         // Tombstone every reblog of this status and fix its author's counter.
+        // Each wrapper's pre-deletion snapshot is returned for streaming.
         let mut reblog_ids: Vec<Id> = Vec::new();
+        let mut cascaded: Vec<Status> = Vec::new();
         {
             let index = write.open_table(STATUS_REBLOG_INDEX)?;
             let lo = schema::pair_key(id.value(), 0);
@@ -868,6 +871,7 @@ impl StatusStore for RedbStore {
             if reblog.is_deleted() {
                 continue;
             }
+            cascaded.push(reblog.clone());
             reblog.deleted_at_ms = Some(now_ms);
             write_status_txn(&write, &reblog)?;
             let mut stats = read_stats_txn(&write, reblog.account_id)?;
@@ -911,7 +915,23 @@ impl StatusStore for RedbStore {
         write_stats_txn(&write, account_id, &stats)?;
 
         write.commit()?;
-        Ok(snapshot)
+        Ok(DeletedStatus {
+            status: snapshot,
+            reblogs: cascaded,
+        })
+    }
+
+    fn own_reblog(&self, account_id: Id, status_id: Id) -> Result<Option<Status>> {
+        let read = self.begin_read()?;
+        let reblog_id = {
+            let table = read.open_table(REBLOGS_BY_ACCOUNT)?;
+            let key = schema::pair_key(account_id.value(), status_id.value());
+            table.get(key.as_slice())?.map(|guard| Id::new(guard.value()))
+        };
+        let Some(reblog_id) = reblog_id else {
+            return Ok(None);
+        };
+        Ok(status_at(&read, reblog_id)?.filter(|s| !s.is_deleted()))
     }
 
     fn status_children(

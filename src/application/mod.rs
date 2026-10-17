@@ -20,3 +20,4 @@ pub mod lists;
 pub mod filters;
 pub mod instance;
 pub mod scheduled_statuses;
+pub mod streaming;

@@ -32,6 +32,76 @@ pub struct ServerInfo {
     pub registrations_open: bool,
     /// Streaming API base URL advertised to clients.
     pub streaming_url: String,
+    /// Streaming host configured separately from this server. Streaming paths
+    /// on this server redirect there when it differs (upstream's
+    /// `StreamingController`). `None` when streams are served here.
+    pub streaming_host: Option<StreamingHost>,
+}
+
+/// Host and optional explicit port of a separately configured streaming base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamingHost {
+    pub scheme: String,
+    pub host: String,
+    pub port: Option<u16>,
+}
+
+impl StreamingHost {
+    /// Parse a `ws`, `wss`, `http` or `https` base URL.
+    pub fn parse(base: &str) -> Option<Self> {
+        let (scheme, rest) = base.split_once("://")?;
+        let authority = rest.split('/').next()?;
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, port)) if !host.ends_with(']') => (host, port.parse::<u16>().ok()),
+            _ => (authority, None),
+        };
+        if host.is_empty() {
+            return None;
+        }
+        Some(Self {
+            scheme: scheme.to_ascii_lowercase(),
+            host: host.to_ascii_lowercase(),
+            port,
+        })
+    }
+
+    /// The effective port: the explicit one, else the scheme default. Upstream
+    /// compares against `80` regardless of scheme; the scheme default avoids a
+    /// redirect loop for `wss` on the default TLS port.
+    fn effective_port(&self) -> u16 {
+        self.port.unwrap_or(match self.scheme.as_str() {
+            "https" | "wss" => 443,
+            _ => 80,
+        })
+    }
+
+    /// Whether `other` names the same host and effective port.
+    pub fn same_origin(&self, other: &StreamingHost) -> bool {
+        self.host == other.host && self.effective_port() == other.effective_port()
+    }
+
+    /// Whether a request for `host` (its `Host` header value) on `scheme`
+    /// addresses this streaming host.
+    pub fn is_same_as(&self, request_host: &str, request_scheme: &str) -> bool {
+        let (host, port) = match request_host.rsplit_once(':') {
+            Some((host, port)) if !host.ends_with(']') => (host, port.parse::<u16>().ok()),
+            _ => (request_host, None),
+        };
+        let request_port = port.unwrap_or(match request_scheme {
+            "https" => 443,
+            _ => 80,
+        });
+        host.eq_ignore_ascii_case(&self.host) && request_port == self.effective_port()
+    }
+
+    /// `Location` for a redirect: the request's scheme and path, this host.
+    pub fn location(&self, request_scheme: &str, path_and_query: &str) -> String {
+        let authority = match self.port {
+            Some(port) => format!("{}:{port}", self.host),
+            None => self.host.clone(),
+        };
+        format!("{request_scheme}://{authority}{path_and_query}")
+    }
 }
 
 impl ServerInfo {
@@ -43,15 +113,23 @@ impl ServerInfo {
     /// Derive the static server facts from configuration.
     ///
     /// The streaming URL is derived from the public URL (`http` -> `ws`,
-    /// `https` -> `wss`) rather than configured separately.
+    /// `https` -> `wss`) unless `streaming_api_base_url` is configured.
     pub fn from_config(cfg: &crate::config::Config) -> Self {
         let public_url = cfg.normalized_public_url();
         let domain = crate::application::accounts::host_from_url(&public_url);
-        let streaming_url = match public_url.split_once("://") {
+        let derived_streaming_url = match public_url.split_once("://") {
             Some(("https", rest)) => format!("wss://{rest}"),
             Some(("http", rest)) => format!("ws://{rest}"),
             _ => public_url.clone(),
         };
+        let (streaming_url, streaming_host) = match &cfg.streaming_api_base_url {
+            Some(base) => (base.clone(), StreamingHost::parse(base)),
+            None => (derived_streaming_url, None),
+        };
+        // A configured base on this server's own origin needs no redirect.
+        let streaming_host = streaming_host.filter(|configured| {
+            StreamingHost::parse(&public_url).is_none_or(|public| !configured.same_origin(&public))
+        });
         Self {
             public_url,
             domain,
@@ -61,6 +139,7 @@ impl ServerInfo {
             site_contact_username: cfg.site_contact_username.clone(),
             registrations_open: cfg.registration_open,
             streaming_url,
+            streaming_host,
         }
     }
 }
@@ -73,4 +152,6 @@ pub struct ApiState {
     pub trusted_proxies: Arc<Vec<IpAddr>>,
     pub max_body_size: usize,
     pub server: Arc<ServerInfo>,
+    /// The streaming hub (Phase 5). The same hub is `context.streaming`.
+    pub streams: crate::streaming::Hub,
 }

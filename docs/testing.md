@@ -18,7 +18,7 @@ Required suites:
 10. Performance and abuse — high-degree graphs, sparse indexes, large/malformed bodies, upload exhaustion, slow hosts, retry storms.
 
 Gate: `bash scripts/smoke-all.sh` (`cargo check --all-targets` + `cargo test` +
-`scripts/smoke-phase{1,2,3,4}.sh`) green before claiming phase completion.
+`scripts/smoke-phase{1,2,3,4,5}.sh`) green before claiming phase completion.
 
 ## Implemented suites (Phase 1)
 
@@ -41,6 +41,14 @@ Gate: `bash scripts/smoke-all.sh` (`cargo check --all-targets` + `cargo test` +
 | Phase 3 relationships | `tests/phase3_relationships.rs` | follow lifecycle, blocks/mutes/notes/endorsements, relationship DTO, races |
 | Phase 3 interactions | `tests/phase3_interactions.rs` | favourites/bookmarks/reblogs/pins/polls/quotes, counters, idempotency |
 | Smoke | `scripts/smoke-phase2.sh`, `scripts/smoke-phase3.sh` | live-binary OAuth/registration and the core social loop |
+
+## Implemented suites (Phase 5)
+
+| Suite | File | Covers |
+|---|---|---|
+| Streaming protocol | `tests/phase5_streaming.rs` (31) | real sockets through the real router: refusals and texts (SSE and WebSocket), SSE headers, health, host redirect; each stream family (public, local, media, hashtag, hashtag/local, user, user:notification, list, direct, public:remote); edit, delete and mention edits; notifications from a job; block, mute and unfollow (retraction, live silence, blocked_by); WebSocket subscribe, unsubscribe, error frames and frame shape; revocation closes streams; caps (per token, total, per WebSocket); heartbeat; the unanswered-ping close; the queue bound; the policy epoch; overflow; the stall sweep; and the concurrent follow, unfollow, block and delete race (no leak after commit) |
+| Stream unit | `src/streaming/channels.rs`, `src/streaming/auth.rs` | SSE and WebSocket name parsing, parameters and refusals; channel ids and de-duplication keys; token precedence; scope families |
+| Smoke | `scripts/smoke-phase5.sh` | live binary: refusals, public create/edit/delete over `curl -N`, follow, delivery, block retraction and silence, notification, a stdlib WebSocket client (frame and refusal header), revocation → `SMOKE_PHASE5_OK` |
 
 ## Implemented suites (Phase 4)
 

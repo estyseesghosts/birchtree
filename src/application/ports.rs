@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::application::streaming::StreamEvent;
 use crate::domain::{
     AccessToken, Account, AccountNote, AccountStats, AuthorizationCode, Block, CustomEmoji,
     CustomFilter, DomainBlock, Endorsement, FilterKeyword, FilterStatus, Follow, Id, Job, JobKind,
@@ -289,6 +290,14 @@ pub struct CreatedStatus {
     pub replayed: bool,
 }
 
+/// A deletion's pre-deletion snapshots (see [`StatusStore::delete_status`]).
+#[derive(Debug, Clone)]
+pub struct DeletedStatus {
+    pub status: Status,
+    /// Reblog wrappers tombstoned by the same transaction.
+    pub reblogs: Vec<Status>,
+}
+
 /// Field-level edit patch (`PUT /api/v1/statuses/:id`). `None` = unchanged.
 #[derive(Debug, Clone, Default)]
 pub struct StatusUpdate {
@@ -354,8 +363,13 @@ pub trait StatusStore: Send + Sync {
 
     /// Tombstone a status in ONE transaction (tombstone + dependent reblogs +
     /// pin removal + parent/author counter fixes + follow-up job). Returns the
-    /// pre-deletion status. `NotFound` when missing, deleted, or not owned.
-    fn delete_status(&self, id: Id, account_id: Id, now_ms: u64) -> Result<Status>;
+    /// pre-deletion snapshots: the status and every reblog wrapper the cascade
+    /// tombstoned (streaming needs them to send `delete` events). `NotFound`
+    /// when missing, deleted, or not owned.
+    fn delete_status(&self, id: Id, account_id: Id, now_ms: u64) -> Result<DeletedStatus>;
+
+    /// The live reblog wrapper `account_id` created of `status_id`, if any.
+    fn own_reblog(&self, account_id: Id, status_id: Id) -> Result<Option<Status>>;
 
     /// Direct reply children of `parent_id`, newest first, cursor-bounded.
     fn status_children(
@@ -1170,6 +1184,24 @@ impl<T> Store for T where
         + TimelineStore
         + SearchStore
 {
+}
+
+/// Publishes committed changes to open streams (Phase 5).
+///
+/// Non-blocking. The hub's delivery runs on its own thread, so a slow client or
+/// a slow policy read never stalls the request that committed the change. If
+/// the hub's event queue overflows, the hub closes every open stream instead of
+/// dropping the event silently: clients reconnect and reread state.
+pub trait StreamingSink: Send + Sync {
+    fn publish(&self, event: StreamEvent);
+}
+
+/// A sink that discards events. Used where no streaming hub is assembled.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoStreaming;
+
+impl StreamingSink for NoStreaming {
+    fn publish(&self, _event: StreamEvent) {}
 }
 
 /// Snapshot of kernel dependencies assembled in `application::context`.

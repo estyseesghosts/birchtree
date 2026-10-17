@@ -22,12 +22,26 @@ fn app(max_body_size: usize) -> (tempfile::TempDir, axum::Router) {
         birchtree::media::blob_store::FsBlobStore::open(dir.path().join("media"))
             .expect("open blob store"),
     );
-    let context = Arc::new(Context::new(clock, ids, store, blobs));
+    let server = common::server_info();
+    let streams = birchtree::streaming::Hub::new(
+        store.clone(),
+        clock.clone(),
+        server.clone(),
+        birchtree::streaming::Limits::default(),
+    );
+    let context = Arc::new(Context::new(
+        clock,
+        ids,
+        store,
+        blobs,
+        Arc::new(streams.clone()),
+    ));
     let router = build_router(ApiState {
         context,
         trusted_proxies: Arc::new(Vec::new()),
         max_body_size,
-        server: common::server_info(),
+        server,
+        streams,
     });
     (dir, router)
 }
