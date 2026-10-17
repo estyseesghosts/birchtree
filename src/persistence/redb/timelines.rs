@@ -215,7 +215,8 @@ impl TimelineStore for RedbStore {
         for entry in entries {
             let (key, _value) = entry?;
             let bytes = key.value();
-            let id = Id::new(u64::from_be_bytes(bytes[tag.len() + 9..].try_into().unwrap()));
+            // Key is `tag || 0xFF || id_be`: the id starts after the separator.
+            let id = Id::new(u64::from_be_bytes(bytes[tag.len() + 1..].try_into().unwrap()));
             ids.push(id);
             if ids.len() >= HASHTAG_SCAN_CAP {
                 break;
