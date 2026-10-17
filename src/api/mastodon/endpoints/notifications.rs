@@ -65,12 +65,22 @@ pub async fn index(State(state): State<ApiState>, auth: Auth, uri: Uri) -> Respo
         Some(query) => forms::parse(query.as_bytes()),
         None => Vec::new(),
     };
+    // Mastodon `limit_param`: absent -> 20, else `min(abs(to_i), 40)` (so
+    // `limit=0` and non-numeric values yield an empty page). Cursors keep
+    // the shared numeric parsing.
+    let limit: usize = match forms::get(&pairs, "limit") {
+        None => DEFAULT_LIMIT,
+        Some(raw) => {
+            let value: i64 = raw.parse().unwrap_or(0);
+            (value.unsigned_abs() as usize).min(MAX_LIMIT)
+        }
+    };
     let page = match pagination::parse(
-        forms::get(&pairs, "limit"),
+        None,
         forms::get(&pairs, "max_id"),
         forms::get(&pairs, "since_id"),
         forms::get(&pairs, "min_id"),
-        DEFAULT_LIMIT,
+        limit,
         MAX_LIMIT,
     ) {
         Ok(page) => page,

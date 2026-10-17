@@ -26,10 +26,11 @@ use crate::domain::{
 
 use super::media::{check_attachable_txn, read_media_txn, write_media_txn};
 use super::schema::{
-    self, ACCOUNT_STATS, BOOKMARKS, BOOKMARKS_BY_STATUS, FAVOURITES, FAVOURITES_BY_STATUS,
-    HASHTAG_INDEX, IDEMPOTENCY, MENTIONS_BY_ACCOUNT, POLL_BY_STATUS, POLLS, POLL_VOTES, QUOTES,
-    QUOTES_BY_QUOTED, REBLOGS_BY_ACCOUNT, STATUSES, STATUS_AUTHOR_INDEX, STATUS_PARENT_INDEX,
-    STATUS_PINS, STATUS_REBLOG_INDEX, STATUS_VERSIONS,
+    self, ACCOUNTS, ACCOUNT_STATS, BOOKMARKS, BOOKMARKS_BY_STATUS, FAVOURITES,
+    FAVOURITES_BY_STATUS, HASHTAG_INDEX, IDEMPOTENCY, MENTIONS_BY_ACCOUNT, POLL_BY_STATUS, POLLS,
+    POLL_VOTES, QUOTES, QUOTES_BY_QUOTED, REBLOGS_BY_ACCOUNT, STATUSES, STATUS_AUTHOR_INDEX,
+    STATUS_PARENT_INDEX, STATUS_PINS, STATUS_REBLOG_INDEX, STATUS_VERSIONS, TIMELINE_LOCAL,
+    TIMELINE_PUBLIC,
 };
 use super::{decode, encode, RedbStore, StoreResult};
 
@@ -85,6 +86,41 @@ pub(super) fn write_status_txn(write: &WriteTransaction, status: &Status) -> Sto
             .as_slice(),
             status.id.value(),
         )?;
+    }
+    maintain_timeline_index(write, status)?;
+    Ok(())
+}
+
+/// Keep the public/local timeline ranges in step with a status write.
+///
+/// A status joins `TIMELINE_PUBLIC` when it is public and not deleted, and
+/// `TIMELINE_LOCAL` when its author's account row is local (localness comes
+/// from the author account inside the same transaction). Tombstones and
+/// non-public visibilities remove the entries; every step is idempotent, so
+/// the writer can be called for counter bumps and reblogs alike.
+fn maintain_timeline_index(write: &WriteTransaction, status: &Status) -> StoreResult<()> {
+    let desc = schema::desc_id(status.id.value());
+    {
+        let mut public = write.open_table(TIMELINE_PUBLIC)?;
+        let mut local = write.open_table(TIMELINE_LOCAL)?;
+        if status.is_deleted() || status.visibility != Visibility::Public {
+            public.remove(desc)?;
+            local.remove(desc)?;
+            return Ok(());
+        }
+        public.insert(desc, ())?;
+        // Author locality, read inside this transaction (the account row is
+        // small and always present for local statuses).
+        let accounts = write.open_table(ACCOUNTS)?;
+        let author_local = match accounts.get(status.account_id.value())? {
+            Some(guard) => decode::<crate::domain::Account>(guard.value())?.local,
+            None => false,
+        };
+        if author_local {
+            local.insert(desc, ())?;
+        } else {
+            local.remove(desc)?;
+        }
     }
     Ok(())
 }

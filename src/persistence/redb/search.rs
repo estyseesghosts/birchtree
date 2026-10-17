@@ -76,8 +76,11 @@ impl SearchStore for RedbStore {
             let (key, _value) = entry?;
             scanned += 1;
             let bytes = key.value();
-            let raw = String::from_utf8_lossy(bytes);
-            let tag = raw.split('\u{ff}').next().unwrap_or("").to_string();
+            // Key layout is `tag || 0xFF || status_id_be`; tags never contain
+            // 0xFF, so the first 0xFF byte ends the tag. Split on raw bytes —
+            // the id suffix is arbitrary binary, not UTF-8.
+            let end = bytes.iter().position(|&b| b == 0xFF).unwrap_or(bytes.len());
+            let tag = String::from_utf8_lossy(&bytes[..end]).to_string();
             if !tag.starts_with(prefix) {
                 // Past the prefix range (ascending keys).
                 break;

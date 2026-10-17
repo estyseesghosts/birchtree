@@ -54,7 +54,12 @@ pub async fn index(State(state): State<ApiState>, auth: OptionalAuth, uri: Uri) 
 
 /// `POST /api/v1/markers` — upsert `home[last_read_id]` /
 /// `notifications[last_read_id]`.
-pub async fn create(State(state): State<ApiState>, auth: Auth, uri: Uri) -> Response {
+pub async fn create(
+    State(state): State<ApiState>,
+    auth: Auth,
+    uri: Uri,
+    request_body: axum::body::Body,
+) -> Response {
     if let Err(err) = auth.0.require_scopes(&["write", "write:statuses"]) {
         return err.into_response();
     }
@@ -62,12 +67,15 @@ pub async fn create(State(state): State<ApiState>, auth: Auth, uri: Uri) -> Resp
         Ok(id) => id,
         Err(err) => return err.into_response(),
     };
-    let pairs = match uri.query() {
+    // Mastodon reads `home[last_read_id]`/`notifications[last_read_id]`
+    // params from the query string OR the form body; parse both.
+    let mut pairs = match uri.query() {
         Some(query) => forms::parse(query.as_bytes()),
         None => Vec::new(),
     };
-    // The handler also accepts the fields in a form body; markers are
-    // commonly posted empty-query with form params by clients.
+    if let Ok(body) = axum::body::to_bytes(request_body, 64 * 1024).await {
+        pairs.extend(forms::parse(&body));
+    }
     let mut updates: Vec<(String, Id, Option<u64>)> = Vec::new();
     for timeline in Marker::TIMELINES {
         let key = format!("{timeline}[last_read_id]");

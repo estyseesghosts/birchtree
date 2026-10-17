@@ -73,7 +73,9 @@ impl MarkerStore for RedbStore {
         let marker = Marker {
             timeline: timeline.to_string(),
             last_read_id,
-            lock_version: existing.as_ref().map_or(0, |m| m.lock_version + 1),
+            // Mastodon's find_or_create + update! leaves a fresh marker at
+            // lock_version 1 (create=0, then one update bump).
+            lock_version: existing.as_ref().map_or(1, |m| m.lock_version + 1),
             updated_at_ms: now_ms,
         };
         {
