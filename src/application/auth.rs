@@ -5,13 +5,16 @@
 
 use crate::application::crypto;
 use crate::application::ports::{
-    AccountStore, NewApp, NewSession, NewToken, OAuthStore, SessionStore,
+    AccountStore, NewApp, NewAuthCode, NewSession, NewToken, OAuthStore, SessionStore,
 };
 use crate::domain::account::normalize_username;
-use crate::domain::{AccessToken, Id, LocalUser, LoginSession, OAuthApplication, Result};
+use crate::domain::{AccessToken, Error, Id, LocalUser, LoginSession, OAuthApplication, Result};
 
 /// Default session lifetime for the OAuth approval flow (24h).
 pub const SESSION_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Authorization-code lifetime (Mastodon/Doorkeeper default: 10 minutes).
+pub const AUTH_CODE_TTL_MS: u64 = 10 * 60 * 1000;
 
 /// Verify a username/password pair for a local account.
 ///
@@ -113,5 +116,122 @@ pub fn create_login_session(
         now_ms,
         ttl_ms: SESSION_TTL_MS,
     })?;
+    Ok((plaintext, record))
+}
+
+/// Issue an app-only (client-credentials) token. `scopes` must already be
+/// validated against the application's registered scopes by the caller.
+pub fn issue_client_credentials_token(
+    store: &dyn OAuthStore,
+    app_id: Id,
+    scopes: Vec<String>,
+    now_ms: u64,
+) -> Result<(String, AccessToken)> {
+    let plaintext = crypto::random_token_hex(32);
+    let token_hash = crypto::sha256_hex(plaintext.as_bytes());
+    let record = store.issue_access_token(NewToken {
+        app_id,
+        user_id: None,
+        token_hash,
+        scopes,
+        now_ms,
+        expires_at_ms: None,
+    })?;
+    Ok((plaintext, record))
+}
+
+/// Issue a one-time authorization code bound to the user, app, redirect URI,
+/// granted scopes and PKCE challenge.
+#[allow(clippy::too_many_arguments)]
+pub fn create_authorization_code(
+    store: &dyn OAuthStore,
+    app_id: Id,
+    user_id: Id,
+    redirect_uri: String,
+    scopes: Vec<String>,
+    code_challenge: Option<String>,
+    code_challenge_method: Option<String>,
+    now_ms: u64,
+) -> Result<(String, crate::domain::AuthorizationCode)> {
+    let plaintext = crypto::random_token_hex(32);
+    let code_hash = crypto::sha256_hex(plaintext.as_bytes());
+    let record = store.create_authorization_code(NewAuthCode {
+        app_id,
+        user_id,
+        code_hash,
+        redirect_uri,
+        scopes,
+        code_challenge,
+        code_challenge_method,
+        now_ms,
+        ttl_ms: AUTH_CODE_TTL_MS,
+    })?;
+    Ok((plaintext, record))
+}
+
+/// Parameters supplied to the token endpoint for an authorization-code grant.
+pub struct CodeExchange<'a> {
+    pub code: &'a str,
+    pub redirect_uri: Option<&'a str>,
+    pub code_verifier: Option<&'a str>,
+}
+
+/// Redeem an authorization code for a user access token.
+///
+/// Enforces one-time use, expiry, app identity, exact redirect-URI matching and
+/// PKCE S256. Any failure is reported as `invalid_grant` (the token endpoint
+/// maps it to HTTP 400).
+pub fn exchange_authorization_code(
+    store: &dyn OAuthStore,
+    app: &OAuthApplication,
+    exchange: CodeExchange<'_>,
+    now_ms: u64,
+) -> Result<(String, AccessToken)> {
+    let Some(code) = store.authorization_code_by_plaintext(exchange.code)? else {
+        return Err(Error::InvalidInput("invalid_grant".into()));
+    };
+    if code.app_id != app.id || !code.is_redeemable_at(now_ms) {
+        return Err(Error::InvalidInput("invalid_grant".into()));
+    }
+
+    // Redirect URI: if supplied it must match the one used at authorization;
+    // if omitted, the app must have exactly one registered redirect URI.
+    match exchange.redirect_uri {
+        Some(uri) if uri == code.redirect_uri => {}
+        Some(_) => return Err(Error::InvalidInput("invalid_grant".into())),
+        None if app.redirect_uris.len() == 1 => {}
+        None => return Err(Error::InvalidInput("invalid_grant".into())),
+    }
+
+    // PKCE: required when the code carried a challenge; only S256 is accepted.
+    match code.code_challenge.as_deref() {
+        Some(challenge) => {
+            if code.code_challenge_method.as_deref() != Some("S256") {
+                return Err(Error::InvalidInput("invalid_grant".into()));
+            }
+            let Some(verifier) = exchange.code_verifier else {
+                return Err(Error::InvalidInput("invalid_grant".into()));
+            };
+            if !crypto::pkce_verify_s256(verifier, challenge) {
+                return Err(Error::InvalidInput("invalid_grant".into()));
+            }
+        }
+        None => {}
+    }
+
+    let plaintext = crypto::random_token_hex(32);
+    let token_hash = crypto::sha256_hex(plaintext.as_bytes());
+    let record = store.redeem_authorization_code(
+        exchange.code,
+        NewToken {
+            app_id: app.id,
+            user_id: Some(code.user_id),
+            token_hash,
+            scopes: code.scopes.clone(),
+            now_ms,
+            expires_at_ms: None,
+        },
+        now_ms,
+    )?;
     Ok((plaintext, record))
 }

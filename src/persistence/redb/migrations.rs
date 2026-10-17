@@ -8,8 +8,8 @@
 use redb::{Database, ReadableDatabase};
 
 use super::schema::{
-    self, ACCESS_TOKENS, ACCOUNTS, HANDLE_INDEX, JOBS, JOBS_INDEX, LOCAL_USERS, META, OAUTH_APPS,
-    SESSIONS,
+    self, ACCESS_TOKENS, ACCOUNTS, AUTHORIZATION_CODES, HANDLE_INDEX, JOBS, JOBS_INDEX, LOCAL_USERS,
+    META, OAUTH_APPS, SESSIONS,
 };
 use super::StoreError;
 
@@ -67,6 +67,11 @@ pub fn apply(db: &Database) -> Result<u64, StoreError> {
             let _ = write.open_table(SESSIONS)?;
             let _ = write.open_table(JOBS)?;
             let _ = write.open_table(JOBS_INDEX)?;
+        }
+
+        // Step v2: authorization codes for the authorization-code + PKCE grant.
+        if current < 2 {
+            let _ = write.open_table(AUTHORIZATION_CODES)?;
         }
 
         {

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Full gate for birchtree: cargo check all targets + cargo test + Phase 1 smoke.
+# Full gate for birchtree: cargo check all targets + cargo test + phase smokes.
 # Run before claiming phase-level completion.
 set -euo pipefail
 
@@ -13,5 +13,8 @@ cargo test
 
 echo "==> scripts/smoke-phase1.sh"
 bash scripts/smoke-phase1.sh
+
+echo "==> scripts/smoke-phase2.sh"
+bash scripts/smoke-phase2.sh
 
 echo "smoke-all: green"

@@ -44,6 +44,22 @@ pub fn random_token_hex(n: usize) -> String {
     hex::encode(buf)
 }
 
+/// PKCE `S256` challenge for a verifier: base64url(sha256(verifier)) without
+/// padding, matching RFC 7636 and Mastodon's `code_challenge_method=S256`.
+pub fn pkce_s256_challenge(verifier: &str) -> String {
+    use base64::Engine as _;
+    let digest = Sha256::digest(verifier.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+}
+
+/// Verify a PKCE `S256` verifier against a stored challenge (constant-time
+/// comparison is unnecessary here; the challenge is not a secret at rest).
+pub fn pkce_verify_s256(verifier: &str, challenge: &str) -> bool {
+    // `challenge` may include CORS/no padding variants; compare the canonical
+    // encoding only.
+    pkce_s256_challenge(verifier) == challenge
+}
+
 /// A fixed valid Argon2 hash used to equalize timing for unknown accounts.
 ///
 /// Verifying against this value costs the same as a real check, so a login
@@ -90,5 +106,15 @@ mod tests {
         assert_eq!(a.len(), 64);
         assert_ne!(a, b);
         assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn pkce_s256_matches_rfc7636_vector() {
+        // RFC 7636 Appendix B.
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+        assert_eq!(pkce_s256_challenge(verifier), challenge);
+        assert!(pkce_verify_s256(verifier, challenge));
+        assert!(!pkce_verify_s256("wrong-verifier", challenge));
     }
 }

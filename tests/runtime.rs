@@ -23,6 +23,7 @@ fn app(max_body_size: usize) -> (tempfile::TempDir, axum::Router) {
         context,
         trusted_proxies: Arc::new(Vec::new()),
         max_body_size,
+        server: common::server_info(),
     });
     (dir, router)
 }

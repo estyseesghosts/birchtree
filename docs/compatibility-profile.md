@@ -14,6 +14,23 @@ Mastodon **4.7.3** (API v7), commit `8ff11c2b`. The pinned tag and its changelog
 - **Federating:** not claimed in Phase 0/1. Two-server interop is a Phase 6 milestone.
 - **Declared API compatibility:** not claimed by default. Every endpoint in the chosen public profile must have a passing contract test or a documented intentional exclusion before compatibility is advertised (Phase 7 exit gate).
 
+## Implemented surface (Phase 2)
+
+- **OAuth:** `POST /api/v1/apps`, `GET`/`POST /oauth/authorize`,
+  `POST /oauth/token` (`authorization_code` + PKCE S256, `client_credentials`),
+  `POST /oauth/revoke`. Tokens are non-expiring; `refresh_token` is
+  `unsupported_grant_type`.
+- **Registration/accounts:** `POST /api/v1/accounts` (app-only token required;
+  open/closed policy), `GET /api/v1/accounts/{id}`,
+  `GET /api/v1/accounts/verify_credentials`,
+  `PATCH /api/v1/accounts/update_credentials`,
+  `GET /api/v1/accounts/relationships`.
+- **Discovery/settings:** `GET /api/v1/instance`, `GET /api/v2/instance`,
+  `GET /api/v1/preferences`.
+- Not yet implemented (documented exclusions, see `phase-2-exit-criteria.md`):
+  email-confirmation enforcement, invite/approval registration modes,
+  account lookup/search, paginated reads, media serving, metrics.
+
 ## Exclusions (explicit, not implied gaps)
 
 - Admin API, moderation dashboard, and full Mastodon web UI: explicitly out of scope until separately scoped.

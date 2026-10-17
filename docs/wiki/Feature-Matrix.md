@@ -1,12 +1,14 @@
 # Feature matrix
 
-Status: in progress (filled in as phases exit). Phase 1 (runtime/`redb`/IDs/
-bootstrap) landed; no Mastodon REST endpoint is exposed yet, so user-facing rows
-stay `planned` until their phase.
+Status: in progress (filled in as phases exit). Phases 1–2 (runtime/`redb`/IDs/
+bootstrap + OAuth, registration and read APIs) landed; later-phase user-facing
+rows stay `planned` until their phase.
 
 | Feature | Mastodon 4.7.3 | birchtree | Status |
 |---|---|---|---|
-| Account registration + OAuth (auth-code, PKCE S256, client-credentials) | yes | — | planned (Phase 1: account/user records, Argon2 credentials, OAuth app + token records, login session; endpoints Phase 2) |
+| Account registration + OAuth (auth-code, PKCE S256, client-credentials) | yes | partial | implemented (Phase 2: app registration, authorize/consent, token/revoke, registration policy open/closed, scopes; email confirmation not enforced, invite/approval modes pending) |
+| Instance discovery + preferences | yes | partial | implemented (Phase 2: `/api/v1/instance`, `/api/v2/instance`, `/api/v1/preferences`) |
+| Account read/update DTOs + relationships (read) | yes | partial | implemented (Phase 2: show, verify/update credentials, relationships; lookup/search and collections pending) |
 | Statuses: create/read/edit/delete, source, context, history | yes | — | planned |
 | Visibility: public/unlisted/private/direct | yes | — | planned |
 | Quotes: state machine, policy, revocation | yes | — | planned |

@@ -20,6 +20,14 @@ pub struct Config {
     /// Whether new account registration is open. Phase 1 keeps this closed;
     /// the CLI bootstrap is always available.
     pub registration_open: bool,
+    /// Instance title shown by `/api/v1/instance` and `/api/v2/instance`.
+    pub site_title: String,
+    /// Instance description.
+    pub site_description: String,
+    /// Contact address advertised by the instance endpoints.
+    pub site_contact_email: String,
+    /// Contact account handle (`username`, local), if configured.
+    pub site_contact_username: Option<String>,
 }
 
 impl Default for Config {
@@ -33,6 +41,10 @@ impl Default for Config {
             max_body_size: 16 * 1024 * 1024,
             worker_poll_interval: Duration::from_millis(250),
             registration_open: false,
+            site_title: "Birchtree".to_string(),
+            site_description: "A Mastodon-compatible server".to_string(),
+            site_contact_email: "admin@localhost".to_string(),
+            site_contact_username: None,
         }
     }
 }

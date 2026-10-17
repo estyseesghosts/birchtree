@@ -6,7 +6,7 @@ Per `birchtree.md` §9, Phases 0–8.
 |---|---|---|
 | 0 | Freeze source contracts; initialize crate | mostly done (route-inventory review open) |
 | 1 | Runtime, `redb`, IDs, configuration, CLI bootstrap | implemented (gate green) |
-| 2 | OAuth, registration, exact read APIs | planned |
+| 2 | OAuth, registration, exact read APIs | implemented (gate green) |
 | 3 | Local statuses, relationships, interaction semantics | planned |
 | 4 | Media, timelines, notifications, client usability | planned |
 | 5 | Streaming (SSE + WebSocket) | planned |

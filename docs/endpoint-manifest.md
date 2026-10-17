@@ -4,7 +4,7 @@ Status: Draft
 
 Route inventory from Mastodon v4.7.3 `config/routes/api.rb` (commit `8ff11c2b`), cross-checked against the public API docs where practical. One manifest row per method/path. Profile column: `In` = in the declared Phase 0/1+ compatibility profile, `Out` = explicitly excluded (admin/moderation, legacy, experimental, or not yet scoped), `Plan` = planned for a later phase.
 
-Auth scopes are Mastodon conventions from the source/docs; they are enforced centrally in Phase 2+, not yet implemented here.
+Auth scopes are Mastodon conventions from the source/docs. They are enforced centrally (Phase 2) at the route boundary: a missing/invalid token yields `401 {"error":"The access token is invalid"}`, an insufficient scope yields `403 {"error":"This action is outside the authorized scopes"}`, and a user endpoint reached with an app-only token yields `422 {"error":"This method requires an authenticated user"}` (or `403 {"error":"This method requires an client credentials authentication"}` for the reverse case on registration).
 
 ## OAuth / discovery (public, not in config/routes/api.rb)
 
@@ -13,22 +13,23 @@ Auth scopes are Mastodon conventions from the source/docs; they are enforced cen
 | GET | `/.well-known/webfinger` | none | — | planned | Plan | WebFinger `acct:` resolution (Phase 6) |
 | GET | `/.well-known/nodeinfo` | none | — | planned | Plan | NodeInfo discovery (Phase 6) |
 | GET | `/nodeinfo/2.0` | none | — | planned | Plan | NodeInfo 2.0 document (Phase 6) |
-| GET/POST | `/oauth/authorize` | session | — | planned | Plan | Doorkeeper authorize; consent page rendered server-side |
-| POST | `/oauth/token` | basic/client | — | planned | Plan | Token issue (auth-code + client-credentials) |
-| POST | `/oauth/revoke` | basic/client | — | planned | Plan | Token revocation |
+| GET/POST | `/oauth/authorize` | session | — | implemented | In | Doorkeeper authorize; login + consent rendered server-side (Phase 2) |
+| POST | `/oauth/token` | basic/client | — | implemented | In | `authorization_code` (PKCE S256) + `client_credentials` (Phase 2) |
+| POST | `/oauth/revoke` | basic/client | — | implemented | In | Always `200 {}`; wrong client `403 unauthorized_client` (Phase 2) |
 
 ## v1 REST API (from `config/routes/api.rb`)
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| GET | `/api/v1/instance` | optional | read | stubbed | In | instance discovery needed by clients |
-| GET | `/api/v2/instance` | optional | read | stubbed | In | instance discovery v2 |
-| GET | `/api/v1/accounts/verify_credentials` | user | read | stubbed | In | |
-| PATCH | `/api/v1/accounts/update_credentials` | user | write | stubbed | In | incl. `source[quote_policy]` |
+| GET | `/api/v1/instance` | none | — | implemented | In | instance discovery, `REST::V1::InstanceSerializer` (Phase 2) |
+| GET | `/api/v2/instance` | none | — | implemented | In | instance discovery v2, `REST::InstanceSerializer` (Phase 2) |
+| POST | `/api/v1/accounts` | app | write \| write:accounts | implemented | In | registration; returns a user token (Phase 2) |
+| GET | `/api/v1/accounts/verify_credentials` | user | profile \| read \| read:accounts | implemented | In | `CredentialAccountSerializer` (Phase 2) |
+| PATCH | `/api/v1/accounts/update_credentials` | user | write \| write:accounts | implemented | In | incl. `source[quote_policy]` (Phase 2) |
 | GET | `/api/v1/accounts/lookup` | user | read | stubbed | In | acct → account resolution |
 | GET | `/api/v1/accounts/search` | user | read | stubbed | In | |
-| GET | `/api/v1/accounts/relationships` | user | read | stubbed | In | |
-| GET | `/api/v1/accounts/:id` | optional | read | stubbed | In | |
+| GET | `/api/v1/accounts/relationships` | user | read \| read:follows | implemented | In | Phase 2 (neutral defaults) |
+| GET | `/api/v1/accounts/:id` | none | — | implemented | In | public profile (Phase 2) |
 | GET | `/api/v1/accounts/:id/statuses` | optional | read | stubbed | In | |
 | GET | `/api/v1/accounts/:id/followers` | optional | read | stubbed | In | |
 | GET | `/api/v1/accounts/:id/following` | optional | read | stubbed | In | |
@@ -39,7 +40,7 @@ Auth scopes are Mastodon conventions from the source/docs; they are enforced cen
 | POST | `/api/v1/accounts/:id/mute` | user | write | stubbed | In | |
 | POST | `/api/v1/accounts/:id/unmute` | user | write | stubbed | In | |
 | POST | `/api/v1/accounts/:id/remove_from_followers` | user | write | stubbed | In | |
-| POST | `/api/v1/apps` | user | — | stubbed | In | app registration; also client-credentials source |
+| POST | `/api/v1/apps` | none | — | implemented | In | app registration; returns `client_secret` once (Phase 2) |
 | GET | `/api/v1/apps/verify_credentials` | app | — | stubbed | In | |
 | GET | `/api/v1/statuses/:id` | optional | read | stubbed | In | |
 | POST | `/api/v1/statuses` | user | write | stubbed | In | incl. `quoted_status_id`/`quote_approval_policy` |
@@ -76,7 +77,7 @@ Auth scopes are Mastodon conventions from the source/docs; they are enforced cen
 | POST | `/api/v1/notifications/clear` | user | write | stubbed | In | |
 | GET | `/api/v1/notifications/unread_count` | user | read:notifications | stubbed | In | |
 | POST | `/api/v1/notifications/:id/dismiss` | user | write | stubbed | In | |
-| GET | `/api/v1/preferences` | user | read | stubbed | In | incl. quote-policy defaults |
+| GET | `/api/v1/preferences` | user | read \| read:accounts | implemented | In | incl. quote-policy defaults (Phase 2) |
 | GET | `/api/v1/filters` | user | read | stubbed | Plan | Phase 7 |
 | POST | `/api/v1/filters` | user | write | stubbed | Plan | Phase 7 |
 | GET | `/api/v1/filters/:id` | user | read | stubbed | Plan | Phase 7 |

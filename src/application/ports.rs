@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use crate::domain::{
-    AccessToken, Account, Id, Job, JobKind, LocalUser, LoginSession, OAuthApplication, Result,
+    AccessToken, Account, AuthorizationCode, Id, Job, JobKind, LocalUser, LoginSession,
+    OAuthApplication, Result,
 };
 
 // Re-export the two kernel ports under their canonical names.
@@ -19,6 +20,10 @@ pub struct NewLocalAccount {
     pub email: Option<String>,
     pub actor_uri: String,
     pub now_ms: u64,
+    /// When true, a `SendConfirmationEmail` job is committed in the same
+    /// transaction as the account (public registration). The CLI bootstrap
+    /// leaves this false.
+    pub send_confirmation_email: bool,
 }
 
 /// Input for registering an OAuth application.
@@ -42,6 +47,19 @@ pub struct NewToken {
     pub expires_at_ms: Option<u64>,
 }
 
+/// Input for creating an OAuth authorization code (hash only).
+pub struct NewAuthCode {
+    pub app_id: Id,
+    pub user_id: Id,
+    pub code_hash: String,
+    pub redirect_uri: String,
+    pub scopes: Vec<String>,
+    pub code_challenge: Option<String>,
+    pub code_challenge_method: Option<String>,
+    pub now_ms: u64,
+    pub ttl_ms: u64,
+}
+
 /// Input for creating a login session.
 pub struct NewSession {
     pub user_id: Id,
@@ -50,9 +68,33 @@ pub struct NewSession {
     pub ttl_ms: u64,
 }
 
+/// Mutable subset of a user's preferences (`PATCH update_credentials`).
+///
+/// `None` fields are left unchanged.
+#[derive(Debug, Default, Clone)]
+pub struct UserSettingsUpdate {
+    pub default_privacy: Option<String>,
+    pub default_sensitive: Option<bool>,
+    pub default_language: Option<String>,
+    pub default_quote_policy: Option<String>,
+}
+
+/// Mutable subset of an account profile (`PATCH update_credentials`).
+///
+/// `None` fields are left unchanged.
+#[derive(Debug, Default, Clone)]
+pub struct AccountProfileUpdate {
+    pub display_name: Option<String>,
+    pub note: Option<String>,
+    pub locked: Option<bool>,
+    pub discoverable: Option<bool>,
+    pub indexable: Option<bool>,
+    pub hide_collections: Option<bool>,
+}
+
 /// Accounts, local users, and the unique handle index.
 pub trait AccountStore: Send + Sync {
-    /// Create an account + credential + handle index entry + follow-up job in
+    /// Create an account + credential + handle index entry + follow-up job(s) in
     /// one atomic transaction.
     fn create_local_account(&self, input: NewLocalAccount) -> Result<Account>;
 
@@ -69,15 +111,40 @@ pub trait AccountStore: Send + Sync {
     ) -> Result<Option<LocalUser>>;
 
     fn account_count(&self) -> Result<u64>;
+
+    /// Apply a profile patch, returning the updated account.
+    fn update_account_profile(
+        &self,
+        account_id: Id,
+        update: AccountProfileUpdate,
+    ) -> Result<Account>;
+
+    /// Apply a preferences patch, returning the updated credential record.
+    fn update_user_settings(&self, account_id: Id, update: UserSettingsUpdate) -> Result<LocalUser>;
 }
 
-/// OAuth applications and access tokens.
+/// OAuth applications, authorization codes and access tokens.
 pub trait OAuthStore: Send + Sync {
     fn register_app(&self, input: NewApp) -> Result<OAuthApplication>;
     fn app_by_client_id(&self, client_id: &str) -> Result<Option<OAuthApplication>>;
+    /// Resolve an application by its numeric id (used to attach the owning app
+    /// to an access token).
+    fn app_by_id(&self, id: Id) -> Result<Option<OAuthApplication>>;
     fn issue_access_token(&self, input: NewToken) -> Result<AccessToken>;
     fn token_by_plaintext(&self, plaintext: &str) -> Result<Option<AccessToken>>;
     fn revoke_token(&self, plaintext: &str) -> Result<bool>;
+
+    fn create_authorization_code(&self, input: NewAuthCode) -> Result<AuthorizationCode>;
+    fn authorization_code_by_plaintext(&self, plaintext: &str) -> Result<Option<AuthorizationCode>>;
+    /// Atomically mark the code used and issue its token. Returns an error if
+    /// the code is missing, already used, or expired — so a replay can never
+    /// mint a second token.
+    fn redeem_authorization_code(
+        &self,
+        plaintext: &str,
+        token: NewToken,
+        now_ms: u64,
+    ) -> Result<AccessToken>;
 }
 
 /// Server-side login sessions for the OAuth approval flow.
@@ -85,6 +152,13 @@ pub trait SessionStore: Send + Sync {
     fn create_session(&self, input: NewSession) -> Result<LoginSession>;
     fn session_by_plaintext(&self, plaintext: &str) -> Result<Option<LoginSession>>;
     fn revoke_session(&self, plaintext: &str) -> Result<bool>;
+}
+
+/// Outbound mail (verification messages). An adapter/job boundary: mail is
+/// never sent inside a request transaction.
+pub trait MailSender: Send + Sync {
+    /// Send an email-confirmation message for a newly registered account.
+    fn send_confirmation(&self, to: &str, account_id: Id, token: &str) -> Result<()>;
 }
 
 /// Durable job queue.

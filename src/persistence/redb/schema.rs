@@ -25,6 +25,10 @@ pub const OAUTH_APPS: TableDefinition<&str, &[u8]> = TableDefinition::new("oauth
 /// Access tokens by hex-encoded SHA-256 token hash.
 pub const ACCESS_TOKENS: TableDefinition<&str, &[u8]> = TableDefinition::new("access_tokens");
 
+/// OAuth authorization codes by hex-encoded SHA-256 code hash (schema v2).
+pub const AUTHORIZATION_CODES: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("authorization_codes");
+
 /// Login sessions by hex-encoded SHA-256 session-token hash.
 pub const SESSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("sessions");
 
@@ -42,7 +46,7 @@ pub const JOBS_INDEX: TableDefinition<&[u8], u64> = TableDefinition::new("jobs_i
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// Current schema version. Bump with a new migration step.
-pub const SCHEMA_VERSION: u64 = 1;
+pub const SCHEMA_VERSION: u64 = 2;
 
 /// All table names, for diagnostics and migration verification.
 pub const TABLE_NAMES: &[&str] = &[
@@ -52,6 +56,7 @@ pub const TABLE_NAMES: &[&str] = &[
     "local_users",
     "oauth_apps",
     "access_tokens",
+    "authorization_codes",
     "sessions",
     "jobs",
     "jobs_index",

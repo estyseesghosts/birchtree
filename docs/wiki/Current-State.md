@@ -1,7 +1,7 @@
 # Current state
 
-Status: 2026-10-16, Phase 1 (runtime, `redb`, IDs, configuration, bootstrap)
-implemented; Phase 2 not started.
+Status: 2026-10-16, Phase 2 (OAuth, registration, exact read APIs) implemented;
+Phase 3 not started.
 
 ## Implemented
 
@@ -19,7 +19,7 @@ Runtime (Phase 1):
 - Configuration validation (public URL, data dir, body/upload bounds, poll interval)
 - Data-dir path permissions (`0700`; world-writable dirs refused)
 - Request body limits and trusted-proxy client-IP handling
-- CLI: `serve`, `check-config`, `create-account` (plus test-only `crash-harness`)
+- CLI: `serve`, `create-account` (plus test-only `crash-harness`)
 
 IDs and clock (Phase 1):
 
@@ -37,32 +37,46 @@ Storage and jobs (Phase 1):
   create writes account + handle index + credential + `UserCreated` job)
 - Durable job envelope with due/lease index, retry backoff, quarantine; in-process worker
 
-Accounts, credentials, OAuth records (Phase 1):
+OAuth, registration and read APIs (Phase 2):
 
-- Accounts + local users; Argon2 password hashing with constant-time verification
-- Basic login session for OAuth approval (hashed session tokens, 24h TTL)
-- OAuth application registration records and hashed access tokens
-- Registration defaults closed; no public signup/UI beyond what OAuth requires
+- `POST /api/v1/apps` — app registration, one-time client secret
+- `GET`/`POST /oauth/authorize` — server-rendered login + consent, session cookie
+- `POST /oauth/token` — `authorization_code` (PKCE S256) and `client_credentials`
+- `POST /oauth/revoke`
+- `POST /api/v1/accounts` — registration gated by policy, returns a user token;
+  requires an app-only token (Mastodon semantics)
+- `GET /api/v1/accounts/{id}`, `GET /api/v1/accounts/verify_credentials`,
+  `PATCH /api/v1/accounts/update_credentials` (incl. `source[quote_policy]`),
+  `GET /api/v1/accounts/relationships`
+- `GET /api/v1/instance`, `GET /api/v2/instance`, `GET /api/v1/preferences`
+- Scope enforcement (broad OR granular), Mastodon error shapes, rate-limit
+  headers, `Auth`/`OptionalAuth` extractors, numeric-cursor pagination widget
+- Schema **v2**: `authorization_codes` table; one-transaction
+  redeem-and-issue; `SendConfirmationEmail` job committed with registration
 
 Tests:
 
-- `cargo test` — **45 passed, 0 failed** (29 unit + 3 `crash_recovery` + 10
-  `persistence_conformance` + 3 `runtime` + 3 `secret_handling`)
-- `scripts/smoke-phase1.sh` — live binary → `SMOKE_OK` (health/ready/404,
-  graceful shutdown, CLI create-account, restart durability, worker handled job)
+- `cargo test` — **93 passed, 0 failed** (45 unit + 3 `crash_recovery` + 13
+  `persistence_conformance` + 3 `runtime` + 3 `secret_handling` + 13
+  `phase2_oauth` + 13 `phase2_api`)
+- `scripts/smoke-phase1.sh` — live binary → `SMOKE_OK`
+- `scripts/smoke-phase2.sh` — live app registration → PKCE → user token → revoke
+  → `SMOKE_PHASE2_OK`
 
 ## Not yet implemented
 
-- All Mastodon REST endpoints: OAuth (`/api/v1/apps`, token), instance discovery,
-  accounts, statuses, timelines, notifications, media, streaming, federation —
-  every unmapped route is explicitly out of profile (404), not a success-shaped stub
+- Phase 3+ REST endpoints: statuses, timelines, notifications, media, streaming,
+  federation, lookup/search, paginated account collections — every unmapped
+  route is explicitly out of profile (404), not a success-shaped stub
+- Email-confirmation enforcement (no SMTP transport; `MailSender` is a logging
+  adapter and endpoints do not gate on `email_verified`)
+- Invite/approval registration modes (only open/closed is modeled)
+- `discoverable`/`indexable`/`hide_collections` persistence (accepted, not stored)
 - Metrics endpoint (deferred to Phase 8)
-- HTTP cursor/`Link` headers and query-bound parsing (Phase 2+)
-- Email verification, MFA, password reset (Phase 2)
-- Media/blob storage and processing jobs (Phase 4/6)
 
 ## Known gaps
 
-Everything in `birchtree.md` Phases 2–8. See `docs/phase-1-exit-criteria.md`
-(complete, with explicit deferrals) and `docs/phase-0-exit-criteria.md` for the
+Everything in `birchtree.md` Phases 3–8. See
+`docs/phase-2-exit-criteria.md` (complete, with explicit deferrals),
+`docs/phase-1-exit-criteria.md`, and `docs/phase-0-exit-criteria.md` for the
 still-open route-inventory review against the pinned Mastodon source.

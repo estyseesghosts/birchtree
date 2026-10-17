@@ -3,10 +3,14 @@
 use redb::{ReadableDatabase, ReadableTable};
 
 use crate::application::crypto::sha256_hex;
-use crate::application::ports::{NewApp, NewSession, NewToken, OAuthStore, SessionStore};
-use crate::domain::{AccessToken, Error, LoginSession, OAuthApplication, Result};
+use crate::application::ports::{
+    NewApp, NewAuthCode, NewSession, NewToken, OAuthStore, SessionStore,
+};
+use crate::domain::{
+    AccessToken, AuthorizationCode, Error, Id, LoginSession, OAuthApplication, Result,
+};
 
-use super::schema::{ACCESS_TOKENS, OAUTH_APPS, SESSIONS};
+use super::schema::{ACCESS_TOKENS, AUTHORIZATION_CODES, OAUTH_APPS, SESSIONS};
 use super::{decode, encode, RedbStore};
 
 impl OAuthStore for RedbStore {
@@ -47,6 +51,21 @@ impl OAuthStore for RedbStore {
             Some(guard) => Ok(Some(decode(guard.value())?)),
             None => Ok(None),
         }
+    }
+
+    fn app_by_id(&self, id: Id) -> Result<Option<OAuthApplication>> {
+        // Applications are few; a bounded scan is acceptable. (An id index can
+        // replace this if the app table ever grows large.)
+        let read = self.db().begin_read()?;
+        let apps = read.open_table(OAUTH_APPS)?;
+        for entry in apps.iter()? {
+            let (_key, value) = entry?;
+            let app: OAuthApplication = decode(value.value())?;
+            if app.id == id {
+                return Ok(Some(app));
+            }
+        }
+        Ok(None)
     }
 
     fn issue_access_token(&self, input: NewToken) -> Result<AccessToken> {
@@ -99,6 +118,84 @@ impl OAuthStore for RedbStore {
         }
         write.commit()?;
         Ok(true)
+    }
+
+    fn create_authorization_code(&self, input: NewAuthCode) -> Result<AuthorizationCode> {
+        let code = AuthorizationCode {
+            id: self.next_id(),
+            code_hash: input.code_hash,
+            app_id: input.app_id,
+            user_id: input.user_id,
+            redirect_uri: input.redirect_uri,
+            scopes: input.scopes,
+            code_challenge: input.code_challenge,
+            code_challenge_method: input.code_challenge_method,
+            created_at_ms: input.now_ms,
+            expires_at_ms: input.now_ms + input.ttl_ms,
+            used: false,
+        };
+        let write = self.db().begin_write()?;
+        {
+            let mut codes = write.open_table(AUTHORIZATION_CODES)?;
+            codes.insert(code.code_hash.as_str(), encode(&code)?.as_slice())?;
+        }
+        write.commit()?;
+        Ok(code)
+    }
+
+    fn authorization_code_by_plaintext(&self, plaintext: &str) -> Result<Option<AuthorizationCode>> {
+        let hash = sha256_hex(plaintext.as_bytes());
+        let read = self.db().begin_read()?;
+        let codes = read.open_table(AUTHORIZATION_CODES)?;
+        match codes.get(hash.as_str())? {
+            Some(guard) => Ok(Some(decode(guard.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn redeem_authorization_code(
+        &self,
+        plaintext: &str,
+        token: NewToken,
+        now_ms: u64,
+    ) -> Result<AccessToken> {
+        let hash = sha256_hex(plaintext.as_bytes());
+        let write = self.db().begin_write()?;
+
+        // Read, validate and consume the code inside the same transaction that
+        // issues the token, so two concurrent exchanges cannot both succeed.
+        let mut code: AuthorizationCode = {
+            let codes = write.open_table(AUTHORIZATION_CODES)?;
+            match codes.get(hash.as_str())? {
+                Some(guard) => decode(guard.value())?,
+                None => return Err(Error::InvalidInput("invalid_grant".into())),
+            }
+        };
+        if !code.is_redeemable_at(now_ms) {
+            return Err(Error::InvalidInput("invalid_grant".into()));
+        }
+        code.used = true;
+        {
+            let mut codes = write.open_table(AUTHORIZATION_CODES)?;
+            codes.insert(hash.as_str(), encode(&code)?.as_slice())?;
+        }
+
+        let record = AccessToken {
+            id: self.next_id(),
+            app_id: token.app_id,
+            user_id: token.user_id,
+            token_hash: token.token_hash,
+            scopes: token.scopes,
+            created_at_ms: token.now_ms,
+            expires_at_ms: token.expires_at_ms,
+            revoked: false,
+        };
+        {
+            let mut tokens = write.open_table(ACCESS_TOKENS)?;
+            tokens.insert(record.token_hash.as_str(), encode(&record)?.as_slice())?;
+        }
+        write.commit()?;
+        Ok(record)
     }
 }
 

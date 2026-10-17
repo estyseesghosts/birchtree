@@ -14,6 +14,17 @@ pub struct LocalUser {
     pub email_verified: bool,
     pub created_at_ms: u64,
     pub disabled: bool,
+    /// User posting/reading preferences (Phase 2). `None` means "use the
+    /// Mastodon default", so records written before these fields existed stay
+    /// readable (`#[serde(default)]`).
+    #[serde(default)]
+    pub default_privacy: Option<String>,
+    #[serde(default)]
+    pub default_sensitive: Option<bool>,
+    #[serde(default)]
+    pub default_language: Option<String>,
+    #[serde(default)]
+    pub default_quote_policy: Option<String>,
 }
 
 /// A server-side login session used to authenticate the OAuth approval flow.

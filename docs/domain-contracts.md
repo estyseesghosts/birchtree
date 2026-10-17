@@ -48,7 +48,7 @@ Durable recipient/activity relationships with types and actor/status context, re
 
 Internal normalized quote representation for FEP-044f, Mastodon quote activities/fields, and legacy inbound representations. External `quote`/`quote_approval` projection distinct from internal protocol provenance. States: pending/accepted/rejected/revoked/deleted. Accepted counts separate; protected targets never leaked through `quote`, preview content, or URI.
 
-## Implementation status (Phase 1)
+## Implementation status (Phase 2)
 
 - **IDs.** `domain::id::Id` is a 64-bit snowflake (`ms << 16 | seq`), strictly
   increasing, serialized as a decimal string, deserialized from string or
@@ -58,10 +58,19 @@ Internal normalized quote representation for FEP-044f, Mastodon quote activities
   `domain::user::LocalUser` (Argon2 PHC hash, email state, disabled) are
   distinct; `handle_key` builds the unique `user@domain` index key and
   `validate_username`/`normalize_username` apply Mastodon's ASCII rules.
-- **OAuth records.** `domain::oauth::{OAuthApplication, AccessToken}` store only
-  the SHA-256 digest of secrets; access tokens default to non-expiring.
+- **OAuth records.** `domain::oauth::{OAuthApplication, AccessToken,
+  AuthorizationCode}` store only the SHA-256 digest of secrets; access tokens
+  default to non-expiring. `AccessToken::user_id == None` marks an app-only
+  (client-credentials) token. `AuthorizationCode` binds the code to app, user,
+  redirect URI, granted scopes and PKCE challenge, and is redeemable only once
+  before `expires_at_ms` (`is_redeemable_at`).
+- **User preferences.** `LocalUser` carries optional `default_privacy`,
+  `default_sensitive`, `default_language`, `default_quote_policy`
+  (`#[serde(default)]` so older records stay readable); `None` means "use the
+  Mastodon default".
 - **Jobs.** `domain::job::Job` is the canonical durable envelope with
   `Pending/Leased/Succeeded/Quarantined`, a due/lease timestamp, retry budget,
   and last error. Lease and backoff constants live here.
+  `JobKind::SendConfirmationEmail` is committed with public registration.
 - Status/relationship/quote/poll/notification types remain the Phase 0 shapes
   and are refined as their phases are implemented.

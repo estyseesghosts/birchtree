@@ -25,6 +25,6 @@ pub use id::{Clock, Id, IdGenerator, SystemClock, TimestampIdGenerator};
 pub use visibility::{QuotePolicy, Visibility};
 pub use status::Status;
 pub use account::Account;
-pub use oauth::{AccessToken, OAuthApplication};
+pub use oauth::{AccessToken, AuthorizationCode, OAuthApplication};
 pub use user::{LocalUser, LoginSession};
 pub use job::{Job, JobKind, JobState};

@@ -16,9 +16,16 @@ Source of truth: `birchtree.md` (revised plan, pinned to Mastodon **v4.7.3**, co
 
 ActivityPub federation is delegated to the `activitypub-federation-rust` crate rather than hand-rolled. Add it as a dependency when federation work (Phase 6) begins; until then the `federation/` module is a thin port/adaptation layer, not a custom ActivityPub implementation.
 
-## Current phase: Phase 1 — runtime, `redb`, IDs, configuration and bootstrap
+## Current phase: Phase 2 — OAuth, registration and exact read APIs
 
-Exit: fresh install and restart preserve identity/data; unique-handle races are safe; IDs serialize/cursor correctly; storage conformance and crash-recovery tests prove primary mutation + job atomicity; secret handling tests pass. Implemented and green — see `docs/phase-1-exit-criteria.md` (with explicit deferrals). The Phase 0 route-inventory review against the Mastodon v4.7.3 source remains open (`docs/phase-0-exit-criteria.md`).
+Exit: a real Mastodon-compatible client can register an app, register an account
+when policy allows, and obtain a user token; PKCE/replay/redirect/scope/app-token/
+registration tests pass; account/instance DTO snapshots match the pinned
+contract. Implemented and green — see `docs/phase-2-exit-criteria.md` (with
+explicit deferrals: email-confirmation enforcement, invite/approval modes,
+account lookup/search, media serving, metrics). Phase 1 remains green
+(`docs/phase-1-exit-criteria.md`). The Phase 0 route-inventory review against the
+Mastodon v4.7.3 source remains open (`docs/phase-0-exit-criteria.md`).
 
 ## State maintenance (required every work session)
 

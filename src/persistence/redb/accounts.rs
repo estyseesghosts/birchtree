@@ -2,7 +2,9 @@
 
 use redb::{ReadableDatabase, ReadableTable};
 
-use crate::application::ports::{AccountStore, NewLocalAccount};
+use crate::application::ports::{
+    AccountProfileUpdate, AccountStore, NewLocalAccount, UserSettingsUpdate,
+};
 use crate::domain::{Account, Error, Id, LocalUser, Result};
 
 use super::schema::{ACCOUNTS, HANDLE_INDEX, LOCAL_USERS};
@@ -66,10 +68,14 @@ impl AccountStore for RedbStore {
             id: user_id,
             account_id,
             password_hash: input.password_hash,
-            email: input.email,
+            email: input.email.clone(),
             email_verified: false,
             created_at_ms: input.now_ms,
             disabled: false,
+            default_privacy: None,
+            default_sensitive: None,
+            default_language: None,
+            default_quote_policy: None,
         };
 
         {
@@ -94,6 +100,25 @@ impl AccountStore for RedbStore {
             input.now_ms,
         );
         super::jobs::insert_job(&write, &job)?;
+
+        // Public registration also commits its confirmation-mail job here, so a
+        // committed account can never lose its verification message.
+        if input.send_confirmation_email {
+            if let Some(email) = input.email.as_deref() {
+                let mail_job = crate::domain::Job::new(
+                    self.next_id(),
+                    crate::domain::JobKind::SendConfirmationEmail,
+                    serde_json::json!({
+                        "account_id": account_id.value(),
+                        "user_id": user_id.value(),
+                        "email": email,
+                    }),
+                    input.now_ms,
+                    input.now_ms,
+                );
+                super::jobs::insert_job(&write, &mail_job)?;
+            }
+        }
 
         write.commit()?;
         Ok(account)
@@ -145,5 +170,70 @@ impl AccountStore for RedbStore {
         let read = self.db().begin_read()?;
         let accounts = read.open_table(ACCOUNTS)?;
         Ok(accounts.len()?)
+    }
+
+    fn update_account_profile(
+        &self,
+        account_id: Id,
+        update: AccountProfileUpdate,
+    ) -> Result<Account> {
+        let write = self.db().begin_write()?;
+        let mut account: Account = {
+            let accounts = write.open_table(ACCOUNTS)?;
+            match accounts.get(account_id.value())? {
+                Some(guard) => decode(guard.value())?,
+                None => return Err(Error::NotFound(format!("account {account_id}"))),
+            }
+        };
+        if let Some(v) = update.display_name {
+            account.display_name = v;
+        }
+        if let Some(v) = update.note {
+            account.note = v;
+        }
+        if let Some(v) = update.locked {
+            account.locked = v;
+        }
+        // `discoverable`/`indexable`/`hide_collections` are accepted but not yet
+        // persisted (no column in Phase 2); recorded as a gap.
+        {
+            let mut accounts = write.open_table(ACCOUNTS)?;
+            accounts.insert(account_id.value(), encode(&account)?.as_slice())?;
+        }
+        write.commit()?;
+        Ok(account)
+    }
+
+    fn update_user_settings(
+        &self,
+        account_id: Id,
+        update: UserSettingsUpdate,
+    ) -> Result<LocalUser> {
+        let write = self.db().begin_write()?;
+        let mut user: LocalUser = {
+            let users = write.open_table(LOCAL_USERS)?;
+            match users.get(account_id.value())? {
+                Some(guard) => decode(guard.value())?,
+                None => return Err(Error::NotFound(format!("local user for {account_id}"))),
+            }
+        };
+        if let Some(v) = update.default_privacy {
+            user.default_privacy = Some(v);
+        }
+        if let Some(v) = update.default_sensitive {
+            user.default_sensitive = Some(v);
+        }
+        if let Some(v) = update.default_language {
+            user.default_language = Some(v);
+        }
+        if let Some(v) = update.default_quote_policy {
+            user.default_quote_policy = Some(v);
+        }
+        {
+            let mut users = write.open_table(LOCAL_USERS)?;
+            users.insert(account_id.value(), encode(&user)?.as_slice())?;
+        }
+        write.commit()?;
+        Ok(user)
     }
 }

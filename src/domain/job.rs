@@ -18,6 +18,10 @@ pub enum JobKind {
     /// Emitted atomically with local account creation. Phase 1 uses it to prove
     /// commit-with-job durability; later phases deliver a welcome/mail step.
     UserCreated,
+    /// Send an account email-confirmation message through the `MailSender`
+    /// adapter. Enqueued atomically with public registration; never sent inside
+    /// the request transaction.
+    SendConfirmationEmail,
     /// Placeholder for the media-processing pipeline (Phase 4).
     ProcessMedia,
     /// Placeholder for outbound federation delivery (Phase 6).
@@ -29,6 +33,7 @@ impl JobKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             JobKind::UserCreated => "user_created",
+            JobKind::SendConfirmationEmail => "send_confirmation_email",
             JobKind::ProcessMedia => "process_media",
             JobKind::DeliverActivity => "deliver_activity",
         }

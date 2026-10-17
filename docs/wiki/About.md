@@ -28,7 +28,7 @@ cargo test
 ./scripts/smoke-all.sh
 ```
 
-The server binary and CLI (e.g. `create-account`) are scaffolding in Phase 0/1; see `docs/wiki/Current-State.md` for what is implemented.
+The server binary serves the Phase 2 OAuth, registration and read APIs plus the CLI (`create-account`); see `docs/wiki/Current-State.md` for what is implemented.
 
 ## Design sources
 

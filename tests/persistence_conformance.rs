@@ -239,6 +239,155 @@ fn migrations_and_data_survive_restart() {
 }
 
 #[test]
+fn authorization_code_redeem_is_single_use() {
+    let (_dir, store) = temp_store();
+    let registered = auth::register_app(
+        &*store,
+        "Client".into(),
+        vec!["https://client.example/cb".into()],
+        vec!["read".into()],
+        None,
+        true,
+        T0,
+    )
+    .unwrap();
+    let user = mk_account(&store, "frank");
+
+    let (code, record) = auth::create_authorization_code(
+        &*store,
+        registered.app.id,
+        user.id,
+        "https://client.example/cb".into(),
+        vec!["read".into()],
+        Some(crypto::pkce_s256_challenge("verifier-value")),
+        Some("S256".to_string()),
+        T0,
+    )
+    .unwrap();
+    assert_eq!(record.expires_at_ms, T0 + auth::AUTH_CODE_TTL_MS);
+
+    let exchange = || {
+        auth::exchange_authorization_code(
+            &*store,
+            &registered.app,
+            auth::CodeExchange {
+                code: &code,
+                redirect_uri: Some("https://client.example/cb"),
+                code_verifier: Some("verifier-value"),
+            },
+            T0,
+        )
+    };
+
+    assert!(exchange().is_ok());
+    // A replay can never mint a second token.
+    assert!(exchange().is_err());
+}
+
+#[test]
+fn authorization_code_redeem_is_atomic_under_contention() {
+    let (_dir, store) = temp_store();
+    let registered = auth::register_app(
+        &*store,
+        "Client".into(),
+        vec!["https://client.example/cb".into()],
+        vec!["read".into()],
+        None,
+        true,
+        T0,
+    )
+    .unwrap();
+    let user = mk_account(&store, "grace");
+    let (code, _record) = auth::create_authorization_code(
+        &*store,
+        registered.app.id,
+        user.id,
+        "https://client.example/cb".into(),
+        vec!["read".into()],
+        None,
+        None,
+        T0,
+    )
+    .unwrap();
+
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let store = Arc::clone(&store);
+        let app = registered.app.clone();
+        let code = code.clone();
+        handles.push(std::thread::spawn(move || {
+            auth::exchange_authorization_code(
+                &*store,
+                &app,
+                auth::CodeExchange {
+                    code: &code,
+                    redirect_uri: Some("https://client.example/cb"),
+                    code_verifier: None,
+                },
+                T0,
+            )
+            .is_ok()
+        }));
+    }
+    let winners = handles
+        .into_iter()
+        .map(|h| h.join().unwrap())
+        .filter(|won| *won)
+        .count();
+    assert_eq!(winners, 1, "exactly one concurrent exchange must win");
+}
+
+#[test]
+fn registration_commits_confirmation_mail_job_atomically() {
+    let (_dir, store) = temp_store();
+    let registered = auth::register_app(
+        &*store,
+        "Client".into(),
+        vec!["https://client.example/cb".into()],
+        vec!["read".into(), "write".into()],
+        None,
+        true,
+        T0,
+    )
+    .unwrap();
+
+    let result = birchtree::application::accounts::register_account(
+        &*store,
+        &*store,
+        "https://example.social",
+        T0,
+        true,
+        &registered.app,
+        birchtree::application::accounts::RegisterAccountCommand {
+            username: "heidi".into(),
+            email: "heidi@example.com".into(),
+            password: "password123".into(),
+            agreement: true,
+            locale: None,
+            reason: None,
+            invite_code: None,
+            display_name: None,
+        },
+    )
+    .unwrap();
+
+    let jobs = store.all_jobs().unwrap();
+    let kinds: Vec<JobKind> = jobs.iter().map(|j| j.kind).collect();
+    assert!(kinds.contains(&JobKind::UserCreated));
+    assert!(kinds.contains(&JobKind::SendConfirmationEmail));
+
+    let mail_job = jobs
+        .iter()
+        .find(|j| j.kind == JobKind::SendConfirmationEmail)
+        .unwrap();
+    assert_eq!(
+        mail_job.payload.get("email").unwrap().as_str().unwrap(),
+        "heidi@example.com"
+    );
+    assert_eq!(result.token.scopes, vec!["read".to_string(), "write".to_string()]);
+}
+
+#[test]
 fn crypto_helpers_reject_tampered_hash() {
     let hash = crypto::hash_password("hunter2hunter2").unwrap();
     assert!(crypto::verify_password(&hash, "hunter2hunter2"));

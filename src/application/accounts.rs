@@ -1,9 +1,10 @@
 //! Account creation use cases.
 
+use crate::application::auth;
 use crate::application::crypto;
-use crate::application::ports::{AccountStore, NewLocalAccount};
+use crate::application::ports::{AccountStore, NewLocalAccount, OAuthStore};
 use crate::domain::account::{normalize_username, validate_username};
-use crate::domain::{Account, Error, Result};
+use crate::domain::{AccessToken, Account, Error, OAuthApplication, Result};
 
 /// Minimum password length (Mastodon requires at least 8 characters).
 pub const MIN_PASSWORD_LEN: usize = 8;
@@ -15,6 +16,27 @@ pub struct CreateAccountCommand {
     pub email: Option<String>,
     pub password: String,
     pub display_name: Option<String>,
+}
+
+/// Input for public registration (`POST /api/v1/accounts`).
+#[derive(Debug, Clone)]
+pub struct RegisterAccountCommand {
+    pub username: String,
+    pub email: String,
+    pub password: String,
+    pub agreement: bool,
+    pub locale: Option<String>,
+    pub reason: Option<String>,
+    pub invite_code: Option<String>,
+    pub display_name: Option<String>,
+}
+
+/// Result of a successful registration: the created account and a user token
+/// scoped to the registering application (Mastodon returns the token body).
+pub struct RegisteredAccount {
+    pub account: Account,
+    pub token_plaintext: String,
+    pub token: AccessToken,
 }
 
 /// Extract the bare host from a public base URL, without pulling in a URL crate.
@@ -56,6 +78,67 @@ pub fn create_account(
         email: cmd.email,
         actor_uri,
         now_ms,
+        // The CLI bootstrap does not send mail.
+        send_confirmation_email: false,
+    })
+}
+
+/// Register a local account through the public API and issue a user token for
+/// the registering application.
+///
+/// This is the same account-creation path as the CLI (`create_account`) plus
+/// the registration policy gates and token issuance. The account, its indexes
+/// and its confirmation-mail job commit atomically; the token is issued after.
+pub fn register_account(
+    accounts: &dyn AccountStore,
+    oauth: &dyn OAuthStore,
+    base_url: &str,
+    now_ms: u64,
+    registration_open: bool,
+    app: &OAuthApplication,
+    cmd: RegisterAccountCommand,
+) -> Result<RegisteredAccount> {
+    if !registration_open {
+        return Err(Error::Forbidden("Registrations are closed".into()));
+    }
+    if !cmd.agreement {
+        return Err(Error::InvalidInput(
+            "agreement must be accepted".into(),
+        ));
+    }
+    if cmd.email.trim().is_empty() || !cmd.email.contains('@') {
+        return Err(Error::InvalidInput("email is invalid".into()));
+    }
+    validate_username(&cmd.username)?;
+    if cmd.password.chars().count() < MIN_PASSWORD_LEN {
+        return Err(Error::InvalidInput(format!(
+            "password must be at least {MIN_PASSWORD_LEN} characters"
+        )));
+    }
+
+    let normalized_username = normalize_username(&cmd.username);
+    let password_hash = crypto::hash_password(&cmd.password).map_err(Error::Internal)?;
+    let domain = host_from_url(base_url);
+    let actor_uri = Account::local_actor_uri(base_url, &cmd.username);
+
+    let account = accounts.create_local_account(NewLocalAccount {
+        username: cmd.username,
+        normalized_username,
+        domain,
+        display_name: cmd.display_name.unwrap_or_default(),
+        password_hash,
+        email: Some(cmd.email.clone()),
+        actor_uri,
+        now_ms,
+        send_confirmation_email: true,
+    })?;
+
+    let (token_plaintext, token) =
+        auth::issue_user_token(oauth, app.id, account.id, app.scopes.clone(), now_ms)?;
+    Ok(RegisteredAccount {
+        account,
+        token_plaintext,
+        token,
     })
 }
 

@@ -5,6 +5,7 @@ pub mod config;
 pub mod domain;
 pub mod federation;
 pub mod jobs;
+pub mod mail;
 pub mod media;
 pub mod observability;
 pub mod persistence;

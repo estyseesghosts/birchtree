@@ -5,13 +5,15 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-use birchtree::api::mastodon::{build_router, ApiState};
+use birchtree::api::mastodon::{build_router, ApiState, ServerInfo};
 use birchtree::application::accounts::{create_account, CreateAccountCommand};
 use birchtree::application::context::Context;
+use birchtree::application::ports::MailSender;
 use birchtree::config::Config;
 use birchtree::domain::id::{SystemClock, TimestampIdGenerator};
 use birchtree::domain::{Clock, IdGenerator};
 use birchtree::jobs;
+use birchtree::mail::LoggingMailSender;
 use birchtree::observability;
 use birchtree::persistence::redb::RedbStore;
 
@@ -56,6 +58,18 @@ fn parse_args(cfg: &mut Config) -> Args {
             args.email = Some(v.to_string());
         } else if let Some(v) = arg.strip_prefix("--display-name=") {
             args.display_name = Some(v.to_string());
+        } else if let Some(v) = arg.strip_prefix("--site-title=") {
+            cfg.site_title = v.to_string();
+        } else if let Some(v) = arg.strip_prefix("--site-description=") {
+            cfg.site_description = v.to_string();
+        } else if let Some(v) = arg.strip_prefix("--site-contact-email=") {
+            cfg.site_contact_email = v.to_string();
+        } else if let Some(v) = arg.strip_prefix("--site-contact-username=") {
+            cfg.site_contact_username = Some(v.trim_start_matches('@').to_string());
+        } else if arg == "--registration-open" {
+            cfg.registration_open = true;
+        } else if arg == "--registration-closed" {
+            cfg.registration_open = false;
         } else if let Some(v) = arg.strip_prefix("--mode=") {
             args.harness_mode = Some(v.to_string());
         } else if arg.starts_with("--") {
@@ -187,12 +201,15 @@ async fn shutdown_signal() {
 async fn serve(cfg: Config) {
     let (store, clock, ids) = build_store(&cfg);
     let context = Arc::new(Context::new(clock.clone(), ids, store.clone()));
+    let server = Arc::new(ServerInfo::from_config(&cfg));
     let state = ApiState {
         context,
         trusted_proxies: Arc::new(cfg.trusted_proxies.clone()),
         max_body_size: cfg.max_body_size,
+        server,
     };
     let app = build_router(state);
+    let mailer: Arc<dyn MailSender> = Arc::new(LoggingMailSender);
 
     let listener = tokio::net::TcpListener::bind(cfg.listen)
         .await
@@ -212,6 +229,7 @@ async fn serve(cfg: Config) {
     let worker = tokio::spawn(jobs::worker::run(
         store.clone(),
         clock.clone(),
+        mailer,
         cfg.worker_poll_interval,
         jobs::worker::DEFAULT_BATCH,
         shutdown_rx,

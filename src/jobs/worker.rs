@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-use crate::application::ports::Store;
+use crate::application::ports::{MailSender, Store};
 use crate::domain::Clock;
 
 use super::handlers;
@@ -22,6 +22,7 @@ pub const DEFAULT_BATCH: usize = 32;
 pub async fn run(
     store: Arc<dyn Store>,
     clock: Arc<dyn Clock>,
+    mailer: Arc<dyn MailSender>,
     poll_interval: Duration,
     batch: usize,
     mut shutdown: watch::Receiver<bool>,
@@ -36,7 +37,7 @@ pub async fn run(
             Ok(jobs) => {
                 tracing::debug!(count = jobs.len(), "claimed jobs");
                 for job in jobs {
-                    match handlers::handle(&job) {
+                    match handlers::handle(&job, &*mailer) {
                         Ok(()) => {
                             if let Err(err) = store.complete(job.id) {
                                 tracing::error!(job = %job.id, error = %err, "complete failed");
