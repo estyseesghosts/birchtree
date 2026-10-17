@@ -1,5 +1,5 @@
-/// Domain-layer errors. These are not HTTP status codes; adapters map them to
-/// Mastodon-compatible responses (see `api/mastodon/errors.rs`).
+//! Domain-layer errors. These are not HTTP status codes; adapters map them to
+//! Mastodon-compatible responses (see `api/mastodon/errors.rs`).
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("not found: {0}")]
@@ -14,6 +14,11 @@ pub enum Error {
     Forbidden(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("storage: {0}")]
+    Storage(String),
     #[error("internal: {0}")]
     Internal(String),
 }
+
+/// Convenience alias used throughout domain and application code.
+pub type Result<T> = std::result::Result<T, Error>;

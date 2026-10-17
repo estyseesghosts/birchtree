@@ -4,8 +4,8 @@ Per `birchtree.md` §9, Phases 0–8.
 
 | Phase | Focus | Status |
 |---|---|---|
-| 0 | Freeze source contracts; initialize crate | in progress |
-| 1 | Runtime, `redb`, IDs, configuration, CLI bootstrap | planned |
+| 0 | Freeze source contracts; initialize crate | mostly done (route-inventory review open) |
+| 1 | Runtime, `redb`, IDs, configuration, CLI bootstrap | implemented (gate green) |
 | 2 | OAuth, registration, exact read APIs | planned |
 | 3 | Local statuses, relationships, interaction semantics | planned |
 | 4 | Media, timelines, notifications, client usability | planned |

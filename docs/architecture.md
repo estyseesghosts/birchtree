@@ -72,3 +72,23 @@ Atomic mutation protocol (per `birchtree.md` §5):
 4. Crash tests prove no committed mutation loses its required job; failure before commit leaves neither mutation nor job.
 
 Media bytes, HTTP calls, follower lists, and unbounded fan-out never enter a transaction.
+
+## Runtime (Phase 1)
+
+- **Config** (`src/config.rs`): public URL (http/https), data dir, listen addr,
+  trusted proxies, max upload/body sizes, worker poll interval, registration
+  flag; validated before services start.
+- **Observability** (`src/observability.rs`): `tracing` subscriber with
+  `RUST_LOG`/`EnvFilter`; authorization redaction. Metrics deferred (Phase 8).
+- **HTTP** (`src/api/mastodon/`): declarative router; `GET /health` (liveness),
+  `GET /ready` (storage readiness); `DefaultBodyLimit`; `TraceLayer`; client-IP
+  resolution behind trusted proxies.
+- **Lifecycle** (`src/main.rs`): SIGINT/SIGTERM graceful shutdown; the durable
+  job worker is signalled and awaited. Operator CLI `create-account`. Test-only
+  `crash-harness` mode for `kill -9` durability tests.
+- **Jobs** (`src/jobs/`): in-process worker claims due jobs under a lease,
+  runs idempotent handlers, and settles by success/retry/backoff/quarantine.
+
+The data dir is created `0700`; world-writable directories are refused. The DB
+file cannot participate in a transaction, so media bytes still follow the
+staged-commit rule above when they land in Phase 4.

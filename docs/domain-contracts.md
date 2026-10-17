@@ -47,3 +47,21 @@ Durable recipient/activity relationships with types and actor/status context, re
 ## Quotes
 
 Internal normalized quote representation for FEP-044f, Mastodon quote activities/fields, and legacy inbound representations. External `quote`/`quote_approval` projection distinct from internal protocol provenance. States: pending/accepted/rejected/revoked/deleted. Accepted counts separate; protected targets never leaked through `quote`, preview content, or URI.
+
+## Implementation status (Phase 1)
+
+- **IDs.** `domain::id::Id` is a 64-bit snowflake (`ms << 16 | seq`), strictly
+  increasing, serialized as a decimal string, deserialized from string or
+  integer. `TimestampIdGenerator` is the `IdGenerator` port implementation.
+- **Account/credential split.** `domain::account::Account` (ActivityPub
+  identity/profile, `local`, `domain`, `actor_uri`, `moved_to`, counts) and
+  `domain::user::LocalUser` (Argon2 PHC hash, email state, disabled) are
+  distinct; `handle_key` builds the unique `user@domain` index key and
+  `validate_username`/`normalize_username` apply Mastodon's ASCII rules.
+- **OAuth records.** `domain::oauth::{OAuthApplication, AccessToken}` store only
+  the SHA-256 digest of secrets; access tokens default to non-expiring.
+- **Jobs.** `domain::job::Job` is the canonical durable envelope with
+  `Pending/Leased/Succeeded/Quarantined`, a due/lease timestamp, retry budget,
+  and last error. Lease and backoff constants live here.
+- Status/relationship/quote/poll/notification types remain the Phase 0 shapes
+  and are refined as their phases are implemented.

@@ -1,31 +1,237 @@
+use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::watch;
 
 use birchtree::api::mastodon::{build_router, ApiState};
-use birchtree::application::ports::{Clock, IdGenerator};
+use birchtree::application::accounts::{create_account, CreateAccountCommand};
+use birchtree::application::context::Context;
 use birchtree::config::Config;
 use birchtree::domain::id::{SystemClock, TimestampIdGenerator};
+use birchtree::domain::{Clock, IdGenerator};
+use birchtree::jobs;
 use birchtree::observability;
 use birchtree::persistence::redb::RedbStore;
-use birchtree::streaming::hub::{hub_and_sink, Hub};
 
-fn build_services(
-    cfg: &Config,
-) -> Result<(Arc<birchtree::application::context::Context>, Arc<Hub>), String> {
+/// Parsed command-line arguments.
+#[derive(Default)]
+struct Args {
+    positional: Vec<String>,
+    username: Option<String>,
+    password: Option<String>,
+    email: Option<String>,
+    display_name: Option<String>,
+    harness_mode: Option<String>,
+}
+
+fn parse_args(cfg: &mut Config) -> Args {
+    let mut args = Args::default();
+    for arg in std::env::args().skip(1) {
+        if let Some(v) = arg.strip_prefix("--public-url=") {
+            cfg.public_url = v.to_string();
+        } else if let Some(v) = arg.strip_prefix("--data-dir=") {
+            cfg.data_dir = v.into();
+        } else if let Some(v) = arg.strip_prefix("--listen=") {
+            cfg.listen = v.parse().unwrap_or_else(|_| {
+                eprintln!("invalid --listen address: {v}");
+                std::process::exit(2);
+            });
+        } else if let Some(v) = arg.strip_prefix("--trusted-proxy=") {
+            cfg.trusted_proxies.push(v.parse().unwrap_or_else(|_| {
+                eprintln!("invalid --trusted-proxy address: {v}");
+                std::process::exit(2);
+            }));
+        } else if let Some(v) = arg.strip_prefix("--max-body-size=") {
+            cfg.max_body_size = v.parse().unwrap_or_else(|_| {
+                eprintln!("invalid --max-body-size: {v}");
+                std::process::exit(2);
+            });
+        } else if let Some(v) = arg.strip_prefix("--username=") {
+            args.username = Some(v.to_string());
+        } else if let Some(v) = arg.strip_prefix("--password=") {
+            args.password = Some(v.to_string());
+        } else if let Some(v) = arg.strip_prefix("--email=") {
+            args.email = Some(v.to_string());
+        } else if let Some(v) = arg.strip_prefix("--display-name=") {
+            args.display_name = Some(v.to_string());
+        } else if let Some(v) = arg.strip_prefix("--mode=") {
+            args.harness_mode = Some(v.to_string());
+        } else if arg.starts_with("--") {
+            eprintln!("unknown flag: {arg}");
+            std::process::exit(2);
+        } else {
+            args.positional.push(arg);
+        }
+    }
+    args
+}
+
+fn build_store(cfg: &Config) -> (Arc<RedbStore>, Arc<dyn Clock>, Arc<dyn IdGenerator>) {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let ids: Arc<dyn IdGenerator> = Arc::new(TimestampIdGenerator::new(Box::new(SystemClock)));
-    let _store = RedbStore::open(cfg.data_dir.join("birchtree.redb"), clock.clone(), ids.clone())
-        .map_err(|err| format!("open redb store: {err}"))?;
-    let (_hub, _streaming) = hub_and_sink(1024);
-    let context = Arc::new(birchtree::application::context::Context::new(clock, ids));
-    Ok((context, Arc::new(Hub::new())))
+    let store = RedbStore::open(cfg.database_path(), clock.clone(), ids.clone())
+        .unwrap_or_else(|err| {
+            eprintln!("open storage: {err}");
+            std::process::exit(1);
+        });
+    (Arc::new(store), clock, ids)
 }
 
 /// `create-account --username=<name> --password=<pw>`: create a local account
-/// from the CLI for operators (Phase 1 gap).
-fn run_create_account(_args: &[String], _cfg: &Config) -> ! {
-    eprintln!("create-account: not yet implemented (Phase 1)");
-    std::process::exit(2);
+/// from the CLI for operators (the Phase 1 bootstrap path).
+fn run_create_account(cfg: &Config, args: &Args) -> ! {
+    let username = args.username.clone().unwrap_or_else(|| {
+        eprintln!("create-account requires --username=<name>");
+        std::process::exit(2);
+    });
+    let password = args
+        .password
+        .clone()
+        .or_else(|| std::env::var("BIRCHTREE_PASSWORD").ok())
+        .unwrap_or_else(|| {
+            eprintln!("create-account requires --password=<pw> (or $BIRCHTREE_PASSWORD)");
+            std::process::exit(2);
+        });
+
+    let (store, clock, _ids) = build_store(cfg);
+    let cmd = CreateAccountCommand {
+        username,
+        email: args.email.clone(),
+        password,
+        display_name: args.display_name.clone(),
+    };
+    match create_account(&*store, &cfg.normalized_public_url(), clock.now_ms(), cmd) {
+        Ok(account) => {
+            // IDs are decimal strings on the wire.
+            println!("created account id={} username={}", account.id, account.username);
+            std::process::exit(0);
+        }
+        Err(err) => {
+            eprintln!("create-account failed: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Test-only harness used by `tests/crash_recovery.rs` to exercise `kill -9`
+/// durability of committed mutations and their jobs.
+fn run_crash_harness(cfg: &Config, args: &Args) -> ! {
+    let mode = args.harness_mode.clone().unwrap_or_else(|| {
+        eprintln!("crash-harness requires --mode=open-and-spin|commit-and-spin");
+        std::process::exit(2);
+    });
+    let (store, _clock, _ids) = build_store(cfg);
+    match mode.as_str() {
+        "open-and-spin" => {
+            println!("OPENED");
+            std::io::stdout().flush().ok();
+        }
+        "commit-and-spin" => {
+            let username = args
+                .username
+                .clone()
+                .unwrap_or_else(|| "crashuser".to_string());
+            let cmd = CreateAccountCommand {
+                username,
+                email: None,
+                password: "crashpassword".to_string(),
+                display_name: None,
+            };
+            let account = create_account(
+                &*store,
+                &cfg.normalized_public_url(),
+                SystemClock.now_ms(),
+                cmd,
+            )
+            .unwrap_or_else(|err| {
+                eprintln!("commit failed: {err}");
+                std::process::exit(1);
+            });
+            println!("COMMITTED {}", account.id);
+            std::io::stdout().flush().ok();
+        }
+        other => {
+            eprintln!("unknown crash-harness mode: {other}");
+            std::process::exit(2);
+        }
+    }
+    // Spin so the parent can SIGKILL the process at a controlled point.
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.ok();
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sig) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            sig.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    tracing::info!("shutdown signal received");
+}
+
+async fn serve(cfg: Config) {
+    let (store, clock, ids) = build_store(&cfg);
+    let context = Arc::new(Context::new(clock.clone(), ids, store.clone()));
+    let state = ApiState {
+        context,
+        trusted_proxies: Arc::new(cfg.trusted_proxies.clone()),
+        max_body_size: cfg.max_body_size,
+    };
+    let app = build_router(state);
+
+    let listener = tokio::net::TcpListener::bind(cfg.listen)
+        .await
+        .unwrap_or_else(|err| {
+            eprintln!("bind {}: {err}", cfg.listen);
+            std::process::exit(1);
+        });
+
+    tracing::info!(
+        listen = %cfg.listen,
+        public_url = %cfg.normalized_public_url(),
+        database = %cfg.database_path().display(),
+        "birchtree listening"
+    );
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let worker = tokio::spawn(jobs::worker::run(
+        store.clone(),
+        clock.clone(),
+        cfg.worker_poll_interval,
+        jobs::worker::DEFAULT_BATCH,
+        shutdown_rx,
+    ));
+
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .unwrap_or_else(|err| {
+        eprintln!("server error: {err}");
+        std::process::exit(1);
+    });
+
+    // Signal the worker and wait for it to drain.
+    let _ = shutdown_tx.send(true);
+    let _ = worker.await;
+    tracing::info!("birchtree stopped");
 }
 
 #[tokio::main]
@@ -33,49 +239,20 @@ async fn main() {
     observability::init();
 
     let mut cfg = Config::default();
-    let mut positional: Vec<String> = Vec::new();
-    for arg in std::env::args().skip(1) {
-        if let Some(mode) = arg.strip_prefix("--mode=") {
-            let _ = mode;
-        } else if let Some(url) = arg.strip_prefix("--public-url=") {
-            cfg.public_url = url.to_string();
-        } else if let Some(dir) = arg.strip_prefix("--data-dir=") {
-            cfg.data_dir = dir.into();
-        } else if let Some(listen) = arg.strip_prefix("--listen=") {
-            cfg.listen = listen.parse().expect("valid --listen addr");
-        } else {
-            positional.push(arg);
-        }
-    }
+    let args = parse_args(&mut cfg);
 
     if let Err(err) = cfg.validate() {
-        eprintln!("{err}");
+        eprintln!("configuration error: {err}");
         std::process::exit(1);
     }
 
-    if positional.first().is_some_and(|cmd| cmd == "create-account") {
-        run_create_account(&positional[1..], &cfg);
-    } else if let Some(cmd) = positional.first() {
-        eprintln!("unknown subcommand: {cmd}");
-        std::process::exit(2);
+    match args.positional.first().map(String::as_str) {
+        Some("create-account") => run_create_account(&cfg, &args),
+        Some("crash-harness") => run_crash_harness(&cfg, &args),
+        Some(other) => {
+            eprintln!("unknown subcommand: {other}");
+            std::process::exit(2);
+        }
+        None => serve(cfg).await,
     }
-
-    let (context, _hub) = build_services(&cfg).unwrap_or_else(|err| {
-        eprintln!("{err}");
-        std::process::exit(1);
-    });
-    let api_state = ApiState {
-        context,
-        trusted_proxies: Arc::new(cfg.trusted_proxies.clone()),
-    };
-    let app = build_router(api_state);
-    let listener = tokio::net::TcpListener::bind(cfg.listen)
-        .await
-        .expect("bind listener");
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .expect("serve axum");
 }

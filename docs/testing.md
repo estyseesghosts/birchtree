@@ -17,4 +17,15 @@ Required suites:
 9. Client tests — real Mastodon-compatible client automation where practical.
 10. Performance and abuse — high-degree graphs, sparse indexes, large/malformed bodies, upload exhaustion, slow hosts, retry storms.
 
-Gate: `bash scripts/smoke-all.sh` (`cargo check --all-targets` + `cargo test`) green before claiming phase completion.
+Gate: `bash scripts/smoke-all.sh` (`cargo check --all-targets` + `cargo test` + `scripts/smoke-phase1.sh`) green before claiming phase completion.
+
+## Implemented suites (Phase 1)
+
+| Suite | File | Covers |
+|---|---|---|
+| Unit | `src/**` `#[cfg(test)]` | IDs/serialization/ordering, username rules, config validation, path permissions, migrations, crypto, redaction, trusted proxies |
+| Persistence conformance | `tests/persistence_conformance.rs` | unique handle race, OAuth/token/session lifecycle, atomic account+job, job lease/retry/quarantine, migration + restart |
+| Crash recovery | `tests/crash_recovery.rs` | `kill -9` after commit (account + job survive), aborted open (no partial state), CLI bootstrap |
+| Runtime | `tests/runtime.rs` | `/health`, `/ready`, unknown-route 404 |
+| Secret handling | `tests/secret_handling.rs` | no plaintext password/token/session in the DB file; token record serialization; header redaction |
+| Smoke | `scripts/smoke-phase1.sh` | live binary: probes, graceful SIGTERM, CLI create-account, restart durability → `SMOKE_OK` |

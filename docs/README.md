@@ -8,6 +8,7 @@ Each contract file carries a `Status:` line at the top: `Draft` or `Frozen`.
 | File | Status | Plan section |
 |---|---|---|
 | `phase-0-exit-criteria.md` | Tracking checklist | §9 Phase 0 |
+| `phase-1-exit-criteria.md` | Tracking checklist | §9 Phase 1 |
 | `architecture.md` | Draft | §3 |
 | `source-audit-v4.7.3.md` | Draft | §2 |
 | `compatibility-profile.md` | Draft | §1, §6 |

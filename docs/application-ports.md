@@ -24,4 +24,12 @@ Application ports (per `birchtree.md` §3/§4). Domain code depends only on thes
 
 Mutation rule: one storage transaction commits primary records, indexes, local counters, dedup/idempotency records, and bounded durable jobs atomically. Media processing, notifications, streaming publication, outbound federation run after commit (see `architecture.md`).
 
-Not yet implemented: trait skeletons exist in `src/application/ports.rs`; redb implementations are Phase 1.
+## Implementation status (Phase 1)
+
+`Clock` and `IdGenerator` are implemented in `domain::id`. `AccountStore`,
+`OAuthStore`, `SessionStore`, `JobQueue`, and `ReadyCheck` are implemented by
+`persistence::redb::RedbStore`, which also satisfies the bundled `Store`
+supertrait assembled into `application::context::Context`. `StatusStore`,
+`RelationshipStore`, `PollStore`, `MediaStore`, `NotificationStore`,
+`ActivityDedup`, `BlobStore`, `StreamingSink`, `FederationHttp`, and
+`MailSender` remain to be implemented in their phases.

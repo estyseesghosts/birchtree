@@ -7,14 +7,18 @@ pub mod rate_limits;
 pub mod dto;
 pub mod endpoints;
 
+use std::net::IpAddr;
 use std::sync::Arc;
+
 use crate::application::context::Context;
 
+pub use router::build_router;
+
+/// Shared HTTP state.
+#[derive(Clone)]
 pub struct ApiState {
     pub context: Arc<Context>,
-    pub trusted_proxies: Arc<Vec<std::net::IpAddr>>,
-}
-
-pub fn build_router(_state: ApiState) -> axum::Router {
-    axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }))
+    /// Proxies trusted to set forwarding headers.
+    pub trusted_proxies: Arc<Vec<IpAddr>>,
+    pub max_body_size: usize,
 }

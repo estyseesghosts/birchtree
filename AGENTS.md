@@ -16,13 +16,13 @@ Source of truth: `birchtree.md` (revised plan, pinned to Mastodon **v4.7.3**, co
 
 ActivityPub federation is delegated to the `activitypub-federation-rust` crate rather than hand-rolled. Add it as a dependency when federation work (Phase 6) begins; until then the `federation/` module is a thin port/adaptation layer, not a custom ActivityPub implementation.
 
-## Current phase: Phase 0 — freeze source contracts and initialize the crate
+## Current phase: Phase 1 — runtime, `redb`, IDs, configuration and bootstrap
 
-Exit: route inventory reviewed against the Mastodon v4.7.3 source; domain/DTO glossary and exact test fixtures exist; `cargo check`/`cargo test` baseline runs; all unresolved ambiguities listed explicitly. See `docs/phase-0-exit-criteria.md`.
+Exit: fresh install and restart preserve identity/data; unique-handle races are safe; IDs serialize/cursor correctly; storage conformance and crash-recovery tests prove primary mutation + job atomicity; secret handling tests pass. Implemented and green — see `docs/phase-1-exit-criteria.md` (with explicit deferrals). The Phase 0 route-inventory review against the Mastodon v4.7.3 source remains open (`docs/phase-0-exit-criteria.md`).
 
 ## State maintenance (required every work session)
 
-1. Before starting: read `birchtree.md` §9 for your phase, `docs/README.md` for contract status, and the latest entry in `state/logs/`.
+1. Before starting: read `birchtree.md` §7 for your phase, `docs/README.md` for contract status, and the latest entry in `state/logs/`.
 2. While working: update the relevant `docs/` contract in place; mark status `Draft` or `Frozen` at the top.
 3. When finishing: append one dated log to `state/logs/YYYY-MM-DD-<topic>.md` recording what changed, what was verified, and open questions. Never rewrite past logs; supersede by reference.
 4. Keep `docs/phase-0-exit-criteria.md` (or the current phase's checklist) checked off accurately. Do not claim exit criteria met without executed evidence.

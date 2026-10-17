@@ -1,6 +1,8 @@
 pub mod account;
 pub mod error;
 pub mod id;
+pub mod job;
+pub mod oauth;
 pub mod visibility;
 pub mod status;
 pub mod user;
@@ -18,9 +20,11 @@ pub mod media;
 pub mod filter;
 
 // Re-export commonly used domain types at the crate level.
+pub use error::{Error, Result};
 pub use id::{Clock, Id, IdGenerator, SystemClock, TimestampIdGenerator};
 pub use visibility::{QuotePolicy, Visibility};
 pub use status::Status;
 pub use account::Account;
-pub use user::LocalUser;
-
+pub use oauth::{AccessToken, OAuthApplication};
+pub use user::{LocalUser, LoginSession};
+pub use job::{Job, JobKind, JobState};

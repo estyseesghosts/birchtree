@@ -1,5 +1,6 @@
 pub mod ports;
 pub mod context;
+pub mod crypto;
 
 pub mod accounts;
 pub mod auth;
