@@ -278,3 +278,131 @@ fn validation_error(message: &str, details: Value) -> Response {
     )
         .into_response()
 }
+
+/// `GET /api/v1/accounts?id[]=…` — multi-fetch up to 40 accounts.
+pub async fn index(
+    State(state): State<ApiState>,
+    auth: crate::api::mastodon::auth::OptionalAuth,
+    RawQuery(query): RawQuery,
+) -> Response {
+    if let Some(authenticated) = &auth.0
+        && let Err(err) = authenticated.require_scopes(&["read", "read:accounts"])
+    {
+        return err.into_response();
+    }
+
+    let pairs = forms::parse(query.unwrap_or_default().as_bytes());
+    let raw_ids = forms::all(&pairs, "id");
+
+    // Upstream caps at 40.
+    if raw_ids.len() > 40 {
+        return ApiError::unprocessable("Validation failed: Too many ids").into_response();
+    }
+
+    let mut ids: Vec<crate::domain::Id> = Vec::new();
+    for raw in raw_ids {
+        if let Ok(id) = raw.parse::<crate::domain::Id>() {
+            ids.push(id);
+        }
+    }
+
+    let store: &dyn Store = &*state.context.store;
+    match store.accounts_by_ids(&ids) {
+        Ok(map) => {
+            // Preserve request order; omit unknown accounts.
+            let mut out: Vec<Value> = Vec::new();
+            for id in &ids {
+                if let Some(account) = map.get(id) {
+                    let stats = store.account_stats(*id).ok();
+                    out.push(dto::account_json_with_stats(
+                        &state.server,
+                        account,
+                        stats.as_ref(),
+                    ));
+                }
+            }
+            axum::Json(out).into_response()
+        }
+        Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
+/// `GET /api/v1/accounts/lookup` — resolve an account by acct.
+pub async fn lookup(
+    State(state): State<ApiState>,
+    auth: crate::api::mastodon::auth::OptionalAuth,
+    RawQuery(query): RawQuery,
+) -> Response {
+    if let Some(authenticated) = &auth.0
+        && let Err(err) = authenticated.require_scopes(&["read", "read:accounts"])
+    {
+        return err.into_response();
+    }
+
+    let pairs = forms::parse(query.unwrap_or_default().as_bytes());
+    let Some(acct) = forms::get(&pairs, "acct") else {
+        return ApiError::bad_request("param is missing or the value is empty: acct")
+            .into_response();
+    };
+
+    let (username, domain) = match acct.split_once('@') {
+        Some((u, d)) => (u.to_string(), d.to_string()),
+        None => (acct.to_string(), state.server.domain.clone()),
+    };
+
+    let store: &dyn Store = &*state.context.store;
+    match store.account_by_handle(&username.to_ascii_lowercase(), &domain) {
+        Ok(Some(account)) => {
+            let stats = store.account_stats(account.id).ok();
+            axum::Json(dto::account_json_with_stats(
+                &state.server,
+                &account,
+                stats.as_ref(),
+            ))
+            .into_response()
+        }
+        Ok(None) => ApiError::not_found().into_response(),
+        Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
+/// `GET /api/v1/accounts/search` — search accounts by query.
+pub async fn search(
+    State(state): State<ApiState>,
+    auth: crate::api::mastodon::auth::OptionalAuth,
+    RawQuery(query): RawQuery,
+) -> Response {
+    if let Some(authenticated) = &auth.0
+        && let Err(err) = authenticated.require_scopes(&["read", "read:accounts"])
+    {
+        return err.into_response();
+    }
+
+    let pairs = forms::parse(query.unwrap_or_default().as_bytes());
+    let q = forms::get(&pairs, "q").unwrap_or("").to_string();
+    let limit = forms::get(&pairs, "limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(20)
+        .min(40);
+
+    let store: &dyn Store = &*state.context.store;
+    let needle = q.to_ascii_lowercase();
+    match store.search_accounts(&needle, 500) {
+        Ok(candidates) => {
+            let mut out: Vec<Value> = Vec::new();
+            for account in candidates.into_iter().take(limit) {
+                if account.suspended {
+                    continue;
+                }
+                let stats = store.account_stats(account.id).ok();
+                out.push(dto::account_json_with_stats(
+                    &state.server,
+                    &account,
+                    stats.as_ref(),
+                ));
+            }
+            axum::Json(out).into_response()
+        }
+        Err(err) => ApiError::from(err).into_response(),
+    }
+}

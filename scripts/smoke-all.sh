@@ -26,4 +26,19 @@ bash scripts/smoke-phase4.sh
 echo "==> scripts/smoke-phase5.sh"
 bash scripts/smoke-phase5.sh
 
+echo "==> scripts/smoke-phase6.sh"
+bash scripts/smoke-phase6.sh
+
+echo "==> scripts/smoke-phase7.sh"
+bash scripts/smoke-phase7.sh
+
+echo "==> scripts/smoke-phase7-1.sh"
+bash scripts/smoke-phase7-1.sh
+
+echo "==> scripts/smoke-phase7-2.sh"
+bash scripts/smoke-phase7-2.sh
+
+echo "==> scripts/smoke-phase7-3.sh"
+bash scripts/smoke-phase7-3.sh
+
 echo "smoke-all: green"

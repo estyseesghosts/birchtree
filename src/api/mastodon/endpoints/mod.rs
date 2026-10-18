@@ -5,6 +5,7 @@
 //! business logic lives here.
 
 pub mod accounts;
+pub mod announcements;
 pub mod apps;
 pub mod emoji;
 pub mod filters;
@@ -20,3 +21,6 @@ pub mod scheduled_statuses;
 pub mod search;
 pub mod statuses;
 pub mod timelines;
+pub mod suggestions;
+pub mod donation_campaigns;
+pub mod reports;
