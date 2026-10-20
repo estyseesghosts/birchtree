@@ -47,6 +47,7 @@ enum_delegate = "0.2"
 reqwest-middleware = "0.3.2"
 anyhow = "1"
 http = "1"
+lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "tokio1", "tokio1-native-tls", "builder"] }
 
 [dev-dependencies]
 futures-core = "0.3"

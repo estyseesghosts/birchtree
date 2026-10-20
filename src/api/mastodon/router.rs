@@ -24,8 +24,7 @@ pub fn build_router(state: ApiState) -> Router {
     let ip_block_state = state.clone();
     let invites: std::sync::Arc<dyn crate::application::accounts::InviteStore> =
         std::sync::Arc::new(crate::application::accounts::MemoryInviteStore::default());
-    let mail_env: std::sync::Arc<crate::mailer::MailEnv> =
-        std::sync::Arc::new(crate::mailer::MailEnv::disabled());
+    let mail_env = state.mail_env.clone();
     Router::new()
         // Runtime probes.
         .route("/health", get(health))

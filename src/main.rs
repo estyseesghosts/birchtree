@@ -161,6 +161,10 @@ fn parse_args(cfg: &mut Config) -> Args {
             cfg.vapid_public_key = v.to_string();
         } else if let Some(v) = arg.strip_prefix("--vapid-private-key=") {
             cfg.vapid_private_key = v.to_string();
+        } else if let Some(v) = arg.strip_prefix("--smtp-url=") {
+            cfg.smtp_url = Some(v.to_string());
+        } else if let Some(v) = arg.strip_prefix("--mail-from=") {
+            cfg.mail_from = Some(v.to_string());
         } else if let Some(v) = arg.strip_prefix("--web-client-dir=") {
             cfg.web_client_dir = Some(std::path::PathBuf::from(v));
         } else if let Some(v) = arg.strip_prefix("--mode=") {
@@ -478,12 +482,33 @@ async fn serve(cfg: Config) {
         streams,
         federation: federation.clone(),
         rate_limit_multiplier: cfg.rate_limit_multiplier,
+        mail_env: Arc::new(birchtree::mailer::MailEnv::from_config(&cfg)),
     };
     if cfg.rate_limit_multiplier > 1 {
         tracing::warn!(multiplier = cfg.rate_limit_multiplier, "debug rate-limit weakening is in force: not for production");
     }
     let app = build_router(state);
-    let mailer: Arc<dyn MailSender> = Arc::new(LoggingMailSender);
+    // Outbound mail: real SMTP delivery through the worker when configured,
+    // the explicit logging adapter otherwise (registration jobs then log
+    // instead of sending; resend endpoints answer 503).
+    let mailer: Arc<dyn MailSender> = if cfg.mail_enabled() {
+        let from = cfg.mail_from.clone().unwrap_or_default();
+        let backend = birchtree::mailer::mailer_from_config(
+            cfg.smtp_url.as_deref(),
+            cfg.mail_from.as_deref(),
+        )
+        .unwrap_or_else(|err| {
+            eprintln!("configuration error: {err}");
+            std::process::exit(1);
+        });
+        Arc::new(birchtree::mail::SmtpJobSender::new(
+            backend,
+            &from,
+            &cfg.normalized_public_url(),
+        ))
+    } else {
+        Arc::new(LoggingMailSender)
+    };
 
     let listener = tokio::net::TcpListener::bind(cfg.listen)
         .await

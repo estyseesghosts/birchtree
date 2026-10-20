@@ -11,16 +11,22 @@
 //! `/auth/password/edit?reset_password_token=…`.
 //!
 //! Architecture: mail is sent AFTER commit, never inside a request
-//! transaction. Without an SMTP provider the mailer is explicitly disabled:
+//! transaction — the resend endpoints enqueue durable jobs and the worker
+//! delivers. Without an SMTP provider the mailer is explicitly disabled:
 //! sends fail with [`MailError::Disabled`] (surfaced as `503`), never a
 //! silent fake success. [`LogMailer`] is the test/dev backend: it stores
 //! messages in an observable outbox (no network) so tests can assert the
-//! send path ran. [`SmtpMailer`] is a validated-but-unimplemented stub: it
-//! refuses sends with [`MailError::Transport`] until delivery lands.
+//! send path ran. [`SmtpMailer`] delivers for real through `lettre`.
 //!
 //! Privacy: tokens are one-time secrets and recipient addresses are PII —
 //! neither is ever logged. Log lines carry only the message kind and the
 //! recipient domain.
+//!
+//! [`SmtpMailer`] delivers for real through `lettre` (synchronous transport
+//! run in [`tokio::task::block_in_place`], so it must run on a multi-thread
+//! runtime — the production worker is one; sync drains in tests keep the log
+//! backend). `smtp://` requires STARTTLS except on loopback (lab/testing);
+//! `smtps://` uses implicit TLS.
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -136,6 +142,10 @@ pub trait Mailer: Send + Sync {
 }
 
 /// Minimal recipient check shared by the provided send paths.
+pub fn validate_address(to: &str) -> Result<(), MailError> {
+    validate_recipient(to)
+}
+
 fn validate_recipient(to: &str) -> Result<(), MailError> {
     let to = to.trim();
     let ok = !to.is_empty()
@@ -206,61 +216,144 @@ impl Mailer for DisabledMailer {
     }
 }
 
-/// Validated SMTP stub. Construction checks the URL shape; `send` refuses
-/// with [`MailError::Transport`] until real delivery lands — an honest
-/// error, never an unsent `Ok`.
+/// Real SMTP backend. Construction parses (no network, no secrets kept
+/// beyond the credentials needed to authenticate); `send` delivers.
+///
+/// URL shapes: `smtp://[user:pass@]host[:port]` (STARTTLS required unless the
+/// host is loopback) and `smtps://[user:pass@]host[:port]` (implicit TLS).
+/// Default ports 587 / 465. Anything else (query strings, other schemes) is
+/// refused at construction.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // `url`/`from` are used by real delivery (parent follow-up).
 pub struct SmtpMailer {
-    url: String,
     from: String,
+    host: String,
+    port: u16,
+    implicit_tls: bool,
+    allow_plaintext: bool,
+    credentials: Option<(String, String)>,
 }
 
 impl SmtpMailer {
     /// Validate `smtp://…` / `smtps://…` URL shape (no network, no secrets).
     pub fn new(url: &str, from: &str) -> Result<Self, String> {
-        validate_smtp_url(url)?;
         if !from.contains('@') {
             return Err("--mail-from must be an email address".to_string());
         }
+        let parsed = url::Url::parse(url)
+            .map_err(|_| "--smtp-url must start with smtp:// or smtps://".to_string())?;
+        let implicit_tls = match parsed.scheme() {
+            "smtps" => true,
+            "smtp" => false,
+            _ => return Err("--smtp-url must start with smtp:// or smtps://".to_string()),
+        };
+        if parsed.query().is_some() {
+            return Err("--smtp-url must not carry a query string".to_string());
+        }
+        let host = parsed
+            .host_str()
+            .filter(|h| !h.is_empty())
+            .ok_or_else(|| "--smtp-url needs a host".to_string())?
+            .to_string();
+        let port = parsed
+            .port()
+            .unwrap_or(if implicit_tls { 465 } else { 587 });
+        let allow_plaintext = matches!(
+            host.as_str(),
+            "localhost" | "127.0.0.1" | "::1"
+        );
+        let credentials = match (parsed.username(), parsed.password()) {
+            ("", _) => None,
+            (user, pass) => {
+                let user = percent_decode(user);
+                let pass = pass.map(percent_decode).unwrap_or_default();
+                if user.is_empty() {
+                    return Err("--smtp-url has an empty username".to_string());
+                }
+                Some((user, pass))
+            }
+        };
         Ok(Self {
-            url: url.to_string(),
             from: from.to_string(),
+            host,
+            port,
+            implicit_tls,
+            allow_plaintext,
+            credentials,
         })
     }
 
     pub fn from_address(&self) -> &str {
         &self.from
     }
+
+    fn transport(&self) -> Result<lettre::SmtpTransport, MailError> {
+        use lettre::transport::smtp::client::{Tls, TlsParameters};
+        let tls_params = TlsParameters::new(self.host.clone())
+            .map_err(|err| MailError::Transport(format!("smtp tls setup failed: {err}")))?;
+        let mut builder = if self.implicit_tls {
+            lettre::SmtpTransport::builder_dangerous(&self.host)
+                .port(self.port)
+                .tls(Tls::Wrapper(tls_params))
+        } else if self.allow_plaintext {
+            lettre::SmtpTransport::builder_dangerous(&self.host).port(self.port)
+        } else {
+            lettre::SmtpTransport::relay(&self.host)
+                .map_err(|err| MailError::Transport(format!("smtp setup failed: {err}")))?
+                .port(self.port)
+                .tls(Tls::Required(tls_params))
+        };
+        builder = builder.timeout(Some(std::time::Duration::from_secs(30)));
+        if let Some((user, pass)) = &self.credentials {
+            builder = builder.credentials(lettre::transport::smtp::authentication::Credentials::new(
+                user.clone(),
+                pass.clone(),
+            ));
+        }
+        Ok(builder.build())
+    }
+}
+
+fn percent_decode(raw: &str) -> String {
+    url::form_urlencoded::parse(raw.as_bytes())
+        .map(|(k, v)| [k, v].concat())
+        .collect()
 }
 
 impl Mailer for SmtpMailer {
     fn send(&self, msg: &MailMessage) -> Result<(), MailError> {
-        tracing::warn!(
+        use lettre::Transport;
+        let email = lettre::Message::builder()
+            .from(
+                msg.from
+                    .parse()
+                    .map_err(|_| MailError::InvalidRecipient("sender address is invalid".into()))?,
+            )
+            .to(msg
+                .to
+                .parse()
+                .map_err(|_| MailError::InvalidRecipient("address is invalid".into()))?)
+            .subject(msg.subject.clone())
+            .body(msg.body_text.clone())
+            .map_err(|err| MailError::Transport(format!("smtp build failed: {err}")))?;
+        let transport = self.transport()?;
+        // Synchronous transport on a multi-thread runtime: the worker (and
+        // only the worker) runs here. Panics outside one — sync test drains
+        // keep the log backend instead.
+        tokio::task::block_in_place(|| transport.send(&email))
+            .map_err(|err| MailError::Transport(format!("smtp delivery failed: {err}")))?;
+        tracing::info!(
             subject = %msg.subject,
             recipient_domain = %msg.to_domain(),
-            "mail not sent (SMTP delivery not implemented)"
+            "mail delivered (smtp)"
         );
-        Err(MailError::Transport(
-            "SMTP delivery is not implemented yet; message not sent".to_string(),
-        ))
-    }
-}
-
-fn validate_smtp_url(url: &str) -> Result<(), String> {
-    let rest = url
-        .strip_prefix("smtp://")
-        .or_else(|| url.strip_prefix("smtps://"));
-    match rest {
-        Some(rest) if !rest.is_empty() => Ok(()),
-        _ => Err("--smtp-url must start with smtp:// or smtps://".to_string()),
+        Ok(())
     }
 }
 
 /// Pick the production backend from configuration.
 ///
 /// `None` URL → [`DisabledMailer`] (explicit 503s, never fake success).
-/// `Some` URL → validated [`SmtpMailer`] stub; a malformed URL or a missing
+/// `Some` URL → real [`SmtpMailer`] delivery; a malformed URL or a missing
 /// sender is a hard startup error, never a silent pass.
 pub fn mailer_from_config(
     smtp_url: Option<&str>,
@@ -283,19 +376,29 @@ pub fn mailer_from_config(
 }
 
 /// HTTP-layer environment for the mail endpoints: the sender address plus
-/// the configured backend. Wired as `Extension<Arc<MailEnv>>` (parent-owned
-/// router wiring); `from` mirrors `Config::mail_from`.
+/// whether a provider is configured. The request path only *enqueues*
+/// durable mail jobs (delivery happens in the worker, after commit); without
+/// a provider the endpoints answer an explicit `503`, never a fake success.
 #[derive(Clone)]
 pub struct MailEnv {
     pub from: String,
-    pub mailer: Arc<dyn Mailer>,
+    pub enabled: bool,
 }
 
 impl MailEnv {
-    pub fn new(from: &str, mailer: Arc<dyn Mailer>) -> Self {
+    pub fn new(from: &str, enabled: bool) -> Self {
         Self {
             from: from.to_string(),
-            mailer,
+            enabled,
+        }
+    }
+
+    /// Build from server configuration (`--smtp-url` / `mail_from`, or the
+    /// JSON file). Validation already ran in `Config::validate`.
+    pub fn from_config(cfg: &crate::config::Config) -> Self {
+        Self {
+            from: cfg.mail_from.clone().unwrap_or_default(),
+            enabled: cfg.mail_enabled(),
         }
     }
 
@@ -303,7 +406,7 @@ impl MailEnv {
     pub fn disabled() -> Self {
         Self {
             from: String::new(),
-            mailer: Arc::new(DisabledMailer),
+            enabled: false,
         }
     }
 }
@@ -358,5 +461,11 @@ mod tests {
         assert!(mailer_from_config(Some("smtp://mail:25"), None).is_err());
         assert!(mailer_from_config(Some("smtp://mail:25"), Some("not-an-address")).is_err());
         assert!(mailer_from_config(Some("smtp://mail:25"), Some("a@b.com")).is_ok());
+        // Shapes beyond host/port/credentials are refused at construction.
+        assert!(mailer_from_config(Some("smtp://mail:25?tls=off"), Some("a@b.com")).is_err());
+        assert!(mailer_from_config(Some("smtp:///no-host"), Some("a@b.com")).is_err());
+        // Credential and port parsing.
+        let m = mailer_from_config(Some("smtp://u:p@mail.example:2525"), Some("a@b.com"));
+        assert!(m.is_ok());
     }
 }

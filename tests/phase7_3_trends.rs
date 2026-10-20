@@ -51,6 +51,7 @@ fn api_state(srv: &TestServer, trends_enabled: bool) -> ApiState {
         streams: streams.clone(),
         federation,
         rate_limit_multiplier: 1,
+        mail_env: std::sync::Arc::new(birchtree::mailer::MailEnv::disabled()),
     }
 }
 

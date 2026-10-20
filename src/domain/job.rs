@@ -22,6 +22,12 @@ pub enum JobKind {
     /// adapter. Enqueued atomically with public registration; never sent inside
     /// the request transaction.
     SendConfirmationEmail,
+    /// Send a password-reset message through the `MailSender` adapter.
+    /// Enqueued by the resend endpoint (`{account_id, email, token}`); the
+    /// token is random per request. Never sent inside the request
+    /// transaction. At-least-once: a retry after a crash can duplicate the
+    /// message (tokens are single-use at redemption).
+    SendPasswordResetEmail,
     /// Create a notification record for the recipient, if not already present
     /// (deduplicated through the notification dedup index, so a replayed or
     /// retried job never duplicates a notification). Enqueued in the same
@@ -92,6 +98,7 @@ impl JobKind {
         match self {
             JobKind::UserCreated => "user_created",
             JobKind::SendConfirmationEmail => "send_confirmation_email",
+            JobKind::SendPasswordResetEmail => "send_password_reset_email",
             JobKind::FanOutNotification => "fan_out_notification",
             JobKind::PollExpired => "poll_expired",
             JobKind::ProcessMedia => "process_media",

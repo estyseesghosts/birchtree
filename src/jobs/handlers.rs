@@ -56,11 +56,39 @@ pub fn handle_with_transcode(
                 .get("email")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| Error::Internal("send_confirmation_email: missing email".into()))?;
-            // The confirmation token is derived deterministically from the job
-            // id so a retried job never mints a different value. A real adapter
-            // would persist/redeem it; Phase 2 ships a logging adapter.
-            let token = crypto::sha256_hex(format!("confirmation:{}", job.id).as_bytes());
-            mailer.send_confirmation(email, account_id, &token)
+            // The resend endpoint puts an explicit random token in the
+            // payload; registration jobs carry none, so fall back to the
+            // job-id derivation (a retried job never mints a different
+            // value). A real adapter would persist/redeem it.
+            let token;
+            let token = match job.payload.get("token").and_then(|v| v.as_str()) {
+                Some(explicit) if !explicit.is_empty() => explicit,
+                _ => {
+                    token = crypto::sha256_hex(format!("confirmation:{}", job.id).as_bytes());
+                    token.as_str()
+                }
+            };
+            mailer.send_confirmation(email, account_id, token)
+        }
+        JobKind::SendPasswordResetEmail => {
+            let account_id = job
+                .payload
+                .get("account_id")
+                .and_then(|v| v.as_u64())
+                .map(Id::new)
+                .ok_or_else(|| Error::Internal("send_password_reset_email: missing account_id".into()))?;
+            let email = job
+                .payload
+                .get("email")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| Error::Internal("send_password_reset_email: missing email".into()))?;
+            let token = job
+                .payload
+                .get("token")
+                .and_then(|v| v.as_str())
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| Error::Internal("send_password_reset_email: missing token".into()))?;
+            mailer.send_password_reset(email, account_id, token)
         }
         JobKind::FanOutNotification => {
             // Idempotent: the notification store dedups by

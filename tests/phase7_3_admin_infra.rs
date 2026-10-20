@@ -70,6 +70,7 @@ fn admin_router(srv: &TestServer, trusted_proxies: Vec<IpAddr>) -> axum::Router 
         streams: srv.streams.clone(),
         federation,
         rate_limit_multiplier: 1,
+        mail_env: std::sync::Arc::new(birchtree::mailer::MailEnv::disabled()),
     };
     admin_infra::routes().with_state(state)
 }
@@ -550,6 +551,7 @@ fn probe_parts(srv: &TestServer, trusted_proxies: Vec<IpAddr>) -> (axum::Router,
         streams: srv.streams.clone(),
         federation,
         rate_limit_multiplier: 1,
+        mail_env: std::sync::Arc::new(birchtree::mailer::MailEnv::disabled()),
     };
     let router = axum::Router::new()
         .route("/probe", get(|| async { "ok" }))

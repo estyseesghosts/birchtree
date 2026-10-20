@@ -10,6 +10,7 @@
 
 use crate::application::ports::MailSender;
 use crate::domain::{Id, Result};
+use crate::mailer::{MailError, Mailer};
 
 /// A `MailSender` that records messages in the log without sending them.
 ///
@@ -30,4 +31,52 @@ impl MailSender for LoggingMailSender {
         );
         Ok(())
     }
+
+    fn send_password_reset(&self, to: &str, account_id: Id, token: &str) -> Result<()> {
+        tracing::info!(
+            account_id = %account_id,
+            recipient = %to,
+            token_issued = !token.is_empty(),
+            "password-reset email queued (logging adapter; no SMTP configured)"
+        );
+        Ok(())
+    }
+}
+
+/// A `MailSender` that delivers through a configured [`Mailer`] backend
+/// (production: the real SMTP mailer) with the operator's sender address and
+/// public base URL (for the token links). Used by the worker; the request
+/// path only enqueues jobs, never sends.
+pub struct SmtpJobSender {
+    mailer: std::sync::Arc<dyn Mailer>,
+    from: String,
+    base_url: String,
+}
+
+impl SmtpJobSender {
+    pub fn new(mailer: std::sync::Arc<dyn Mailer>, from: &str, base_url: &str) -> Self {
+        Self {
+            mailer,
+            from: from.to_string(),
+            base_url: base_url.to_string(),
+        }
+    }
+}
+
+impl MailSender for SmtpJobSender {
+    fn send_confirmation(&self, to: &str, account_id: Id, token: &str) -> Result<()> {
+        self.mailer
+            .send_confirmation(&self.from, to, account_id, token, &self.base_url)
+            .map_err(domain_mail_error)
+    }
+
+    fn send_password_reset(&self, to: &str, account_id: Id, token: &str) -> Result<()> {
+        self.mailer
+            .send_password_reset(&self.from, to, account_id, token, &self.base_url)
+            .map_err(domain_mail_error)
+    }
+}
+
+fn domain_mail_error(err: MailError) -> crate::domain::Error {
+    err.into()
 }

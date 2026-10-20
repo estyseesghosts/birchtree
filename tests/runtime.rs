@@ -45,6 +45,7 @@ fn app(max_body_size: usize) -> (tempfile::TempDir, axum::Router) {
         streams,
         federation,
         rate_limit_multiplier: 1,
+        mail_env: std::sync::Arc::new(birchtree::mailer::MailEnv::disabled()),
     });
     (dir, router)
 }

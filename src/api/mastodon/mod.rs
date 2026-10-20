@@ -202,4 +202,7 @@ pub struct ApiState {
     pub federation: activitypub_federation::config::FederationConfig<crate::activitypub::FedContext>,
     /// Multiplier on the API rate limit (1 in production). See `Config::rate_limit_multiplier`.
     pub rate_limit_multiplier: u32,
+    /// Outbound-mail environment (sender + enabled flag, from server config).
+    /// The request path only enqueues mail jobs; delivery runs in the worker.
+    pub mail_env: std::sync::Arc<crate::mailer::MailEnv>,
 }

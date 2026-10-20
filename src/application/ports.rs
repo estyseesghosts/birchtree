@@ -207,6 +207,8 @@ pub trait SessionStore: Send + Sync {
 pub trait MailSender: Send + Sync {
     /// Send an email-confirmation message for a newly registered account.
     fn send_confirmation(&self, to: &str, account_id: Id, token: &str) -> Result<()>;
+    /// Send a password-reset message (resend endpoint job).
+    fn send_password_reset(&self, to: &str, account_id: Id, token: &str) -> Result<()>;
 }
 
 /// Blob/object storage for media bytes and custom emoji images.

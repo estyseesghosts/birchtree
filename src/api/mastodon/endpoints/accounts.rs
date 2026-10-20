@@ -536,7 +536,9 @@ pub async fn invite_show(
 /// re-sends the confirmation mail; `200 {}`. Requires a user token with
 /// `write`/`write:accounts` and an unconfirmed address (`403` otherwise, like
 /// upstream `require_user_not_confirmed!`). Without a mail provider the
-/// answer is an explicit `503`, never a fake success.
+/// answer is an explicit `503`, never a fake success. Delivery is a durable
+/// `SendConfirmationEmail` job (worker sends after commit, like upstream
+/// `deliver_later`); the token is random per request.
 ///
 /// Not enforced (documented D12 remainder): `created_by_application`
 /// ownership (`require_user_owned_by_application!`) — birchtree stores no
@@ -569,21 +571,28 @@ pub async fn email_confirmation_create(
     let Some(email) = user.email else {
         return ApiError::unprocessable("email address is missing").into_response();
     };
-    // Deterministic per-account token so resends are idempotent (matches the
-    // job-derived token shape; redemption lands with the confirmation flow).
-    let token = crate::application::crypto::sha256_hex(
-        format!("confirmation:{account_id}").as_bytes(),
-    );
-    match accounts::request_confirmation_email(
-        &*env.mailer,
-        &env.from,
-        &email,
-        account_id,
-        &token,
-        &state.server.public_url,
+    if !env.enabled {
+        return mail_error_response(MailError::Disabled(
+            "no SMTP provider configured (set smtp_url and mail_from)",
+        ));
+    }
+    if let Err(err) = crate::mailer::validate_address(&email) {
+        return mail_error_response(err);
+    }
+    // Random per request (unguessable, unlike the deterministic registration
+    // token); the job payload carries it to the worker.
+    let token = crate::application::crypto::random_token_hex(32);
+    match store.enqueue(
+        crate::domain::JobKind::SendConfirmationEmail,
+        json!({
+            "account_id": account_id.value(),
+            "email": email,
+            "token": token,
+        }),
+        state.context.now_ms(),
     ) {
-        Ok(()) => axum::Json(json!({})).into_response(),
-        Err(err) => mail_error_response(err),
+        Ok(_) => axum::Json(json!({})).into_response(),
+        Err(err) => ApiError::from(err).into_response(),
     }
 }
 
@@ -633,17 +642,25 @@ pub async fn password_reset_create(
     let Some(email) = user.email else {
         return ApiError::unprocessable("email address is missing").into_response();
     };
-    let token =
-        crate::application::crypto::sha256_hex(format!("password-reset:{account_id}").as_bytes());
-    match accounts::request_password_reset(
-        &*env.mailer,
-        &env.from,
-        &email,
-        account_id,
-        &token,
-        &state.server.public_url,
+    if !env.enabled {
+        return mail_error_response(MailError::Disabled(
+            "no SMTP provider configured (set smtp_url and mail_from)",
+        ));
+    }
+    if let Err(err) = crate::mailer::validate_address(&email) {
+        return mail_error_response(err);
+    }
+    let token = crate::application::crypto::random_token_hex(32);
+    match store.enqueue(
+        crate::domain::JobKind::SendPasswordResetEmail,
+        json!({
+            "account_id": account_id.value(),
+            "email": email,
+            "token": token,
+        }),
+        state.context.now_ms(),
     ) {
-        Ok(()) => axum::Json(json!({})).into_response(),
-        Err(err) => mail_error_response(err),
+        Ok(_) => axum::Json(json!({})).into_response(),
+        Err(err) => ApiError::from(err).into_response(),
     }
 }

@@ -31,11 +31,28 @@ indirection so operators need not store secrets in the file:
 An unset variable is a startup error naming the variable. Secret values are
 never logged.
 
+## Outbound mail (SMTP)
+
+`POST /api/v1/emails/confirmations` and `POST /api/v1/emails/password_reset`
+deliver for real once a provider is configured (flags or file):
+
+```sh
+birchtree --smtp-url=smtps://user:pass@mail.example.com:465 \
+  --mail-from=noreply@example.com
+```
+
+Shapes: `smtp://[user:pass@]host[:port]` (STARTTLS required, except on
+loopback for labs) and `smtps://…` (implicit TLS, default port 465).
+Resend endpoints enqueue durable jobs and answer `200 {}` immediately; the
+worker delivers after commit (at-least-once: a crash retry can duplicate a
+message). Without a provider the endpoints answer `503` and registration
+mails only reach the log. Mail bodies/subjects mirror upstream
+`UserMailer` (Devise defaults); token links point at the public URL.
+
 ## File-only keys
 
 These have no CLI flag and can only be set via the file: `max_file_size`,
-`worker_poll_interval_ms`, `trends_enabled`, `invites_enabled`, `smtp_url`,
-`mail_from`.
+`worker_poll_interval_ms`, `trends_enabled`, `invites_enabled`.
 
 ## Reloading
 

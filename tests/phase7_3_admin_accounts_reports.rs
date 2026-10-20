@@ -115,6 +115,7 @@ fn admin_router(srv: &TestServer) -> axum::Router {
         streams,
         federation,
         rate_limit_multiplier: 1,
+        mail_env: std::sync::Arc::new(birchtree::mailer::MailEnv::disabled()),
     };
     build_router(state)
 }

@@ -93,6 +93,7 @@ fn approval_server(require_approval: bool) -> ApprovalSrv {
         streams: streams.clone(),
         federation,
         rate_limit_multiplier: 1,
+        mail_env: std::sync::Arc::new(birchtree::mailer::MailEnv::disabled()),
     });
     ApprovalSrv {
         _dir: dir,
