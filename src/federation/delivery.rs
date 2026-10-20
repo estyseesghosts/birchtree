@@ -3,14 +3,23 @@
 //! The job's payload holds the activity JSON, fixed when the event was planned.
 //! Each attempt signs and sends those exact bytes (the crate's `SendActivityTask`),
 //! so a retry sends the same activity. The outcome settles the job:
-//! - a 2xx: done.
+//! - a 2xx: done; the destination's failure count resets.
 //! - a 4xx, a 5xx, a timeout or a transport error: retry with the queue's backoff.
 //!   The 4xx rule is birchtree's (D28): the middleware in `federation::net` turns
-//!   a 4xx into an error, so the crate does not treat it as delivered.
+//!   a 4xx delivery into an error, so the crate does not treat it as delivered.
 //! - a refused URL, a missing key, or a payload that is not an activity: permanent.
 //!   The job is quarantined for an operator.
 //!
 //! Each destination is its own job, so one failing inbox does not hold up others.
+//! On top of the per-job backoff, destinations carry a failure budget and a
+//! cooldown ([`DEST_FAILURE_BUDGET`], [`dest_cooldown_ms`]): consecutive
+//! failures to one host move its cooldown out exponentially, and a job aimed
+//! at a host inside its cooldown is parked — completed now, re-enqueued as a
+//! deferred copy due when the cooldown ends — instead of hitting the down host
+//! again. Past the budget, or past [`DEST_MAX_DEFERRALS`] parks, the job is
+//! quarantined. A success resets the host. Permanent (quarantine-class)
+//! failures never touch the host's budget: one bad inbox must not cool down
+//! its host.
 
 use activitypub_federation::{
     activity_sending::SendActivityTask,
@@ -25,7 +34,33 @@ use url::Url;
 use crate::activitypub::actor::ActorRecord;
 use crate::activitypub::error::FedError;
 use crate::activitypub::FedContext;
-use crate::domain::{Id, Job, JobKind};
+use crate::domain::{DeliveryDestState, Id, Job, JobKind};
+
+/// First cooldown after one failed attempt to a host.
+pub const DEST_COOLDOWN_BASE_MS: u64 = 60_000;
+/// The cooldown never moves past this.
+pub const DEST_COOLDOWN_CAP_MS: u64 = 3_600_000;
+/// Consecutive failed attempts to a host before its jobs quarantine fast.
+pub const DEST_FAILURE_BUDGET: u32 = 10;
+/// Times a job may be parked for a cooling destination before quarantine.
+pub const DEST_MAX_DEFERRALS: u32 = 25;
+
+/// The cooldown after `failures` consecutive failures: the base, doubled per
+/// failure past the first, capped.
+pub fn dest_cooldown_ms(failures: u32) -> u64 {
+    let shift = failures.saturating_sub(1).min(16);
+    DEST_COOLDOWN_BASE_MS.saturating_mul(1 << shift).min(DEST_COOLDOWN_CAP_MS)
+}
+
+/// The failure domain of an inbox URL: its lowercased host, with the explicit
+/// port when one is named. Inboxes on one host share a budget and a cooldown.
+pub fn dest_host(inbox: &Url) -> String {
+    match (inbox.host_str(), inbox.port()) {
+        (Some(host), Some(port)) => format!("{}:{port}", host.to_lowercase()),
+        (Some(host), None) => host.to_lowercase(),
+        (None, _) => inbox.as_str().to_lowercase(),
+    }
+}
 
 /// How a failed delivery settles its job.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,15 +150,47 @@ pub async fn run(config: &FederationConfig<FedContext>, job: &Job) -> Result<(),
     let activity = OutboundActivity::from_body(body).map_err(|e| DeliveryError::Quarantine(format!("delivery body is not an activity: {e}")))?;
 
     let ctx: &FedContext = config;
-    let account = ctx
-        .app
-        .store
+    let store = &*ctx.app.store;
+    let now = ctx.app.now_ms();
+    let host = dest_host(&inbox_url);
+    // A host inside its cooldown is not hit again: park this job as a
+    // deferred copy due when the cooldown ends. The park does not consume
+    // the job's retry budget; past the deferral cap the job quarantines.
+    if let Some(state) = store
+        .delivery_dest(&host)
+        .map_err(|e| DeliveryError::Retry(e.to_string()))?
+        && now < state.cooldown_until_ms
+    {
+        let deferrals = payload.get("deferrals").and_then(Value::as_u64).unwrap_or(0);
+        if deferrals >= u64::from(DEST_MAX_DEFERRALS) {
+            return Err(DeliveryError::Quarantine(format!(
+                "destination {host} still cooling down after {deferrals} deferrals"
+            )));
+        }
+        let mut parked = payload.clone();
+        if let Some(object) = parked.as_object_mut() {
+            object.insert("deferrals".into(), Value::from(deferrals + 1));
+        }
+        store
+            .enqueue_at(JobKind::DeliverActivity, parked, state.cooldown_until_ms, now)
+            .map_err(|e| DeliveryError::Retry(e.to_string()))?;
+        tracing::info!(
+            target: "birchtree::federation",
+            direction = "outbound",
+            inbox,
+            host = %host,
+            deferrals = deferrals + 1,
+            outcome = "parked: destination cooling down",
+            "delivery deferred"
+        );
+        return Ok(());
+    }
+
+    let account = store
         .account_by_id(sender)
         .map_err(|e| DeliveryError::Retry(e.to_string()))?
         .ok_or_else(|| DeliveryError::Quarantine("sender account is gone".into()))?;
-    let keys = ctx
-        .app
-        .store
+    let keys = store
         .actor_keys(sender)
         .map_err(|e| DeliveryError::Retry(e.to_string()))?
         .filter(|keys| keys.private_key_pem.is_some())
@@ -138,15 +205,50 @@ pub async fn run(config: &FederationConfig<FedContext>, job: &Job) -> Result<(),
         return Err(DeliveryError::Quarantine(format!("inbox {inbox} refused by federation policy")));
     }
     for task in tasks {
-        task.sign_and_send(&data).await.map_err(classify)?;
-        tracing::info!(
-            target: "birchtree::federation",
-            direction = "outbound",
-            inbox,
-            activity = %activity.id(),
-            outcome = "delivered (2xx)",
-            "activity sent"
-        );
+        match task.sign_and_send(&data).await {
+            Ok(()) => {
+                // A success resets the host: the outage, if any, is over.
+                if store.delivery_dest(&host).map_err(|e| DeliveryError::Retry(e.to_string()))?.is_some() {
+                    store
+                        .set_delivery_dest(&host, DeliveryDestState { failures: 0, cooldown_until_ms: 0 })
+                        .map_err(|e| DeliveryError::Retry(e.to_string()))?;
+                }
+                tracing::info!(
+                    target: "birchtree::federation",
+                    direction = "outbound",
+                    inbox,
+                    activity = %activity.id(),
+                    outcome = "delivered (2xx)",
+                    "activity sent"
+                );
+            }
+            Err(err) => {
+                let settled = classify(err);
+                // Only a retryable failure charges the host's budget: a
+                // permanent refusal is one bad inbox, not a sick host.
+                if let DeliveryError::Retry(msg) = &settled {
+                    let failures = store
+                        .delivery_dest(&host)
+                        .map_err(|e| DeliveryError::Retry(e.to_string()))?
+                        .map(|s| s.failures)
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    let state = DeliveryDestState {
+                        failures,
+                        cooldown_until_ms: now.saturating_add(dest_cooldown_ms(failures)),
+                    };
+                    store
+                        .set_delivery_dest(&host, state)
+                        .map_err(|e| DeliveryError::Retry(e.to_string()))?;
+                    if failures > DEST_FAILURE_BUDGET {
+                        return Err(DeliveryError::Quarantine(format!(
+                            "destination {host} failed {failures} times in a row; budget exhausted: {msg}"
+                        )));
+                    }
+                }
+                return Err(settled);
+            }
+        }
     }
     Ok(())
 }

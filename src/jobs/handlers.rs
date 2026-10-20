@@ -157,7 +157,8 @@ pub fn handle_with_transcode(
         JobKind::FederationEvent
         | JobKind::ResolveParent
         | JobKind::CrawlReplies
-        | JobKind::FetchRemoteMedia => Ok(()),
+        | JobKind::FetchRemoteMedia
+        | JobKind::PreviewCardFetch => Ok(()),
         JobKind::GenerateAnnualReport => {            let account_id = job
                 .payload
                 .get("account_id")
@@ -225,12 +226,46 @@ pub fn handle_with_transcode(
             }
             Ok(())
         }
-        // Async kinds run in the job worker (network/toolchain), never in the
-        // sync drain: tests and offline drains complete them without doing
-        // work. `TranscodeMedia` is reserved for a future split of the
-        // pipeline; the v1/v2 lifecycle rides `ProcessMedia` with the
-        // worker-threaded config.
-        JobKind::WebPushDelivery | JobKind::TranscodeMedia => Ok(()),
+        // D38 account deletion: one bounded, idempotent batch per job; the
+        // chain continues while a full page was seen. A crashed chain
+        // resumes from the last enqueued cursor (or from this job's own
+        // cursor when the crash predates the follow-up enqueue, via the
+        // job lease); tombstones are idempotent so replays are harmless.
+        // The batch clock is the job's creation time, not its lease-shifted
+        // due time, so follow-ups stay immediately claimable and retries
+        // stamp deterministic times.
+        JobKind::AccountDeletionBatch => {
+            crate::jobs::account_deletion::run_batch(
+                store,
+                streaming,
+                &job.payload,
+                job.created_at_ms,
+            )?;
+            Ok(())
+        }
+        // `TranscodeMedia` carries the same `{media_id}` payload as
+        // `ProcessMedia` and funnels through the same finish: rows that need
+        // a transcode take the ffmpeg pipeline when a toolchain is threaded
+        // (the worker always threads one), and every other row — including
+        // every row in a toolchain-less sync drain — takes the legacy
+        // pure-Rust finish. No dead dispatch: both media kinds do work here.
+        JobKind::TranscodeMedia => {
+            let media_id = crate::media::transcode::TranscodeJobPayload::media_id_from_json(
+                &job.payload,
+            )
+            .map_err(|err| Error::Internal(err.to_string()))?;
+            crate::application::media::process_media_job_with_config(
+                store,
+                blobs,
+                media_id,
+                job.due_at_ms,
+                transcode,
+            )
+        }
+        // Push delivery needs the async HTTP client, which the sync drain
+        // does not have: the worker owns `WebPushDelivery`, and offline
+        // drains complete it without doing work.
+        JobKind::WebPushDelivery => Ok(()),
         JobKind::DeliverActivity => Err(Error::Internal(
             "deliver_activity runs in the job worker (federation::delivery), not here".into(),
         )),

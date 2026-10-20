@@ -9,8 +9,7 @@
 
 use crate::application::federation_ports::{NewQuote, NewReport};
 use crate::application::policy::{quote_permission, QuotePermission};
-use crate::application::ports::{NewMedia, NewPollSpec, NewStatus, RemoteStatusIdentity, Store, VoteRejection};
-use crate::domain::{Error, Id, JobKind, QuoteState, Result, Status, Visibility};
+use crate::application::ports::{NewMedia, NewPollSpec, NewStatus, RemoteStatusIdentity, Store, VoteRejection};use crate::domain::{Error, Id, JobKind, QuoteState, Result, Status, Visibility};
 
 /// What an inbound activity did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,7 +152,9 @@ pub fn ingest_note(store: &dyn Store, note: RemoteNote, poll: Option<RemotePoll>
             in_reply_to_account_id: parent.as_ref().map(|p| p.account_id),
             media_ids,
             mentions,
-            tags: note.tags.clone(),
+            // D25: inbound tags land normalized (same rule as local
+            // writes), so remote `#café` and local `#cafe` are one tag.
+            tags: crate::application::statuses::normalize_tag_list(&note.tags),
             poll: usable_poll.as_ref().map(|p| NewPollSpec {
                 multiple: p.multiple,
                 hide_totals: false,
@@ -256,6 +257,10 @@ pub fn update_note(store: &dyn Store, actor_id: Id, note: &RemoteNote, now_ms: u
             spoiler_text: Some(note.spoiler_text.clone()),
             sensitive: Some(note.sensitive),
             language: note.language.clone(),
+            // Remote tags ride the wire `Hashtag` array (already
+            // normalized at parse); re-derive the stored list from them so
+            // a tag edit moves the hashtag-index keys (bug 4).
+            tags: Some(crate::application::statuses::normalize_tag_list(&note.tags)),
             ..Default::default()
         },
         now_ms,

@@ -276,16 +276,7 @@ pub fn create_status(
     // added by the store via `NewQuoteSpec.quoted_account_id`, not here.
     let handles = extract_mention_handles(&text);
     // D25: normalize at write — `#café` and `#cafe` store as one tag.
-    let tags = {
-        let mut normalized = Vec::new();
-        for raw in extract_tags(&text) {
-            let tag = normalize_tag(&raw);
-            if !tag.is_empty() && !normalized.contains(&tag) {
-                normalized.push(tag);
-            }
-        }
-        normalized
-    };
+    let tags = canonical_tags(&text);
     let local_domain = host_from_url(base_url);
     let mentions = resolve_mentions(store, &handles, Some(&local_domain));
 
@@ -643,9 +634,9 @@ pub fn update_status(
     }
 
     let mut update = StatusUpdate::default();
-    if let Some(text) = cmd.text {
+    if let Some(text) = &cmd.text {
         update.source_text = Some(text.clone());
-        update.content_html = Some(render_html(&text));
+        update.content_html = Some(render_html(text));
     }
     if let Some(spoiler) = cmd.spoiler_text {
         // Present-and-blank clears the CW (`Some(None)`), as in Mastodon.
@@ -676,6 +667,12 @@ pub fn update_status(
                 .ok_or_else(|| Error::InvalidInput(ERR_RECORD_INVALID.into()))?,
         );
     }
+    // Tags are re-derived on every edit (steady-state write path): the
+    // effective text is the edited text, or the stored text when the edit
+    // leaves it alone. The store replaces the tag list and moves the
+    // hashtag-index keys in the same transaction.
+    let effective_text = cmd.text.clone().unwrap_or_else(|| status.source_text.clone());
+    update.tags = Some(canonical_tags(&effective_text));
 
     store.update_status(cmd.status_id, cmd.account_id, update, now_ms)
 }
@@ -776,9 +773,34 @@ pub fn count_length(text: &str) -> usize {
     total + text[last..].chars().count()
 }
 
-/// Extract lowercased hashtag bodies (`[A-Za-z0-9_]+` after `#`), skipping
-/// `#` runs that sit inside a word (`café#tag`), preserving order and
-/// deduplicating (Mastodon stores unique tags per status).
+/// Canonical stored tags for a source text: extract with the D25-widened
+/// pattern, [`normalize_tag`] each, drop empties, deduplicate preserving
+/// order. Used on create and on every edit (steady-state writes), and by
+/// the backfill planner — so the planner converging proves the write path
+/// already converged.
+pub fn canonical_tags(text: &str) -> Vec<String> {
+    normalize_tag_list(&extract_tags(text).into_iter().collect::<Vec<_>>())
+}
+
+/// Normalize an explicit tag list (wire `Hashtag` arrays, remote updates):
+/// [`normalize_tag`] each, drop empties, deduplicate preserving order.
+/// Idempotent — already-normalized input passes through unchanged.
+pub fn normalize_tag_list(raw: &[String]) -> Vec<String> {
+    let mut tags = Vec::new();
+    for item in raw {
+        let tag = normalize_tag(item);
+        if !tag.is_empty() && !tags.contains(&tag) {
+            tags.push(tag);
+        }
+    }
+    tags
+}
+
+/// Extract hashtag bodies after `#` (D25-widened pattern: Unicode
+/// letters/digits plus upstream's keep-set), skipping `#` runs that sit
+/// inside a word (`café#tag`), preserving order and deduplicating (Mastodon
+/// stores unique tags per status). Callers canonicalize with
+/// [`normalize_tag`] (see [`canonical_tags`]).
 pub fn extract_tags(text: &str) -> Vec<String> {
     let re = tag_regex();
     let mut tags: Vec<String> = Vec::new();

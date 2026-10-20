@@ -26,6 +26,7 @@ pub mod trends;
 pub mod custom_emoji;
 pub mod federation;
 pub mod report;
+pub mod rule;
 
 // Re-export commonly used domain types at the crate level.
 pub use error::{Error, Result};
@@ -36,10 +37,10 @@ pub use account::Account;
 pub use admin_infra::{
     AdminAccountOverview, AdminAuditRecord, AdminCanonicalEmailBlock, AdminDomainAllow,
     AdminDomainBlock, AdminDomainSeverity, AdminEmailDomainBlock, AdminIpBlock, AdminIpSeverity,
-    AdminMediaOwner, AdminReportTarget, AdminTag,
+    AdminMediaOwner, AdminReportTarget, AdminTag, FollowMetricRow,
 };
 pub use oauth::{AccessToken, AuthorizationCode, OAuthApplication};
-pub use user::{LocalUser, LoginSession, UserRole};
+pub use user::{LocalUser, LoginSession, SignInEvent, UserRole};
 pub use job::{Job, JobKind, JobState};
 pub use follow::{Follow, FollowState};
 pub use relationship::{
@@ -59,4 +60,6 @@ pub use trends::{TagUsage, TrendLink, TrendPublisher, TrendStatusFlag, TrendTagF
 pub use idempotency::IdempotencyRecord;
 pub use conversation::{ConversationState, PushPolicy, WebPushSubscription};
 pub use federation::ActorKeys;
+pub use federation::DeliveryDestState;
 pub use report::Report;
+pub use rule::{AccountWarning, Rule, RULE_TEXT_LIMIT};

@@ -133,6 +133,13 @@ pub async fn run(config: &FederationConfig<FedContext>, job: &crate::domain::Job
             };
             (vec![body], outgoing::inboxes_of(store, &[target.id]).map_err(retry)?)
         }
+        // Account deletion (D38, upstream `DeleteAccountService#delete_actor!`):
+        // the actor becomes a `Tombstone` for every follower inbox. Only
+        // local actors reach here (`run` quarantines remote actors above).
+        "delete_actor" => {
+            let body = outgoing::delete_actor(&author);
+            (vec![body], outgoing::follower_inboxes(store, author.id).map_err(retry)?)
+        }
         "quote_request" | "quote_accept" | "quote_reject" => {
             let quote = quote_of(store, uint("quote_id"))?;
             let quoting = status_of(store, Some(quote.quoting_status_id))?;

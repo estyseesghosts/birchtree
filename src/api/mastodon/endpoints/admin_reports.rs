@@ -24,7 +24,7 @@ use crate::api::mastodon::pagination;
 use crate::api::mastodon::status_view::load_status_views;
 use crate::api::mastodon::ApiState;
 use crate::application::admin as admin_uc;
-use crate::application::ports::{AccountStore, AdminReportFilter, AdminReportPatch, Store};
+use crate::application::ports::{AccountStore, AdminInfraStore, AdminReportFilter, AdminReportPatch, Store};
 use crate::domain::{Account, Id, LocalUser, Report, UserRole};
 
 use super::admin_accounts::admin_account_json;
@@ -91,8 +91,10 @@ fn nest_account(
 /// `app/serializers/rest/admin/report_serializer.rb`).
 ///
 /// `statuses` are full `REST::StatusSerializer` rows for the moderator viewer.
-/// `rules` is always `[]`: rule ids are accepted and stored on update, but
-/// there is no Rule model yet (planned gap).
+/// `rules` renders the attached server rules (D37; upstream `Report#rules`
+/// through `REST::RuleSerializer`: `id`/`text` here — no translations,
+/// which have no model). Ids with no rule row are skipped (a deleted rule
+/// leaves a stale id on the report, documented).
 fn report_json(
     state: &ApiState,
     store: &dyn Store,
@@ -141,6 +143,20 @@ fn report_json(
         })
         .collect();
 
+    let rule_ids: Vec<Id> = report
+        .rule_ids
+        .iter()
+        .filter_map(|raw| raw.parse::<Id>().ok())
+        .collect();
+    let infra: &dyn AdminInfraStore = store;
+    let rules = infra
+        .admin_rules_by_ids(&rule_ids)
+        .map_err(ApiError::from)?;
+    let rules_json: Vec<Value> = rules
+        .iter()
+        .map(|rule| json!({ "id": rule.id.to_string(), "text": rule.text }))
+        .collect();
+
     Ok(json!({
         "id": report.id.to_string(),
         "action_taken": report.action_taken,
@@ -155,7 +171,7 @@ fn report_json(
         "assigned_account": admin_json(assigned, assigned_user),
         "action_taken_by_account": admin_json(action_by, action_by_user),
         "statuses": status_json,
-        "rules": [],
+        "rules": rules_json,
     }))
 }
 
@@ -294,6 +310,16 @@ pub async fn update(
         admin_uc::check_report_patch(category.as_deref(), rule_ids.as_deref())
     {
         return ApiError::from(err).into_response();
+    }
+    // D37: attached rule ids must reference existing rules (upstream
+    // `validate_rule_ids`); unknown ids are refused `422`.
+    if let Some(ids) = rule_ids.as_deref() {
+        if !ids.is_empty() {
+            let infra: &dyn AdminInfraStore = store;
+            if let Err(err) = admin_uc::load_rules(infra, ids) {
+                return ApiError::from(err).into_response();
+            }
+        }
     }
     let patch = AdminReportPatch {
         category,

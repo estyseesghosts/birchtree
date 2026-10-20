@@ -18,6 +18,7 @@ use crate::api::mastodon::errors::ApiError;
 use crate::api::mastodon::{status_view, ApiState};
 use crate::application::ports::Store;
 use crate::application::trends;
+use crate::application::web as web_cases;
 
 /// `Deprecation` for the deprecated `/api/v1/trends` alias of `/tags`:
 /// upstream deprecated it 2022-03-30, rendered as `@<unix timestamp>` with
@@ -38,11 +39,12 @@ pub async fn trends_alias(State(state): State<ApiState>, auth: OptionalAuth, uri
 fn tags_page(state: &ApiState, auth: &OptionalAuth, uri: &Uri, deprecated: bool) -> Response {
     let viewer = auth.0.as_ref().and_then(|a| a.token.user_id);
     let (offset, limit) = offset_limit(uri, 10);
+    let now = state.context.now_ms();
     let store: &dyn Store = &*state.context.store;
     let names = if !state.server.trends_enabled {
         Vec::new()
     } else {
-        match trends::approved_tags(store) {
+        match trends::approved_tags(store, now) {
             Ok(names) => names,
             Err(err) => return ApiError::from(err).into_response(),
         }
@@ -51,7 +53,15 @@ fn tags_page(state: &ApiState, auth: &OptionalAuth, uri: &Uri, deprecated: bool)
     let full = page.len() == limit && limit > 0;
     let body: Vec<serde_json::Value> = page
         .iter()
-        .map(|flag| dto::trend_tag_json(&state.server, flag, viewer))
+        .map(|flag| {
+            let history = trends::tag_history(store, &flag.name, now).unwrap_or_default();
+            let (following, featuring) = viewer
+                .map(|viewer| {
+                    web_cases::tag_relationship(store, viewer, &flag.name).unwrap_or((false, false))
+                })
+                .unwrap_or((false, false));
+            dto::trend_tag_json(&state.server, flag, viewer, &history, following, featuring)
+        })
         .collect();
     paged_json(uri, body, offset, limit, full, deprecated)
 }
@@ -65,7 +75,7 @@ pub async fn links_index(State(state): State<ApiState>, auth: OptionalAuth, uri:
     let links = if !state.server.trends_enabled {
         Vec::new()
     } else {
-        match trends::approved_links(store) {
+        match trends::approved_links(store, state.context.now_ms()) {
             Ok(links) => links,
             Err(err) => return ApiError::from(err).into_response(),
         }
@@ -78,13 +88,27 @@ pub async fn links_index(State(state): State<ApiState>, auth: OptionalAuth, uri:
 }
 
 /// `GET /api/v1/trends/statuses` (approved statuses only).
+///
+/// `?locale=` is accepted and ordering-only: statuses stored in that
+/// language sort first, stably; every approved status is still listed
+/// (real per-user locale ranking needs the `chosen_languages` setting,
+/// gap D21).
 pub async fn statuses_index(
     State(state): State<ApiState>,
     auth: OptionalAuth,
     uri: Uri,
 ) -> Response {
     let viewer = auth.0.as_ref().and_then(|a| a.token.user_id);
-    let (offset, limit) = offset_limit(&uri, 20);
+    let pairs = match uri.query() {
+        Some(query) => forms::parse(query.as_bytes()),
+        None => Vec::new(),
+    };
+    let (offset, limit) = trends::parse_offset_limit(
+        forms::get(&pairs, "offset"),
+        forms::get(&pairs, "limit"),
+        20,
+    );
+    let locale = forms::get(&pairs, "locale").map(str::to_string);
     let store: &dyn Store = &*state.context.store;
     let statuses = if !state.server.trends_enabled {
         Vec::new()
@@ -94,7 +118,7 @@ pub async fn statuses_index(
             Err(err) => return ApiError::from(err).into_response(),
         }
     };
-    let page = trends::page(statuses, offset, limit);
+    let page = trends::page(trends::locale_first(statuses, locale.as_deref()), offset, limit);
     let full = page.len() == limit && limit > 0;
     let views = match status_view::load_status_views(
         &state.server,

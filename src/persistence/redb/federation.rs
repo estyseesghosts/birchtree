@@ -12,12 +12,12 @@ use crate::application::federation_ports::{
 };
 use crate::application::notifications::fan_out_payload;
 use crate::domain::{
-    Account, ActorKeys, Error, Follow, FollowState, Id, Job, JobKind, NotificationType, Result,
+    Account, ActorKeys, DeliveryDestState, Error, Follow, FollowState, Id, Job, JobKind, NotificationType, Result,
 };
 
 use super::relationships::{read_follow_txn, read_stats_txn, write_stats_txn};
 use super::schema::{
-    self, ACCOUNTS, ACCOUNT_BY_ACTOR_URI, ACTIVITY_DEDUP, ACTOR_KEYS,
+    self, ACCOUNTS, ACCOUNT_BY_ACTOR_URI, ACTIVITY_DEDUP, ACTOR_KEYS, DELIVERY_DEST,
     FOLLOWS, FOLLOWS_BY_FOLLOWED, FOLLOW_BY_URI, HANDLE_INDEX,
 };
 use super::{decode, encode, RedbStore, StoreResult};
@@ -228,6 +228,25 @@ impl FederationStore for RedbStore {
         let read = self.begin_read()?;
         let table = read.open_table(ACTIVITY_DEDUP)?;
         Ok(table.get(activity_uri)?.is_some())
+    }
+
+    fn delivery_dest(&self, host: &str) -> Result<Option<DeliveryDestState>> {
+        let read = self.begin_read()?;
+        let table = read.open_table(DELIVERY_DEST)?;
+        match table.get(host)? {
+            Some(guard) => Ok(Some(decode(guard.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn set_delivery_dest(&self, host: &str, state: DeliveryDestState) -> Result<()> {
+        let write = self.begin_write()?;
+        {
+            let mut table = write.open_table(DELIVERY_DEST)?;
+            table.insert(host, encode(&state)?.as_slice())?;
+        }
+        write.commit()?;
+        Ok(())
     }
 
     fn commit_inbound(

@@ -680,12 +680,17 @@ impl StatusStore for RedbStore {
 
         // -- Nothing effective changed: abort the (still read-only) txn so no
         //    snapshot, `edited_at` bump or write happens.
+        let tags_changed = update
+            .tags
+            .as_ref()
+            .is_some_and(|tags| *tags != status.tags);
         let changed = source_changed
             || html_changed
             || spoiler_changed
             || sensitive_changed
             || language_changed
             || media_changed
+            || tags_changed
             || poll_changed;
         if !changed {
             return Ok(None);
@@ -791,6 +796,27 @@ impl StatusStore for RedbStore {
         }
         if media_changed {
             status.media_ids = new_media;
+        }
+        // -- Tags: replace the stored list and move the hashtag-index keys
+        // in this same transaction (bug 4: edits used to leave both stale).
+        if let Some(new_tags) = &update.tags {
+            if *new_tags != status.tags {
+                let mut index = write.open_table(HASHTAG_INDEX)?;
+                for tag in &status.tags {
+                    if !new_tags.contains(tag) {
+                        index.remove(schema::hashtag_key(tag, id.value()).as_slice())?;
+                    }
+                }
+                for tag in new_tags {
+                    if !status.tags.contains(tag) {
+                        index.insert(
+                            schema::hashtag_key(tag, id.value()).as_slice(),
+                            id.value(),
+                        )?;
+                    }
+                }
+                status.tags = new_tags.clone();
+            }
         }
         // `quote_approval_policy` rides along with a real edit but is not a
         // change by itself (no snapshot, no `edited_at`); the dedicated

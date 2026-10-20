@@ -71,6 +71,19 @@ pub enum JobKind {
     /// The payload carries the resume cursor; each batch enqueues its
     /// follow-up until a pass plans nothing.
     TagBackfill,
+    /// One bounded batch of the async account-deletion worker (Phase 7.3,
+    /// D38). The payload carries `{account_id, after}` where `after` is the
+    /// exclusive resume cursor (`None` starts at the newest status). Each
+    /// batch tombstones at most one page of the account's statuses (each
+    /// tombstone commits its own federated `Delete` event) and enqueues its
+    /// follow-up while a full page was seen. A crashed batch is retried from
+    /// its own cursor; tombstones are idempotent, so replays are harmless.
+    AccountDeletionBatch,
+    /// Fetch one trend link's preview-card metadata through the safe HTTP
+    /// client (Phase 7.3, D40). The payload carries `{link_id, url}`. The
+    /// handler is idempotent (a row that already has metadata is a no-op)
+    /// and never fabricates card fields.
+    PreviewCardFetch,
 }
 
 impl JobKind {
@@ -94,6 +107,8 @@ impl JobKind {
             JobKind::TranscodeMedia => "transcode_media",
             JobKind::WebPushDelivery => "web_push_delivery",
             JobKind::TagBackfill => "tag_backfill",
+            JobKind::AccountDeletionBatch => "account_deletion_batch",
+            JobKind::PreviewCardFetch => "preview_card_fetch",
         }
     }
 }

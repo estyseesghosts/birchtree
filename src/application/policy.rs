@@ -122,6 +122,48 @@ pub fn follow_language_allows(
         .any(|l| l.eq_ignore_ascii_case(status_language))
 }
 
+/// D21: upstream `User#chosen_languages` rule (`PublicFeed#language_scope`,
+/// `streaming/index.js` `chosenLanguages` filter).
+///
+/// When the viewer set preferred languages, a status passes only when its
+/// language is one of them, compared exactly (upstream's SQL `IN` and
+/// `indexOf` are exact). A status without a language never passes once the
+/// preference is set (SQL `NULL NOT IN (...)`, `indexOf(null) === -1`). No
+/// preference, or an empty one, keeps everything.
+pub fn chosen_language_allows(
+    chosen: Option<&[String]>,
+    status_language: Option<&str>,
+) -> bool {
+    let Some(chosen) = chosen else {
+        return true;
+    };
+    if chosen.is_empty() {
+        return true;
+    }
+    let Some(language) = status_language else {
+        return false;
+    };
+    chosen.iter().any(|l| l == language)
+}
+
+/// D21: normalize a chosen-languages preference the way upstream's
+/// `normalizes :chosen_languages, with: ->(chosen_languages) {
+/// chosen_languages.compact_blank.presence }` does: drop blanks, drop
+/// empties, deduplicate order-preserving. An empty result means "unset".
+/// Unlike follow languages, the tags are NOT case-folded (upstream stores
+/// them verbatim and compares exactly).
+pub fn normalize_chosen_languages(raw: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for tag in raw {
+        let tag = tag.trim().to_string();
+        if tag.is_empty() || out.contains(&tag) {
+            continue;
+        }
+        out.push(tag);
+    }
+    out
+}
+
 /// D23: keep the valid BCP-47-ish language tags (same shape as the status
 /// `language` validator), lowercased, deduplicated, order-preserving.
 /// Invalid entries are dropped, never stored.

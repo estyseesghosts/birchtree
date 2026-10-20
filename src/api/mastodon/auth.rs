@@ -23,6 +23,11 @@ use crate::domain::{AccessToken, Id, OAuthApplication, UserRole};
 pub struct Authenticated {
     pub token: AccessToken,
     pub app: OAuthApplication,
+    /// Whether the token owner's account is approved. Resolved once per
+    /// request in [`resolve`]; app-only tokens and tokens whose credential
+    /// row is gone read `true` (fail-open: approval gating only ever
+    /// restricts accounts the approval queue actually holds).
+    pub approved: bool,
 }
 
 impl Authenticated {
@@ -46,8 +51,17 @@ impl Authenticated {
 
     /// The resource-owner account id, or Mastodon's user-required error for an
     /// app-only (client-credentials) token.
+    ///
+    /// D36: an unapproved (pending) account's token is refused here with
+    /// upstream's `require_user!` response for `:pending_approval`
+    /// (`403 Your login is currently pending approval`). Email confirmation
+    /// stays unenforced (the separate Phase 2 gap).
     pub fn require_user(&self) -> ApiResult<Id> {
-        self.token.user_id.ok_or_else(ApiError::requires_user)
+        let user_id = self.token.user_id.ok_or_else(ApiError::requires_user)?;
+        if !self.approved {
+            return Err(ApiError::forbidden("Your login is currently pending approval"));
+        }
+        Ok(user_id)
     }
 
     /// Role-before-scope gate for the admin API (`/api/v1/admin/*` and
@@ -151,7 +165,17 @@ async fn resolve(state: &ApiState, plaintext: &str) -> ApiResult<Authenticated> 
         .app_by_id(token.app_id)
         .map_err(ApiError::from)?
         .ok_or_else(ApiError::invalid_token)?;
-    Ok(Authenticated { token, app })
+    // D36: resolve the approval state once per request so `require_user`
+    // gates pending accounts exactly where upstream's `require_user!` does.
+    let approved = match token.user_id {
+        None => true,
+        Some(user_id) => store
+            .user_by_account_id(user_id)
+            .map_err(ApiError::from)?
+            .map(|user| user.approved)
+            .unwrap_or(true),
+    };
+    Ok(Authenticated { token, app, approved })
 }
 
 #[axum::async_trait]

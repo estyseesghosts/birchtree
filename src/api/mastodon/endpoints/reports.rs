@@ -88,7 +88,7 @@ pub async fn create(State(state): State<ApiState>, auth: Auth, LenientForm(pairs
         "forwarded": forwarded,
         "created_at": created,
         "status_ids": status_ids.iter().map(|i| i.value().to_string()).collect::<Vec<_>>(),
-        "rule_ids": null,
+        "rule_ids": Vec::<String>::new(),
         "target_account": dto::account_json(&state.server, &target),
     }))
     .into_response()

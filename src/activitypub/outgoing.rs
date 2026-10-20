@@ -266,6 +266,21 @@ pub fn delete(author: &Account, status: &Status) -> Value {
     })
 }
 
+/// `Delete` of a local actor (account deletion, upstream
+/// `ActivityPub::DeleteActorSerializer` as sent by `DeleteAccountService`):
+/// the actor becomes a `Tombstone`. Recipients are the account's followers
+/// (relays do not exist here, so there is no low-priority fan-out).
+pub fn delete_actor(author: &Account) -> Value {
+    json!({
+        "@context": context(),
+        "id": format!("{}#delete", author.actor_uri),
+        "type": "Delete",
+        "actor": author.actor_uri.clone(),
+        "to": [PUBLIC],
+        "object": {"id": author.actor_uri, "type": "Tombstone", "formerType": "Person"},
+    })
+}
+
 /// A local vote on a remote poll, as Mastodon sends it
 /// (`VoteSerializer`): a `Create` of a `Note` naming the chosen option,
 /// `inReplyTo` the poll, addressed to the poll's author.

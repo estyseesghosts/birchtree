@@ -88,18 +88,26 @@ pub async fn follow(
         return federated_follow(&state, viewer, &target).await;
     }
     let pairs = body;
+    // D23 clear path: upstream passes `languages` on presence
+    // (`params.key?(:languages) ? params[:languages] : nil`,
+    // `AccountsController#follow`, v4.7.3), so an absent param keeps the
+    // stored preference while a present-but-empty one (`languages[]=`,
+    // which flattens to `[""]` and normalizes to `[]`) clears it. Rails
+    // treats `[]` as no-preference (`Follow#languages` fails `present?`
+    // in `filter_from_home`), and so does `follow_language_allows`.
+    // Caveat: a JSON `{"languages": []}` flattens to zero pairs, so it
+    // reads as absent and keeps the preference — form clients clear with
+    // `languages[]=`, JSON clients with unfollow/re-follow (D23 row).
+    let languages_present = forms::has(&pairs, "languages");
     let cmd = relationships::FollowCommand {
         follower_id: viewer,
         target_id: target.id,
         show_reblogs: forms::get(&pairs, "reblogs").map(bool_cast),
         notify: forms::get(&pairs, "notify").map(bool_cast),
-        languages: {
-            let langs = forms::all(&pairs, "languages[]");
-            if langs.is_empty() {
-                None
-            } else {
-                Some(langs.into_iter().map(str::to_string).collect())
-            }
+        languages: if languages_present {
+            Some(forms::all(&pairs, "languages").into_iter().map(str::to_string).collect())
+        } else {
+            None
         },
     };
     match relationships::follow(store, state.context.now_ms(), cmd) {

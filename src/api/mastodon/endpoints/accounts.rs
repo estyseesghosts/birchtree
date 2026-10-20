@@ -108,6 +108,7 @@ pub async fn register(
         &state.server.public_url,
         state.context.now_ms(),
         state.server.registrations_open,
+        state.server.registrations_require_approval,
         &auth.0.app,
         cmd,
     ) {
@@ -140,6 +141,18 @@ pub async fn show(State(state): State<ApiState>, Path(id): Path<String>) -> Resp
     let store: &dyn Store = &*state.context.store;
     match store.account_by_id(id) {
         Ok(Some(account)) => {
+            // D36: unapproved local accounts are invisible (upstream
+            // `check_account_approval` → 404). Remote accounts have no
+            // credential row and always render.
+            if account.local {
+                match store.user_by_account_id(id) {
+                    Ok(Some(user)) if !user.approved => {
+                        return ApiError::not_found().into_response();
+                    }
+                    Ok(_) => {}
+                    Err(err) => return ApiError::from(err).into_response(),
+                }
+            }
             let stats = store.account_stats(id).ok();
             axum::Json(dto::account_json_with_stats(
                 &state.server,
@@ -211,11 +224,31 @@ pub async fn update_credentials(
 
     // `source[...]` carries posting preferences.
     let source = |key: &str| forms::get(&pairs, key);
+    // D21: `source[chosen_languages][]` (JSON `{"source":
+    // `{"chosen_languages": [...]}}` flattens to the same key). Presence —
+    // even with no values — replaces the preference; absence leaves it.
+    let mut chosen_languages: Option<Vec<String>> = None;
+    if pairs
+        .iter()
+        .any(|(key, _)| key == "source[chosen_languages][]" || key == "source[chosen_languages]")
+    {
+        let mut raw: Vec<String> = forms::all(&pairs, "source[chosen_languages][]")
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        raw.extend(
+            forms::all(&pairs, "source[chosen_languages]")
+                .into_iter()
+                .map(str::to_string),
+        );
+        chosen_languages = Some(raw);
+    }
     if source("source[privacy]").is_some()
         || source("source[sensitive]").is_some()
         || source("source[language]").is_some()
         || source("source[quote_policy]").is_some()
         || field("home_mention_policy").is_some()
+        || chosen_languages.is_some()
     {
         let update = UserSettingsUpdate {
             default_privacy: source("source[privacy]").map(str::to_string),
@@ -227,6 +260,7 @@ pub async fn update_credentials(
                     .as_str()
                     .to_string()
             }),
+            chosen_languages,
         };
         if let Err(err) = store.update_user_settings(account_id, update) {
             return ApiError::from(err).into_response();
@@ -331,10 +365,20 @@ pub async fn index(
     let store: &dyn Store = &*state.context.store;
     match store.accounts_by_ids(&ids) {
         Ok(map) => {
-            // Preserve request order; omit unknown accounts.
+            // Preserve request order; omit unknown accounts. D36: unapproved
+            // local accounts are omitted too (upstream `set_accounts` →
+            // `without_unapproved`).
             let mut out: Vec<Value> = Vec::new();
             for id in &ids {
                 if let Some(account) = map.get(id) {
+                    // A store error fails closed (the account is omitted).
+                    let unapproved = match store.user_by_account_id(*id) {
+                        Ok(user) => user.is_some_and(|u| !u.approved),
+                        Err(_) => true,
+                    };
+                    if account.local && unapproved {
+                        continue;
+                    }
                     let stats = store.account_stats(*id).ok();
                     out.push(dto::account_json_with_stats(
                         &state.server,

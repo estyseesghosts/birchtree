@@ -13,6 +13,11 @@ use crate::domain::{
 use super::schema::{ACCESS_TOKENS, AUTHORIZATION_CODES, OAUTH_APPS, SESSIONS};
 use super::{decode, encode, RedbStore};
 
+/// D24: entries walked to revoke one account's tokens. Tokens are few per
+/// instance; the cap only stops a pathological table from stalling an admin
+/// suspension. A hit leaves the remainder live (reported, never silent).
+const ACCOUNT_TOKEN_SCAN_CAP: usize = 100_000;
+
 impl OAuthStore for RedbStore {
     fn register_app(&self, input: NewApp) -> Result<OAuthApplication> {
         let write = self.begin_write()?;
@@ -118,6 +123,52 @@ impl OAuthStore for RedbStore {
         }
         write.commit()?;
         Ok(true)
+    }
+
+    fn revoke_account_tokens(&self, account_id: Id) -> Result<Vec<Id>> {
+        let write = self.begin_write()?;
+        let mut revoked: Vec<(Id, String)> = Vec::new();
+        let mut scanned = 0usize;
+        {
+            let tokens = write.open_table(ACCESS_TOKENS)?;
+            for entry in tokens.iter()? {
+                if scanned >= ACCOUNT_TOKEN_SCAN_CAP {
+                    break;
+                }
+                scanned += 1;
+                let (key, value) = entry?;
+                let token: AccessToken = decode(value.value())?;
+                if token.user_id == Some(account_id) && !token.revoked {
+                    revoked.push((token.id, key.value().to_owned()));
+                }
+            }
+        }
+        if scanned >= ACCOUNT_TOKEN_SCAN_CAP && revoked.is_empty() {
+            tracing::warn!(
+                account = %account_id,
+                scanned,
+                "token revocation scan hit its cap"
+            );
+        }
+        // Newest-first so the freshest sessions die first.
+        revoked.sort_by(|a, b| b.0.cmp(&a.0));
+        {
+            let mut tokens = write.open_table(ACCESS_TOKENS)?;
+            for (id, key) in &revoked {
+                let bytes = {
+                    let Some(guard) = tokens.get(key.as_str())? else {
+                        continue;
+                    };
+                    guard.value().to_vec()
+                };
+                let mut token: AccessToken = decode(&bytes)?;
+                let _ = id;
+                token.revoked = true;
+                tokens.insert(key.as_str(), encode(&token)?.as_slice())?;
+            }
+        }
+        write.commit()?;
+        Ok(revoked.into_iter().map(|(id, _)| id).collect())
     }
 
     fn create_authorization_code(&self, input: NewAuthCode) -> Result<AuthorizationCode> {

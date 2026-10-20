@@ -10,8 +10,8 @@
 //!
 //! Phase 7.2: status search runs behind [`SearchMode`](crate::search::SearchMode)
 //! (`embedded` default / `database` / `off`) via [`search_with_mode`]. The
-//! legacy [`search`] entry keeps the Phase 4 database behavior for the
-//! endpoint until the mode is wired through configuration.
+//! legacy [`search`] entry keeps the Phase 4 database behavior for callers
+//! that do not thread a mode (it is the `Database` arm, exactly).
 
 use crate::application::ports::Store;
 use crate::domain::{Account, Error, Id, Result, Status};

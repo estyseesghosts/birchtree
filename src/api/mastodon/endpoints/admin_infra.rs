@@ -47,7 +47,7 @@ use crate::application::ports::{
 use crate::domain::{
     AdminAccountOverview, AdminCanonicalEmailBlock, AdminDomainAllow, AdminDomainBlock,
     AdminDomainSeverity, AdminEmailDomainBlock, AdminIpBlock, AdminIpSeverity, AdminMediaOwner,
-    AdminReportTarget, AdminTag, Id,
+    AdminReportTarget, AdminTag, FollowMetricRow, Id,
 };
 
 /// Scope alternatives for admin reads of a sub-scoped resource.
@@ -986,6 +986,19 @@ fn daily_counts(times: &[u64], buckets: &[u64]) -> Vec<u64> {
     counts
 }
 
+/// Count distinct `who` per day bucket (D39 `active_users`: unique logins
+/// per day, like upstream's `:unique` activity tracker).
+fn daily_unique(pairs: &[(Id, u64)], buckets: &[u64]) -> Vec<u64> {
+    use std::collections::HashSet;
+    let mut sets: Vec<HashSet<Id>> = buckets.iter().map(|_| HashSet::new()).collect();
+    for (who, time) in pairs {
+        if let Ok(idx) = buckets.binary_search(&(time - time % DAY_MS)) {
+            sets[idx].insert(*who);
+        }
+    }
+    sets.iter().map(|set| set.len() as u64).collect()
+}
+
 fn daily_data(buckets: &[u64], counts: &[u64]) -> Vec<Value> {
     buckets
         .iter()
@@ -1036,6 +1049,18 @@ pub async fn measures(State(state): State<ApiState>, auth: Auth, LenientForm(bod
         Err(err) => return ApiError::from(err).into_response(),
     };
     let media_owners = match store.admin_media_owners(METRIC_SCAN_CAP) {
+        Ok(rows) => rows,
+        Err(err) => return ApiError::from(err).into_response(),
+    };
+    let follows: Vec<FollowMetricRow> = match store.admin_follow_metrics(METRIC_SCAN_CAP) {
+        Ok(rows) => rows,
+        Err(err) => return ApiError::from(err).into_response(),
+    };
+    let sign_ins = match store.admin_sign_ins(METRIC_SCAN_CAP) {
+        Ok(rows) => rows,
+        Err(err) => return ApiError::from(err).into_response(),
+    };
+    let resolved_times = match store.admin_report_resolved_times(METRIC_SCAN_CAP) {
         Ok(rows) => rows,
         Err(err) => return ApiError::from(err).into_response(),
     };
@@ -1161,13 +1186,105 @@ pub async fn measures(State(state): State<ApiState>, auth: Auth, LenientForm(bod
                     "data": daily_data(&buckets, &counts),
                 }));
             }
+            "resolved_reports" => {
+                // Upstream `ResolvedReportsMeasure`: resolutions by
+                // `action_taken_at`, with a previous-window total.
+                let total = sum_in_window(&resolved_times, start, end);
+                let previous = sum_in_window(&resolved_times, prev_start, prev_end);
+                let counts = daily_counts(&resolved_times, &buckets);
+                out.push(json!({
+                    "key": "resolved_reports",
+                    "unit": Value::Null,
+                    "total": total.to_string(),
+                    "previous_total": previous.to_string(),
+                    "data": daily_data(&buckets, &counts),
+                }));
+            }
+            "active_users" => {
+                // D39 sign-in telemetry: daily *unique* password logins
+                // (upstream's `:unique` activity tracker). Totals are sums
+                // of the daily uniques, like upstream.
+                let in_window: Vec<(Id, u64)> = sign_ins
+                    .iter()
+                    .copied()
+                    .filter(|(_, t)| *t >= start && *t <= end)
+                    .collect();
+                let in_prev: Vec<(Id, u64)> = sign_ins
+                    .iter()
+                    .copied()
+                    .filter(|(_, t)| *t >= prev_start && *t <= prev_end)
+                    .collect();
+                let counts = daily_unique(&in_window, &buckets);
+                let total: u64 = counts.iter().sum();
+                let previous: u64 = daily_unique(&in_prev, &buckets).iter().sum();
+                out.push(json!({
+                    "key": "active_users",
+                    "unit": Value::Null,
+                    "total": total.to_string(),
+                    "previous_total": previous.to_string(),
+                    "data": daily_data(&buckets, &counts),
+                }));
+            }
+            "instance_follows" => {
+                // Upstream `InstanceFollowsMeasure`: follows by *target*
+                // domain. `total_in_time_range?` is false, so the total is
+                // the all-time count and there is no `previous_total`.
+                let scoped: Vec<&FollowMetricRow> = follows
+                    .iter()
+                    .filter(|row| {
+                        domains.get(&row.target_id).is_some_and(|(domain, local)| {
+                            in_scope(domain, *local)
+                        })
+                    })
+                    .collect();
+                let total = scoped.len() as u64;
+                let windowed: Vec<u64> = scoped
+                    .iter()
+                    .map(|row| row.created_at_ms)
+                    .filter(|&t| t >= start && t <= end)
+                    .collect();
+                let counts = daily_counts(&windowed, &buckets);
+                out.push(json!({
+                    "key": "instance_follows",
+                    "unit": Value::Null,
+                    "total": total.to_string(),
+                    "data": daily_data(&buckets, &counts),
+                }));
+            }
+            "instance_followers" => {
+                // Upstream `InstanceFollowersMeasure`: follows by
+                // *follower* domain; otherwise shaped like
+                // `instance_follows`.
+                let scoped: Vec<&FollowMetricRow> = follows
+                    .iter()
+                    .filter(|row| {
+                        domains.get(&row.follower_id).is_some_and(|(domain, local)| {
+                            in_scope(domain, *local)
+                        })
+                    })
+                    .collect();
+                let total = scoped.len() as u64;
+                let windowed: Vec<u64> = scoped
+                    .iter()
+                    .map(|row| row.created_at_ms)
+                    .filter(|&t| t >= start && t <= end)
+                    .collect();
+                let counts = daily_counts(&windowed, &buckets);
+                out.push(json!({
+                    "key": "instance_followers",
+                    "unit": Value::Null,
+                    "total": total.to_string(),
+                    "data": daily_data(&buckets, &counts),
+                }));
+            }
             _ => {
-                // Unknown keys (and known-but-uncomputable ones:
-                // `active_users`, `interactions`, `resolved_reports`,
-                // `tag_accounts`, `tag_uses`, `tag_servers`,
-                // `instance_follows`, `instance_followers`) are omitted, as
-                // upstream's `filter_map` drops unknown keys. The omitted
-                // known keys are recorded as planned gaps in the manifest.
+                // Omitted like unknown keys upstream (`filter_map` drops
+                // them): `interactions` (no unified interaction event log —
+                // posts, favourites, reblogs, votes and follows are not
+                // journaled as events), `tag_accounts`, `tag_uses` and
+                // `tag_servers` (no per-tag daily history store — D40).
+                // Each omitted known key keeps its reason in the endpoint
+                // manifest (D39).
             }
         }
     }
@@ -1204,6 +1321,10 @@ pub async fn dimensions(State(state): State<ApiState>, auth: Auth, LenientForm(b
     };
     let accounts = match store.admin_accounts_overview(METRIC_SCAN_CAP) {
         Ok(accounts) => accounts,
+        Err(err) => return ApiError::from(err).into_response(),
+    };
+    let follows: Vec<FollowMetricRow> = match store.admin_follow_metrics(METRIC_SCAN_CAP) {
+        Ok(rows) => rows,
         Err(err) => return ApiError::from(err).into_response(),
     };
     let domains: HashMap<Id, String> = accounts.iter().map(|a| (a.id, a.domain.clone())).collect();
@@ -1273,10 +1394,58 @@ pub async fn dimensions(State(state): State<ApiState>, auth: Auth, LenientForm(b
                 data.truncate(limit);
                 out.push(json!({ "key": "space_usage", "data": data }));
             }
+            "instance_accounts" => {
+                // Upstream `InstanceAccountsDimension`: accounts of one
+                // domain (exact match) by follower count, most-followed
+                // first. The domain defaults to the local one (upstream
+                // `params.require`s it — lenient here, documented).
+                let wanted = forms::get(&body, "domain").unwrap_or(&state.server.domain);
+                let mut counts: HashMap<String, u64> = HashMap::new();
+                let mut names: HashMap<Id, String> = HashMap::new();
+                for account in &accounts {
+                    if account.domain == wanted {
+                        counts.entry(account.username.clone()).or_insert(0);
+                        names.insert(account.id, account.username.clone());
+                    }
+                }
+                for row in &follows {
+                    if let Some(name) = names.get(&row.target_id) {
+                        *counts.entry(name.clone()).or_insert(0) += 1;
+                    }
+                }
+                out.push(json!({
+                    "key": "instance_accounts",
+                    "data": top_counts(counts, limit),
+                }));
+            }
+            "instance_languages" => {
+                // Upstream `InstanceLanguagesDimension`: one domain's
+                // non-reblog statuses by language. `human_key` carries the
+                // bare language code (upstream localizes it; no locale
+                // catalog here — documented).
+                let wanted = forms::get(&body, "domain").unwrap_or(&state.server.domain);
+                let mut counts: HashMap<String, u64> = HashMap::new();
+                for row in &status_rows {
+                    if row.is_reblog {
+                        continue;
+                    }
+                    if domains.get(&row.account_id).is_some_and(|d| d == wanted) {
+                        let locale = row.language.clone().unwrap_or_else(|| "und".to_string());
+                        *counts.entry(locale).or_insert(0) += 1;
+                    }
+                }
+                out.push(json!({
+                    "key": "instance_languages",
+                    "data": top_counts(counts, limit),
+                }));
+            }
             _ => {
-                // Omitted like unknown keys upstream: `software_versions`,
-                // `tag_servers`, `tag_languages`, `instance_accounts`,
-                // `instance_languages` (no data source here — planned gaps).
+                // Omitted like unknown keys upstream: `software_versions`
+                // (no component-version census is collected),
+                // `tag_servers`, `tag_languages` (no per-tag domain or
+                // language census — D40, no tag-history store). Each
+                // omitted known key keeps its reason in the endpoint
+                // manifest (D39).
             }
         }
     }

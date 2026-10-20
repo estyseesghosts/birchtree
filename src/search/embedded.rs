@@ -96,7 +96,9 @@ impl EmbeddedIndex {
         }
         let mut wanted: Vec<String> = tokenize(query)
             .into_iter()
-            .filter(|t| t.len() >= MIN_QUERY_TOKEN_LEN)
+            // `MIN_QUERY_TOKEN_LEN` counts characters, not bytes (see its
+            // contract): a two-CJK-character query is served.
+            .filter(|t| t.chars().count() >= MIN_QUERY_TOKEN_LEN)
             .collect();
         wanted.sort();
         wanted.dedup();

@@ -29,14 +29,14 @@ Gate: `birchtree.md` §7 Phase 6 and §8 items 7 and 11. Contract: `docs/federat
 ## Delivery
 
 - [x] Durable `DeliverActivity` job: retry on 5xx, 408, 429, timeouts and transport errors; quarantine on a refused URL, a missing key, or a payload that no longer parses. Evidence: `delivery_retries_a_server_error_and_completes_an_accepted_one`, `delivery_quarantines_*`.
-- [x] A 4xx is final (the crate's rule), recorded as delivered (D28). Evidence: `delivery_treats_a_client_error_as_final`.
-- [ ] Per-destination cooldown and failure budget (birchtree.md §7 "failure cooldown"). Not built: a failing host retries on its own job backoff only.
+- [x] A 4xx delivery is retried through the middleware (D28); document-fetch GETs pass their status through so 404/410 stay terminal. Evidence: `tests/phase6_gaps_round2_e.rs` (410 terminal, 404 not converted).
+- [x] Per-destination cooldown and failure budget (birchtree.md §7 "failure cooldown"). Failing hosts cool down exponentially with parking; unrelated delivery unaffected; budget exhaustion quarantines. Evidence: `tests/phase6_gaps_round2_e.rs`.
 
 ## Safe outbound HTTP (SSRF)
 
 - [x] Proxies disabled; redirects not followed by reqwest; connect-time address check on every resolved address (DNS rebinding); timeouts; private and loopback addresses refused unless the operator allowlist names them. Evidence: `src/federation/net.rs` and `policy.rs` tests, lab (the lab allowlist is the only exception).
 - [x] Plain HTTP refused unless `--federation-allow-http` (lab only). Evidence: `verifier_refuses_private_literals_and_plain_http`.
-- [ ] Response size and content validation for documents: the crate's fixed 200 KB limit applies to fetches and inbox bodies (D27 for the inbox). Not separately tested.
+- [x] Response size and content validation for documents: the crate's 200 KB body cap and content-type/id checks apply to every actor/object/collection fetch through the safe client; delivery POSTs convert 4xx to retry, fetch GETs pass statuses through (410 terminal, 404 terminal). Evidence: `tests/phase6_gaps_round2_e.rs`.
 
 ## Not started (Phase 6 scope, §7)
 

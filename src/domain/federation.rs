@@ -46,6 +46,16 @@ pub struct RefreshRecord {
     pub refresh_id: String,
 }
 
+/// Delivery health of one destination host (Phase 6, per-destination failure
+/// budget + cooldown). `failures` counts consecutive failed attempts;
+/// `cooldown_until_ms` is the time before the next attempt may be sent.
+/// A success resets both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeliveryDestState {
+    pub failures: u32,
+    pub cooldown_until_ms: u64,
+}
+
 /// The key ID an actor publishes for its main key.
 pub fn main_key_id(actor_uri: &str) -> String {
     format!("{actor_uri}#main-key")

@@ -765,7 +765,11 @@ async fn admin_measures_read_scope_and_real_keys() {
     assert_eq!(media["total"], "0");
     assert_eq!(media["human_value"], "0 Bytes");
 
-    // Uncomputable known keys are omitted, never fabricated.
+    // Uncomputable known keys are omitted, never fabricated. D39 serves
+    // `active_users` (sign-in telemetry) and `resolved_reports`
+    // (`action_taken_at`), so they render honest zeroes here;
+    // `interactions` (no event log) and `tag_uses` (no tag history) stay
+    // omitted.
     let (status, body) = post(
         &router,
         "/api/v1/admin/measures",
@@ -774,7 +778,12 @@ async fn admin_measures_read_scope_and_real_keys() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, Value::Array(Vec::new()));
+    let rows = body.as_array().expect("array");
+    let keys: Vec<&str> = rows.iter().map(|row| row["key"].as_str().expect("key")).collect();
+    assert!(keys.contains(&"active_users"), "{body}");
+    assert!(keys.contains(&"resolved_reports"), "{body}");
+    assert!(!keys.contains(&"interactions"), "{body}");
+    assert!(!keys.contains(&"tag_uses"), "{body}");
 }
 
 #[tokio::test]

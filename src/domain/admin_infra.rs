@@ -158,6 +158,9 @@ pub struct AdminAccountOverview {
     pub created_at_ms: u64,
     pub domain: String,
     pub local: bool,
+    /// Bare username (D39 `instance_accounts` dimension keys by username,
+    /// like upstream).
+    pub username: String,
 }
 
 /// One report row projected for instance-scoped metrics.
@@ -173,4 +176,15 @@ pub struct AdminMediaOwner {
     pub created_at_ms: u64,
     pub file_size: u64,
     pub owner_id: Id,
+}
+
+/// One follow row projected for instance-scoped metrics
+/// (`instance_follows` counts follows by *target* domain,
+/// `instance_followers` by *follower* domain — upstream
+/// `InstanceFollowsMeasure` / `InstanceFollowersMeasure`).
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct FollowMetricRow {
+    pub follower_id: Id,
+    pub target_id: Id,
+    pub created_at_ms: u64,
 }

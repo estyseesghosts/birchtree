@@ -13,10 +13,11 @@ use crate::domain::{
     AdminIpSeverity, AdminMediaOwner, AdminReportTarget, AdminTag, AnnualReport,
     AuthorizationCode, Block, CustomEmoji, CustomFilter,
     DomainBlock,
-    Endorsement, FilterKeyword, FilterStatus, Follow, Id, Job, JobKind, List, LocalUser,
+    Endorsement, FilterKeyword, FilterStatus, Follow, FollowMetricRow, Id, Job, JobKind, List,
+    LocalUser,
     LoginSession, Marker, MediaAttachment, Mute, NewAnnualReport, Notification, NotificationType,
     OAuthApplication,
-    Poll, QuotePolicy, QuoteRecord, RepliesPolicy, Report, Result, ScheduledStatus, Status,
+    Poll, QuotePolicy, QuoteRecord, RepliesPolicy, Report, Result, Rule, ScheduledStatus, Status,
     StatusApplication, StatusVersion, TagUsage, TrendLink, TrendPublisher, TrendStatusFlag,
     TrendTagFlag, UserRole, Visibility,
 };
@@ -40,6 +41,10 @@ pub struct NewLocalAccount {
     /// transaction as the account (public registration). The CLI bootstrap
     /// leaves this false.
     pub send_confirmation_email: bool,
+    /// Whether the account starts approved. Public registration sets this
+    /// `false` when the operator requires approval (the pending queue);
+    /// operator-created accounts are always approved.
+    pub approved: bool,
 }
 
 /// Input for registering an OAuth application.
@@ -95,6 +100,10 @@ pub struct UserSettingsUpdate {
     pub default_quote_policy: Option<String>,
     /// D22 home mention policy (`show`/`collapse`/`filter`; `None` = unchanged).
     pub home_mention_policy: Option<String>,
+    /// D21 chosen content languages (`None` = unchanged; `Some`, possibly
+    /// empty, = replace; an empty list clears the preference like upstream's
+    /// `compact_blank.presence` normalization).
+    pub chosen_languages: Option<Vec<String>>,
 }
 
 /// Mutable subset of an account profile (`PATCH update_credentials`).
@@ -148,6 +157,11 @@ pub trait AccountStore: Send + Sync {
     /// transaction, returning the updated credential record. `NotFound` when
     /// no local user exists for `account_id` (wrong id or remote account).
     fn set_user_role(&self, account_id: Id, role: UserRole) -> Result<LocalUser>;
+
+    /// Record one password sign-in event for the admin `active_users`
+    /// telemetry (D39). Called once when a local user completes the browser
+    /// password login; API calls on an existing token are not sign-ins.
+    fn record_sign_in(&self, account_id: Id, now_ms: u64) -> Result<()>;
 }
 
 /// OAuth applications, authorization codes and access tokens.
@@ -160,6 +174,12 @@ pub trait OAuthStore: Send + Sync {
     fn issue_access_token(&self, input: NewToken) -> Result<AccessToken>;
     fn token_by_plaintext(&self, plaintext: &str) -> Result<Option<AccessToken>>;
     fn revoke_token(&self, plaintext: &str) -> Result<bool>;
+    /// D24: revoke every live token whose user is `account_id` (suspension /
+    /// disablement kill), returning the revoked token ids so the adapter can
+    /// close their open streams (`StreamEvent::TokenRevoked` per id, after
+    /// commit). The scan is bounded (see the `redb` implementation's cap);
+    /// ids are returned newest-first.
+    fn revoke_account_tokens(&self, account_id: Id) -> Result<Vec<Id>>;
 
     fn create_authorization_code(&self, input: NewAuthCode) -> Result<AuthorizationCode>;
     fn authorization_code_by_plaintext(&self, plaintext: &str) -> Result<Option<AuthorizationCode>>;
@@ -301,7 +321,7 @@ pub struct NewStatus {
     pub mentions: Vec<Id>,
     /// Resolved silent mentions (quote access grants): visibility only.
     pub silent_mentions: Vec<Id>,
-    /// Lowercased hashtags without the `#` prefix.
+    /// Normalized hashtags without the `#` prefix (D25).
     pub tags: Vec<String>,
     pub poll: Option<NewPollSpec>,
     pub quote: Option<NewQuoteSpec>,
@@ -341,6 +361,10 @@ pub struct StatusUpdate {
     /// Extend poll expiry without resetting votes.
     pub poll_expires_in_ms: Option<u64>,
     pub quote_approval_policy: Option<QuotePolicy>,
+    /// Replace the stored hashtags (already normalized by the caller) and
+    /// move the hashtag-index keys in the same transaction. `None` leaves
+    /// tags and index untouched.
+    pub tags: Option<Vec<String>>,
 }
 
 /// Per-viewer status flags for DTO packing.
@@ -805,6 +829,9 @@ pub struct StatusMetricRow {
     pub created_at_ms: u64,
     pub language: Option<String>,
     pub application_name: Option<String>,
+    /// True for reblog wrappers (excluded from language breakdowns, like
+    /// upstream's `statuses.reblog_of_id IS NULL`).
+    pub is_reblog: bool,
 }
 
 /// Admin infrastructure rows: domain allows/blocks, email-domain blocks, IP
@@ -954,6 +981,9 @@ pub trait AdminInfraStore: Send + Sync {
     fn admin_status_metrics(&self, cap: usize) -> Result<Vec<StatusMetricRow>>;
     /// Report creation times, oldest first, bounded by `cap`.
     fn admin_report_created_times(&self, cap: usize) -> Result<Vec<u64>>;
+    /// Resolution times (`action_taken_at`) of resolved reports, bounded by
+    /// `cap` (D39 `resolved_reports` measure).
+    fn admin_report_resolved_times(&self, cap: usize) -> Result<Vec<u64>>;
     /// `(created_at, target_account_id)` per report, bounded by `cap`.
     fn admin_report_targets(&self, cap: usize) -> Result<Vec<AdminReportTarget>>;
     /// `(created_at_ms, file_size)` per media attachment, oldest first,
@@ -966,8 +996,25 @@ pub trait AdminInfraStore: Send + Sync {
     fn admin_hashtag_names(&self, cap: usize) -> Result<Vec<String>>;
     /// `(domain, account_count)` for remote domains, bounded by `cap`.
     fn admin_remote_domains(&self, cap: usize) -> Result<Vec<(String, u64)>>;
+    /// `(follower_id, target_id, created_at)` per follow, bounded by `cap`
+    /// (D39 `instance_follows` / `instance_followers` measures).
+    fn admin_follow_metrics(&self, cap: usize) -> Result<Vec<FollowMetricRow>>;
+    /// `(account_id, created_at)` per recorded password sign-in, bounded by
+    /// `cap` (D39 `active_users` measure).
+    fn admin_sign_ins(&self, cap: usize) -> Result<Vec<(Id, u64)>>;
     /// Local domain (bare host of the public URL) for instance scoping.
     fn admin_local_domain(&self) -> String;
+
+    // -- Server rules (D37) --
+    /// Create one server rule (operator-managed, like custom emoji).
+    fn admin_create_rule(&self, text: &str, hint: &str, now_ms: u64) -> Result<Rule>;
+    /// Delete one server rule. Reports that referenced it keep the stale id;
+    /// serialization skips ids with no rule row (documented).
+    fn admin_delete_rule(&self, id: Id) -> Result<bool>;
+    /// Every server rule, id-ascending (operator reads).
+    fn admin_rules(&self) -> Result<Vec<Rule>>;
+    /// The rules for `ids`, in `ids` order, skipping unknown ids.
+    fn admin_rules_by_ids(&self, ids: &[Id]) -> Result<Vec<Rule>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1057,6 +1104,26 @@ pub trait TrendStore: Send + Sync {
         target_type: &str,
         target_id: &str,
     ) -> Result<Vec<AdminAuditRecord>>;
+
+    /// Newest live status id carrying `tag` (already normalized), if any —
+    /// the recency input of the trend-score pipeline. `None` when the tag
+    /// has no indexed status.
+    fn tag_newest_status_id(&self, tag: &str) -> Result<Option<Id>>;
+
+    /// Store preview-card metadata fetched by the link crawler (D40) in ONE
+    /// transaction. Fields are real fetched content or `None` (never
+    /// fabricated); `None` arguments leave the stored field unchanged.
+    /// `None` when the row is gone.
+    fn update_trend_link_card(
+        &self,
+        id: Id,
+        title: Option<String>,
+        description: Option<String>,
+        provider_name: Option<String>,
+        provider_url: Option<String>,
+        image_url: Option<String>,
+        now_ms: u64,
+    ) -> Result<Option<TrendLink>>;
 }
 
 /// Annual-report storage (generation runs as a durable job).
@@ -1576,8 +1643,9 @@ pub trait SearchStore: Send + Sync {
 pub enum AdminAccountStatus {
     /// No moderation flag and not disabled.
     Active,
-    /// Awaiting approval. Birchtree has no pending-approval state (Phase 2
-    /// gap: approval registration modes), so this matches nothing.
+    /// Awaiting approval: local accounts whose credential row has
+    /// `approved == false` (upstream `User.pending`). Remote accounts, which
+    /// have no credential row, never match.
     Pending,
     Disabled,
     Sensitized,
@@ -1619,6 +1687,10 @@ pub struct AdminAccountPatch {
     pub silenced: Option<bool>,
     pub sensitized: Option<bool>,
     pub disabled: Option<bool>,
+    /// Approval state (`approve` sets `Some(true)`; upstream `User#approve!`
+    /// also enables the account, which the endpoint expresses as
+    /// `disabled: Some(false)` alongside).
+    pub approved: Option<bool>,
     /// Audit action name recorded with the write (`enable`, `suspend`, ...).
     pub audit_action: String,
 }
@@ -1639,8 +1711,9 @@ pub struct AdminReportFilter {
 pub struct AdminReportPatch {
     /// New category (`spam`, `legal`, `other`, ...).
     pub category: Option<String>,
-    /// Attached rule ids. Rules have no model yet: a non-empty list is
-    /// rejected by the use case; empty clears nothing (stored as given when
+    /// Attached rule ids. A non-empty list is validated against the rule
+    /// store (unknown ids are refused `422`, like upstream
+    /// `validate_rule_ids`); empty clears nothing (stored as given when
     /// empty).
     pub rule_ids: Option<Vec<String>>,
     /// `Some(None)` unassigns; `None` leaves the assignee unchanged.
@@ -1681,9 +1754,12 @@ pub trait AdminStore: Send + Sync {
     ) -> Result<(Account, Option<LocalUser>)>;
 
     /// Suspend and disable an account in ONE transaction (the audit row
-    /// records `audit_action`: `destroy` for DELETE, `reject` for reject).
+    /// records `audit_action`: `destroy` for DELETE, `reject` for reject),
+    /// and enqueue the async deletion worker's first batch plus the
+    /// federated `Delete` of the actor in the same transaction (D38).
     /// Returns `false` when the account is missing. The account's statuses
-    /// are left in place (planned gap: no async deletion worker yet).
+    /// are removed by the bounded, restartable batch chain, not here; the
+    /// account row itself is retained (suspended) so its URI resolves.
     fn admin_delete_account(
         &self,
         actor_account_id: Id,
@@ -1693,15 +1769,18 @@ pub trait AdminStore: Send + Sync {
     ) -> Result<bool>;
 
     /// One account-action write in ONE transaction: the moderation flags, the
-    /// report resolutions it implies, and one audit row for the action plus
-    /// one per resolved report. `NotFound` when the account (or the named
-    /// report) is missing.
+    /// warning row it records (every action type records a strike, like
+    /// upstream `process_strike!`; `text` is the moderator's warning text),
+    /// the report resolutions it implies, and one audit row for the action
+    /// plus one per resolved report. `NotFound` when the account (or the
+    /// named report) is missing.
     fn admin_account_action(
         &self,
         actor_account_id: Id,
         account_id: Id,
         action: &str,
         report_id: Option<Id>,
+        text: Option<String>,
         now_ms: u64,
     ) -> Result<()>;
 
@@ -1729,6 +1808,14 @@ pub trait AdminStore: Send + Sync {
 
     /// Audit records, newest first, bounded by `cap` (test and operator reads).
     fn admin_audit_entries(&self, cap: usize) -> Result<Vec<AdminAuditRecord>>;
+
+    /// Warning rows (strikes) against `target_account_id`, newest first
+    /// (test and operator reads; upstream serves warnings through the
+    /// dashboard only, with no admin API read).
+    fn admin_warnings_for_account(
+        &self,
+        target_account_id: Id,
+    ) -> Result<Vec<crate::domain::AccountWarning>>;
 }
 
 /// Filters a candidate status through the *viewer's* perspective while a

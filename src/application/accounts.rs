@@ -80,6 +80,8 @@ pub fn create_account(
         now_ms,
         // The CLI bootstrap does not send mail.
         send_confirmation_email: false,
+        // Operator-created accounts are usable immediately.
+        approved: true,
     })
 }
 
@@ -89,12 +91,20 @@ pub fn create_account(
 /// This is the same account-creation path as the CLI (`create_account`) plus
 /// the registration policy gates and token issuance. The account, its indexes
 /// and its confirmation-mail job commit atomically; the token is issued after.
+///
+/// When `require_approval` is set (upstream `registrations_mode ==
+/// "approved"`), the account is created unapproved: it appears under the
+/// admin `pending` filter and its token is refused by user-token endpoints
+/// (upstream `require_user!` → `403 Your login is currently pending
+/// approval`) until an admin approves it. The token is still issued, like
+/// upstream's `AppSignUpService` response.
 pub fn register_account(
     accounts: &dyn AccountStore,
     oauth: &dyn OAuthStore,
     base_url: &str,
     now_ms: u64,
     registration_open: bool,
+    require_approval: bool,
     app: &OAuthApplication,
     cmd: RegisterAccountCommand,
 ) -> Result<RegisteredAccount> {
@@ -131,6 +141,7 @@ pub fn register_account(
         actor_uri,
         now_ms,
         send_confirmation_email: true,
+        approved: !require_approval,
     })?;
 
     let (token_plaintext, token) =

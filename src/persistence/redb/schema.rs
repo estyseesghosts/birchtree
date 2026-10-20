@@ -325,6 +325,36 @@ pub const ADMIN_AUDIT: TableDefinition<u64, &[u8]> = TableDefinition::new("admin
 pub const REMOTE_MEDIA_SOURCE: TableDefinition<u64, &str> = TableDefinition::new("remote_media_source");
 
 // ---------------------------------------------------------------------------
+// Phase 6 (schema v10): remote tombstones (the Delete-beats-Create race) and
+// per-destination delivery state (failure budget + cooldown).
+// ---------------------------------------------------------------------------
+
+/// Object URIs a remote `Delete` removed before any `Create` for them arrived
+/// (`uri -> deleted_at_ms`). A late `Create` for a tombstoned URI is dropped,
+/// as upstream does (`delete.rb`: `Tombstone.find_or_create_by`, same-host only).
+pub const REMOTE_TOMBSTONE: TableDefinition<&str, u64> = TableDefinition::new("remote_tombstone");
+
+/// Delivery state per destination host (`host -> JSON DeliveryDestState`):
+/// consecutive failures and the cooldown the next attempt must wait out.
+pub const DELIVERY_DEST: TableDefinition<&str, &[u8]> = TableDefinition::new("delivery_dest");
+
+// ---------------------------------------------------------------------------
+// Phase 7.3 (schema v11): server rules, account warnings, sign-in telemetry
+// (D37 rules/warnings, D39 `active_users`).
+// ---------------------------------------------------------------------------
+
+/// Server rules by rule id -> JSON `Rule` (D37; operator-managed).
+pub const RULES: TableDefinition<u64, &[u8]> = TableDefinition::new("rules");
+
+/// Account warnings (strikes) by warning id -> JSON `AccountWarning` (D37).
+pub const ACCOUNT_WARNINGS: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("account_warnings");
+
+/// Password sign-in events by event id -> JSON `SignInEvent` (D39
+/// `active_users` telemetry; one row per completed browser password login).
+pub const SIGN_INS: TableDefinition<u64, &[u8]> = TableDefinition::new("sign_ins");
+
+// ---------------------------------------------------------------------------
 // Phase 7.3 (schema v8): admin infrastructure rows (subagent C). Global
 // ordered tables use `desc_id(row_id)` keys so a forward scan yields newest
 // first; per-value unique indexes hold the real row id.
@@ -455,7 +485,7 @@ pub fn audit_target_prefix(target_type: &str, target_id: &str) -> Vec<u8> {
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// Current schema version. Bump with a new migration step.
-pub const SCHEMA_VERSION: u64 = 9;
+pub const SCHEMA_VERSION: u64 = 11;
 
 /// All table names, for diagnostics and migration verification.
 pub const TABLE_NAMES: &[&str] = &[
@@ -472,7 +502,12 @@ pub const TABLE_NAMES: &[&str] = &[
     "statuses",
     "status_by_uri",
     "remote_refresh",
+    "remote_tombstone",
+    "delivery_dest",
     "reports",
+    "rules",
+    "account_warnings",
+    "sign_ins",
     "admin_audit",
     "remote_media_source",
     "quote_by_approval",

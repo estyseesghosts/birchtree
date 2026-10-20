@@ -9,7 +9,7 @@
 //! crate's job, driven by the adapters in `activitypub/` and `federation/`.
 
 use crate::domain::federation::RefreshRecord;
-use crate::domain::{Account, ActorKeys, Follow, Id, MediaAttachment, QuoteRecord, QuoteState, Report, Result, Status};
+use crate::domain::{Account, ActorKeys, DeliveryDestState, Follow, Id, MediaAttachment, QuoteRecord, QuoteState, Report, Result, Status};
 
 /// The payload of one outbound delivery: which local actor signs it, where it
 /// goes, and the activity that is sent. The activity is fixed at commit time,
@@ -92,6 +92,14 @@ pub trait FederationStore: Send + Sync {
     /// Whether an activity with this canonical URI was already applied.
     fn activity_seen(&self, activity_uri: &str) -> Result<bool>;
 
+    /// Delivery health of a destination host (`None` = no failures on record).
+    fn delivery_dest(&self, host: &str) -> Result<Option<DeliveryDestState>>;
+
+    /// Store the delivery health of a destination host. One transaction, no
+    /// network I/O. The caller computes the state (see
+    /// `federation::delivery`); a success resets it to zero failures.
+    fn set_delivery_dest(&self, host: &str, state: DeliveryDestState) -> Result<()>;
+
     /// Upsert the remote account, record the activity, apply its effect and
     /// commit the follow-up jobs, all in ONE transaction. A duplicate activity
     /// commits nothing.
@@ -155,6 +163,14 @@ pub trait FederationContentStore: Send + Sync {
 
     /// Whether an activity URI is recorded as applied.
     fn activity_recorded(&self, activity_uri: &str) -> Result<bool>;
+
+    /// File a tombstone for an object URI a remote `Delete` removed before any
+    /// `Create` for it arrived. Returns `true` when the tombstone is new.
+    /// One transaction, no network I/O.
+    fn record_remote_tombstone(&self, uri: &str, now_ms: u64) -> Result<bool>;
+
+    /// When the tombstone for `uri` was filed, if it was.
+    fn remote_tombstone(&self, uri: &str) -> Result<Option<u64>>;
 
     /// A quote by the authorization URI it carries (`approval_uri`).
     fn quote_by_approval_uri(&self, approval_uri: &str) -> Result<Option<QuoteRecord>>;

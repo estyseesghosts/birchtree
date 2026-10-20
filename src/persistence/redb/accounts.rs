@@ -7,7 +7,7 @@ use redb::ReadableTable;
 use crate::application::ports::{
     AccountProfileUpdate, AccountStore, NewLocalAccount, UserSettingsUpdate,
 };
-use crate::domain::{Account, Error, Id, LocalUser, Result, UserRole};
+use crate::domain::{Account, Error, Id, LocalUser, Result, SignInEvent, UserRole};
 
 use super::schema::{ACCOUNTS, HANDLE_INDEX, LOCAL_USERS};
 use super::{decode, encode, RedbStore, StoreResult};
@@ -76,11 +76,13 @@ impl AccountStore for RedbStore {
             email_verified: false,
             created_at_ms: input.now_ms,
             disabled: false,
+            approved: input.approved,
             default_privacy: None,
             default_sensitive: None,
             default_language: None,
             default_quote_policy: None,
             home_mention_policy: None,
+            chosen_languages: None,
             // New accounts start role-less; operators grant roles via the CLI.
             role: UserRole::None,
         };
@@ -262,6 +264,17 @@ impl AccountStore for RedbStore {
         if let Some(v) = update.home_mention_policy {
             user.home_mention_policy = Some(v);
         }
+        if let Some(v) = update.chosen_languages {
+            // An empty list clears the preference (upstream `compact_blank`
+            // `.presence` normalization); otherwise store the normalized tags.
+            let normalized =
+                crate::application::policy::normalize_chosen_languages(&v);
+            user.chosen_languages = if normalized.is_empty() {
+                None
+            } else {
+                Some(normalized)
+            };
+        }
         {
             let mut users = write.open_table(LOCAL_USERS)?;
             users.insert(account_id.value(), encode(&user)?.as_slice())?;
@@ -286,5 +299,27 @@ impl AccountStore for RedbStore {
         }
         write.commit()?;
         Ok(user)
+    }
+
+    fn record_sign_in(&self, account_id: Id, now_ms: u64) -> Result<()> {
+        let write = self.begin_write()?;
+        // Only real local users leave sign-in telemetry; a missing
+        // credential row (or a remote id) records nothing, never an error.
+        let users = write.open_table(LOCAL_USERS)?;
+        if users.get(account_id.value())?.is_none() {
+            return Ok(());
+        }
+        drop(users);
+        let event = SignInEvent {
+            id: self.next_id(),
+            account_id,
+            created_at_ms: now_ms,
+        };
+        {
+            let mut table = write.open_table(super::schema::SIGN_INS)?;
+            table.insert(event.id.value(), encode(&event)?.as_slice())?;
+        }
+        write.commit()?;
+        Ok(())
     }
 }

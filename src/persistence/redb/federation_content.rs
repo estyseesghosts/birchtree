@@ -13,7 +13,7 @@ use crate::domain::{
 
 use super::schema::{
     self, ACCOUNTS, ACTIVITY_DEDUP, QUOTES, QUOTES_BY_QUOTED, QUOTES_BY_QUOTING, QUOTE_BY_APPROVAL,
-    REMOTE_MEDIA_SOURCE, REMOTE_REFRESH, REPORTS, STATUSES, STATUS_BY_URI, STATUS_PARENT_INDEX,
+    REMOTE_MEDIA_SOURCE, REMOTE_REFRESH, REMOTE_TOMBSTONE, REPORTS, STATUSES, STATUS_BY_URI, STATUS_PARENT_INDEX,
     UNRESOLVED_PARENT,
 };
 use super::{decode, encode, RedbStore, StoreResult};
@@ -102,6 +102,27 @@ impl FederationContentStore for RedbStore {
         let read = self.begin_read()?;
         let table = read.open_table(ACTIVITY_DEDUP)?;
         Ok(table.get(activity_uri)?.is_some())
+    }
+
+    fn record_remote_tombstone(&self, uri: &str, now_ms: u64) -> Result<bool> {
+        let write = self.begin_write()?;
+        let fresh = {
+            let mut table = write.open_table(REMOTE_TOMBSTONE)?;
+            if table.get(uri)?.is_some() {
+                false
+            } else {
+                table.insert(uri, now_ms)?;
+                true
+            }
+        };
+        write.commit()?;
+        Ok(fresh)
+    }
+
+    fn remote_tombstone(&self, uri: &str) -> Result<Option<u64>> {
+        let read = self.begin_read()?;
+        let table = read.open_table(REMOTE_TOMBSTONE)?;
+        Ok(table.get(uri)?.map(|g| g.value()))
     }
 
     fn quote_by_approval_uri(&self, approval_uri: &str) -> Result<Option<QuoteRecord>> {

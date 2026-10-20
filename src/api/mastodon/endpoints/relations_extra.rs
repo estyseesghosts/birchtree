@@ -332,13 +332,14 @@ pub async fn familiar_followers(
 
 /// Pinned `REST::TagSerializer` projection over a stored or ad-hoc tag
 /// name. There is no tag table yet (recorded in the manifest), so the name
-/// is the id; `history` is a contract-shaped empty array; `following` and
+/// is the id; `history` is seven real per-day buckets; `following` and
 /// `featuring` appear for authenticated viewers with real values.
 fn tag_json(
     state: &ApiState,
     store: &dyn Store,
     viewer: Option<Id>,
     name: &str,
+    now_ms: u64,
 ) -> Value {
     let mut object = serde_json::Map::new();
     object.insert("id".into(), Value::String(name.to_string()));
@@ -347,7 +348,22 @@ fn tag_json(
         "url".into(),
         Value::String(state.server.asset_url(&format!("tags/{name}"))),
     );
-    object.insert("history".into(), Value::Array(Vec::new()));
+    let history = crate::application::trends::tag_history(store, name, now_ms).unwrap_or_default();
+    object.insert(
+        "history".into(),
+        Value::Array(
+            history
+                .iter()
+                .map(|day| {
+                    serde_json::json!({
+                        "day": day.day_sec.to_string(),
+                        "uses": day.uses.to_string(),
+                        "accounts": day.accounts.to_string(),
+                    })
+                })
+                .collect(),
+        ),
+    );
     if let Some(viewer) = viewer {
         let (following, featuring) = web_cases::tag_relationship(store, viewer, name)
             .unwrap_or((false, false));
@@ -381,7 +397,9 @@ pub async fn followed_tags(
     };
     let body: Vec<Value> = rows
         .iter()
-        .map(|row: &TagFollow| tag_json(&state, store, Some(viewer), &row.tag))
+        .map(|row: &TagFollow| {
+            tag_json(&state, store, Some(viewer), &row.tag, state.context.now_ms())
+        })
         .collect();
     let full = rows.len() == page.limit;
     let next = if full { rows.last().map(|r| r.id) } else { None };
@@ -540,13 +558,13 @@ pub async fn tag_show(
     let viewer = auth.0.as_ref().and_then(|a| a.token.user_id);
     let store: &dyn Store = &*state.context.store;
     let name = web_cases::normalize_tag_name(&raw);
-    axum::Json(tag_json(&state, store, viewer, &name)).into_response()
+    axum::Json(tag_json(&state, store, viewer, &name, state.context.now_ms())).into_response()
 }
 
 /// Shared tag-mutation response: the tag with the viewer's fresh flags.
 fn tag_response(state: &ApiState, viewer: Id, name: &str) -> Response {
     let store: &dyn Store = &*state.context.store;
-    axum::Json(tag_json(state, store, Some(viewer), name)).into_response()
+    axum::Json(tag_json(state, store, Some(viewer), name, state.context.now_ms())).into_response()
 }
 
 /// `POST /api/v1/tags/:id/follow`.

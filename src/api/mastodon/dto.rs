@@ -1150,12 +1150,20 @@ pub fn search_json(accounts: Vec<Value>, statuses: Vec<Value>, hashtags: Vec<Val
 // `REST::AnnualReportSerializer` + `REST::AnnualReportsSerializer`).
 // ---------------------------------------------------------------------------
 
-/// `REST::TagSerializer` for a trend tag: the tag name is the id (no tag
-/// table yet, as recorded in the endpoint manifest); `history` is a
-/// contract-shaped empty array until per-day usage history lands;
-/// `following`/`featuring` appear for authenticated viewers only (there is
-/// no tag-follow store yet, so they are `false`).
-pub fn trend_tag_json(server: &ServerInfo, flag: &TrendTagFlag, viewer: Option<crate::domain::Id>) -> Value {
+/// `REST::TagSerializer` for a trend tag: the flag row id is the id
+/// (upstream's numeric Tag row id); `history` is seven real per-day buckets
+/// (`{day, uses, accounts}`, strings, newest first — upstream
+/// `Trends::History::Day#as_json`); `following`/`featuring` appear for
+/// authenticated viewers with real values from the tag-follow and
+/// featured-tag stores.
+pub fn trend_tag_json(
+    server: &ServerInfo,
+    flag: &TrendTagFlag,
+    viewer: Option<crate::domain::Id>,
+    history: &[crate::application::trends::TagHistoryDay],
+    following: bool,
+    featuring: bool,
+) -> Value {
     let mut object = Map::new();
     // Upstream `REST::TagSerializer#id` is the numeric Tag row id (as a
     // string), not the name; the flag row plays that role here.
@@ -1169,10 +1177,20 @@ pub fn trend_tag_json(server: &ServerInfo, flag: &TrendTagFlag, viewer: Option<c
             flag.name
         )),
     );
-    object.insert("history".into(), json!([]));
+    object.insert(
+        "history".into(),
+        json!(history
+            .iter()
+            .map(|day| serde_json::json!({
+                "day": day.day_sec.to_string(),
+                "uses": day.uses.to_string(),
+                "accounts": day.accounts.to_string(),
+            }))
+            .collect::<Vec<_>>()),
+    );
     if viewer.is_some() {
-        object.insert("following".into(), json!(false));
-        object.insert("featuring".into(), json!(false));
+        object.insert("following".into(), json!(following));
+        object.insert("featuring".into(), json!(featuring));
     }
     Value::Object(object)
 }
@@ -1184,8 +1202,11 @@ pub fn admin_trend_tag_json(
     server: &ServerInfo,
     flag: &TrendTagFlag,
     viewer: Option<crate::domain::Id>,
+    history: &[crate::application::trends::TagHistoryDay],
+    following: bool,
+    featuring: bool,
 ) -> Value {
-    let mut object = match trend_tag_json(server, flag, viewer) {
+    let mut object = match trend_tag_json(server, flag, viewer, history, following, featuring) {
         Value::Object(map) => map,
         other => return other,
     };

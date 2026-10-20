@@ -60,6 +60,7 @@ pub async fn tags_index(State(state): State<ApiState>, auth: Auth, uri: Uri) -> 
     };
     let page = trends::page(candidates, offset, limit);
     let full = page.len() == limit && limit > 0;
+    let now = state.context.now_ms();
     let body: Vec<serde_json::Value> = page
         .iter()
         .map(|candidate| {
@@ -70,7 +71,11 @@ pub async fn tags_index(State(state): State<ApiState>, auth: Auth, uri: Uri) -> 
                 reviewed_at_ms: None,
                 created_at_ms: 0,
             });
-            dto::admin_trend_tag_json(&state.server, &flag, Some(viewer))
+            let history = trends::tag_history(store, &flag.name, now).unwrap_or_default();
+            let (following, featuring) =
+                crate::application::web::tag_relationship(store, viewer, &flag.name)
+                    .unwrap_or((false, false));
+            dto::admin_trend_tag_json(&state.server, &flag, Some(viewer), &history, following, featuring)
         })
         .collect();
     crate::api::mastodon::endpoints::trends::paged_admin(&uri, body, offset, limit, full)
@@ -112,8 +117,20 @@ fn review_tag(state: &ApiState, auth: &Auth, raw: &str, allowed: bool) -> Respon
     let store: &dyn Store = &*state.context.store;
     match store.review_trend_tag(id, allowed, viewer, state.context.now_ms()) {
         Ok(flag) => {
-            axum::Json(dto::admin_trend_tag_json(&state.server, &flag, Some(viewer)))
-                .into_response()
+            let history = trends::tag_history(store, &flag.name, state.context.now_ms())
+                .unwrap_or_default();
+            let (following, featuring) =
+                crate::application::web::tag_relationship(store, viewer, &flag.name)
+                    .unwrap_or((false, false));
+            axum::Json(dto::admin_trend_tag_json(
+                &state.server,
+                &flag,
+                Some(viewer),
+                &history,
+                following,
+                featuring,
+            ))
+            .into_response()
         }
         Err(err) => ApiError::from(err).into_response(),
     }
@@ -313,7 +330,7 @@ pub async fn statuses_index(State(state): State<ApiState>, auth: Auth, uri: Uri)
     };
     let (offset, limit) = offset_limit(&uri, 20);
     let store: &dyn Store = &*state.context.store;
-    let candidates = match trends::status_candidates(store) {
+    let candidates = match trends::status_candidates(store, state.context.now_ms()) {
         Ok(candidates) => candidates,
         Err(err) => return ApiError::from(err).into_response(),
     };

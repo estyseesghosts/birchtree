@@ -121,26 +121,35 @@ pub fn indexable_text(status: &Status) -> String {
 ///
 /// Splits on anything that is not a Unicode alphanumeric (so `café`,
 /// CJK text and `_`-joined names behave sanely), drops tokens longer than
-/// 64 characters, and skips empties. Query text goes through the same
-/// function, so both sides agree on token shapes.
+/// [`MAX_TOKEN_LEN`] characters, and skips empties. Query text goes through
+/// the same function, so both sides agree on token shapes.
+///
+/// Length contract: the limit counts Unicode scalar values (`char`s), not
+/// bytes and not grapheme clusters — a 64-`é` token (128 bytes in UTF-8) is
+/// kept whole, while a 65-character token is dropped even if it fits in
+/// fewer bytes than some kept token. Case folding may expand a character
+/// (e.g. `İ` → `i̇`); the count applies after folding.
 pub fn tokenize(text: &str) -> Vec<String> {
-    const MAX_TOKEN_LEN: usize = 64;
     let mut tokens = Vec::new();
     let mut current = String::new();
+    let mut current_chars = 0usize;
     let mut overlong = false;
     for ch in text.chars() {
         if ch.is_alphanumeric() {
             if !overlong {
                 for lower in ch.to_lowercase() {
                     current.push(lower);
+                    current_chars += 1;
                 }
-                if current.len() > MAX_TOKEN_LEN {
+                if current_chars > MAX_TOKEN_LEN {
                     overlong = true;
                     current.clear();
+                    current_chars = 0;
                 }
             }
         } else if !current.is_empty() {
             tokens.push(std::mem::take(&mut current));
+            current_chars = 0;
         } else {
             overlong = false;
         }
@@ -151,9 +160,18 @@ pub fn tokenize(text: &str) -> Vec<String> {
     tokens
 }
 
+/// Longest token the index keeps: [`MAX_TOKEN_LEN`] Unicode scalar values
+/// (see [`tokenize`]). Longer runs are dropped, never truncated, so a query
+/// for a truncated prefix cannot match a dropped token by accident.
+pub const MAX_TOKEN_LEN: usize = 64;
+
 /// Minimum query-token length served by the embedded index. Single characters
 /// prefix-match most of the vocabulary, so they are dropped; when nothing
 /// remains the query matches nothing (still `200` with empty `statuses`).
+///
+/// Length contract: like [`MAX_TOKEN_LEN`] this counts Unicode scalar values,
+/// not bytes — a two-`é` query token (4 bytes) is served, a one-CJK-character
+/// token is not.
 pub const MIN_QUERY_TOKEN_LEN: usize = 2;
 
 /// Process-wide embedded index (the single-node server has one).

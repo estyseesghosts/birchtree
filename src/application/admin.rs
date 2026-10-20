@@ -7,9 +7,10 @@
 
 use crate::application::ports::{
     AdminAccountFilter, AdminAccountPatch, AdminAccountStatus, AdminReportFilter, AdminReportPatch,
-    AdminStore,
+    AdminInfraStore, AdminStore, OAuthStore, Store, StreamingSink,
 };
-use crate::domain::{Account, Error, Id, LocalUser, Report, Result};
+use crate::application::streaming::StreamEvent;
+use crate::domain::{Account, Error, Id, LocalUser, Report, Result, Rule};
 
 /// Report categories upstream accepts (`app/models/report.rb`).
 const REPORT_CATEGORIES: &[&str] = &["other", "spam", "legal", "violation"];
@@ -116,16 +117,47 @@ pub fn account_action(
     account_id: Id,
     action: &str,
     report_id: Option<Id>,
+    text: Option<String>,
     now_ms: u64,
 ) -> Result<()> {
-    store.admin_account_action(actor, account_id, action, report_id, now_ms)
+    store.admin_account_action(actor, account_id, action, report_id, text, now_ms)
+}
+
+/// D24: kill an account's sessions after its suspension or disablement
+/// commits. Revokes every live token of the account in one transaction, then
+/// — after commit — publishes one `TokenRevoked` per token so the hub closes
+/// their open streams (upstream's `kill`: `Account::Suspensions#suspend!`
+/// publishes `timeline:system:{id}` `{event: :kill}`, `User#disable!` and
+/// `User#revoke_access!` do the same per token).
+///
+/// Revocation is permanent: `enable`/`unsuspend`/`approve` do NOT restore
+/// tokens (upstream likewise never un-revokes). A killed token answers
+/// `401 Invalid access token` on REST and streaming reuse.
+///
+/// Call this AFTER every commit that newly suspends or disables an account:
+/// `DELETE`, `reject`, the `disable`/`suspend` action types, and patches that
+/// set `suspended`/`disabled`. The D36 approval-queue and D38 deletion-worker
+/// paths must call it too when they land — a suspend/disable without a kill
+/// leaves the account's streams open (register D24).
+pub fn kill_account_tokens(
+    store: &dyn Store,
+    sink: &dyn StreamingSink,
+    account_id: Id,
+) -> Result<usize> {
+    let store: &dyn OAuthStore = store;
+    let revoked = store.revoke_account_tokens(account_id)?;
+    for token_id in &revoked {
+        sink.publish(StreamEvent::TokenRevoked { token_id: *token_id });
+    }
+    Ok(revoked.len())
 }
 
 /// Validate a report category and rule-id combination.
 ///
-/// Rules have no model yet: a non-`violation` category with rule ids is
-/// rejected (upstream: `rule_ids` must be absent); a `violation` category
-/// keeps the ids on the row but renders `rules: []` (documented gap).
+/// A non-`violation` category with rule ids is rejected (upstream:
+/// `rule_ids` must be absent). A `violation` category keeps the ids on the
+/// row; their existence is validated separately by [`load_rules`] (upstream
+/// `validate_rule_ids`).
 pub fn check_report_patch(category: Option<&str>, rule_ids: Option<&[String]>) -> Result<()> {
     if let Some(category) = category {
         if !REPORT_CATEGORIES.contains(&category) {
@@ -144,6 +176,39 @@ pub fn check_report_patch(category: Option<&str>, rule_ids: Option<&[String]>) -
         ));
     }
     Ok(())
+}
+
+/// Resolve report rule ids against the rule store, in order (D37).
+///
+/// Every id must parse and reference an existing rule, like upstream's
+/// `validate_rule_ids` (`rules.size == rule_ids.size`); otherwise the
+/// update is refused `422` (`reports.errors.invalid_rules`).
+pub fn load_rules(store: &dyn AdminInfraStore, rule_ids: &[String]) -> Result<Vec<Rule>> {
+    let mut ids = Vec::with_capacity(rule_ids.len());
+    for raw in rule_ids {
+        let id: Id = raw.parse().map_err(|_| {
+            Error::InvalidInput("Validation failed: Rule ids does not reference valid rules".into())
+        })?;
+        ids.push(id);
+    }
+    let rules = store.admin_rules_by_ids(&ids)?;
+    if rules.len() != ids.len() {
+        return Err(Error::InvalidInput(
+            "Validation failed: Rule ids does not reference valid rules".into(),
+        ));
+    }
+    Ok(rules)
+}
+
+/// Create one server rule (operator-managed, like custom emoji).
+pub fn create_rule(store: &dyn AdminInfraStore, text: &str, hint: &str, now_ms: u64) -> Result<Rule> {
+    store.admin_create_rule(text, hint, now_ms)
+}
+
+/// Delete one server rule. Reports that referenced it keep the stale id;
+/// serialization skips ids with no rule row.
+pub fn delete_rule(store: &dyn AdminInfraStore, id: Id) -> Result<bool> {
+    store.admin_delete_rule(id)
 }
 
 /// Update one queued report with its audit action.

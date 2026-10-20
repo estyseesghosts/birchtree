@@ -137,25 +137,11 @@ pub fn update_web_push_subscription(
         .ok_or_else(|| Error::NotFound("subscription".into()))
 }
 
-/// Destroy by unsubscribe token (no session needed upstream), falling back to
-/// the numeric id owned by the caller. Always succeeds, like upstream's
-/// `push_subscription&.destroy; head 200`.
-pub fn destroy_web_push_subscription(
-    store: &dyn Store,
-    user_id: Option<Id>,
-    token_or_id: &str,
-) -> Result<()> {
-    if store
-        .destroy_web_push_subscription_by_token(token_or_id)?
-        .is_some()
-    {
-        return Ok(());
-    }
-    if let (Some(user_id), Ok(id)) = (user_id, token_or_id.parse::<Id>()) {
-        store.destroy_web_push_subscription(user_id, id)?;
-    }
-    Ok(())
-}
+// NOTE: there is deliberately no application-level destroy wrapper: the
+// endpoint (`api::mastodon::endpoints::web::push_destroy`) tries the
+// capability-token path first (CSRF-exempt, like upstream) and only then
+// the numeric-id session path (CSRF-checked). A shared wrapper would hide
+// which path was taken and re-open the CSRF gap.
 
 // ---------------------------------------------------------------------------
 // Relation collection reads

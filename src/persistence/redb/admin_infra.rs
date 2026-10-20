@@ -14,8 +14,8 @@ use crate::application::admin_infra as use_cases;
 use crate::domain::{
     Account, AdminAccountOverview, AdminAuditRecord, AdminCanonicalEmailBlock, AdminDomainAllow,
     AdminDomainBlock, AdminDomainSeverity, AdminEmailDomainBlock, AdminIpBlock, AdminIpSeverity,
-    AdminMediaOwner, AdminReportTarget, AdminTag, Error, Id, MediaAttachment, Report, Result,
-    Status,
+    AdminMediaOwner, AdminReportTarget, AdminTag, Error, Follow, FollowMetricRow, Id,
+    MediaAttachment, Report, Result, Rule, SignInEvent, Status,
 };
 
 use super::schema::{
@@ -23,7 +23,7 @@ use super::schema::{
     ADMIN_CANONICAL_EMAIL_BLOCK_BY_HASH, ADMIN_DOMAIN_ALLOWS, ADMIN_DOMAIN_ALLOW_BY_DOMAIN,
     ADMIN_DOMAIN_BLOCKS, ADMIN_DOMAIN_BLOCK_BY_DOMAIN, ADMIN_EMAIL_DOMAIN_BLOCKS,
     ADMIN_EMAIL_DOMAIN_BLOCK_BY_DOMAIN, ADMIN_IP_BLOCKS, ADMIN_IP_BLOCK_BY_IP, ADMIN_TAGS,
-    ADMIN_TAG_BY_NAME, HASHTAG_INDEX, MEDIA, REPORTS, STATUSES,
+    ADMIN_TAG_BY_NAME, FOLLOWS, HASHTAG_INDEX, MEDIA, REPORTS, RULES, SIGN_INS, STATUSES,
 };
 use super::{decode, encode, RedbStore};
 
@@ -747,6 +747,7 @@ impl AdminInfraStore for RedbStore {
                 created_at_ms: status.created_at_ms,
                 language: status.language.clone(),
                 application_name: status.application.as_ref().map(|app| app.name.clone()),
+                is_reblog: status.is_reblog(),
             });
             if out.len() >= cap.max(1) {
                 break;
@@ -770,6 +771,30 @@ impl AdminInfraStore for RedbStore {
             }
             let report: Report = decode(value.value())?;
             out.push(report.created_at_ms);
+            if out.len() >= cap.max(1) {
+                break;
+            }
+        }
+        self.note_scanned(scanned);
+        out.sort_unstable();
+        Ok(out)
+    }
+
+    fn admin_report_resolved_times(&self, cap: usize) -> Result<Vec<u64>> {
+        let read = self.begin_read()?;
+        let reports = read.open_table(REPORTS)?;
+        let mut out = Vec::new();
+        let mut scanned = 0usize;
+        for entry in reports.iter()? {
+            let (_key, value) = entry?;
+            scanned += 1;
+            if scanned > METRIC_SCAN_CAP {
+                break;
+            }
+            let report: Report = decode(value.value())?;
+            if let Some(at) = report.action_taken_at_ms {
+                out.push(at);
+            }
             if out.len() >= cap.max(1) {
                 break;
             }
@@ -848,6 +873,7 @@ impl AdminInfraStore for RedbStore {
                 created_at_ms: account.created_at_ms,
                 domain: account.domain,
                 local: account.local,
+                username: account.username,
             });
             if out.len() >= cap.max(1) {
                 break;
@@ -903,6 +929,113 @@ impl AdminInfraStore for RedbStore {
             }
         }
         self.note_scanned(scanned);
+        Ok(out)
+    }
+
+    fn admin_follow_metrics(&self, cap: usize) -> Result<Vec<FollowMetricRow>> {
+        let read = self.begin_read()?;
+        let follows = read.open_table(FOLLOWS)?;
+        let mut out = Vec::new();
+        let mut scanned = 0usize;
+        for entry in follows.iter()? {
+            let (_key, value) = entry?;
+            scanned += 1;
+            if scanned > METRIC_SCAN_CAP {
+                break;
+            }
+            let follow: Follow = decode(value.value())?;
+            out.push(FollowMetricRow {
+                follower_id: follow.follower_id,
+                target_id: follow.followed_id,
+                created_at_ms: follow.created_at_ms,
+            });
+            if out.len() >= cap.max(1) {
+                break;
+            }
+        }
+        self.note_scanned(scanned);
+        Ok(out)
+    }
+
+    fn admin_sign_ins(&self, cap: usize) -> Result<Vec<(Id, u64)>> {
+        let read = self.begin_read()?;
+        let table = read.open_table(SIGN_INS)?;
+        let mut out = Vec::new();
+        let mut scanned = 0usize;
+        for entry in table.iter()? {
+            let (_key, value) = entry?;
+            scanned += 1;
+            if scanned > METRIC_SCAN_CAP {
+                break;
+            }
+            let event: SignInEvent = decode(value.value())?;
+            out.push((event.account_id, event.created_at_ms));
+            if out.len() >= cap.max(1) {
+                break;
+            }
+        }
+        self.note_scanned(scanned);
+        Ok(out)
+    }
+
+    fn admin_create_rule(&self, text: &str, hint: &str, now_ms: u64) -> Result<Rule> {
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return Err(Error::InvalidInput(
+                "Validation failed: Text can't be blank".into(),
+            ));
+        }
+        if text.chars().count() > crate::domain::RULE_TEXT_LIMIT {
+            return Err(Error::InvalidInput(
+                "Validation failed: Text is too long".into(),
+            ));
+        }
+        let write = self.begin_write()?;
+        let rule = Rule {
+            id: self.next_id(),
+            text,
+            hint: hint.to_string(),
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        };
+        {
+            let mut table = write.open_table(RULES)?;
+            table.insert(rule.id.value(), encode(&rule)?.as_slice())?;
+        }
+        write.commit()?;
+        Ok(rule)
+    }
+
+    fn admin_delete_rule(&self, id: Id) -> Result<bool> {
+        let write = self.begin_write()?;
+        let removed = {
+            let mut table = write.open_table(RULES)?;
+            table.remove(id.value())?.is_some()
+        };
+        write.commit()?;
+        Ok(removed)
+    }
+
+    fn admin_rules(&self) -> Result<Vec<Rule>> {
+        let read = self.begin_read()?;
+        let table = read.open_table(RULES)?;
+        let mut out = Vec::new();
+        for entry in table.range(0u64..)? {
+            let (_, value) = entry?;
+            out.push(decode(value.value())?);
+        }
+        Ok(out)
+    }
+
+    fn admin_rules_by_ids(&self, ids: &[Id]) -> Result<Vec<Rule>> {
+        let read = self.begin_read()?;
+        let table = read.open_table(RULES)?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(guard) = table.get(id.value())? {
+                out.push(decode(guard.value())?);
+            }
+        }
         Ok(out)
     }
 

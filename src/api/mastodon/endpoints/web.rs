@@ -13,6 +13,9 @@
 //! - `POST /api/web/push_subscriptions`, `PUT/PATCH /:id`, `DELETE /:id` —
 //!   session-bound web push subscriptions (`require_user!` except destroy,
 //!   which finds the row by its unsubscribe token and always answers 200).
+//!   Destroy by token is CSRF-exempt like upstream (`skip_forgery_protection
+//!   only: :destroy`); the numeric-id fallback underneath is a birchtree
+//!   extension and requires CSRF when a session user acts (D44).
 //!
 //! Session authentication reuses the Phase 2 login session
 //! (`birchtree_session` cookie). CSRF uses the double-submit cookie set at
@@ -243,8 +246,19 @@ pub async fn push_update(
     }
 }
 
-/// `DELETE /api/web/push_subscriptions/:id`: no `require_user!` upstream —
-/// the row is found by its unsubscribe token and the answer is always 200.
+/// `DELETE /api/web/push_subscriptions/:id`.
+///
+/// Upstream (`PushSubscriptionsController#destroy`, v4.7.3) finds the row by
+/// its unsubscribe token only and skips forgery protection for this action
+/// (`skip_forgery_protection only: :destroy`): the token is a bearer
+/// capability, so presenting it *is* the authorization and no session or
+/// CSRF check applies. This handler keeps that path first and exempt.
+///
+/// The numeric-id fallback underneath is a birchtree extension (upstream has
+/// no id lookup here): when the token misses and a session user acts on a
+/// numeric id, the request is a state-changing session request like the
+/// other web routes, so it must pass [`check_csrf`]. Without a session the
+/// answer stays upstream's unconditional `200` (no user enumeration).
 pub async fn push_destroy(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -252,8 +266,22 @@ pub async fn push_destroy(
 ) -> Response {
     let user = session_user(&state, &headers).ok();
     let store: &dyn Store = &*state.context.store;
-    match web_cases::destroy_web_push_subscription(store, user, &raw) {
-        Ok(()) => axum::Json(serde_json::json!({})).into_response(),
+    match store.destroy_web_push_subscription_by_token(&raw) {
+        Ok(Some(_)) => return axum::Json(serde_json::json!({})).into_response(),
+        Ok(None) => {}
+        Err(err) => return ApiError::from(err).into_response(),
+    }
+    let Some(user_id) = user else {
+        return axum::Json(serde_json::json!({})).into_response();
+    };
+    let Ok(id) = raw.parse::<Id>() else {
+        return axum::Json(serde_json::json!({})).into_response();
+    };
+    if let Err(err) = check_csrf(&headers) {
+        return err.into_response();
+    }
+    match store.destroy_web_push_subscription(user_id, id) {
+        Ok(_) => axum::Json(serde_json::json!({})).into_response(),
         Err(err) => ApiError::from(err).into_response(),
     }
 }

@@ -952,3 +952,73 @@ fn an_ordinary_delete_enqueues_no_undo_announce() {
         "ordinary delete must not enqueue undo_announce: {events:?}"
     );
 }
+
+#[test]
+fn inbound_tags_normalize_and_remote_edits_recompute_them() {
+    use birchtree::application::ports::TimelineQuery;
+    use birchtree::application::timelines;
+    let (_dir, store) = temp_store();
+    let (eve, _) = remote(&store, "eve");
+    let alice = common::mk_account(&store, "alice").id;
+    let query = || TimelineQuery {
+        max_id: None,
+        since_id: None,
+        min_id: None,
+        limit: 20,
+        only_media: false,
+        local_only: false,
+        remote_only: false,
+    };
+
+    // A remote `#café` lands normalized, sharing the local `cafe` tag.
+    let mut n = note(
+        "https://remote.example/users/eve",
+        "https://remote.example/notes/40",
+        "hi",
+        "",
+    );
+    n.author_id = eve;
+    n.tags = vec!["café".to_string(), "cafe".to_string()];
+    let stored = inbound::ingest_note(&*store, n.clone(), None, now_ms()).unwrap();
+    assert_eq!(stored.status.tags, vec!["cafe".to_string()]);
+
+    let local_input = || NewStatus {
+        account_id: alice,
+        uri_base: format!("{BASE}/users/alice/statuses"),
+        url_base: format!("{BASE}/@alice"),
+        source_text: "#cafe from here".into(),
+        content_html: "<p>#cafe from here</p>".into(),
+        visibility: Visibility::Public,
+        tags: vec!["cafe".to_string()],
+        ..NewStatus::default()
+    };
+    let local = store
+        .create_status(local_input(), now_ms())
+        .expect("status")
+        .status;
+    assert_eq!(local.tags, vec!["cafe".to_string()]);
+    let page = timelines::tag(&*store, Some(alice), "café", query(), now_ms()).expect("tag");
+    let ids: Vec<Id> = page.statuses.iter().map(|s| s.id).collect();
+    assert!(ids.contains(&stored.status.id), "remote café unifies: {ids:?}");
+    assert!(ids.contains(&local.id), "local cafe present: {ids:?}");
+
+    // A remote tag edit recomputes the stored list and moves index keys.
+    let mut edit = n.clone();
+    edit.tags = vec!["Music".to_string()];
+    assert_eq!(
+        inbound::update_note(&*store, eve, &edit, now_ms()).unwrap(),
+        Applied::Applied
+    );
+    let status = store.status_by_uri(&n.uri).unwrap().unwrap();
+    assert_eq!(status.tags, vec!["music".to_string()]);
+    let old_page = timelines::tag(&*store, Some(alice), "cafe", query(), now_ms()).expect("tag");
+    assert!(
+        !old_page.statuses.iter().any(|s| s.id == status.id),
+        "old tag released the status"
+    );
+    let new_page = timelines::tag(&*store, Some(alice), "music", query(), now_ms()).expect("tag");
+    assert!(
+        new_page.statuses.iter().any(|s| s.id == status.id),
+        "new tag indexes the status"
+    );
+}

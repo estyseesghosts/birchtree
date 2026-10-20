@@ -24,6 +24,12 @@ pub struct Config {
     /// Whether new account registration is open. Phase 1 keeps this closed;
     /// the CLI bootstrap is always available.
     pub registration_open: bool,
+    /// Whether public registration creates accounts awaiting approval
+    /// (upstream `Setting.registrations_mode == "approved"`). New accounts
+    /// land with `approved = false`, appear under the admin `pending`
+    /// filter, and their tokens are refused by user-token endpoints until
+    /// an admin approves them. Off by default (upstream default `open`).
+    pub registration_requires_approval: bool,
     /// Instance title shown by `/api/v1/instance` and `/api/v2/instance`.
     pub site_title: String,
     /// Instance description.
@@ -70,6 +76,15 @@ pub struct Config {
     pub transcoding_enabled: bool,
     /// ffmpeg binary path (Phase 7.1).
     pub ffmpeg_path: String,
+    /// libwebp `-quality` 0–100 (Phase 7.1; still-image pipeline).
+    pub webp_quality: u8,
+    /// VP9 `-crf` 0–63, constrained-quality mode with `-b:v 0` (Phase 7.1;
+    /// GIF and video pipelines).
+    pub vp9_crf: u8,
+    /// VP9 `-cpu-used` 0–5; higher is faster and slightly worse (Phase 7.1).
+    pub vp9_cpu_used: u8,
+    /// Opus `-b:a` in kbit/s (Phase 7.1; video-with-audio pipeline).
+    pub opus_bitrate_kbps: u32,
     /// Per-job wall-time limit in seconds (Phase 7.1).
     pub transcode_wall_time_secs: u64,
     /// Per-job output-size limit in bytes (Phase 7.1).
@@ -100,6 +115,7 @@ impl Default for Config {
             max_status_chars: 500,
             worker_poll_interval: Duration::from_millis(250),
             registration_open: false,
+            registration_requires_approval: false,
             site_title: "Birchtree".to_string(),
             site_description: "A Mastodon-compatible server".to_string(),
             site_contact_email: "admin@localhost".to_string(),
@@ -114,6 +130,10 @@ impl Default for Config {
             search_mode: crate::search::SearchMode::Embedded,
             transcoding_enabled: true,
             ffmpeg_path: "ffmpeg".to_string(),
+            webp_quality: 80,
+            vp9_crf: 30,
+            vp9_cpu_used: 2,
+            opus_bitrate_kbps: 96,
             transcode_wall_time_secs: 120,
             transcode_max_output_bytes: 64 * 1024 * 1024,
             transcode_max_memory_bytes: 1024 * 1024 * 1024,
@@ -163,6 +183,24 @@ impl Config {
         if self.transcode_max_memory_bytes == 0 {
             return Err("transcode_max_memory_bytes must be > 0".to_string());
         }
+        if self.webp_quality > 100 {
+            return Err(format!(
+                "webp_quality {} out of range 0-100",
+                self.webp_quality
+            ));
+        }
+        if self.vp9_crf > 63 {
+            return Err(format!("vp9_crf {} out of range 0-63", self.vp9_crf));
+        }
+        if self.vp9_cpu_used > 5 {
+            return Err(format!(
+                "vp9_cpu_used {} out of range 0-5",
+                self.vp9_cpu_used
+            ));
+        }
+        if self.opus_bitrate_kbps == 0 {
+            return Err("opus_bitrate_kbps must be > 0".to_string());
+        }
         if let Some(base) = &self.streaming_api_base_url {
             let valid = ["ws://", "wss://", "http://", "https://"]
                 .iter()
@@ -189,11 +227,14 @@ impl Config {
         let config = crate::media::transcode::TranscodeConfig {
             enabled: self.transcoding_enabled,
             ffmpeg_path: self.ffmpeg_path.clone(),
+            webp_quality: self.webp_quality,
+            vp9_crf: self.vp9_crf,
+            vp9_cpu_used: self.vp9_cpu_used,
+            opus_bitrate_kbps: self.opus_bitrate_kbps,
             wall_time_secs: self.transcode_wall_time_secs,
             max_output_bytes: self.transcode_max_output_bytes,
             max_memory_bytes: self.transcode_max_memory_bytes,
             max_file_size: self.max_file_size,
-            ..crate::media::transcode::TranscodeConfig::default()
         };
         if self.transcoding_enabled {
             config

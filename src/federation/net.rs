@@ -98,6 +98,12 @@ pub fn client(cfg: &SafeHttpConfig) -> Result<reqwest::Client, String> {
 /// does not retry it; birchtree wants 4xx retried (owner decision, 2026-10-18, D28).
 /// An error here reaches the crate as `ReqwestMiddleware`, and the delivery job
 /// settles it as a retry. The job's retry budget bounds the attempts.
+///
+/// Only deliveries (activity POSTs to an inbox) are converted. Document
+/// fetches (GET/HEAD) pass their status through, so the crate maps a missing
+/// document to `NotFound`, a deleted one to `ObjectDeleted` (410) and a bad
+/// body to a parse error — each terminal for that URI — instead of every 4xx
+/// becoming a retried middleware error.
 pub struct FailClientErrors;
 
 #[async_trait]
@@ -108,7 +114,11 @@ impl reqwest_middleware::Middleware for FailClientErrors {
         extensions: &mut http::Extensions,
         next: reqwest_middleware::Next<'_>,
     ) -> reqwest_middleware::Result<reqwest::Response> {
+        let is_fetch = matches!(*req.method(), reqwest::Method::GET | reqwest::Method::HEAD);
         let response = next.run(req, extensions).await?;
+        if is_fetch {
+            return Ok(response);
+        }
         let status = response.status();
         if status.is_client_error() {
             return Err(reqwest_middleware::Error::Middleware(anyhow::anyhow!(

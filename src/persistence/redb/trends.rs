@@ -10,7 +10,7 @@ use redb::ReadableTable;
 
 use crate::application::ports::{AnnualReportStore, TrendStore};
 use crate::domain::{
-    AdminAuditRecord, AnnualReport, Error, Id, JobKind, NewAnnualReport, Result, Status,
+    AdminAuditRecord, AnnualReport, Error, Id, Job, JobKind, NewAnnualReport, Result, Status,
     TagUsage, TrendLink, TrendPublisher, TrendStatusFlag, TrendTagFlag,
 };
 
@@ -284,6 +284,20 @@ impl TrendStore for RedbStore {
                 };
                 links.insert(row.id.value(), encode(&row)?.as_slice())?;
                 by_url.insert(url.as_str(), row.id.value())?;
+                // A new row gets one bounded preview-card fetch (D40): the
+                // crawler fills the card fields after commit; a retry never
+                // duplicates the row, and the job is a no-op when metadata
+                // already arrived.
+                super::jobs::insert_job(
+                    &write,
+                    &Job::new(
+                        self.next_id(),
+                        JobKind::PreviewCardFetch,
+                        serde_json::json!({"link_id": row.id.value(), "url": row.url}),
+                        now_ms,
+                        now_ms,
+                    ),
+                )?;
                 // Every link URL's host gets a publisher row (the admin
                 // publishers index lists every seen host).
                 if let Some(host) = link_host(url)
@@ -474,6 +488,81 @@ impl TrendStore for RedbStore {
         }
         write.commit()?;
         Ok(row)
+    }
+
+    fn tag_newest_status_id(&self, tag: &str) -> Result<Option<Id>> {
+        if tag.is_empty() {
+            return Ok(None);
+        }
+        let read = self.begin_read()?;
+        let index = read.open_table(schema::HASHTAG_INDEX)?;
+        // Keys are `tag || 0xFF || status_id_be` ascending: the last key of
+        // the prefix range is the newest indexed status. The walk is bounded
+        // like the tag-usage derivation.
+        let mut prefix = Vec::with_capacity(tag.len() + 9);
+        prefix.extend_from_slice(tag.as_bytes());
+        prefix.push(0xFF);
+        let mut end = prefix.clone();
+        end.extend_from_slice(&u64::MAX.to_be_bytes());
+        let mut newest: Option<Id> = None;
+        let mut scanned = 0usize;
+        for entry in index.range(prefix.as_slice()..=end.as_slice())? {
+            let (key, _) = entry?;
+            let bytes = key.value();
+            let id = Id::new(u64::from_be_bytes(bytes[tag.len() + 1..].try_into().unwrap()));
+            newest = Some(id);
+            scanned += 1;
+            if scanned >= TAG_USAGE_SCAN_CAP {
+                break;
+            }
+        }
+        self.note_scanned(scanned);
+        Ok(newest)
+    }
+
+    fn update_trend_link_card(
+        &self,
+        id: Id,
+        title: Option<String>,
+        description: Option<String>,
+        provider_name: Option<String>,
+        provider_url: Option<String>,
+        image_url: Option<String>,
+        now_ms: u64,
+    ) -> Result<Option<TrendLink>> {
+        let _ = now_ms;
+        let write = self.begin_write()?;
+        let mut row: TrendLink = {
+            let table = write.open_table(TREND_LINKS)?;
+            match table.get(id.value())? {
+                Some(guard) => decode(guard.value())?,
+                None => return Ok(None),
+            }
+        };
+        // `None` arguments leave the stored field unchanged, so a partial
+        // fetch (a page with a title but no description) never blanks a
+        // field an earlier fetch filled.
+        if let Some(title) = title {
+            row.title = Some(title);
+        }
+        if let Some(description) = description {
+            row.description = Some(description);
+        }
+        if let Some(provider_name) = provider_name {
+            row.provider_name = Some(provider_name);
+        }
+        if let Some(provider_url) = provider_url {
+            row.provider_url = Some(provider_url);
+        }
+        if let Some(image_url) = image_url {
+            row.image_url = Some(image_url);
+        }
+        {
+            let mut table = write.open_table(TREND_LINKS)?;
+            table.insert(id.value(), encode(&row)?.as_slice())?;
+        }
+        write.commit()?;
+        Ok(Some(row))
     }
 }
 

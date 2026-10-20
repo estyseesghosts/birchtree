@@ -27,6 +27,9 @@ struct Args {
     display_name: Option<String>,
     role: Option<String>,
     harness_mode: Option<String>,
+    text: Option<String>,
+    hint: Option<String>,
+    id: Option<String>,
 }
 
 fn parse_args(cfg: &mut Config) -> Args {
@@ -66,6 +69,12 @@ fn parse_args(cfg: &mut Config) -> Args {
             args.display_name = Some(v.to_string());
         } else if let Some(v) = arg.strip_prefix("--role=") {
             args.role = Some(v.to_string());
+        } else if let Some(v) = arg.strip_prefix("--text=") {
+            args.text = Some(v.to_string());
+        } else if let Some(v) = arg.strip_prefix("--hint=") {
+            args.hint = Some(v.to_string());
+        } else if let Some(v) = arg.strip_prefix("--id=") {
+            args.id = Some(v.to_string());
         } else if let Some(v) = arg.strip_prefix("--site-title=") {
             cfg.site_title = v.to_string();
         } else if let Some(v) = arg.strip_prefix("--site-description=") {
@@ -98,6 +107,8 @@ fn parse_args(cfg: &mut Config) -> Args {
             cfg.registration_open = true;
         } else if arg == "--registration-closed" {
             cfg.registration_open = false;
+        } else if arg == "--registration-require-approval" {
+            cfg.registration_requires_approval = true;
         } else if let Some(v) = arg.strip_prefix("--search-mode=") {
             cfg.search_mode =
                 birchtree::search::SearchMode::parse(v).unwrap_or_else(|| {
@@ -108,6 +119,26 @@ fn parse_args(cfg: &mut Config) -> Args {
             cfg.transcoding_enabled = false;
         } else if let Some(v) = arg.strip_prefix("--ffmpeg-path=") {
             cfg.ffmpeg_path = v.to_string();
+        } else if let Some(v) = arg.strip_prefix("--webp-quality=") {
+            cfg.webp_quality = v.parse().unwrap_or_else(|_| {
+                eprintln!("invalid --webp-quality (want 0-100): {v}");
+                std::process::exit(2);
+            });
+        } else if let Some(v) = arg.strip_prefix("--vp9-crf=") {
+            cfg.vp9_crf = v.parse().unwrap_or_else(|_| {
+                eprintln!("invalid --vp9-crf (want 0-63): {v}");
+                std::process::exit(2);
+            });
+        } else if let Some(v) = arg.strip_prefix("--vp9-cpu-used=") {
+            cfg.vp9_cpu_used = v.parse().unwrap_or_else(|_| {
+                eprintln!("invalid --vp9-cpu-used (want 0-5): {v}");
+                std::process::exit(2);
+            });
+        } else if let Some(v) = arg.strip_prefix("--opus-bitrate-kbps=") {
+            cfg.opus_bitrate_kbps = v.parse().unwrap_or_else(|_| {
+                eprintln!("invalid --opus-bitrate-kbps (want an integer > 0): {v}");
+                std::process::exit(2);
+            });
         } else if let Some(v) = arg.strip_prefix("--transcode-wall-time-secs=") {
             cfg.transcode_wall_time_secs = v.parse().unwrap_or_else(|_| {
                 eprintln!("invalid --transcode-wall-time-secs: {v}");
@@ -473,6 +504,17 @@ async fn serve(cfg: Config) {
         eprintln!("configuration error: {err}");
         std::process::exit(1);
     });
+    // A `SIGKILL` between ffmpeg spawn and temp-guard drop orphans temp
+    // files permanently; sweep them once at startup (bounded, age-gated, so
+    // a live job's fresh files are never touched).
+    let swept = birchtree::media::transcode::sweep_tmp_files(
+        &std::env::temp_dir(),
+        birchtree::media::transcode::TMP_SWEEP_GRACE_MS,
+        birchtree::media::transcode::TMP_SWEEP_CAP,
+    );
+    if swept > 0 {
+        tracing::info!(swept, "removed stale transcode temp files at startup");
+    }
     let worker_extra = jobs::worker::WorkerExtra {
         push_client: reqwest::Client::builder()
             .no_proxy()
@@ -534,11 +576,122 @@ async fn main() {
     match args.positional.first().map(String::as_str) {
         Some("create-account") => run_create_account(&cfg, &args),
         Some("grant-role") | Some("set-role") => run_grant_role(&cfg, &args),
+        Some("create-rule") => run_create_rule(&cfg, &args),
+        Some("delete-rule") => run_delete_rule(&cfg, &args),
+        Some("list-rules") => run_list_rules(&cfg, &args),
         Some("crash-harness") => run_crash_harness(&cfg, &args),
+        Some("sweep-transcode-orphans") => run_sweep_transcode_orphans(&cfg, &args),
         Some(other) => {
             eprintln!("unknown subcommand: {other}");
             std::process::exit(2);
         }
         None => serve(cfg).await,
     }
+}
+
+/// `create-rule --text=<text> [--hint=<hint>]`: create one server rule
+/// (D37; operator-managed, like custom emoji). Moderators attach rules to
+/// reports through the admin report update. Prints the numeric id.
+fn run_create_rule(cfg: &Config, args: &Args) -> ! {
+    use birchtree::application::ports::AdminInfraStore;
+    let text = args.text.clone().unwrap_or_else(|| {
+        eprintln!("create-rule requires --text=<rule text>");
+        std::process::exit(2);
+    });
+    let (store, clock, _ids) = build_store(cfg);
+    match store.admin_create_rule(&text, args.hint.as_deref().unwrap_or(""), clock.now_ms()) {
+        Ok(rule) => {
+            println!("created rule id={}", rule.id);
+            std::process::exit(0);
+        }
+        Err(err) => {
+            eprintln!("create-rule failed: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `delete-rule --id=<id>`: delete one server rule (D37). Reports that
+/// referenced it keep the stale id; serialization skips ids with no rule.
+fn run_delete_rule(cfg: &Config, args: &Args) -> ! {
+    use birchtree::application::ports::AdminInfraStore;
+    use birchtree::domain::Id;
+    let id: Id = args.id.as_deref().unwrap_or("").parse().unwrap_or_else(|_| {
+        eprintln!("delete-rule requires --id=<rule id>");
+        std::process::exit(2);
+    });
+    let (store, _clock, _ids) = build_store(cfg);
+    match store.admin_delete_rule(id) {
+        Ok(true) => {
+            println!("deleted rule id={id}");
+            std::process::exit(0);
+        }
+        Ok(false) => {
+            eprintln!("delete-rule: no rule {id}");
+            std::process::exit(1);
+        }
+        Err(err) => {
+            eprintln!("delete-rule failed: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `list-rules`: print every server rule id-first (D37 operator read).
+fn run_list_rules(cfg: &Config, _args: &Args) -> ! {
+    use birchtree::application::ports::AdminInfraStore;
+    let (store, _clock, _ids) = build_store(cfg);
+    match store.admin_rules() {
+        Ok(rules) => {
+            for rule in rules {
+                println!("{} {}", rule.id, rule.text);
+            }
+            std::process::exit(0);
+        }
+        Err(err) => {
+            eprintln!("list-rules failed: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `sweep-transcode-orphans [--media-id=<id> ...]`: operator re-drive of the
+/// orphan sweeper (Phase 7.1). Always sweeps stale `/tmp` transcode files;
+/// each `--media-id=` additionally sweeps that attachment's staging blobs
+/// when its row is terminal (missing/`Ready`/`Failed`). Prints counts.
+fn run_sweep_transcode_orphans(cfg: &Config, args: &Args) -> ! {
+    use birchtree::domain::Id;
+
+    let tmp_removed = birchtree::media::transcode::sweep_tmp_files(
+        &std::env::temp_dir(),
+        birchtree::media::transcode::TMP_SWEEP_GRACE_MS,
+        birchtree::media::transcode::TMP_SWEEP_CAP,
+    );
+    let (store, _clock, _ids) = build_store(cfg);
+    let blobs = birchtree::media::blob_store::FsBlobStore::open(cfg.data_dir.join("media"))
+        .unwrap_or_else(|err| {
+            eprintln!("open media store: {err}");
+            std::process::exit(1);
+        });
+    let mut staged_removed = 0usize;
+    for raw in &args.positional[1..] {
+        let Some(id_raw) = raw.strip_prefix("--media-id=") else {
+            eprintln!("unknown sweep-transcode-orphans argument: {raw}");
+            std::process::exit(2);
+        };
+        let id: Id = id_raw.parse().unwrap_or_else(|_| {
+            eprintln!("invalid --media-id (want a numeric id): {id_raw}");
+            std::process::exit(2);
+        });
+        match birchtree::media::transcode::sweep_staging_for_media(&*store, &blobs, id) {
+            Ok(true) => staged_removed += 1,
+            Ok(false) => {}
+            Err(err) => {
+                eprintln!("sweep media {id}: {err}");
+                std::process::exit(1);
+            }
+        }
+    }
+    println!("swept {tmp_removed} temp files, {staged_removed} staged-blob orphans");
+    std::process::exit(0);
 }

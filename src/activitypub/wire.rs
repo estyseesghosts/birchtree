@@ -85,15 +85,19 @@ impl Note {
             .collect()
     }
 
-    /// The hashtag names, without the `#`, lower-cased as birchtree stores them.
+    /// The hashtag names, without the `#`, normalized the way birchtree
+    /// stores them (D25: NFKC-subset + lowercase + ASCII folding, so a
+    /// remote `#café` lands on the same `cafe` tag as a local one),
+    /// deduplicated preserving order.
     pub fn hashtags(&self) -> Vec<String> {
-        self.tag
-            .iter()
-            .filter(|t| t.kind == "Hashtag")
-            .filter_map(|t| t.name.as_ref())
-            .map(|n| n.trim_start_matches('#').to_lowercase())
-            .filter(|n| !n.is_empty())
-            .collect()
+        crate::application::statuses::normalize_tag_list(
+            &self
+                .tag
+                .iter()
+                .filter(|t| t.kind == "Hashtag")
+                .filter_map(|t| t.name.clone())
+                .collect::<Vec<_>>(),
+        )
     }
 
     /// The Note's visibility from its audience (`PostStatusService` / `ActivityPub::Parser::StatusParser#visibility`):

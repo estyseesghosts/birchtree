@@ -63,6 +63,9 @@ struct ViewerScope<'a> {
     /// D23: the viewer's follow-languages preference per author, resolved
     /// lazily from `follow_of` (`None` = no row or no preference).
     follow_langs: Mutex<HashMap<Id, Option<Vec<String>>>>,
+    /// D21: the viewer's `chosen_languages` preference, resolved lazily
+    /// from the user row (`None` = unset or empty).
+    chosen_languages: Mutex<Option<Option<Vec<String>>>>,
     error: Mutex<Option<Error>>,
 }
 
@@ -77,6 +80,7 @@ impl<'a> ViewerScope<'a> {
             exclusive: Mutex::new(HashSet::new()),
             mention_policy: Mutex::new(None),
             follow_langs: Mutex::new(HashMap::new()),
+            chosen_languages: Mutex::new(None),
             error: Mutex::new(None),
         }
     }
@@ -221,6 +225,37 @@ impl<'a> ViewerScope<'a> {
             });
         lock(&self.follow_langs).insert(author, loaded.clone());
         policy::follow_language_allows(loaded.as_deref(), language)
+    }
+
+    /// D21: the viewer's `chosen_languages` preference, loaded once per
+    /// scope (`None` when the viewer is anonymous or has none stored).
+    /// Applied to the public timeline and the public + hashtag streams only,
+    /// like upstream (`PublicFeed#language_scope`, `streaming/index.js`
+    /// `chosenLanguages`): the REST tag timeline, home and list feeds keep
+    /// no chosen-language filter, as upstream's `TagFeed`/`HomeFeed`/
+    /// `ListFeed` have none.
+    fn chosen_languages(&self) -> Option<Vec<String>> {
+        if let Some(cached) = lock(&self.chosen_languages).clone() {
+            return cached;
+        }
+        let loaded = self
+            .viewer
+            .and_then(|v| {
+                self.store
+                    .user_by_account_id(v)
+                    .ok()
+                    .flatten()
+                    .and_then(|user| user.chosen_languages)
+            })
+            .filter(|langs| !langs.is_empty());
+        *lock(&self.chosen_languages) = Some(loaded.clone());
+        loaded
+    }
+
+    /// D21: whether a status in `language` passes the viewer's
+    /// `chosen_languages` preference.
+    fn chosen_language_allows(&self, language: Option<&str>) -> bool {
+        policy::chosen_language_allows(self.chosen_languages().as_deref(), language)
     }
 
     /// A reblog wrapper is shown only when the reblogged author passes the
@@ -371,9 +406,15 @@ impl TimelineFilter for PublicFilter<'_> {
     fn include(&self, status: &Status) -> bool {
         let self_reply_or_plain = status.in_reply_to_id.is_none()
             || status.in_reply_to_account_id == Some(status.account_id);
+        // D21: upstream `PublicFeed#language_scope` — the viewer's
+        // `chosen_languages` restrict even the public timeline (but not the
+        // tag timeline: `TagFeed` has no language scope).
         status.visibility == Visibility::Public
             && self_reply_or_plain
             && self.scope.author_allowed(status.account_id)
+            && self
+                .scope
+                .chosen_language_allows(status.language.as_deref())
     }
 }
 
@@ -625,7 +666,10 @@ pub fn public_stream_includes(
 
 /// Hashtag stream gate: public, not a reblog, and the streaming block and mute
 /// checks. Replies are kept, as upstream's hashtag streams keep them. The
-/// caller checks that `status` carries the tag.
+/// caller checks that `status` carries the tag. D21: upstream's streaming
+/// `chosenLanguages` filter applies here (`needsFiltering: true` on the
+/// hashtag channels), even though the REST tag timeline has no language
+/// scope (`TagFeed`).
 pub fn tag_stream_includes(
     store: &dyn Store,
     viewer: Option<Id>,
@@ -636,7 +680,9 @@ pub fn tag_stream_includes(
         return Ok(false);
     }
     let scope = ViewerScope::new(store, viewer, now_ms);
-    let kept = scope.author_allowed(status.account_id) && !mentions_blocked_or_muted(&scope, status);
+    let kept = scope.author_allowed(status.account_id)
+        && !mentions_blocked_or_muted(&scope, status)
+        && scope.chosen_language_allows(status.language.as_deref());
     scope.finish()?;
     Ok(kept)
 }
@@ -670,36 +716,99 @@ pub fn list_stream_includes(
     Ok(kept)
 }
 
-/// Cap on the statuses one retraction sends (block or mute).
-const RETRACT_LIMIT: usize = 200;
+/// Matches per `authors_timeline` call inside one retraction. Small enough
+/// that a single call stays within the store's merge budget; calls repeat
+/// with a `max_id` cursor until a short page ends the scan.
+const RETRACT_BATCH: usize = 500;
+/// Safety bound on retraction calls per author set (home authors, then each
+/// list's members): `64 * 500 = 32_000` statuses, past any realistic open
+/// stream. A hit is reported in [`RetractStats::truncated`] rather than
+/// silently capping at 200 like before.
+const RETRACT_MAX_BATCHES: usize = 64;
+
+/// What one block/mute retraction walked (executed evidence for D15).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetractStats {
+    /// Retractable statuses collected.
+    pub retracted: usize,
+    /// `authors_timeline` calls issued.
+    pub batches: usize,
+    /// `true` when the safety bound stopped the scan with a full page left.
+    pub truncated: bool,
+}
 
 /// Statuses a block or mute of `target` removes from `viewer`'s open streams.
 ///
-/// Upstream's `FeedManager#clear_from_home` and `clear_from_lists` rule: the
-/// statuses by `target`, reblogs by `target`, reblogs of `target`'s statuses,
-/// and statuses mentioning `target`, from the viewer's home authors and list
-/// members. Call this BEFORE the block or mute commits: a block unfollows, so
-/// the home author set would no longer include `target`'s statuses afterwards.
+/// Upstream's `FeedManager#clear_from_home` (`app/lib/feed_manager.rb:286`)
+/// and `clear_from_list` (`app/lib/feed_manager.rb:306`) rule, over every
+/// feed entry held: the statuses by `target`, reblogs by `target`, reblogs of
+/// `target`'s statuses, and statuses mentioning `target`, from the viewer's
+/// home authors and list members. Upstream reads the whole materialized feed
+/// (`zrange 0 -1`); here the scan pages through the same author sets with a
+/// `max_id` cursor, one bounded call per batch, so a 10k-status backlog
+/// cannot stall the request in a single unbounded read. Backpressure still
+/// applies at delivery: a retraction bigger than the connection queue closes
+/// the stream and the client reconnects to fresh state (contract "Bounds").
+///
+/// Call this BEFORE the block or mute commits: a block unfollows, so the
+/// home author set would no longer include `target`'s statuses afterwards.
 pub fn retraction_candidates(store: &dyn Store, viewer: Id, target: Id) -> Result<Vec<Status>> {
+    Ok(retraction_candidates_with_stats(store, viewer, target)?.0)
+}
+
+/// [`retraction_candidates`] plus its [`RetractStats`].
+pub fn retraction_candidates_with_stats(
+    store: &dyn Store,
+    viewer: Id,
+    target: Id,
+) -> Result<(Vec<Status>, RetractStats)> {
     let matcher = RetractMatcher {
         store,
         target,
         reblog_authors: Mutex::new(HashMap::new()),
     };
-    let query = TimelineQuery {
-        limit: RETRACT_LIMIT,
-        ..TimelineQuery::default()
-    };
+    let mut stats = RetractStats::default();
+    let mut found: Vec<Status> = Vec::new();
     let mut authors = store.following(viewer, None, HOME_AUTHOR_CAP)?;
     authors.push(viewer);
-    let mut found = store.authors_timeline(&authors, query, &matcher)?.statuses;
+    let mut truncated = false;
+    truncated |= scan_retractable(&authors, &matcher, &mut found, &mut stats)?;
     for list in store.lists_by_account(viewer)? {
         let members = store.all_list_members(list.id, LIST_MEMBER_CAP)?;
-        found.extend(store.authors_timeline(&members, query, &matcher)?.statuses);
+        truncated |= scan_retractable(&members, &matcher, &mut found, &mut stats)?;
     }
+    stats.truncated = truncated;
     let mut seen = HashSet::new();
     found.retain(|status| seen.insert(status.id));
-    Ok(found)
+    stats.retracted = found.len();
+    Ok((found, stats))
+}
+
+/// Page one author set newest-first until a short page ends the scan or the
+/// safety bound hits. Returns whether the bound truncated the scan.
+fn scan_retractable(
+    authors: &[Id],
+    matcher: &RetractMatcher<'_>,
+    found: &mut Vec<Status>,
+    stats: &mut RetractStats,
+) -> Result<bool> {
+    let mut max_id: Option<Id> = None;
+    for _ in 0..RETRACT_MAX_BATCHES {
+        let query = TimelineQuery {
+            limit: RETRACT_BATCH,
+            max_id,
+            ..TimelineQuery::default()
+        };
+        let page = matcher.store.authors_timeline(authors, query, matcher)?;
+        stats.batches += 1;
+        let full = page.statuses.len() >= RETRACT_BATCH;
+        max_id = page.statuses.last().map(|status| status.id);
+        found.extend(page.statuses);
+        if !full {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Matches the retraction rule. The reblog-author lookup is cached per call.

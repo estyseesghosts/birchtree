@@ -13,10 +13,11 @@ use crate::application::ports::{
     AdminStore,
 };
 use crate::domain::{
-    Account, AdminAuditRecord, Error, Id, LocalUser, Report, Result, UserRole,
+    Account, AccountWarning, AdminAuditRecord, Error, Id, Job, JobKind, LocalUser, Report, Result,
+    UserRole,
 };
 
-use super::schema::{ACCOUNTS, ADMIN_AUDIT, LOCAL_USERS, REPORTS};
+use super::schema::{ACCOUNTS, ACCOUNT_WARNINGS, ADMIN_AUDIT, LOCAL_USERS, REPORTS};
 use super::{decode, encode, RedbStore, StoreResult};
 
 /// Maximum index entries walked to fill one admin page.
@@ -115,8 +116,10 @@ fn role_matches(user: Option<&LocalUser>, filter: &AdminAccountFilter) -> bool {
 fn status_matches(account: &Account, user: Option<&LocalUser>, status: AdminAccountStatus) -> bool {
     let disabled = user.map(|u| u.disabled).unwrap_or(false);
     match status {
-        // No pending-approval state exists (Phase 2 gap), so nothing is pending.
-        AdminAccountStatus::Pending => false,
+        // Pending = a local credential row that is not approved yet
+        // (upstream `User.pending`, D36). Remote accounts have no
+        // credential row, so they never match.
+        AdminAccountStatus::Pending => user.is_some_and(|u| !u.approved),
         AdminAccountStatus::Active => {
             !account.suspended && !account.silenced && !account.sensitized && !disabled
         }
@@ -310,6 +313,15 @@ impl AdminStore for RedbStore {
             };
             record.disabled = disabled;
         }
+        // D36 approval state: `approve` sets this (alongside re-enabling).
+        if let Some(approved) = patch.approved {
+            let Some(record) = user.as_mut() else {
+                return Err(Error::InvalidInput(
+                    "Only local accounts can be approved".into(),
+                ));
+            };
+            record.approved = approved;
+        }
         write_account_txn(&write, &account)?;
         if let Some(record) = &user {
             write_user_txn(&write, record)?;
@@ -338,14 +350,38 @@ impl AdminStore for RedbStore {
         let Some(mut account) = read_account_txn(&write, account_id)? else {
             return Ok(false);
         };
-        // Immediate suspend + disable (no async deletion worker yet; the
-        // account's statuses are left in place — a planned gap).
+        // Immediate suspend + disable, then an async deletion worker removes
+        // the account's statuses in bounded, restartable batches (D38,
+        // upstream `AccountDeletionWorker` + `DeleteAccountService`). The
+        // batch job and the federated `Delete` of the actor commit in this
+        // same transaction, so a committed deletion can never lose its
+        // follow-up work (`birchtree.md` §5). Each tombstoned status commits
+        // its own federated `Delete` (a `Tombstone` of the Note) when its
+        // batch runs; the account row itself is retained (suspended) so its
+        // URI keeps resolving instead of dangling.
         account.suspended = true;
         write_account_txn(&write, &account)?;
         if let Some(mut user) = read_user_txn(&write, account_id)? {
             user.disabled = true;
             write_user_txn(&write, &user)?;
         }
+        super::jobs::insert_job(
+            &write,
+            &Job::new(
+                self.next_id(),
+                JobKind::AccountDeletionBatch,
+                serde_json::json!({"account_id": account_id.value()}),
+                now_ms,
+                now_ms,
+            ),
+        )?;
+        super::federation_content::federation_event_txn(
+            &write,
+            self.next_id(),
+            account_id,
+            serde_json::json!({"event": "delete_actor"}),
+            now_ms,
+        )?;
         write_audit_txn(
             &write,
             self.next_id(),
@@ -365,6 +401,7 @@ impl AdminStore for RedbStore {
         account_id: Id,
         action: &str,
         report_id: Option<Id>,
+        text: Option<String>,
         now_ms: u64,
     ) -> Result<()> {
         let write = self.begin_write()?;
@@ -372,13 +409,27 @@ impl AdminStore for RedbStore {
             .ok_or_else(|| Error::NotFound(format!("account {account_id}")))?;
         let user = read_user_txn(&write, account_id)?;
         let local = account.local && user.is_some();
+        // Moderator warning text (upstream `text_for_warning`, minus presets:
+        // there is no preset model, so the text stands alone).
+        let warning_text = text.unwrap_or_default();
+        // Warning linkage (upstream `BaseAction#report`): the named report,
+        // if any, whatever the action type. Missing → 404 like
+        // `Report.find`. Its statuses ride on the warning (upstream
+        // `include_statuses`, default true).
+        let linked_status_ids: Vec<Id> = match report_id {
+            None => Vec::new(),
+            Some(target) => read_report_txn(&write, target)?
+                .ok_or_else(|| Error::NotFound(format!("report {target}")))?
+                .status_ids,
+        };
 
         match action {
             "none" => {
-                // Warn-only actions have no warning/notification model yet.
+                // A warn-only action without a report stays refused `422`:
+                // there is nothing to warn about and nothing to resolve.
                 let Some(target) = report_id else {
                     return Err(Error::InvalidInput(
-                        "Validation failed: Account warnings are not supported".into(),
+                        "Validation failed: Report must be given for a warning".into(),
                     ));
                 };
                 let mut report = read_report_txn(&write, target)?
@@ -487,6 +538,36 @@ impl AdminStore for RedbStore {
                     now_ms,
                 )?;
             }
+        }
+
+        // Every action type records a strike (upstream `process_strike!`):
+        // author, target, linked report, action, text and status ids.
+        let warning = AccountWarning {
+            id: self.next_id(),
+            account_id: actor_account_id,
+            target_account_id: account_id,
+            report_id,
+            action: action.to_string(),
+            text: warning_text,
+            status_ids: linked_status_ids,
+            created_at_ms: now_ms,
+        };
+        {
+            let mut table = write.open_table(ACCOUNT_WARNINGS)?;
+            table.insert(warning.id.value(), encode(&warning)?.as_slice())?;
+        }
+        // A log entry is only interesting if the warning carries custom
+        // text from someone (upstream `create_log!`).
+        if !warning.text.is_empty() {
+            write_audit_txn(
+                &write,
+                self.next_id(),
+                actor_account_id,
+                "warn",
+                "warning",
+                &warning.id.to_string(),
+                now_ms,
+            )?;
         }
 
         write.commit()?;
@@ -627,6 +708,23 @@ impl AdminStore for RedbStore {
             }
             let (_, value) = entry?;
             out.push(decode(value.value())?);
+        }
+        Ok(out)
+    }
+
+    fn admin_warnings_for_account(
+        &self,
+        target_account_id: Id,
+    ) -> Result<Vec<AccountWarning>> {
+        let read = self.begin_read()?;
+        let table = read.open_table(ACCOUNT_WARNINGS)?;
+        let mut out = Vec::new();
+        for entry in table.range(0u64..=u64::MAX)?.rev() {
+            let (_, value) = entry?;
+            let warning: AccountWarning = decode(value.value())?;
+            if warning.target_account_id == target_account_id {
+                out.push(warning);
+            }
         }
         Ok(out)
     }

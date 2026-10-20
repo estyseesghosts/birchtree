@@ -25,6 +25,38 @@ Inbound failures never roll back committed local actions.
 - One failing host must not block unrelated delivery.
 - Safe HTTP client: DNS/IP SSRF defenses, redirect/time/size limits, content validation.
 
+### Per-destination failure budget and cooldown (`src/federation/delivery.rs`)
+
+Each destination host carries a `DeliveryDestState` (`failures`, `cooldown_until_ms`, table `delivery_dest`): consecutive failed attempts to one host move its cooldown out exponentially (`DEST_COOLDOWN_BASE_MS` 60 s, doubling, capped at `DEST_COOLDOWN_CAP_MS` 1 h). A job aimed at a host inside its cooldown is parked — completed now and re-enqueued as a deferred copy due when the cooldown ends — instead of hitting the down host again. Past `DEST_FAILURE_BUDGET` (10) consecutive failures, or `DEST_MAX_DEFERRALS` (25) parks, the job quarantines. A 2xx resets the host. Only a retryable send failure charges the host's budget: a permanent refusal (refused URL, missing key, unparseable payload) quarantines the job without cooling down its host, so one bad inbox never penalizes its neighbours. Inboxes on one host share the budget and the cooldown (the failure domain is the host, not the path). Evidence: `tests/phase6_gaps_round2_e.rs` (failing host parks with no second hit; unrelated delivery unaffected; success resets; budget and deferral cap quarantine).
+
+### Delete-beats-Create tombstones (`src/federation/tombstone.rs`, table `remote_tombstone`)
+
+Upstream files a `Tombstone` row when a `Delete` arrives, even for an object never seen, guarded by the same-host check (`delete.rb`: `Tombstone.find_or_create_by`, `non_matching_uri_hosts?`). Birchtree matches it (each store call is one short transaction; a `Create` that wins the race is caught the other way — the `Delete` then lands on the stored row):
+
+- Inbound `Delete` for an object URI with no status row files a tombstone, same-host only (an actor may only tombstone its own host's objects, so a forged `Delete` cannot poison arbitrary URIs). A URI with a row, or with a tombstone already, is a duplicate; another host's URI is ignored (and, per D33, not recorded as seen).
+- Every `Create`-shaped ingest path (inbox `Create`, `Update`-as-`Create`, quote instruments, object dereference via `NoteRef::from_json`) checks the tombstone first: a tombstoned URI is dropped as a duplicate (the dereference path reports it deleted, which is terminal for the fetcher) instead of resurrecting it.
+- Outbound: a locally deleted status keeps its `STATUS_BY_URI` mapping on the tombstoned row, so a redelivered or relayed `Create` for the same URI is a duplicate and the content is untouched. Deleted local objects are served as `Tombstone` documents (410) on the object route.
+
+Evidence: `tests/phase6_gaps_round2_e.rs` (Delete-before-Create both directions, cross-host poisoning refused, edits of tombstoned URIs ignored).
+
+### Remote document limits (dereference path through the safe client)
+
+Document fetches (actor/object/collection dereference) go through the crate's client built in `federation::net` (SSRF resolver, no reqwest redirects, connect + total timeouts, URL policy) with the `FailClientErrors` rule. The crate enforces the wire limits; birchtree pins and tests them:
+
+- Body cap 200 KB (`MAX_BODY_SIZE` in the vendored shim): an oversize document is rejected (`ResponseBodyLimit`), never buffered.
+- Content validation: only ActivityStreams content types are accepted (`FetchInvalidContentType` otherwise); the object's `id` must match the final URL (`FetchWrongId`). (The vendored fetch parses the body before the content-type check, so a non-JSON body fails earlier with `ParseFetchedObject` — terminal too.)
+- Statuses pass through on fetches: the 4xx-to-error rule (D28) applies to delivery POSTs only. A 410 maps to `ObjectDeleted` and a 404 to a parse failure — each terminal for that URI (no retry loop) — instead of every 4xx becoming a retried middleware error.
+
+Evidence: `tests/phase6_gaps_round2_e.rs` (oversize/wrong-content rejected, 410 terminal, 404 passes through; wrong-content parent fetch leaves the reply unresolved with no re-enqueue).
+
+### Delete distribution and tombstones, local side (D38, 2026-10-20)
+
+Upstream: `DeleteAccountService` removes the account's statuses in batches (`BatchedRemoveStatusService`, slices of 50) and sends a `Delete` of the actor (`ActivityPub::DeleteActorSerializer`) to follower inboxes (plus relays, which do not exist here); a single status delete sends a `Delete` of the Note. Birchtree matches that shape:
+
+- Local status delete (single or via the deletion worker): one `FederationEvent {event: "delete", status_id}` committed in the same transaction as the tombstone (`StatusStore::delete_status`), fanned out per destination inbox by the event worker as `Delete {object: {id, type: Tombstone, formerType: Note}}` (`src/activitypub/outgoing.rs`, `src/federation/events.rs`).
+- Local account deletion (`DELETE /api/v1/admin/accounts/:id`, `reject`): suspend + disable immediately, plus — in the same transaction — the first `AccountDeletionBatch {account_id, after}` job and a `FederationEvent {event: "delete_actor"}`. The batch chain tombstones 50 statuses per job (each with its own `Delete` event) and ends on a short page; the actor event goes to follower inboxes as `Delete {object: {id, type: Tombstone, formerType: Person}}`.
+- Tombstone rule (outbound side): rows are tombstoned, never hard-removed — status rows keep `deleted_at_ms`, the account row stays suspended — so deleted URIs keep resolving (as tombstones) instead of dangling, and a retried batch can never resurrect or duplicate a status. Delivery is at-least-once per destination under the job retry budget, then quarantine; duplicates are idempotent downstream (activity-ID dedup).
+
 ## Initial activity set (Phase 6)
 
 Create/Note, Update, Delete, Follow/Accept/Reject/Undo, Like/Undo, Announce/Undo, Block, quote Request/Accept/Reject/Revoke, and Flag (send and receive). Flag is required by reports (Phase 7.3); local report creation does not depend on it.

@@ -86,6 +86,19 @@ pub fn all<'a>(pairs: &'a [(String, String)], key: &str) -> Vec<&'a str> {
         .collect()
 }
 
+/// Whether `key` was sent at all (either `key` or `key[]`), even with an
+/// empty value list. Unlike [`all`], this distinguishes "absent" from
+/// "present but empty", which presence-sensitive endpoints (upstream's
+/// `params.key?(:languages)` on follow) need: an absent param keeps the
+/// stored value, a present-but-empty one clears it. Note the JSON-body
+/// caveat: an empty JSON array flattens to zero pairs (see
+/// [`crate::api::json_body`]), so `{"languages": []}` still reads as
+/// absent — only the form encoding (`languages[]=`) carries emptiness.
+pub fn has(pairs: &[(String, String)], key: &str) -> bool {
+    let bracket = format!("{key}[]");
+    pairs.iter().any(|(k, _)| k == key || k == &bracket)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

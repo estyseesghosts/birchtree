@@ -30,6 +30,10 @@ pub struct ServerInfo {
     pub site_contact_username: Option<String>,
     /// Whether public registration is open (mirrors `Config::registration_open`).
     pub registrations_open: bool,
+    /// Whether public registration creates pending accounts (mirrors
+    /// `Config::registration_requires_approval`, upstream
+    /// `Setting.registrations_mode == "approved"`).
+    pub registrations_require_approval: bool,
     /// Maximum status text length in characters (mirrors
     /// `Config::max_status_chars`; advertised by the instance endpoints).
     pub max_status_chars: usize,
@@ -165,6 +169,7 @@ impl ServerInfo {
             site_contact_email: cfg.site_contact_email.clone(),
             site_contact_username: cfg.site_contact_username.clone(),
             registrations_open: cfg.registration_open,
+            registrations_require_approval: cfg.registration_requires_approval,
             max_status_chars: cfg.max_status_chars,
             streaming_url,
             streaming_host,

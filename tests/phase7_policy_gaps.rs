@@ -602,3 +602,50 @@ fn d26_retroactive_rule_leaves_preexisting_notifications() {
     assert!(fanout_follow(&*store, recipient, actor).is_none());
     assert_eq!(notifications_of(&*store, recipient).len(), 1);
 }
+
+#[tokio::test]
+async fn d25_edits_recompute_tags_and_move_index_keys() {
+    let srv = TestServer::new(true);
+    let alice = user_token(&srv, "alice").await;
+    let created = create_with(&srv, &alice, &status_form("#café au lait", "")).await;
+    let id: Id = created.parse().expect("status id");
+    let stored = srv.store.status_by_id(id).expect("store").expect("status");
+    assert_eq!(stored.tags, vec!["cafe".to_string()]);
+
+    // Edit swaps the hashtag: stored list recomputed, index moved.
+    post_ok(
+        &srv,
+        "PUT",
+        &format!("/api/v1/statuses/{created}"),
+        &alice,
+        &status_form("#music loudly", ""),
+    )
+    .await;
+    let edited = srv.store.status_by_id(id).expect("store").expect("status");
+    assert_eq!(edited.tags, vec!["music".to_string()]);
+    assert!(edited.edited_at_ms.is_some());
+    let old = get_json(&srv, "/api/v1/timelines/tag/cafe", Some(&alice)).await;
+    assert!(
+        !old.as_array().unwrap().iter().any(|s| s["id"] == created),
+        "old tag released: {old}"
+    );
+    let new = get_json(&srv, "/api/v1/timelines/tag/music", Some(&alice)).await;
+    assert!(
+        new.as_array().unwrap().iter().any(|s| s["id"] == created),
+        "new tag indexed: {new}"
+    );
+
+    // A no-op PUT still converges (tags unchanged, no new version).
+    let before = edited.edited_at_ms;
+    post_ok(
+        &srv,
+        "PUT",
+        &format!("/api/v1/statuses/{created}"),
+        &alice,
+        &status_form("#music loudly", ""),
+    )
+    .await;
+    let same = srv.store.status_by_id(id).expect("store").expect("status");
+    assert_eq!(same.tags, vec!["music".to_string()]);
+    assert_eq!(same.edited_at_ms, before, "no-op edit bumps nothing");
+}

@@ -380,6 +380,23 @@ pub fn apply(db: &Database) -> Result<u64, StoreError> {
             let _ = write.open_table(schema::FEATURED_TAGS)?;
         }
 
+        // Step v10: remote tombstones (Delete-beats-Create) and per-destination
+        // delivery state. Tables only; both materialize from live federation
+        // traffic, so there is nothing to backfill.
+        if current < 10 {
+            let _ = write.open_table(schema::REMOTE_TOMBSTONE)?;
+            let _ = write.open_table(schema::DELIVERY_DEST)?;
+        }
+
+        // Step v11: server rules, account warnings, sign-in telemetry (D37,
+        // D39). Tables only; rules are operator-managed and the event tables
+        // materialize from live traffic, so there is nothing to backfill.
+        if current < 11 {
+            let _ = write.open_table(schema::RULES)?;
+            let _ = write.open_table(schema::ACCOUNT_WARNINGS)?;
+            let _ = write.open_table(schema::SIGN_INS)?;
+        }
+
         {
             let mut meta = write.open_table(META)?;
             meta.insert(

@@ -15,7 +15,7 @@ use crate::activitypub::FedContext;
 use crate::application::ports::{BlobStore, MailSender, Store, StreamingSink};
 use crate::domain::{Clock, JobKind};
 use crate::federation::delivery::{self, DeliveryError};
-use crate::federation::{events, media, threads};
+use crate::federation::{events, media, preview, threads};
 
 use super::handlers;
 
@@ -82,6 +82,10 @@ pub async fn run(
                         JobKind::ResolveParent => threads::resolve_parent(&federation, &job).await,
                         JobKind::CrawlReplies => threads::crawl_replies(&federation, &job).await,
                         JobKind::FetchRemoteMedia => media::fetch(&federation, &job).await,
+                        JobKind::PreviewCardFetch => {
+                            let ctx: &FedContext = &federation;
+                            preview::fetch(&*store, &ctx.media_client, &ctx.http, &job).await
+                        }
                         JobKind::WebPushDelivery => {
                             crate::application::push::run_push_job_record(
                                 &*store,

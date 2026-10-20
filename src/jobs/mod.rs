@@ -5,3 +5,4 @@ pub mod handlers;
 pub mod search_index;
 pub mod tag_backfill;
 pub mod transcode;
+pub mod account_deletion;

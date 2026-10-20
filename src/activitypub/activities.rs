@@ -34,6 +34,7 @@ use crate::application::federation::{
 use crate::application::federation_inbound::{self as inbound, Applied, RemoteNote};
 use crate::application::federation_ports::InboundDisposition;
 use crate::domain::{Id, Visibility};
+use crate::federation::tombstone::{self, CheckedIngest};
 
 /// Every activity the inbox accepts. The body is the crate's `WithContext<Activity>`.
 ///
@@ -781,11 +782,16 @@ impl ActivityHandler for Create {
             CreateObject::Question(question) => {
                 verify_object_author(&question.id, &question.attributed_to, self.actor.inner())?;
                 let (note, poll) = question_input(&question, author.account.id, now);
-                let ingested = inbound::ingest_note(store, note, Some(poll), now)?;
-                if let Some(parent_uri) = &ingested.parent_unknown {
-                    crate::federation::threads::schedule_parent(store, ingested.status.id, parent_uri, now)?;
-                }
-                let applied = if ingested.created { Applied::Applied } else { Applied::Duplicate };
+                let applied = match tombstone::ingest_checked(store, note, Some(poll), now)? {
+                    CheckedIngest::Live(ingested) => {
+                        if let Some(parent_uri) = &ingested.parent_unknown {
+                            crate::federation::threads::schedule_parent(store, ingested.status.id, parent_uri, now)?;
+                        }
+                        if ingested.created { Applied::Applied } else { Applied::Duplicate }
+                    }
+                    // The Delete won the race: the note stays gone.
+                    CheckedIngest::Tombstoned => Applied::Duplicate,
+                };
                 log_outcome("Create", &self.id, self.actor.inner(), &applied);
                 record(store, &self.id, &applied, now)?;
                 Ok(())
@@ -804,7 +810,16 @@ impl ActivityHandler for Create {
                         inbound::VoteDisposition::NotAVote => {}
                     }
                 }
-                let ingested = inbound::ingest_note(store, note_input(&note, author.account.id), None, now)?;
+                let ingested = match tombstone::ingest_checked(store, note_input(&note, author.account.id), None, now)? {
+                    CheckedIngest::Live(ingested) => ingested,
+                    // The Delete won the race: the note stays gone.
+                    CheckedIngest::Tombstoned => {
+                        let tombstoned = Applied::Duplicate;
+                        log_outcome("Create", &self.id, self.actor.inner(), &tombstoned);
+                        record(store, &self.id, &tombstoned, now)?;
+                        return Ok(());
+                    }
+                };
                 if let Some(parent_uri) = &ingested.parent_unknown {
                     crate::federation::threads::schedule_parent(store, ingested.status.id, parent_uri, now)?;
                 }
@@ -869,16 +884,19 @@ impl ActivityHandler for Update {
                 let author = self.actor.dereference(data).await?;
                 let (note, poll) = question_input(&question, author.account.id, now);
                 // Out-of-order delivery: an Update for a status never seen is
-                // ingested as its Create (Mastodon does the same).
+                // ingested as its Create (Mastodon does the same), unless its
+                // Delete arrived first (then it stays gone).
                 let applied = match store.status_by_uri(&note.uri)? {
                     Some(_) => inbound::sync_question(store, author.account.id, &note.uri, &poll, now)?,
-                    None => {
-                        let ingested = inbound::ingest_note(store, note, Some(poll), now)?;
-                        if let Some(parent_uri) = &ingested.parent_unknown {
-                            crate::federation::threads::schedule_parent(store, ingested.status.id, parent_uri, now)?;
+                    None => match tombstone::ingest_checked(store, note, Some(poll), now)? {
+                        CheckedIngest::Live(ingested) => {
+                            if let Some(parent_uri) = &ingested.parent_unknown {
+                                crate::federation::threads::schedule_parent(store, ingested.status.id, parent_uri, now)?;
+                            }
+                            if ingested.created { Applied::Applied } else { Applied::Duplicate }
                         }
-                        if ingested.created { Applied::Applied } else { Applied::Duplicate }
-                    }
+                        CheckedIngest::Tombstoned => Applied::Duplicate,
+                    },
                 };
                 log_outcome("Update", &self.id, self.actor.inner(), &applied);
                 record(store, &self.id, &applied, now)?;
@@ -937,6 +955,9 @@ impl ActivityHandler for Delete {
             return Ok(());
         }
         let applied = inbound::delete_note(store, author.account.id, &object_uri, now)?;
+        // Delete-beats-Create: a Delete for an object never seen here files a
+        // tombstone (same-host only), so a late Create cannot resurrect it.
+        let applied = tombstone::file_remote_tombstone(store, &object_uri, self.actor.inner(), applied, now)?;
         log_outcome("Delete", &self.id, self.actor.inner(), &applied);
         record(store, &self.id, &applied, now)?;
         Ok(())
@@ -1100,15 +1121,30 @@ impl ActivityHandler for QuoteRequest {
         let now = data.app.now_ms();
         let author = ObjectId::<ActorRecord>::from(self.actor.clone()).dereference(data).await?;
         // The quoting status arrives inline or by URI: store it, then decide.
+        // A quoting status whose Delete arrived first stays gone.
         let quoting = match &self.instrument {
             crate::activitypub::wire::Instrument::Note(note) => {
                 verify_note_author(note, &self.actor)?;
-                inbound::ingest_note(store, note_input(note, author.account.id), None, now)?.status.id
+                match tombstone::ingest_checked(store, note_input(note, author.account.id), None, now)? {
+                    CheckedIngest::Live(ingested) => ingested.status.id,
+                    CheckedIngest::Tombstoned => {
+                        let tombstoned = Applied::Ignored("quoting status was deleted before it arrived".into());
+                        log_outcome("QuoteRequest", &self.id, &self.actor, &tombstoned);
+                        return Ok(());
+                    }
+                }
             }
             crate::activitypub::wire::Instrument::Question(question) => {
                 verify_object_author(&question.id, &question.attributed_to, &self.actor)?;
                 let (note, poll) = question_input(question, author.account.id, now);
-                inbound::ingest_note(store, note, Some(poll), now)?.status.id
+                match tombstone::ingest_checked(store, note, Some(poll), now)? {
+                    CheckedIngest::Live(ingested) => ingested.status.id,
+                    CheckedIngest::Tombstoned => {
+                        let tombstoned = Applied::Ignored("quoting status was deleted before it arrived".into());
+                        log_outcome("QuoteRequest", &self.id, &self.actor, &tombstoned);
+                        return Ok(());
+                    }
+                }
             }
             crate::activitypub::wire::Instrument::Id(url) => {
                 ObjectId::<NoteRef>::from(url.clone()).dereference(data).await?.status.id

@@ -363,6 +363,7 @@ fn registration_commits_confirmation_mail_job_atomically() {
         "https://example.social",
         T0,
         true,
+        false,
         &registered.app,
         birchtree::application::accounts::RegisterAccountCommand {
             username: "heidi".into(),

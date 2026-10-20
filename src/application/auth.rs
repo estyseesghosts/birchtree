@@ -20,6 +20,12 @@ pub const AUTH_CODE_TTL_MS: u64 = 10 * 60 * 1000;
 ///
 /// Runs a dummy Argon2 verification for unknown accounts so timing does not
 /// reveal whether the handle exists.
+///
+/// D36: accounts awaiting approval (`approved == false`) never authenticate,
+/// even with the right password (upstream `nonfunctional_reason` →
+/// `:pending_approval` blocks Devise login; the user sees "Your login is
+/// currently pending approval"). Email confirmation stays unenforced (the
+/// separate Phase 2 gap): `email_verified == false` alone still logs in.
 pub fn authenticate_password(
     store: &dyn AccountStore,
     normalized_username: &str,
@@ -28,7 +34,9 @@ pub fn authenticate_password(
 ) -> Result<Option<LocalUser>> {
     let handle = normalize_username(normalized_username);
     match store.local_user_by_handle(&handle, domain)? {
-        Some(user) if !user.disabled && crypto::verify_password(&user.password_hash, password) => {
+        Some(user)
+            if !user.disabled && user.approved && crypto::verify_password(&user.password_hash, password) =>
+        {
             Ok(Some(user))
         }
         Some(_) => {

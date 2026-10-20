@@ -33,6 +33,7 @@ fn quick_account(store: &RedbStore, name: &str) -> Id {
             actor_uri: format!("{BASE}/users/{name}"),
             now_ms: T0,
             send_confirmation_email: false,
+            approved: true,
         })
         .expect("create account")
         .id

@@ -472,32 +472,34 @@ async fn admin_accounts_member_actions_and_audit() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(json(&bytes)["error"], "Forbidden");
-    // approve is the enable-equivalent (no approval state); reject suspends.
+    // approve on an already-approved account → 403 (upstream
+    // `UserPolicy#approve?` requires a pending account; D36).
     let (status, _, bytes) = send(
         &f.router,
         post_admin(&format!("{base}/approve"), "", Some(&f.admin_token)),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(json(&bytes)["disabled"], false);
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json(&bytes)["error"], "Forbidden");
+    // reject on an already-approved account → 403 (upstream
+    // `UserPolicy#reject?`); the account stays active. The pending →
+    // approve/reject transitions live in `tests/phase7_gaps_round2_c.rs`.
     let (status, _, bytes) = send(
         &f.router,
         post_admin(&format!("{base}/reject"), "", Some(&f.admin_token)),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(json(&bytes), serde_json::json!({}));
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json(&bytes)["error"], "Forbidden");
     let (status, _, bytes) = send(&f.router, get_request(&base, Some(&f.admin_token), None)).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(json(&bytes)["suspended"], true);
-    assert_eq!(json(&bytes)["disabled"], true);
+    assert_eq!(json(&bytes)["suspended"], false);
+    assert_eq!(json(&bytes)["disabled"], false);
     // One audit row per write exists for this target.
     let entries = f.srv.store.admin_audit_entries(100).expect("audit");
     assert!(entries.iter().any(|e| e.action == "suspend" && e.target_id == f.user_id.to_string()));
     assert!(entries.iter().any(|e| e.action == "unsuspend"));
     assert!(entries.iter().any(|e| e.action == "enable"));
-    assert!(entries.iter().any(|e| e.action == "approve"));
-    assert!(entries.iter().any(|e| e.action == "reject"));
     // Unknown member target → 404.
     let (status, _, _) = send(
         &f.router,

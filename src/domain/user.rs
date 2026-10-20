@@ -37,6 +37,12 @@ impl UserRole {
     }
 }
 
+/// Rows written before the approval queue existed were usable accounts, so
+/// they decode as approved.
+fn default_approved() -> bool {
+    true
+}
+
 /// Local login credentials and preferences, separate from the ActivityPub actor.
 ///
 /// The password is stored only as an Argon2 PHC string; the plaintext never
@@ -51,6 +57,12 @@ pub struct LocalUser {
     pub email_verified: bool,
     pub created_at_ms: u64,
     pub disabled: bool,
+    /// Whether an admin approved the account (upstream `User#approved`).
+    /// `false` = awaiting approval (the pending queue). Pre-approval-mode
+    /// rows decode as `true` (`#[serde(default)]`); public registration sets
+    /// this `false` only when the operator requires approval.
+    #[serde(default = "default_approved")]
+    pub approved: bool,
     /// User posting/reading preferences (Phase 2). `None` means "use the
     /// Mastodon default", so records written before these fields existed stay
     /// readable (`#[serde(default)]`).
@@ -66,6 +78,17 @@ pub struct LocalUser {
     /// record, read as the `show` default).
     #[serde(default)]
     pub home_mention_policy: Option<String>,
+    /// D21 `chosen_languages`: the viewer's preferred content languages
+    /// (upstream `users.chosen_languages`, set through the web settings UI;
+    /// here set through `PATCH /api/v1/accounts/update_credentials`
+    /// `source[chosen_languages][]`). `None` = unset: no language filtering.
+    /// Applied to the REST public timeline and the public + hashtag streams,
+    /// like upstream (`PublicFeed#language_scope`, `streaming/index.js`
+    /// `chosenLanguages`); the REST tag timeline, home and list feeds keep
+    /// no chosen-language filter, as upstream's `TagFeed`/`HomeFeed`/
+    /// `ListFeed` have none.
+    #[serde(default)]
+    pub chosen_languages: Option<Vec<String>>,
     /// Staff role for the admin API (Phase 7.3). `None` (the `#[serde(default)]`
     /// for every pre-7.3 record) means "no staff role".
     #[serde(default)]
@@ -73,7 +96,6 @@ pub struct LocalUser {
 }
 
 /// A server-side login session used to authenticate the OAuth approval flow.
-///
 /// Only the hash of the session token is persisted; the plaintext is handed to
 /// the client once and never stored.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -91,4 +113,18 @@ impl LoginSession {
     pub fn is_valid_at(&self, now_ms: u64) -> bool {
         now_ms < self.expires_at_ms
     }
+}
+
+/// One recorded password sign-in (Phase 7.3 admin `active_users` telemetry).
+///
+/// Birchtree records a row each time a local user completes the browser
+/// password login (`POST /oauth/authorize`); API calls on an existing
+/// non-expiring token are not sign-ins. Upstream's `active_users` also
+/// counts throttled per-request touches (`UserTrackingConcern`), so the
+/// counts here are genuine logins and run lower than Mastodon's.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SignInEvent {
+    pub id: Id,
+    pub account_id: Id,
+    pub created_at_ms: u64,
 }

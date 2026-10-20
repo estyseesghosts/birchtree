@@ -96,6 +96,7 @@ impl Fixture {
         Authenticated {
             token,
             app: self.app.clone(),
+            approved: true,
         }
     }
 
@@ -111,6 +112,7 @@ impl Fixture {
         Authenticated {
             token,
             app: self.app.clone(),
+            approved: true,
         }
     }
 }

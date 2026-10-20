@@ -62,7 +62,9 @@ fn opt_or_null(value: Option<String>) -> Value {
 /// - `ip`/`ips`: birchtree stores no login IPs → `null`/`[]`.
 /// - `locale`/`invite_request`/`created_by_application_id`/
 ///   `invited_by_account_id`: no invite/locale storage → `null`.
-/// - `approved`: no pending-approval state (Phase 2 gap) → always `true`.
+/// - `approved`: the credential's approval state (D36; `null` for remote
+///   accounts, which have no credential row — upstream `user_approved?`
+///   with `allow_nil`).
 /// - `role`: birchtree roles have no numeric ids or permission bitmask; the
 ///   id is the role name and permissions stay empty.
 pub fn admin_account_json(
@@ -87,7 +89,7 @@ pub fn admin_account_json(
         "silenced": account.silenced,
         "sensitized": account.sensitized,
         "disabled": user.map(|u| json!(u.disabled)).unwrap_or(Value::Null),
-        "approved": true,
+        "approved": user.map(|u| json!(u.approved)).unwrap_or(Value::Null),
         "locale": Value::Null,
         "invite_request": Value::Null,
         "created_by_application_id": Value::Null,
@@ -298,7 +300,8 @@ pub async fn show(
 
 /// `DELETE /api/v1/admin/accounts/:id` — immediate suspend + disable (no
 /// async deletion worker yet; statuses stay — a planned gap). Answers
-/// `200 {}` like upstream's `render_empty`.
+/// `200 {}` like upstream's `render_empty`. D24: the target's tokens are
+/// revoked and its open streams close.
 pub async fn destroy(
     State(state): State<ApiState>,
     auth: Auth,
@@ -314,9 +317,28 @@ pub async fn destroy(
         Err(err) => return err.into_response(),
     };
     match store.admin_delete_account(actor, target, "destroy", state.context.now_ms()) {
-        Ok(true) => axum::Json(json!({})).into_response(),
+        Ok(true) => {
+            kill_tokens(&state, target);
+            axum::Json(json!({})).into_response()
+        }
         Ok(false) => ApiError::not_found().into_response(),
         Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
+/// D24 follow-up: revoke the account's tokens and close its open streams.
+/// Runs after the suspension/disablement commit; a failure is logged, never
+/// reported as an admin error — the moderation itself already committed.
+fn kill_tokens(state: &ApiState, target: Id) {
+    let store: &dyn Store = &*state.context.store;
+    match admin_uc::kill_account_tokens(store, &*state.context.streaming, target) {
+        Ok(0) => {}
+        Ok(revoked) => {
+            tracing::info!(account = %target, revoked, "killed tokens on suspension/disablement");
+        }
+        Err(err) => {
+            tracing::warn!(account = %target, error = ?err, "token kill failed after suspension/disablement");
+        }
     }
 }
 
@@ -344,8 +366,14 @@ async fn patch_flag(
     }
     let mut patch = patch;
     patch.audit_action = audit_action.to_string();
+    let kills = patch.suspended == Some(true) || patch.disabled == Some(true);
     match admin_uc::moderate_account(store, actor, account.id, patch, state.context.now_ms()) {
-        Ok((account, user)) => account_response(&state, &account, user.as_ref()),
+        Ok((account, user)) => {
+            if kills {
+                kill_tokens(&state, account.id);
+            }
+            account_response(&state, &account, user.as_ref())
+        }
         Err(err) => ApiError::from(err).into_response(),
     }
 }
@@ -432,32 +460,63 @@ pub async fn unsuspend(
 }
 
 /// `POST /api/v1/admin/accounts/:id/approve` — local accounts only.
-/// No pending-approval state exists (Phase 2 gap: approval registration
-/// modes), so approve is the enable-equivalent (`disabled=false`) plus an
-/// `approve` audit row (planned gap P7.3-B1).
+///
+/// Upstream `User#approve!`: re-enable when disabled, set `approved`, and
+/// run the new-user setup when the e-mail is confirmed. The re-enable and
+/// the approval flag commit here with an `approve` audit row; the
+/// new-user setup (bootstrap timeline, welcome mail, `account.approved`
+/// webhook) stays dormant until the Phase 2 email-confirmation gap closes,
+/// because it is gated on confirmation upstream.
+///
+/// Like upstream's `UserPolicy#approve?`, an already-approved account is
+/// refused `403 {"error":"Forbidden"}`.
 pub async fn approve(
     State(state): State<ApiState>,
     auth: Auth,
     Path(id): Path<String>,
 ) -> Response {
-    patch_flag(
-        state,
-        auth,
-        &id,
-        "approve",
+    let (actor, _) = match gate(&auth.0, &*state.context.store, WRITE_SCOPES) {
+        Ok(pair) => pair,
+        Err(err) => return err.into_response(),
+    };
+    let store: &dyn Store = &*state.context.store;
+    let (account, user) = match load_target(store, &id).await {
+        Ok(pair) => pair,
+        Err(err) => return err.into_response(),
+    };
+    if let Err(err) = admin_uc::require_local_target(&account, user.as_ref()) {
+        return ApiError::from(err).into_response();
+    }
+    if user.is_some_and(|u| u.approved) {
+        return ApiError::role_forbidden().into_response();
+    }
+    match admin_uc::moderate_account(
+        store,
+        actor,
+        account.id,
         AdminAccountPatch {
             disabled: Some(false),
+            approved: Some(true),
+            audit_action: "approve".to_string(),
             ..Default::default()
         },
-        true,
-    )
-    .await
+        state.context.now_ms(),
+    ) {
+        Ok((account, user)) => account_response(&state, &account, user.as_ref()),
+        Err(err) => ApiError::from(err).into_response(),
+    }
 }
 
-/// `POST /api/v1/admin/accounts/:id/reject` — local accounts only. The
-/// account is suspended + disabled immediately (same as DELETE); there is no
-/// pending-approval queue to remove it from (planned gap P7.3-B1). Answers
-/// `200 {}` like upstream's `render_empty`.
+/// `POST /api/v1/admin/accounts/:id/reject` — local accounts only.
+///
+/// Upstream runs `DeleteAccountService` (the account is gone); here the
+/// account is suspended + disabled immediately (same as DELETE) and its
+/// statuses are removed by the D38 async deletion worker with federated
+/// `Delete` distribution. Answers `200 {}` like upstream's `render_empty`.
+/// D24: the target's tokens are revoked and its open streams close.
+///
+/// Like upstream's `UserPolicy#reject?`, an already-approved account is
+/// refused `403 {"error":"Forbidden"}`.
 pub async fn reject(
     State(state): State<ApiState>,
     auth: Auth,
@@ -475,8 +534,14 @@ pub async fn reject(
     if let Err(err) = admin_uc::require_local_target(&account, user.as_ref()) {
         return ApiError::from(err).into_response();
     }
+    if user.is_some_and(|u| u.approved) {
+        return ApiError::role_forbidden().into_response();
+    }
     match store.admin_delete_account(actor, account.id, "reject", state.context.now_ms()) {
-        Ok(true) => axum::Json(json!({})).into_response(),
+        Ok(true) => {
+            kill_tokens(&state, account.id);
+            axum::Json(json!({})).into_response()
+        }
         Ok(false) => ApiError::not_found().into_response(),
         Err(err) => ApiError::from(err).into_response(),
     }
@@ -485,8 +550,15 @@ pub async fn reject(
 /// `POST /api/v1/admin/accounts/:account_id/action` — `Admin::AccountAction`
 /// types `none`/`disable`/`sensitive`/`silence`/`suspend` (verified against
 /// `app/models/admin/account_action.rb`). Answers `200 {}` like upstream's
-/// `render_empty`. Warning text/e-mail notifications have no model and are
-/// dropped (the action type is still audited).
+/// `render_empty`.
+///
+/// Every action records a warning row (strike: author, target, linked
+/// report, action, text, status ids — D37, upstream `process_strike!`); a
+/// `none` action without `report_id` stays refused `422` (there is nothing
+/// to warn about and nothing to resolve). Warning e-mail delivery has no
+/// mailer and is dropped (documented); the `send_email_notification` flag
+/// is accepted but changes nothing. Warning presets have no model: a
+/// `warning_preset_id` is refused `404` like a missing preset row.
 pub async fn action(
     State(state): State<ApiState>,
     auth: Auth,
@@ -517,15 +589,30 @@ pub async fn action(
             Err(err) => return err.into_response(),
         },
     };
+    // D37 warning text (the moderator's message on the strike) and the
+    // linked report. A warning preset id names a row of a model that does
+    // not exist here, so any value is a missing record (404).
+    let text = forms::get(&pairs, "text").map(str::to_string);
+    if forms::get(&pairs, "warning_preset_id").is_some_and(|v| !v.is_empty()) {
+        return ApiError::not_found().into_response();
+    }
     match admin_uc::account_action(
         store,
         actor,
         account.id,
         &action_type,
         report_id,
+        text,
         state.context.now_ms(),
     ) {
-        Ok(()) => axum::Json(json!({})).into_response(),
+        Ok(()) => {
+            // D24: only `disable` and `suspend` remove access; the other
+            // action types leave tokens alone.
+            if action_type == "disable" || action_type == "suspend" {
+                kill_tokens(&state, account.id);
+            }
+            axum::Json(json!({})).into_response()
+        }
         Err(err) => ApiError::from(err).into_response(),
     }
 }

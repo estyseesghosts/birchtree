@@ -266,6 +266,10 @@ pub async fn authorize_post(
         let domain = state.server.domain.clone();
         match auth::authenticate_password(store, username, &domain, password) {
             Ok(Some(user)) => {
+                // D39: one sign-in event per completed password login (the
+                // admin `active_users` telemetry). Recording is best-effort:
+                // the login itself already succeeded.
+                let _ = store.record_sign_in(user.account_id, state.context.now_ms());
                 match auth::create_login_session(store, user.account_id, state.context.now_ms()) {
                     Ok((plaintext, _session)) => {
                         let prepared = match prepare(&state, &pairs) {

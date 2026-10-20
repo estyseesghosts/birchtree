@@ -49,3 +49,10 @@ Phase 0 route-inventory review against the Mastodon v4.7.3 source remains open
 - Verify by execution: run tests/prototypes and paste or reference real output in the state log. Do not mark work done on reasoning alone.
 - Compatibility claims require tests against real Mastodon v4.7.3 fixtures or target clients, not internal mocks.
 - Both `cargo check --all-targets` and `cargo test` must pass on the release-relevant baseline before a phase exit is claimed.
+
+## Subagent delegation (hard rule)
+
+- Subagents share one worktree: concurrent subagents read and write the same files. The delegating agent must partition work so they cannot collide.
+- Assign disjoint file sets; shared files (`docs/*` contracts, schema/migrations, router/ports, shared test files) are owned by the parent for merging — subagents propose patch snippets, they do not edit shared files directly.
+- Subagents use uniquely-named test files, leave changes uncommitted, and never `git commit`, `git stash`, `git reset`, or `git checkout --` anything.
+- Check `git status --short` before starting; respect uncommitted work by others; stage/commit only your own files when explicitly told to.

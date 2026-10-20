@@ -63,7 +63,8 @@ use crate::media::processing;
 // ---------------------------------------------------------------------------
 
 /// Default upload size cap: 16 MiB (Mastodon parity, mirrors
-/// `Config::max_file_size` until the wiring patch threads it through).
+/// `Config::max_file_size`, which [`TranscodeConfig::max_file_size`] copies at
+/// startup via `Config::transcode_config`).
 pub const DEFAULT_MAX_FILE_SIZE: u64 = 16 * 1024 * 1024;
 
 /// Default per-job derived-output cap: 64 MiB.
@@ -92,8 +93,11 @@ pub const REQUIRED_DECODERS: &[&str] = &[
     "aac", "opus", "vorbis", "mp3", "flac", "pcm_s16le",
 ];
 
-/// Transcoding configuration (wiring patch: constructed from `Config`, see
-/// the Phase 7.1 report's PATCHES FOR PARENT).
+/// Transcoding configuration, built from [`crate::config::Config`] at
+/// startup (see `Config::transcode_config`): CLI/config knobs for quality
+/// (`webp_quality`, `vp9_crf`, `vp9_cpu_used`, `opus_bitrate_kbps`), caps
+/// (`max_file_size`, `max_output_bytes`, `max_memory_bytes`, wall time) and
+/// the toolchain path.
 #[derive(Debug, Clone)]
 pub struct TranscodeConfig {
     /// Master switch. `validate` enforces the toolchain only when set; the
@@ -826,11 +830,15 @@ fn rss_bytes(pid: u32) -> Option<u64> {
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Filename prefix of transcode temp files (input/probe/output). The
+/// orphan sweeper ([`sweep_tmp_files`]) keys on this prefix.
+pub const TEMP_PREFIX: &str = "birchtree-transcode-";
+
 /// A fresh temp path that never collides within or across processes.
 fn temp_path(prefix: &str, ext: &str) -> PathBuf {
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "birchtree-transcode-{prefix}-{}-{n}.{ext}",
+        "{TEMP_PREFIX}{prefix}-{}-{n}.{ext}",
         std::process::id()
     ))
 }
@@ -866,6 +874,109 @@ pub fn staging_key_for(file_key: &str, ext: &str) -> Option<String> {
     Some(format!("{dir}/derived.{ext}"))
 }
 
+/// Maximum `/tmp` orphans removed by one [`sweep_tmp_files`] pass: the sweep
+/// is bounded so a crowded temp dir cannot stall startup.
+pub const TMP_SWEEP_CAP: usize = 1_000;
+
+/// Minimum age of a `/tmp` file the sweeper removes: a running transcode
+/// holds its temp files for seconds at most (wall-time cap 120 s default),
+/// so one hour of grace never touches a live job while still converging
+/// `SIGKILL` orphans within an operator-tolerable window.
+pub const TMP_SWEEP_GRACE_MS: u64 = 3_600_000;
+
+/// Remove stale transcode temp files (`{TEMP_PREFIX}*`) from `dir`.
+///
+/// A `SIGKILL` between ffmpeg spawn and `TempGuard` drop orphans the input /
+/// probe / output files permanently (no guard runs on `SIGKILL`), so the
+/// server calls this once at startup and the operator can re-run it via the
+/// `sweep-transcode-orphans` CLI. Only files whose mtime is at least
+/// `older_than_ms` old are removed, so a concurrently running transcode's
+/// fresh files are never touched; entries whose age cannot be read are kept
+/// for the next pass, never fatal. At most `cap` files (clamped to
+/// [`TMP_SWEEP_CAP`]) are removed per call, so a crowded temp dir cannot
+/// stall startup. Returns the number of files removed. Staging blobs inside
+/// the blob store are covered by [`sweep_staging_for_media`], not here.
+pub fn sweep_tmp_files(dir: &Path, older_than_ms: u64, cap: usize) -> usize {
+    let cap = cap.min(TMP_SWEEP_CAP);
+    let entries = std::fs::read_dir(dir)
+        .map(|read| read.collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut removed = 0usize;
+    for entry in entries {
+        if removed >= cap {
+            break;
+        }
+        let Ok(entry) = entry else { continue };
+        if !entry.file_name().to_string_lossy().starts_with(TEMP_PREFIX) {
+            continue;
+        }
+        let age_ms: Option<u64> = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .and_then(|age| u64::try_from(age.as_millis()).ok());
+        match age_ms {
+            Some(age) if age >= older_than_ms => {
+                if std::fs::remove_file(entry.path()).is_ok() {
+                    removed += 1;
+                }
+            }
+            _ => continue,
+        }
+    }
+    removed
+}
+
+/// Remove one attachment's orphaned staging blobs, if any.
+///
+/// The derived blob is staged under a deterministic key
+/// ([`staging_key_for`]) and deleted best-effort after the `Ready` commit, so
+/// a crash between commit and cleanup — or a retry's overwrite that itself
+/// crashed — leaves a staging orphan behind a terminal row, where no future
+/// job will ever revisit it (retries are no-ops on `Ready`/`Failed` rows).
+/// This function deletes both candidate staging keys (`derived.webm`,
+/// `derived.webp`; the plan is not stored on the row, so both shapes are
+/// probed) when the row is missing, `Ready` or `Failed`, and returns whether
+/// anything was removed. `Pending`/`Processing` rows are left alone: the
+/// in-flight job (or its retry) owns their staging keys, and a quarantined
+/// job's row stays `Pending` until the operator re-drives it.
+///
+/// Deletion is best-effort per key (a store error aborts with `Err` so the
+/// caller can retry; a missing key is simply not counted).
+pub fn sweep_staging_for_media(
+    store: &dyn Store,
+    blobs: &dyn BlobStore,
+    media_id: Id,
+) -> Result<bool> {
+    let media = store.media_by_id(media_id)?;
+    let terminal = match &media {
+        None => true,
+        Some(media) => matches!(media.state, MediaState::Ready | MediaState::Failed),
+    };
+    if !terminal {
+        return Ok(false);
+    }
+    let file_key = media.map(|media| media.file_key).unwrap_or_default();
+    if file_key.is_empty() {
+        return Ok(false);
+    }
+    let mut removed = false;
+    for ext in ["webm", "webp"] {
+        let Some(key) = staging_key_for(&file_key, ext) else {
+            continue;
+        };
+        match blobs.get(&key)? {
+            None => {}
+            Some(_) => {
+                blobs.delete(&key)?;
+                removed = true;
+            }
+        }
+    }
+    Ok(removed)
+}
+
 /// Transcode `input_bytes` (extension `input_ext`, a hint for ffmpeg's
 /// demuxer only) into the plan's derived bytes.
 pub fn transcode_bytes(
@@ -898,9 +1009,11 @@ pub fn transcode_bytes(
 // Durable job payload and handler.
 // ---------------------------------------------------------------------------
 
-/// Payload of the post-commit transcode job (wiring patch: enqueued under a
-/// new `JobKind::TranscodeMedia`; until that lands, the `ProcessMedia` hook
-/// patch in the Phase 7.1 report routes through [`run_transcode_job`]).
+/// Payload of the post-commit transcode job, enqueued under
+/// `JobKind::TranscodeMedia` and dispatched by the job worker (ffmpeg runs
+/// off the async runtime); the sync drain funnels the same payload through
+/// [`run_transcode_job`] when a toolchain is threaded, and completes it
+/// without work otherwise.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TranscodeJobPayload {
     pub media_id: Id,

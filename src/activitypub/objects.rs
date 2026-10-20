@@ -74,12 +74,25 @@ impl Object for NoteRef {
         let now = data.app.now_ms();
         match json {
             NoteOrQuestion::Note(note) => {
+                // A dereferenced object whose Delete arrived first stays gone:
+                // report it deleted (terminal for the fetcher) instead of
+                // resurrecting it.
+                if data.app.store.remote_tombstone(note.id.as_str())?.is_some() {
+                    return Err(FedError::Protocol(activitypub_federation::error::Error::ObjectDeleted(
+                        note.id.clone(),
+                    )));
+                }
                 let author = crate::activitypub::objects::author_of(data, &note.attributed_to).await?;
                 let input = note_input(&note, author);
                 let ingested = ingest_note(&*data.app.store, input, None, now)?;
                 Ok(NoteRef { status: ingested.status })
             }
             NoteOrQuestion::Question(question) => {
+                if data.app.store.remote_tombstone(question.id.as_str())?.is_some() {
+                    return Err(FedError::Protocol(activitypub_federation::error::Error::ObjectDeleted(
+                        question.id.clone(),
+                    )));
+                }
                 let author = crate::activitypub::objects::author_of(data, &question.attributed_to).await?;
                 let (input, poll) = question_input(&question, author, now);
                 let ingested = ingest_note(&*data.app.store, input, Some(poll), now)?;
