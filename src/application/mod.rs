@@ -23,6 +23,7 @@ pub mod markers;
 pub mod emoji;
 pub mod polls;
 pub mod media;
+pub mod license_policy;
 pub mod search;
 pub mod lists;
 pub mod filters;

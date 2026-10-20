@@ -489,6 +489,7 @@ pub async fn create(
             cmd,
             scheduled_at_ms,
             state.server.max_status_chars,
+            &state.server.license_policy,
         ) {
             Ok(row) => {
                 let media = store
@@ -509,7 +510,7 @@ pub async fn create(
         };
     }
 
-    match statuses::create_status(store, &state.server.public_url, state.context.now_ms(), cmd, state.server.max_status_chars) {
+    match statuses::create_status(store, &state.server.public_url, state.context.now_ms(), cmd, state.server.max_status_chars, &state.server.license_policy) {
         Ok(created) => {
             // An idempotent replay committed nothing new, so nothing streams.
             if !created.replayed {
@@ -611,7 +612,7 @@ pub async fn update(
         quote_approval_policy: field("quote_approval_policy"),
     };
     let store: &dyn Store = &*state.context.store;
-    match statuses::update_status(store, state.context.now_ms(), cmd) {
+    match statuses::update_status(store, state.context.now_ms(), cmd, &state.server.license_policy) {
         Ok(maybe_status) => {
             // No changes: reload and answer 200 with the unchanged status.
             let status = match maybe_status {

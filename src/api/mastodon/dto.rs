@@ -122,6 +122,14 @@ pub fn account_json_with_stats(
         // moving signal rather than fabricating a nested object.
         object.insert("moved".into(), json!({ "id": moved_to.to_string() }));
     }
+    // Core extension CORE-L: `preferredLicense` renders only when the policy
+    // is enabled (`off` omits the key); enabled + `None` renders `null`.
+    if let Some(value) = crate::application::license_policy::license_wire_value(
+        &server.license_policy,
+        account.default_license,
+    ) {
+        object.insert("preferredLicense".into(), value);
+    }
     Value::Object(object)
 }
 
@@ -673,6 +681,20 @@ pub fn media_attachment_json(server: &ServerInfo, media: &MediaAttachment) -> Va
         "description": if media.description.is_empty() { Value::Null } else { json!(media.description) },
         "blurhash": media.blurhash.clone().map(Value::String).unwrap_or(Value::Null),
     })
+    .as_object()
+    .cloned()
+    .map(|mut object| {
+        // Core extension CORE-L: `license` renders only when the policy is
+        // enabled (`off` omits the key); enabled + `None` renders `null`
+        // (all rights reserved).
+        if let Some(value) =
+            crate::application::license_policy::license_wire_value(&server.license_policy, media.license)
+        {
+            object.insert("license".into(), value);
+        }
+        Value::Object(object)
+    })
+    .unwrap_or(Value::Null)
 }
 
 /// The `meta` object: `original` (and `small` when a preview exists) plus

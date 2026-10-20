@@ -97,6 +97,7 @@ impl MediaStore for RedbStore {
             created_at_ms: self.now_ms(),
             updated_at_ms: self.now_ms(),
             error: None,
+            license: input.license,
         };
 
         {
@@ -199,6 +200,7 @@ impl MediaStore for RedbStore {
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
             error: None,
+            license: input.license,
         };
         write_media_txn(&write, &media)?;
         {
@@ -260,6 +262,9 @@ impl MediaStore for RedbStore {
         }
         if let Some(thumbnail) = patch.thumbnail_key {
             media.thumbnail_key = thumbnail;
+        }
+        if let Some(license) = patch.license {
+            media.license = license;
         }
         media.updated_at_ms = now_ms;
         write_media_txn(&write, &media)?;

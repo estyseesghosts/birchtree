@@ -134,6 +134,9 @@ pub fn ingest_note(store: &dyn Store, note: RemoteNote, poll: Option<RemotePoll>
             account_id: note.author_id,
             r#type: media_kind(&attachment.media_type).into(),
             description: attachment.description.clone(),
+            // CORE-L: federation wire license parsing lands with the AP
+            // wire slice; remote rows store NULL until then.
+            license: None,
         })?;
         store.set_remote_media_source(media.id, &attachment.source_url)?;
         media_ids.push(media.id);

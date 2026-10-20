@@ -132,6 +132,7 @@ fn upsert_remote_txn(
                 hide_collections: None,
                 fields: Vec::new(),
                 attribution_domains: Vec::new(),
+                default_license: None,
                 created_at_ms: now_ms,
             }
         }

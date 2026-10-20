@@ -83,6 +83,7 @@ impl AccountStore for RedbStore {
             hide_collections: None,
             fields: Vec::new(),
             attribution_domains: Vec::new(),
+            default_license: None,
             created_at_ms: input.now_ms,
         };
         let user = LocalUser {
@@ -302,6 +303,9 @@ impl AccountStore for RedbStore {
         }
         if let Some(v) = update.bot {
             account.bot = v;
+        }
+        if let Some(v) = update.default_license {
+            account.default_license = v;
         }
         {
             let mut accounts = write.open_table(ACCOUNTS)?;

@@ -89,19 +89,29 @@ impl TestServer {
         Self::assemble(dir, store, false, limits)
     }
 
+    /// Open a fresh server with a config tweak (core-extension policy
+    /// tests set `license_policy` / `place_policy` / `alt_text_policy`).
+    pub fn with_config(
+        registration_open: bool,
+        configure: impl FnOnce(&mut Config),
+    ) -> Self {
+        let (dir, store) = temp_store();
+        let mut cfg = Config {
+            public_url: TEST_PUBLIC_URL.to_string(),
+            registration_open,
+            transcoding_enabled: false,
+            ..Config::default()
+        };
+        configure(&mut cfg);
+        Self::assemble_with_cfg(dir, store, cfg, Limits::default())
+    }
+
     fn assemble(
         dir: tempfile::TempDir,
         store: Arc<RedbStore>,
         registration_open: bool,
         limits: Limits,
     ) -> Self {
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-        let ids: Arc<dyn IdGenerator> =
-            Arc::new(TimestampIdGenerator::new(Box::new(SystemClock)));
-        let blobs: Arc<birchtree::media::blob_store::FsBlobStore> = Arc::new(
-            birchtree::media::blob_store::FsBlobStore::open(dir.path().join("media"))
-                .expect("open blob store"),
-        );
         let cfg = Config {
             public_url: TEST_PUBLIC_URL.to_string(),
             registration_open,
@@ -111,6 +121,22 @@ impl TestServer {
             transcoding_enabled: false,
             ..Config::default()
         };
+        Self::assemble_with_cfg(dir, store, cfg, limits)
+    }
+
+    fn assemble_with_cfg(
+        dir: tempfile::TempDir,
+        store: Arc<RedbStore>,
+        cfg: Config,
+        limits: Limits,
+    ) -> Self {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let ids: Arc<dyn IdGenerator> =
+            Arc::new(TimestampIdGenerator::new(Box::new(SystemClock)));
+        let blobs: Arc<birchtree::media::blob_store::FsBlobStore> = Arc::new(
+            birchtree::media::blob_store::FsBlobStore::open(dir.path().join("media"))
+                .expect("open blob store"),
+        );
         let server = Arc::new(ServerInfo::from_config(&cfg));
         let streams = Hub::new(store.clone(), clock.clone(), server.clone(), limits);
         let context = Arc::new(Context::new(

@@ -148,6 +148,10 @@ pub struct AccountProfileUpdate {
     pub attribution_domains: Option<Vec<String>>,
     /// Automated account flag (`update_credentials[bot]`).
     pub bot: Option<bool>,
+    /// Core extension CORE-L: author's default license (`None` leaves it
+    /// unchanged; `Some(None)` clears; `Some(Some(id))` sets; validated
+    /// before the store call).
+    pub default_license: Option<Option<u8>>,
 }
 
 /// Accounts, local users, and the unique handle index.
@@ -1487,6 +1491,10 @@ pub struct NewMedia {
     /// One of `unknown`/`image`/`gifv`/`video`/`audio`.
     pub r#type: String,
     pub description: String,
+    /// Core extension CORE-L: Pixelfed license id (validated before the
+    /// store call; `None` = all rights reserved). Already policy-gated by
+    /// the caller (`off` stores `None`).
+    pub license: Option<u8>,
 }
 
 /// An uploaded attachment whose bytes are already staged in the blob store.
@@ -1515,6 +1523,10 @@ pub struct NewMediaUpload {
     pub duration_ms: Option<u64>,
     pub frame_rate: Option<String>,
     pub bitrate: Option<u64>,
+    /// Core extension CORE-L: Pixelfed license id (validated before the
+    /// store call; `None` = all rights reserved). Already policy-gated by
+    /// the caller (`off` stores `None`).
+    pub license: Option<u8>,
 }
 
 /// Processing result committed by the `ProcessMedia` job (idempotent).
@@ -1544,6 +1556,9 @@ pub struct MediaPatch {
     pub focus: Option<Option<crate::domain::FocusPoint>>,
     /// Replace the cover image blob key (`None` leaves it unchanged).
     pub thumbnail_key: Option<Option<String>>,
+    /// Core extension CORE-L: replace the license (`None` leaves it
+    /// unchanged; `Some(None)` clears to all-rights).
+    pub license: Option<Option<u8>>,
 }
 
 pub trait MediaStore: Send + Sync {

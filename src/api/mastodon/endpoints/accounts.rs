@@ -260,6 +260,33 @@ pub async fn update_credentials(
         });
 
     let store: &dyn Store = &*state.context.store;
+    // Core extension CORE-L: top-level `default_license` sets the author's
+    // default attachment license. Under `off` the param is
+    // accepted-and-ignored; otherwise a present value validates (422 on
+    // out-of-enum) and present-blank clears.
+    let default_license = match field("default_license") {
+        None => None,
+        Some(_) if state.server.license_policy == "off" => None,
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Some(None)
+            } else {
+                match trimmed.parse::<i64>() {
+                    Ok(value) => match crate::domain::license::parse_license(Some(value)) {
+                        Ok(parsed) => Some(parsed),
+                        Err(err) => return ApiError::from(err).into_response(),
+                    },
+                    Err(_) => {
+                        return ApiError::unprocessable(
+                            crate::domain::license::ERR_LICENSE_INVALID,
+                        )
+                        .into_response()
+                    }
+                }
+            }
+        }
+    };
     let profile = AccountProfileUpdate {
         display_name,
         note,
@@ -270,6 +297,7 @@ pub async fn update_credentials(
         fields: profile_fields,
         attribution_domains,
         bot,
+        default_license,
     };
     if let Err(err) = store.update_account_profile(account_id, profile) {
         return ApiError::from(err).into_response();

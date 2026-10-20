@@ -107,6 +107,11 @@ pub struct Account {
     /// Domains attributed to this account (upstream `attribution_domains`).
     #[serde(default)]
     pub attribution_domains: Vec<String>,
+    /// Core extension CORE-L: author's default license id (Pixelfed ids);
+    /// `None` = no default. Rides inline in the `accounts` JSON blob
+    /// (schema v17); pre-v17 rows decode as `None`.
+    #[serde(default)]
+    pub default_license: Option<u8>,
     pub created_at_ms: u64,
 }
 
@@ -175,6 +180,7 @@ mod tests {
             hide_collections: None,
             fields: Vec::new(),
             attribution_domains: Vec::new(),
+            default_license: None,
             created_at_ms: 0,
         };
         assert_eq!(a.acct(), "alice");

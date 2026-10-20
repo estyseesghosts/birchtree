@@ -581,6 +581,7 @@ fn stage_pending(
                 duration_ms: None,
                 frame_rate: None,
                 bitrate: None,
+                license: None,
             },
             T0,
         )
@@ -1041,6 +1042,8 @@ fn converted_meta_follows_the_derived_blob() {
         Some("0.5,-0.25"),
         false,
         16 * 1024 * 1024,
+        "off",
+        None,
     )
     .expect("upload");
     assert_eq!(media.state, MediaState::Ready);

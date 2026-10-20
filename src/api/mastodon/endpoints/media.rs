@@ -82,11 +82,25 @@ pub async fn update(
     let Ok(id) = raw.parse::<Id>() else {
         return ApiError::not_found().into_response();
     };
-    let (description, focus, thumbnail) = match update_fields(&state, request).await {
+    let (description, focus, thumbnail, license) = match update_fields(&state, request).await {
         Ok(fields) => fields,
         Err(err) => return err.into_response(),
     };
     let store: &dyn Store = &*state.context.store;
+    // Core extension CORE-L: raw license param; blank clears, absent leaves
+    // unchanged; non-numeric is a 422 (the use case 422s out-of-enum, and
+    // ignores everything under `off`).
+    let license = match license {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(raw)) => match raw.parse::<i64>() {
+            Ok(value) => Some(Some(value)),
+            Err(_) => {
+                return ApiError::unprocessable(crate::domain::license::ERR_LICENSE_INVALID)
+                    .into_response()
+            }
+        },
+    };
     match media::update_media(
         store,
         &*state.context.blobs,
@@ -96,6 +110,8 @@ pub async fn update(
         focus.as_deref(),
         thumbnail.as_deref(),
         state.context.now_ms(),
+        &state.server.license_policy,
+        license,
     ) {
         Ok(media) => media_response(&state, media),
         Err(err) => ApiError::from(err).into_response(),
@@ -166,6 +182,9 @@ struct UploadFields {
     thumbnail: Option<Vec<u8>>,
     description: Option<String>,
     focus: Option<String>,
+    /// Core extension CORE-L: raw `license` param (validated in the use
+    /// case; ignored under `off`).
+    license: Option<String>,
 }
 
 /// Shared v1/v2 upload path. `delay` enables Mastodon's larger-format
@@ -205,6 +224,20 @@ async fn upload(state: &ApiState, auth: &Auth, request: Request, delay: bool) ->
         None
     };
     let transcode_ref = transcode.as_ref();
+    // Core extension CORE-L: raw license param; the use case validates
+    // (422 on out-of-enum) unless the policy is `off` (ignored entirely).
+    let license = match fields.license.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(value) => Some(value),
+            Err(_) => {
+                return crate::api::mastodon::errors::ApiError::unprocessable(
+                    crate::domain::license::ERR_LICENSE_INVALID,
+                )
+                .into_response()
+            }
+        },
+    };
     match media::upload_media_with_config(
         &*state.context.store,
         &*state.context.blobs,
@@ -217,6 +250,8 @@ async fn upload(state: &ApiState, auth: &Auth, request: Request, delay: bool) ->
         delay,
         max_file_size,
         transcode_ref,
+        &state.server.license_policy,
+        license,
     ) {
         Ok(media) => {
             let status = if delay && media.state != MediaState::Ready {
@@ -281,19 +316,29 @@ async fn upload_fields(state: &ApiState, request: Request) -> ApiResult<UploadFi
                 fields.description = Some(String::from_utf8_lossy(&value).into_owned());
             }
             Some("focus") => fields.focus = Some(String::from_utf8_lossy(&value).into_owned()),
+            Some("license") => {
+                fields.license = Some(String::from_utf8_lossy(&value).into_owned());
+            }
             _ => {}
         }
     }
     Ok(fields)
 }
 
-/// Parse the update fields: multipart (`thumbnail`/`description`/`focus`;
-/// a `file` part is ignored — only the permitted params apply) or
-/// form-encoded (`description`/`focus`).
+/// Parse the update fields: multipart (`thumbnail`/`description`/`focus`/
+/// `license`; a `file` part is ignored — only the permitted params apply)
+/// or form-encoded (`description`/`focus`/`license`). The license element is
+/// `Some(Some(raw))` when present, `Some(None)` when present-but-blank
+/// (clears), `None` when absent (unchanged).
 async fn update_fields(
     state: &ApiState,
     request: Request,
-) -> ApiResult<(Option<String>, Option<String>, Option<Vec<u8>>)> {
+) -> ApiResult<(
+    Option<String>,
+    Option<String>,
+    Option<Vec<u8>>,
+    Option<Option<String>>,
+)> {
     if !is_multipart(&request) {
         let LenientForm(pairs) = LenientForm::from_request(request, state)
             .await
@@ -302,12 +347,17 @@ async fn update_fields(
             forms::get(&pairs, "description").map(str::to_string),
             forms::get(&pairs, "focus").map(str::to_string),
             None,
+            forms::get(&pairs, "license").map(|raw| {
+                let trimmed = raw.trim().to_string();
+                if trimmed.is_empty() { None } else { Some(trimmed) }
+            }),
         ));
     }
     let mut multipart = multipart(state, request).await?;
     let mut description = None;
     let mut focus = None;
     let mut thumbnail = None;
+    let mut license: Option<Option<String>> = None;
     while let Some(field) = next_field(&mut multipart).await? {
         let name = field.name().map(str::to_string);
         let value = field_bytes(field).await?;
@@ -315,10 +365,14 @@ async fn update_fields(
             Some("thumbnail") => thumbnail = Some(value),
             Some("description") => description = Some(String::from_utf8_lossy(&value).into_owned()),
             Some("focus") => focus = Some(String::from_utf8_lossy(&value).into_owned()),
+            Some("license") => {
+                let raw = String::from_utf8_lossy(&value).trim().to_string();
+                license = Some(if raw.is_empty() { None } else { Some(raw) });
+            }
             _ => {}
         }
     }
-    Ok((description, focus, thumbnail))
+    Ok((description, focus, thumbnail, license))
 }
 
 fn is_multipart(request: &Request) -> bool {

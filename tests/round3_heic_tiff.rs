@@ -248,6 +248,7 @@ fn stage_pending(
                 duration_ms: None,
                 frame_rate: None,
                 bitrate: None,
+                license: None,
             },
             T0,
         )
@@ -384,6 +385,8 @@ fn tiff_upload_defers_then_converges_to_webp() {
         true,
         birchtree::media::transcode::DEFAULT_MAX_FILE_SIZE,
         Some(&config),
+        "off",
+        None,
     )
     .expect("tiff upload must be accepted");
     assert_eq!(media.mime_type, "image/tiff");
@@ -443,6 +446,8 @@ fn heic_upload_converts_inline_to_webp() {
         false,
         birchtree::media::transcode::DEFAULT_MAX_FILE_SIZE,
         Some(&config),
+        "off",
+        None,
     )
     .expect("heic upload must be accepted");
     assert_eq!(media.mime_type, "image/heic");
@@ -513,6 +518,8 @@ fn tiff_without_a_toolchain_is_refused_not_silently_served() {
         None,
         false,
         birchtree::media::transcode::DEFAULT_MAX_FILE_SIZE,
+        "off",
+        None,
     )
     .expect_err("toolchain-less tiff upload must be refused");
     assert!(

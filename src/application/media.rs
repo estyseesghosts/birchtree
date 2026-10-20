@@ -163,6 +163,8 @@ pub fn upload_media(
     focus: Option<&str>,
     delay: bool,
     max_file_size: u64,
+    license_policy: &str,
+    license: Option<i64>,
 ) -> Result<MediaAttachment> {
     stage_and_finish_upload(
         store,
@@ -176,6 +178,8 @@ pub fn upload_media(
         delay,
         max_file_size,
         None,
+        license_policy,
+        license,
     )
 }
 
@@ -195,6 +199,8 @@ pub fn upload_media_with_config(
     delay: bool,
     max_file_size: u64,
     config: Option<&crate::media::transcode::TranscodeConfig>,
+    license_policy: &str,
+    license: Option<i64>,
 ) -> Result<MediaAttachment> {
     stage_and_finish_upload(
         store,
@@ -208,6 +214,8 @@ pub fn upload_media_with_config(
         delay,
         max_file_size,
         config,
+        license_policy,
+        license,
     )
 }
 
@@ -227,6 +235,8 @@ fn stage_and_finish_upload(
     delay: bool,
     max_file_size: u64,
     config: Option<&crate::media::transcode::TranscodeConfig>,
+    license_policy: &str,
+    license: Option<i64>,
 ) -> Result<MediaAttachment> {
     // 1. A missing/blank file param.
     if file_bytes.is_empty() {
@@ -246,6 +256,15 @@ fn stage_and_finish_upload(
     }
     // 5. Focus.
     let focus = parse_focus(focus.unwrap_or_default())?;
+    // 5b. Core extension CORE-L: the license rides on the attachment row.
+    // Under `off` the param is accepted-and-ignored entirely (not even
+    // parsed, so garbage values are ignored too); otherwise an out-of-enum
+    // value is a 422 and the upload itself never gates on licenses.
+    let license = if license_policy == "off" {
+        None
+    } else {
+        crate::domain::license::parse_license(license)?
+    };
     // 6. Thumbnail: only video/audio may carry one (Mastodon's
     //    `validates :thumbnail, absence: true, if: !audio_or_video?`).
     let thumbnail = match thumbnail_bytes {
@@ -294,6 +313,7 @@ fn stage_and_finish_upload(
             duration_ms: None,
             frame_rate: None,
             bitrate: None,
+            license,
         },
         now_ms,
     )?;
@@ -516,6 +536,8 @@ pub fn update_media(
     focus: Option<&str>,
     thumbnail: Option<&[u8]>,
     now_ms: u64,
+    license_policy: &str,
+    license: Option<Option<i64>>,
 ) -> Result<MediaAttachment> {
     // Same addressability + `check_processing` gate as `show_media`.
     let media = load_addressable_media(store, account_id, id)?;
@@ -529,6 +551,17 @@ pub fn update_media(
             return Err(Error::InvalidInput(ERR_DESCRIPTION_TOO_LONG.into()));
         }
         patch.description = Some(description.to_string());
+    }
+    // Core extension CORE-L: present license replaces, present-blank clears,
+    // absent leaves unchanged. Under `off` the param is accepted-and-ignored.
+    if let Some(raw) = license
+        && license_policy != "off"
+    {
+        let parsed = match raw {
+            None => None,
+            Some(value) => crate::domain::license::parse_license(Some(value))?,
+        };
+        patch.license = Some(parsed);
     }
     if let Some(focus) = focus {
         patch.focus = Some(parse_focus(focus)?);
@@ -706,6 +739,8 @@ mod tests {
             None,
             false,
             1024,
+            "off",
+            None,
         )
         .expect_err("oversized upload rejected");
         assert_invalid_input(
@@ -729,6 +764,8 @@ mod tests {
             None,
             false,
             1024 * 1024,
+            "off",
+            None,
         )
         .expect_err("blank file");
         assert_invalid_input(err, ERR_BLANK_FILE);
@@ -745,6 +782,8 @@ mod tests {
             None,
             false,
             1024 * 1024,
+            "off",
+            None,
         )
         .expect_err("text file");
         assert_invalid_input(err, ERR_CONTENT_TYPE);
@@ -766,6 +805,8 @@ mod tests {
             Some("0.5,-0.25"),
             false,
             16 * 1024 * 1024,
+            "off",
+            None,
         )
         .expect("upload");
         assert_eq!(media.state, MediaState::Ready);
@@ -806,6 +847,8 @@ mod tests {
             None,
             true,
             16 * 1024 * 1024,
+            "off",
+            None,
         )
         .expect("upload");
         assert_eq!(media.state, MediaState::Pending);
@@ -844,6 +887,8 @@ mod tests {
             None,
             false,
             16 * 1024 * 1024,
+            "off",
+            None,
         )
         .expect_err("thumbnail on an image");
         assert_invalid_input(err, ERR_THUMBNAIL_BLANK);
@@ -864,6 +909,8 @@ mod tests {
             None,
             false,
             16 * 1024 * 1024,
+            "off",
+            None,
         )
         .expect("upload");
 
@@ -876,6 +923,8 @@ mod tests {
             Some("0.1,0.2"),
             None,
             1_700_000_000_001,
+            "off",
+            None,
         )
         .expect("update");
         assert_eq!(updated.description, "updated");
@@ -887,7 +936,7 @@ mod tests {
         // Foreign accounts cannot see or patch it.
         assert!(show_media(&*store, Id::new(99), media.id).is_err());
         assert!(
-            update_media(&*store, &blobs, Id::new(99), media.id, Some("x"), None, None, 2)
+            update_media(&*store, &blobs, Id::new(99), media.id, Some("x"), None, None, 2, "off", None)
                 .is_err()
         );
 

@@ -172,6 +172,7 @@ pub fn create_status(
     now_ms: u64,
     cmd: CreateStatusCommand,
     max_chars: usize,
+    license_policy: &str,
 ) -> Result<CreateStatusResult> {
     let CreateStatusCommand {
         account_id,
@@ -341,6 +342,37 @@ pub fn create_status(
     }
 
     let poll = poll.map(|p| build_poll_spec(now_ms, p)).transpose()?;
+
+    // Core extension CORE-L: under `enforced`, a top-level non-DM status
+    // carrying media needs an effective license (per-attachment else author
+    // default) on every attachment. Replies and DMs are exempt; the media
+    // upload itself never gated. Missing rows are left to the store's
+    // attachability check below (same 422 family).
+    if license_policy == "enforced"
+        && visibility != Visibility::Direct
+        && in_reply_to.is_none()
+        && !media_ids.is_empty()
+    {
+        let attached = store.media_by_ids(&media_ids)?;
+        let mut effective = Vec::with_capacity(media_ids.len());
+        for id in &media_ids {
+            if let Some(media) = attached.get(id) {
+                effective.push(crate::application::license_policy::effective_license(
+                    media.license,
+                    account.default_license,
+                ));
+            }
+        }
+        if effective.len() == media_ids.len() {
+            crate::application::license_policy::check_status_licenses(
+                license_policy,
+                false,
+                false,
+                true,
+                &effective,
+            )?;
+        }
+    }
 
     let base = base_url.trim_end_matches('/');
     let content_html = render_html(&text);
@@ -653,6 +685,7 @@ pub fn update_status(
     store: &dyn Store,
     now_ms: u64,
     cmd: UpdateStatusCommand,
+    license_policy: &str,
 ) -> Result<Option<Status>> {
     let status = store
         .status_by_id(cmd.status_id)?
@@ -684,6 +717,36 @@ pub fn update_status(
         update.language = Some(language);
     }
     if let Some(media_ids) = cmd.media_ids {
+        // Core extension CORE-L: same enforced gate as creation, evaluated
+        // against the resulting attachment set. Replies and DMs exempt.
+        if license_policy == "enforced"
+            && status.in_reply_to_id.is_none()
+            && status.visibility != Visibility::Direct
+            && !media_ids.is_empty()
+        {
+            let attached = store.media_by_ids(&media_ids)?;
+            let author = store
+                .account_by_id(cmd.account_id)?
+                .ok_or_else(|| Error::NotFound("account".into()))?;
+            let mut effective = Vec::with_capacity(media_ids.len());
+            for id in &media_ids {
+                if let Some(media) = attached.get(id) {
+                    effective.push(crate::application::license_policy::effective_license(
+                        media.license,
+                        author.default_license,
+                    ));
+                }
+            }
+            if effective.len() == media_ids.len() {
+                crate::application::license_policy::check_status_licenses(
+                    license_policy,
+                    false,
+                    false,
+                    true,
+                    &effective,
+                )?;
+            }
+        }
         update.media_ids = Some(media_ids);
     }
     if let Some(poll) = cmd.poll {

@@ -86,6 +86,10 @@ pub struct ServerInfo {
     pub remote_live_feed_access: String,
     pub local_topic_feed_access: String,
     pub remote_topic_feed_access: String,
+    /// Core extension CORE-L (mirrors `Config::license_policy`, default
+    /// `off`). The DTO layer consults it to decide whether `license` /
+    /// `preferredLicense` render.
+    pub license_policy: String,
 }
 
 /// Host and optional explicit port of a separately configured streaming base.
@@ -210,6 +214,7 @@ impl ServerInfo {
             remote_live_feed_access: cfg.remote_live_feed_access.clone(),
             local_topic_feed_access: cfg.local_topic_feed_access.clone(),
             remote_topic_feed_access: cfg.remote_topic_feed_access.clone(),
+            license_policy: cfg.license_policy.clone(),
         }
     }
 }
