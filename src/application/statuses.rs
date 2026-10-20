@@ -20,7 +20,8 @@ use crate::application::ports::{
 use crate::application::policy;
 use crate::domain::account::normalize_username;
 use crate::domain::{
-    Error, Id, QuotePolicy, Result, Status, StatusApplication, StatusVersion, Visibility,
+    Error, Id, InteractionEvent, InteractionEventKind, QuotePolicy, Result, Status,
+    StatusApplication, StatusVersion, Visibility,
 };
 
 // ---------------------------------------------------------------------------
@@ -373,6 +374,24 @@ pub fn create_status(
         },
         now_ms,
     )?;
+
+    // D39 `interactions` journal: upstream counts ONLY non-self replies
+    // (`PostStatusService#bump_potential_friendship!`,
+    // `app/services/post_status_service.rb:262-266`). Idempotent replays
+    // (`replayed`) and top-level/self-reply posts journal nothing. The store
+    // mints the event id; a journal failure never fails the post itself
+    // (metrics must not break the write path — same fire-and-forget shape as
+    // `record_sign_in` at `api/oauth/authorization.rs:272`).
+    if !created.replayed
+        && in_reply_to.is_some()
+        && in_reply_to_account != Some(account_id)
+    {
+        let _ = store.record_interaction(InteractionEvent::for_journal(
+            account_id,
+            InteractionEventKind::Reply,
+            now_ms,
+        ));
+    }
 
     Ok(CreateStatusResult {
         status: created.status,

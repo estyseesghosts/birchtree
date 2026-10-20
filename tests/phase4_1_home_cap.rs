@@ -34,6 +34,7 @@ fn quick_account(store: &RedbStore, name: &str) -> Id {
             now_ms: T0,
             send_confirmation_email: false,
             approved: true,
+            created_by_application: None,
         })
         .expect("create account")
         .id

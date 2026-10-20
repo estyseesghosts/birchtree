@@ -10,7 +10,8 @@ use crate::application::ports::{
     FollowOptions, FollowOutcome, Relationship, Store,
 };
 use crate::domain::{
-    Account, AccountNote, Block, DomainBlock, Endorsement, Error, Follow, Id, Mute, Result,
+    Account, AccountNote, Block, DomainBlock, Endorsement, Error, Follow, Id,
+    InteractionEvent, InteractionEventKind, Mute, Result,
 };
 
 /// Maximum private-note length (Mastodon `AccountNote::COMMENT_SIZE_LIMIT`).
@@ -86,7 +87,29 @@ pub fn follow(store: &dyn Store, now_ms: u64, cmd: FollowCommand) -> Result<Foll
     // A request only opens when there is no ACTIVE follow yet; an existing
     // row keeps its state (the store updates the options idempotently).
     let request = target.locked && !pair.following;
-    store.follow(cmd.follower_id, cmd.target_id, opts, request, now_ms)
+    let outcome = store.follow(cmd.follower_id, cmd.target_id, opts, request, now_ms)?;
+    // D39 `interactions` journal: upstream counts new follows AND new follow
+    // requests (`FollowService#call`, `app/services/follow_service.rb:33`),
+    // but not option changes on existing rows (early return). The store
+    // preserves `created_at_ms` across option updates, so a row stamped with
+    // this call's `now_ms` is genuinely new. Same-ms caveat: an option change
+    // issued within the same millisecond as the row's creation re-counts
+    // (upstream's pre-check avoids this; accepted — metrics, not authority).
+    // Journal failures never fail the follow (fire-and-forget, like
+    // `record_sign_in`).
+    let fresh = match &outcome {
+        FollowOutcome::Following(follow) | FollowOutcome::Requested(follow) => {
+            follow.created_at_ms == now_ms
+        }
+    };
+    if fresh {
+        let _ = store.record_interaction(InteractionEvent::for_journal(
+            cmd.follower_id,
+            InteractionEventKind::Follow,
+            now_ms,
+        ));
+    }
+    Ok(outcome)
 }
 
 /// Unfollow an account or cancel a pending follow request.

@@ -93,6 +93,15 @@ pub struct LocalUser {
     /// for every pre-7.3 record) means "no staff role".
     #[serde(default)]
     pub role: UserRole,
+    /// OAuth application that created this account via signup (`None` for
+    /// CLI-created and pre-attribution records). Upstream's
+    /// `require_user_owned_by_application!` gates the email-confirmation
+    /// resend/check endpoints on this; birchtree enforces it via
+    /// [`crate::application::accounts::check_confirmation_ownership`]:
+    /// `None` (grandfathered rows) is served to any calling app, a recorded
+    /// id must equal the caller's app id, otherwise `403 Forbidden`.
+    #[serde(default)]
+    pub created_by_application: Option<Id>,
 }
 
 /// Invite-token validity and code generation (round 3, area A).
@@ -233,4 +242,24 @@ pub struct SignInEvent {
     pub id: Id,
     pub account_id: Id,
     pub created_at_ms: u64,
+}
+
+/// A pending email token (confirmation or password reset): the bearer the
+/// mailed link carries. Stored by token string; redemption consumes the row
+/// (single-use). Tokens are random per request (`random_token_hex`); the
+/// deterministic job-id fallback only exists for registration jobs that
+/// predate an explicit token.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EmailToken {
+    pub account_id: Id,
+    pub kind: EmailTokenKind,
+    pub created_at_ms: u64,
+}
+
+/// Which flow an [`EmailToken`] belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmailTokenKind {
+    Confirmation,
+    PasswordReset,
 }

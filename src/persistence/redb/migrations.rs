@@ -397,6 +397,45 @@ pub fn apply(db: &Database) -> Result<u64, StoreError> {
             let _ = write.open_table(schema::SIGN_INS)?;
         }
 
+        // Step v12: durable invites, email index + tokens, interaction events
+        // (D12/D39 remainders). The event tables materialize from live
+        // traffic; the email index is backfilled from existing credential
+        // rows (bounded by the pre-v12 user count; skips rows without an
+        // address; re-inserting the same keys is a no-op).
+        if current < 12 {
+            let _ = write.open_table(schema::INVITES)?;
+            let _ = write.open_table(schema::EMAIL_INDEX)?;
+            let _ = write.open_table(schema::EMAIL_TOKENS)?;
+            let _ = write.open_table(schema::INTERACTION_EVENTS)?;
+            use redb::{ReadableTable, ReadableTableMetadata};
+            let backfill: Vec<(String, u64)> = {
+                let users = write.open_table(schema::LOCAL_USERS)?;
+                let user_count = users.len()? as usize;
+                let mut backfill = Vec::new();
+                for entry in users.range(0u64..=u64::MAX)? {
+                    let (_, value) = entry?;
+                    let user: serde_json::Value = serde_json::from_slice(value.value())?;
+                    let email = user
+                        .get("email")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|e| !e.is_empty());
+                    let account_id = user.get("account_id").and_then(|v| v.as_u64());
+                    if let (Some(email), Some(account_id)) = (email, account_id) {
+                        backfill.push((email.to_ascii_lowercase(), account_id));
+                    }
+                    if backfill.len() >= user_count {
+                        break;
+                    }
+                }
+                backfill
+            };
+            let mut index = write.open_table(schema::EMAIL_INDEX)?;
+            for (email, account_id) in backfill {
+                index.insert(email.as_str(), account_id)?;
+            }
+        }
+
         {
             let mut meta = write.open_table(META)?;
             meta.insert(

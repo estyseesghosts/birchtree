@@ -483,6 +483,7 @@ async fn serve(cfg: Config) {
         federation: federation.clone(),
         rate_limit_multiplier: cfg.rate_limit_multiplier,
         mail_env: Arc::new(birchtree::mailer::MailEnv::from_config(&cfg)),
+        invites: store.clone() as std::sync::Arc<dyn birchtree::application::accounts::InviteStore>,
     };
     if cfg.rate_limit_multiplier > 1 {
         tracing::warn!(multiplier = cfg.rate_limit_multiplier, "debug rate-limit weakening is in force: not for production");

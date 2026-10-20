@@ -524,6 +524,9 @@ async fn streaming_path_redirects_to_a_configured_host() {
         federation,
         rate_limit_multiplier: 1,
         mail_env: std::sync::Arc::new(birchtree::mailer::MailEnv::disabled()),
+        invites: std::sync::Arc::new(
+            birchtree::application::accounts::MemoryInviteStore::default(),
+        ),
     });
     let response = send(
         &router,

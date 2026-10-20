@@ -8,7 +8,7 @@
 
 use crate::application::ports::{PairState, Store};
 use crate::application::policy;
-use crate::domain::{Error, Id, Result, Status, Visibility};
+use crate::domain::{Error, Id, InteractionEvent, InteractionEventKind, Result, Status, Visibility};
 
 /// Load `status_id` as `viewer_id` under the show gate.
 ///
@@ -51,7 +51,23 @@ pub fn favourite(store: &dyn Store, viewer_id: Id, status_id: Id, now_ms: u64) -
     if !policy::can_favourite(viewer_id, &status, pair) {
         return Err(Error::NotFound("status".into()));
     }
-    store.favourite_status(viewer_id, status.id, now_ms)
+    // D39 journal: upstream counts only the create (`favourite_service.rb`
+    // returns early on an existing row). No newness signal comes back from
+    // the port, so pre-check the viewer flags; a same-instant double-tap can
+    // over-count by one, the same race upstream's check-then-create has.
+    let fresh = store
+        .viewer_status_flags(viewer_id, &[status.id])
+        .map(|flags| !flags.get(&status.id).is_some_and(|f| f.favourited))
+        .unwrap_or(true);
+    let status = store.favourite_status(viewer_id, status.id, now_ms)?;
+    if fresh {
+        let _ = store.record_interaction(InteractionEvent::for_journal(
+            viewer_id,
+            InteractionEventKind::Favourite,
+            now_ms,
+        ));
+    }
+    Ok(status)
 }
 
 /// `POST /api/v1/statuses/:id/unfavourite` — 200 no-op when the viewer never
@@ -103,7 +119,21 @@ pub fn reblog(
                 )
             })?,
     };
-    store.reblog_status(viewer_id, target.id, visibility, now_ms)
+    // D39 journal, same newness rule as favourite (upstream
+    // `reblog_service.rb` counts only the create).
+    let fresh = store
+        .viewer_status_flags(viewer_id, &[target.id])
+        .map(|flags| !flags.get(&target.id).is_some_and(|f| f.reblogged))
+        .unwrap_or(true);
+    let reblog = store.reblog_status(viewer_id, target.id, visibility, now_ms)?;
+    if fresh {
+        let _ = store.record_interaction(InteractionEvent::for_journal(
+            viewer_id,
+            InteractionEventKind::Reblog,
+            now_ms,
+        ));
+    }
+    Ok(reblog)
 }
 
 /// `POST /api/v1/statuses/:id/unreblog` — deletes the viewer's reblog of the

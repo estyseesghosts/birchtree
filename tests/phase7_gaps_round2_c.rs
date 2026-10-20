@@ -94,6 +94,9 @@ fn approval_server(require_approval: bool) -> ApprovalSrv {
         federation,
         rate_limit_multiplier: 1,
         mail_env: std::sync::Arc::new(birchtree::mailer::MailEnv::disabled()),
+        invites: std::sync::Arc::new(
+            birchtree::application::accounts::MemoryInviteStore::default(),
+        ),
     });
     ApprovalSrv {
         _dir: dir,
@@ -631,9 +634,12 @@ async fn d39_measures_served_and_refused() {
     let by_key = |key: &str| {
         rows.as_array().unwrap().iter().find(|r| r["key"] == key).cloned()
     };
-    for refused in ["interactions", "tag_accounts", "tag_uses", "tag_servers", "bogus_key"] {
+    for refused in ["tag_accounts", "tag_uses", "tag_servers", "bogus_key"] {
         assert!(by_key(refused).is_none(), "{refused} must stay omitted");
     }
+    // Round 4 serves `interactions` from the unified journal.
+    let interactions = by_key("interactions").expect("interactions served");
+    assert!(interactions.get("previous_total").is_some(), "in-window totals carry previous_total");
     let resolved = by_key("resolved_reports").expect("resolved_reports served");
     assert!(resolved["total"].as_str().unwrap().parse::<u64>().unwrap() >= 1);
     assert!(resolved.get("previous_total").is_some(), "in-window totals carry previous_total");

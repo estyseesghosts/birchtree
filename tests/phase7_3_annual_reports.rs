@@ -48,6 +48,9 @@ impl Harness {
             federation: federation_config(context, TEST_PUBLIC_URL),
             rate_limit_multiplier: 1,
         mail_env: std::sync::Arc::new(birchtree::mailer::MailEnv::disabled()),
+        invites: std::sync::Arc::new(
+            birchtree::application::accounts::MemoryInviteStore::default(),
+        ),
         };
         let router = axum::Router::new()
             .route("/api/v1/annual_reports", route_get(annual_reports::index))

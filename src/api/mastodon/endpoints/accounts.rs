@@ -23,6 +23,7 @@ use crate::application::ports::{
 };
 use crate::application::relationships;
 use crate::domain::Error as DomainError;
+use crate::domain::{EmailToken, EmailTokenKind};
 use crate::mailer::{MailEnv, MailError};
 
 /// Scope alternatives accepted by the write endpoints.
@@ -476,13 +477,14 @@ pub async fn search(
 }
 
 // ---------------------------------------------------------------------------
-// Invites + email (round 3, area A).
+// Invites + email (round 3, area A; D12 remainder closed here).
 //
 // Router wiring is parent-owned; the proposed routes are in the area report:
 //   GET  /invite/:invite_code               -> invite_show
+//   GET  /auth/confirmation                  -> confirmation::confirmation_get
 //   POST /api/v1/emails/confirmations       -> email_confirmation_create
 //   GET  /api/v1/emails/check_confirmation  -> email_confirmation_check
-//   POST /api/v1/emails/password_reset      -> password_reset_create (extension)
+//   POST /api/v1/emails/password_reset      -> password_reset_create (public)
 // ---------------------------------------------------------------------------
 
 /// Map a [`MailError`] to an explicit HTTP refusal. Disabled mail is `503`
@@ -535,15 +537,15 @@ pub async fn invite_show(
 /// (`app/controllers/api/v1/emails/confirmations_controller.rb:13-18`):
 /// re-sends the confirmation mail; `200 {}`. Requires a user token with
 /// `write`/`write:accounts` and an unconfirmed address (`403` otherwise, like
-/// upstream `require_user_not_confirmed!`). Without a mail provider the
+/// upstream `require_user_not_confirmed!`), and the caller's app must own the
+/// signup (`403` on mismatch, like upstream
+/// `require_user_owned_by_application!`; pre-attribution rows with no recorded
+/// app are grandfathered). Without a mail provider the
 /// answer is an explicit `503`, never a fake success. Delivery is a durable
 /// `SendConfirmationEmail` job (worker sends after commit, like upstream
-/// `deliver_later`); the token is random per request.
-///
-/// Not enforced (documented D12 remainder): `created_by_application`
-/// ownership (`require_user_owned_by_application!`) — birchtree stores no
-/// signup-app id yet — and confirmation redemption (no `auth/confirmation`
-/// flow yet, so `email_verified` never flips in-flow).
+/// `deliver_later`); the token is random per request and is stored durably
+/// BEFORE the job enqueues (a crash between the two leaves a harmless orphan
+/// token, never a mailed link with no backing row).
 pub async fn email_confirmation_create(
     State(state): State<ApiState>,
     auth: Auth,
@@ -562,6 +564,9 @@ pub async fn email_confirmation_create(
         Ok(None) => return ApiError::not_found().into_response(),
         Err(err) => return ApiError::from(err).into_response(),
     };
+    if let Err(err) = accounts::check_confirmation_ownership(&user, auth.0.app.id) {
+        return ApiError::from(err).into_response();
+    }
     if user.email_verified {
         return ApiError::forbidden(
             "This method is only available while the e-mail is awaiting confirmation",
@@ -582,6 +587,17 @@ pub async fn email_confirmation_create(
     // Random per request (unguessable, unlike the deterministic registration
     // token); the job payload carries it to the worker.
     let token = crate::application::crypto::random_token_hex(32);
+    let now_ms = state.context.now_ms();
+    if let Err(err) = store.store_email_token(
+        &token,
+        EmailToken {
+            account_id,
+            kind: EmailTokenKind::Confirmation,
+            created_at_ms: now_ms,
+        },
+    ) {
+        return ApiError::from(err).into_response();
+    }
     match store.enqueue(
         crate::domain::JobKind::SendConfirmationEmail,
         json!({
@@ -589,7 +605,7 @@ pub async fn email_confirmation_create(
             "email": email,
             "token": token,
         }),
-        state.context.now_ms(),
+        now_ms,
     ) {
         Ok(_) => axum::Json(json!({})).into_response(),
         Err(err) => ApiError::from(err).into_response(),
@@ -598,7 +614,10 @@ pub async fn email_confirmation_create(
 
 /// `GET /api/v1/emails/check_confirmation` — mirrors
 /// `Api::V1::Emails::ConfirmationsController#check`: `200 true`/`false` for
-/// whether the caller's address is confirmed. User token, `read` scope.
+/// whether the caller's address is confirmed. User token, `read` scope. The
+/// caller's app must own the signup (`403` on mismatch, like upstream
+/// `require_user_owned_by_application!`; pre-attribution rows are
+/// grandfathered).
 pub async fn email_confirmation_check(State(state): State<ApiState>, auth: Auth) -> Response {
     if let Err(err) = auth.0.require_scopes(&["read", "read:accounts"]) {
         return err.into_response();
@@ -609,56 +628,90 @@ pub async fn email_confirmation_check(State(state): State<ApiState>, auth: Auth)
     };
     let store: &dyn Store = &*state.context.store;
     match store.user_by_account_id(account_id) {
-        Ok(Some(user)) => axum::Json(json!(user.email_verified)).into_response(),
+        Ok(Some(user)) => {
+            if let Err(err) = accounts::check_confirmation_ownership(&user, auth.0.app.id) {
+                return ApiError::from(err).into_response();
+            }
+            axum::Json(json!(user.email_verified)).into_response()
+        }
         Ok(None) => ApiError::not_found().into_response(),
         Err(err) => ApiError::from(err).into_response(),
     }
 }
 
-/// `POST /api/v1/emails/password_reset` — sends a reset mail to the caller's
-/// own address (`200 {}`). Birchtree extension: upstream has no API reset
-/// route (web-only `/auth/password`). A public forgot-password endpoint
-/// needs an email index the store port does not have yet (proposal in the
-/// area report); scoping to the authenticated user needs none and cannot
-/// enumerate accounts.
+/// `POST /api/v1/emails/password_reset` — public forgot-password flow
+/// (`200 {}` always, when mail is configured).
+///
+/// This replaces the earlier authenticated-only extension. Upstream has no API
+/// reset route at all (password reset is web-only: `POST /auth/password`,
+/// Devise `PasswordsController#create`, which is unauthenticated and always
+/// redirects visibly-successful). The Devise parity shape is therefore a
+/// public endpoint taking an `email` param: a known address stores a token
+/// and queues a `SendPasswordResetEmail` job; an unknown address queues
+/// nothing — and every case answers the same `200 {}` so the endpoint is
+/// never an account-enumeration oracle. (The authed-only variant is dropped
+/// because it matches neither upstream surface: no client that speaks the
+/// Devise flow can use it, and it cannot serve a user who forgot their
+/// password but still holds a token.)
+///
+/// When no mail provider is configured the answer is the same explicit `503`
+/// for known and unknown addresses alike (still no oracle: the response
+/// carries no information about the address).
 pub async fn password_reset_create(
     State(state): State<ApiState>,
-    auth: Auth,
     Extension(env): Extension<Arc<MailEnv>>,
+    FormBody(pairs): FormBody,
 ) -> Response {
-    if let Err(err) = auth.0.require_scopes(&["write", "write:accounts"]) {
-        return err.into_response();
-    }
-    let account_id = match auth.0.require_user() {
-        Ok(id) => id,
-        Err(err) => return err.into_response(),
-    };
-    let store: &dyn Store = &*state.context.store;
-    let user = match store.user_by_account_id(account_id) {
-        Ok(Some(user)) => user,
-        Ok(None) => return ApiError::not_found().into_response(),
-        Err(err) => return ApiError::from(err).into_response(),
-    };
-    let Some(email) = user.email else {
-        return ApiError::unprocessable("email address is missing").into_response();
-    };
+    let email_param = forms::get(&pairs, "email").unwrap_or("").trim().to_string();
+    let now_ms = state.context.now_ms();
     if !env.enabled {
         return mail_error_response(MailError::Disabled(
             "no SMTP provider configured (set smtp_url and mail_from)",
         ));
     }
-    if let Err(err) = crate::mailer::validate_address(&email) {
-        return mail_error_response(err);
+    let store: &dyn Store = &*state.context.store;
+    let account = match store.account_by_email(&email_param) {
+        Ok(account) => account,
+        Err(err) => return ApiError::from(err).into_response(),
+    };
+    // Unknown address: queue nothing, answer 200 (no enumeration oracle).
+    let Some(account) = account else {
+        return axum::Json(json!({})).into_response();
+    };
+    let address = match store.user_by_account_id(account.id) {
+        Ok(Some(user)) => user.email,
+        Ok(None) => None,
+        Err(err) => return ApiError::from(err).into_response(),
+    };
+    let Some(address) = address else {
+        return axum::Json(json!({})).into_response();
+    };
+    // A stored address that no longer validates is dropped silently (answering
+    // 422 here would turn the endpoint into an oracle for known addresses).
+    if crate::mailer::validate_address(&address).is_err() {
+        return axum::Json(json!({})).into_response();
     }
     let token = crate::application::crypto::random_token_hex(32);
+    // Durable first, as on the confirmation resend: a crash between the two
+    // leaves a harmless orphan token, never a mailed link with no backing row.
+    if let Err(err) = store.store_email_token(
+        &token,
+        EmailToken {
+            account_id: account.id,
+            kind: EmailTokenKind::PasswordReset,
+            created_at_ms: now_ms,
+        },
+    ) {
+        return ApiError::from(err).into_response();
+    }
     match store.enqueue(
         crate::domain::JobKind::SendPasswordResetEmail,
         json!({
-            "account_id": account_id.value(),
-            "email": email,
+            "account_id": account.id.value(),
+            "email": address,
             "token": token,
         }),
-        state.context.now_ms(),
+        now_ms,
     ) {
         Ok(_) => axum::Json(json!({})).into_response(),
         Err(err) => ApiError::from(err).into_response(),

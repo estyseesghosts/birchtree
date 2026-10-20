@@ -21,6 +21,72 @@ pub struct AdminDomainAllow {
     pub created_at_ms: u64,
 }
 
+/// A unified interaction event for the admin `interactions` measure (D39).
+/// Upstream journals these in Redis (`ActivityTracker('activity:interactions')`,
+/// `:basic` per-day counters read by
+/// `app/lib/admin/metrics/measure/interactions_measure.rb`); birchtree appends
+/// one row per local interaction to `INTERACTION_EVENTS`. Writers live in the
+/// application use cases; the kinds below match upstream's five tracker call
+/// sites exactly (verified 2026-10-20 against Mastodon v4.7.3 `8ff11c2b`):
+/// - `Reply`: `PostStatusService#bump_potential_friendship!`
+///   (`app/services/post_status_service.rb:262-266`) — fires ONLY for replies
+///   to another account (`return if !@status.reply? ||
+///   @account.id == @status.in_reply_to_account_id`). Top-level posts and
+///   self-replies never increment, so there is deliberately no `Post` kind.
+/// - `Favourite`: `FavouriteService#increment_statistics`
+///   (`app/services/favourite_service.rb:40-42`) — after create; re-favourites
+///   of an existing row return early without incrementing.
+/// - `Reblog`: `ReblogService#increment_statistics`
+///   (`app/services/reblog_service.rb:49-51`) — same dedup shape.
+/// - `Vote`: `VoteService#call` (`app/services/vote_service.rb:33`) —
+///   unconditional after the ballot transaction (even when `already_voted`).
+/// - `Follow`: `FollowService#call` (`app/services/follow_service.rb:33`) —
+///   before the direct/request branch (follow requests count too), but after
+///   the already-following/requested early returns (option changes don't).
+///
+/// Local user actions only: federation inbound calls the store ports directly
+/// (`application::federation_inbound`), bypassing the journaling use cases,
+/// so remote activity never lands here — matching upstream, where only the
+/// local services above increment the tracker.
+///
+/// Storage ids are minted server-side by the `InteractionLog` implementation
+/// (like every other store write); `InteractionEvent.id` on a passed-in event
+/// is replaced, never trusted.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InteractionEvent {
+    pub id: Id,
+    pub account_id: Id,
+    pub kind: InteractionEventKind,
+    pub created_at_ms: u64,
+}
+
+impl InteractionEvent {
+    /// Build an event for journaling; the store replaces [`Id::new`]`(0)`
+    /// with a freshly minted timestamp-oriented id on write.
+    pub fn for_journal(account_id: Id, kind: InteractionEventKind, created_at_ms: u64) -> Self {
+        Self {
+            id: Id::new(0),
+            account_id,
+            kind,
+            created_at_ms,
+        }
+    }
+}
+
+/// Interaction kinds journaled for the `interactions` measure.
+///
+/// `Post` is deliberately absent: upstream only counts non-self replies
+/// (`PostStatusService#bump_potential_friendship!`), never top-level posts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionEventKind {
+    Reply,
+    Favourite,
+    Reblog,
+    Vote,
+    Follow,
+}
+
 /// Severity of a server-level domain block (upstream `DomainBlock` enum).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]

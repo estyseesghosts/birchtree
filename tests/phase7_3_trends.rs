@@ -52,6 +52,9 @@ fn api_state(srv: &TestServer, trends_enabled: bool) -> ApiState {
         federation,
         rate_limit_multiplier: 1,
         mail_env: std::sync::Arc::new(birchtree::mailer::MailEnv::disabled()),
+        invites: std::sync::Arc::new(
+            birchtree::application::accounts::MemoryInviteStore::default(),
+        ),
     }
 }
 

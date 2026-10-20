@@ -205,4 +205,7 @@ pub struct ApiState {
     /// Outbound-mail environment (sender + enabled flag, from server config).
     /// The request path only enqueues mail jobs; delivery runs in the worker.
     pub mail_env: std::sync::Arc<crate::mailer::MailEnv>,
+    /// Invite-token store (durable redb backend in production, memory in
+    /// tests). Threaded explicitly so the backend is visible, not ambient.
+    pub invites: std::sync::Arc<dyn crate::application::accounts::InviteStore>,
 }

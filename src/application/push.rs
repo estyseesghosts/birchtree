@@ -15,16 +15,20 @@
 //! (upstream removes gone endpoints the same way). Network I/O never runs
 //! inside a request transaction.
 //!
-//! Delivery (round 3, area C closes the encryption half): standard
-//! subscriptions get an RFC 8291 `aes128gcm`-encrypted JSON payload (the
+//! Delivery (round 3, area C closes the encryption half; round 4 the legacy
+//! half): standard subscriptions get an RFC 8291 `aes128gcm`-encrypted JSON
+//! payload and legacy (`!standard`, keys present) subscriptions get a
+//! draft-ietf-webpush-encryption-04 `aesgcm`-encrypted JSON payload (the
 //! `Web::NotificationSerializer` shape — see `push_notification_payload` for
-//! the two documented field deviations) under the same VAPID identity and
-//! the same TTL/urgency, with the same policy/alert gates and the same
-//! gone-endpoint cleanup. Legacy (`!standard`) subscriptions keep the
-//! VAPID tickle: the wire stays RFC 8030-compliant (a push message MAY have
-//! no body), at the cost that those clients cannot render the notification
-//! without fetching. Upstream's legacy `aesgcm` encoding is not implemented
-//! (recorded in the D42 register note).
+//! the two documented field deviations), each under the same VAPID identity
+//! and the same TTL/urgency, with the same policy/alert gates and the same
+//! gone-endpoint cleanup. The legacy wire matches upstream's
+//! `perform_legacy_request` exactly: the ciphertext alone is the body with
+//! `Content-Encoding: aesgcm`, `Encryption: salt=…`,
+//! `Crypto-Key: dh=…;<vapid key>` and `Authorization: WebPush <jwt>`.
+//! Legacy rows with no keys keep the VAPID tickle: the wire stays RFC
+//! 8030-compliant (a push message MAY have no body), at the cost that those
+//! clients cannot render the notification without fetching.
 
 use std::collections::HashMap;
 
@@ -177,9 +181,11 @@ pub fn push_audience_origin(endpoint: &str) -> std::result::Result<String, Strin
 
 /// An RFC 8030 delivery request: VAPID headers, TTL and urgency matching
 /// upstream's worker. `body` is empty (a "tickle" — the client wakes and
-/// fetches) for legacy (`!standard`) subscriptions; for standard
-/// subscriptions it carries the RFC 8291 `aes128gcm` ciphertext with
-/// `content_encoding` set (round 3, area C; closes the D42 encryption gap).
+/// fetches) for legacy (`!standard`) subscriptions with no keys; for
+/// standard subscriptions it carries the RFC 8291 `aes128gcm` ciphertext
+/// with `content_encoding` set (round 3, area C), and for legacy
+/// subscriptions with keys the `aesgcm` ciphertext with `content_encoding`
+/// set plus the `encryption` header (round 4, D42 remainder).
 #[derive(Debug, Clone)]
 pub struct PushRequest {
     pub url: String,
@@ -188,6 +194,10 @@ pub struct PushRequest {
     pub ttl_secs: u64,
     pub body: Vec<u8>,
     pub content_encoding: Option<String>,
+    /// `Encryption: salt=…`, legacy-`aesgcm` only (upstream's legacy request
+    /// carries the salt in this header; the standard encoding embeds it in
+    /// the body instead). `None` for tickles and standard deliveries.
+    pub encryption: Option<String>,
 }
 
 pub fn build_push_request(
@@ -212,6 +222,7 @@ pub fn build_push_request(
         ttl_secs: PUSH_TTL_SECS,
         body: Vec::new(),
         content_encoding: None,
+        encryption: None,
     })
 }
 
@@ -239,6 +250,57 @@ pub fn build_push_request_encrypted(
     tickle.body = encrypted.body;
     tickle.content_encoding = Some(encrypted.content_encoding.to_string());
     Ok(tickle)
+}
+
+/// Whether the subscription carries keys to encrypt under. Write-time
+/// validation (`domain::conversation::validate_push_keys`) requires both
+/// halves, so a row with a missing half predates validation or bypassed the
+/// API; such rows keep the bodiless tickle (they cannot be encrypted and are
+/// never dropped for it).
+fn subscription_has_keys(subscription: &WebPushSubscription) -> bool {
+    !subscription.key_p256dh.trim().is_empty() && !subscription.key_auth.trim().is_empty()
+}
+
+/// Build the legacy encrypted delivery for a keyed non-standard subscription
+/// (upstream `perform_legacy_request`,
+/// `app/workers/web/push_notification_worker.rb:42-61`): the same VAPID
+/// identity/TTL/urgency as the tickle, but the body is the `aesgcm`
+/// encryption of `payload_json` under the subscription keys, with
+/// `Content-Encoding: aesgcm`, `Encryption: salt=<base64url(salt)>`,
+/// `Crypto-Key: dh=<base64url(server_pub)>;<vapid key>` and the legacy
+/// `Authorization: WebPush <jwt>` scheme (upstream
+/// `WebPushRequest#legacy_authorization_header`).
+///
+/// Key errors name only the role and length (never key bytes) and are
+/// returned for the caller to map onto subscription cleanup, like
+/// upstream's invalid-row destroy.
+pub fn build_push_request_aesgcm(
+    subscription: &WebPushSubscription,
+    keys: &VapidKeys,
+    subject: &str,
+    now_ms: u64,
+    payload_json: &[u8],
+) -> std::result::Result<PushRequest, String> {
+    use base64::Engine as _;
+    let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let mut request = build_push_request(subscription, keys, subject, now_ms)?;
+    let encrypted = crate::application::push_crypto::encrypt_aesgcm(
+        &subscription.key_p256dh,
+        &subscription.key_auth,
+        payload_json,
+    )?;
+    let audience = push_audience_origin(&subscription.endpoint)?;
+    let jwt = vapid_jwt(keys, &audience, subject, now_ms)?;
+    request.authorization = format!("WebPush {jwt}");
+    request.crypto_key = format!(
+        "dh={};{}",
+        enc.encode(encrypted.server_pub),
+        request.crypto_key
+    );
+    request.encryption = Some(format!("salt={}", enc.encode(encrypted.salt)));
+    request.body = encrypted.ciphertext;
+    request.content_encoding = Some(encrypted.content_encoding.to_string());
+    Ok(request)
 }
 
 fn subscription_key_trimmed(raw: &str) -> &str {
@@ -273,7 +335,9 @@ pub fn classify_push_response(status: u16) -> PushOutcome {
 /// their `Content-Encoding` (upstream's standard request adds the same
 /// pair, plus `Authorization`, `Ttl`/`TTL`, `Urgency` and `Unsubscribe-URL`;
 /// the unsubscribe URL is a web-route concern and stays out of this
-/// transport type).
+/// transport type). Legacy `aesgcm` requests additionally carry the
+/// `Encryption: salt=…` header (upstream's legacy request sends it
+/// alongside `Crypto-Key: dh=…;…`).
 pub async fn deliver_push(
     client: &reqwest::Client,
     request: &PushRequest,
@@ -288,6 +352,9 @@ pub async fn deliver_push(
         outgoing = outgoing
             .header("Content-Type", "application/octet-stream")
             .header("Content-Encoding", encoding.clone());
+    }
+    if let Some(encryption) = &request.encryption {
+        outgoing = outgoing.header("Encryption", encryption.clone());
     }
     let response = outgoing.body(request.body.clone()).send().await;
     match response {
@@ -386,8 +453,10 @@ pub enum PushJobOutcome {
 /// Loads both rows, skips stale notifications (older than the 48 h TTL),
 /// checks the subscription's policy/alert gates against the notification,
 /// then sends: an RFC 8291 `aes128gcm`-encrypted JSON payload for standard
-/// subscriptions (round 3, area C), the VAPID tickle for legacy
-/// (`!standard`) ones. Missing rows complete silently (upstream rescues
+/// subscriptions (round 3, area C), an `aesgcm`-encrypted JSON payload for
+/// legacy (`!standard`) subscriptions with keys (round 4, upstream
+/// `perform_legacy_request`), and the VAPID tickle for legacy subscriptions
+/// with no keys. Missing rows complete silently (upstream rescues
 /// `RecordNotFound` the same way).
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_push_job(
@@ -439,11 +508,12 @@ pub async fn handle_push_job(
     if !notification_activity_present(store, &notification)? {
         return Ok(PushJobOutcome::Complete);
     }
-    // Standard subscriptions get the encrypted payload (upstream
-    // `perform_standard_request`); legacy ones keep the tickle (upstream
-    // `perform_legacy_request` used `aesgcm`, which this server does not
-    // implement — the tickle stays RFC 8030-compliant and is documented in
-    // the D42 register note).
+    // Standard subscriptions get the `aes128gcm` payload (upstream
+    // `perform_standard_request`); keyed legacy ones get the `aesgcm`
+    // payload (upstream `perform_legacy_request`); keyless legacy rows keep
+    // the tickle (this server's RFC 8030-compliant fallback for rows that
+    // predate key validation — upstream destroys such rows instead, via its
+    // `unless valid?` gate, but a bodiless tickle never misfires).
     let request = if subscription.standard {
         let payload_json = push_notification_payload(store, &notification)?;
         match build_push_request_encrypted(&subscription, keys, subject, now_ms, &payload_json) {
@@ -452,6 +522,17 @@ pub async fn handle_push_job(
             // write-time validation): drop the subscription, like upstream's
             // invalid-row destroy. Never retries: the keys will not heal.
             // The reason names only roles and lengths, never key bytes.
+            Err(message) => {
+                tracing::warn!(reason = message, "web_push_delivery: dropping subscription");
+                return Ok(PushJobOutcome::DeleteSubscriptionAndComplete(subscription.id));
+            }
+        }
+    } else if subscription_has_keys(&subscription) {
+        let payload_json = push_notification_payload(store, &notification)?;
+        match build_push_request_aesgcm(&subscription, keys, subject, now_ms, &payload_json) {
+            Ok(request) => request,
+            // Same invalid-row destroy as the standard path: corrupt keys
+            // will not heal, and a tickle would hide the breakage.
             Err(message) => {
                 tracing::warn!(reason = message, "web_push_delivery: dropping subscription");
                 return Ok(PushJobOutcome::DeleteSubscriptionAndComplete(subscription.id));

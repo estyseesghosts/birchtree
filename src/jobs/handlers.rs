@@ -59,7 +59,8 @@ pub fn handle_with_transcode(
             // The resend endpoint puts an explicit random token in the
             // payload; registration jobs carry none, so fall back to the
             // job-id derivation (a retried job never mints a different
-            // value). A real adapter would persist/redeem it.
+            // value). The bearer is persisted before sending so the mailed
+            // link is redeemable; overwrite = idempotent across retries.
             let token;
             let token = match job.payload.get("token").and_then(|v| v.as_str()) {
                 Some(explicit) if !explicit.is_empty() => explicit,
@@ -68,6 +69,15 @@ pub fn handle_with_transcode(
                     token.as_str()
                 }
             };
+            // D12: persist the bearer before sending so the mailed link is redeemable.
+            // Overwrite = idempotent: a retried job re-stores the same deterministic token.
+            if let Err(err) = store.store_email_token(token, crate::domain::EmailToken {
+                account_id,
+                kind: crate::domain::EmailTokenKind::Confirmation,
+                created_at_ms: job.created_at_ms,
+            }) {
+                tracing::warn!(error = %err, "confirmation token store failed");
+            }
             mailer.send_confirmation(email, account_id, token)
         }
         JobKind::SendPasswordResetEmail => {

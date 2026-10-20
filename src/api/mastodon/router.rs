@@ -22,8 +22,7 @@ pub fn build_router(state: ApiState) -> Router {
     let max_body = state.max_body_size;
     let rate_multiplier = state.rate_limit_multiplier;
     let ip_block_state = state.clone();
-    let invites: std::sync::Arc<dyn crate::application::accounts::InviteStore> =
-        std::sync::Arc::new(crate::application::accounts::MemoryInviteStore::default());
+    let invites = state.invites.clone();
     let mail_env = state.mail_env.clone();
     Router::new()
         // Runtime probes.
@@ -36,6 +35,12 @@ pub fn build_router(state: ApiState) -> Router {
         )
         .route("/oauth/token", post(token::token))
         .route("/oauth/revoke", post(token::revoke))
+        // Email confirmation redemption (D12): browser link from the mailed
+        // token; success vs invalid/used shapes, no JS.
+        .route(
+            "/auth/confirmation",
+            get(crate::api::oauth::confirmation::confirmation_get),
+        )
         // Instance.
         .route("/api/v1/instance", get(endpoints::instance::v1))
         .route("/api/v2/instance", get(endpoints::instance::v2))
@@ -58,10 +63,9 @@ pub fn build_router(state: ApiState) -> Router {
             get(endpoints::accounts::relationships),
         )
         .route("/api/v1/accounts/:id", get(endpoints::accounts::show))
-        // Invites + email (round 3, area A). `MailEnv::disabled()` makes the
-        // mail endpoints answer an explicit 503 until an SMTP provider is
-        // configured; `MemoryInviteStore` is the dev/test backend — the
-        // durable redb implementation is follow-up work (see D12).
+        // Invites + email. Without a mail provider the mail endpoints
+        // answer an explicit 503 (never fake success); invites read the
+        // configured store (durable redb in production).
         .route("/invite/:invite_code", get(endpoints::accounts::invite_show))
         .route(
             "/api/v1/emails/confirmations",

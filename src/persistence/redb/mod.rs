@@ -35,6 +35,11 @@ pub mod search;
 pub mod federation;
 pub mod federation_content;
 
+// D39 remainder: unified interaction-event journal backing the admin
+// `interactions` measure. Table + migration are schema v12 (parent); the
+// `InteractionLog` implementation lands with the metrics work.
+pub mod interactions;
+
 // Phase 7.3: admin account moderation, the moderator report queue and the
 // audit trail (subagent B). Shares the `ADMIN_AUDIT` table with subagent C's
 // `AdminInfraStore` audit writes (same record shape, `target_type`

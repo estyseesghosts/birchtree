@@ -13,7 +13,10 @@ use crate::domain::{
     AdminIpSeverity, AdminMediaOwner, AdminReportTarget, AdminTag, AnnualReport,
     AuthorizationCode, Block, CustomEmoji, CustomFilter,
     DomainBlock,
-    Endorsement, FilterKeyword, FilterStatus, Follow, FollowMetricRow, Id, Job, JobKind, List,
+    EmailToken,
+    Endorsement, Error, FilterKeyword, FilterStatus, Follow, FollowMetricRow, Id, Job, JobKind,
+    InteractionEvent, InteractionEventKind,
+    List,
     LocalUser,
     LoginSession, Marker, MediaAttachment, Mute, NewAnnualReport, Notification, NotificationPolicy,
     NotificationRequest, NotificationType,
@@ -46,6 +49,10 @@ pub struct NewLocalAccount {
     /// `false` when the operator requires approval (the pending queue);
     /// operator-created accounts are always approved.
     pub approved: bool,
+    /// OAuth application that performed the signup (`None` for CLI-created
+    /// and pre-attribution records). Recorded on the credential row for the
+    /// email-confirmation ownership check (D12 remainder).
+    pub created_by_application: Option<Id>,
 }
 
 /// Input for registering an OAuth application.
@@ -163,6 +170,33 @@ pub trait AccountStore: Send + Sync {
     /// telemetry (D39). Called once when a local user completes the browser
     /// password login; API calls on an existing token are not sign-ins.
     fn record_sign_in(&self, account_id: Id, now_ms: u64) -> Result<()>;
+
+    /// Resolve a local account by email address (normalized lowercase; D12
+    /// public forgot-password). `None` for unknown addresses — the caller,
+    /// not this method, decides what to reveal (no enumeration oracle here).
+    /// Scaffold default refuses loudly; RedbStore overrides.
+    fn account_by_email(&self, _normalized_email: &str) -> Result<Option<Account>> {
+        Err(Error::Internal("account_by_email is not implemented".into()))
+    }
+
+    /// Flip the email-verified flag (D12 confirmation redemption).
+    /// Scaffold default refuses loudly; RedbStore overrides.
+    fn set_email_verified(&self, _account_id: Id, _verified: bool) -> Result<LocalUser> {
+        Err(Error::Internal("set_email_verified is not implemented".into()))
+    }
+
+    /// Store a pending email token (D12 redemption; single-use bearer).
+    /// Scaffold default refuses loudly; RedbStore overrides.
+    fn store_email_token(&self, _token: &str, _record: EmailToken) -> Result<()> {
+        Err(Error::Internal("store_email_token is not implemented".into()))
+    }
+
+    /// Consume a pending email token: returns the record and deletes the row
+    /// (`None` for unknown/already-used tokens). Scaffold default refuses
+    /// loudly; RedbStore overrides.
+    fn redeem_email_token(&self, _token: &str) -> Result<Option<EmailToken>> {
+        Err(Error::Internal("redeem_email_token is not implemented".into()))
+    }
 }
 
 /// OAuth applications, authorization codes and access tokens.
@@ -1977,6 +2011,31 @@ pub trait TimelineStore: Send + Sync {
     ) -> Result<TimelinePage>;
 }
 
+/// Unified interaction-event journal backing the admin `interactions`
+/// measure (D39). Writers are the application use cases, one row per local
+/// interaction; readers are the admin measures. Scaffold defaults refuse
+/// loudly; RedbStore overrides (see `persistence::redb::interactions`).
+pub trait InteractionLog: Send + Sync {
+    /// Append one interaction event (idempotent only by construction: callers
+    /// journal each user action once; a retried *job* must not re-journal —
+    /// journal at the use-case commit, never in a job handler).
+    fn record_interaction(&self, event: InteractionEvent) -> Result<()> {
+        let _ = event;
+        Err(Error::Internal("record_interaction is not implemented".into()))
+    }
+
+    /// Count journaled events in `[since_ms, until_ms)`, optionally filtered
+    /// to one kind. `None` kind counts everything (the `interactions` key).
+    fn count_interactions(
+        &self,
+        _kind: Option<InteractionEventKind>,
+        _since_ms: u64,
+        _until_ms: u64,
+    ) -> Result<u64> {
+        Err(Error::Internal("count_interactions is not implemented".into()))
+    }
+}
+
 /// Bundled persistence surface assembled into a `Context`.
 ///
 /// Implemented once by the `redb` adapter; application code depends on the
@@ -1987,6 +2046,7 @@ pub trait Store:
     + SessionStore
     + JobQueue
     + ReadyCheck
+    + InteractionLog
     + StatusStore
     + RelationshipStore
     + PollStore
@@ -2017,6 +2077,7 @@ impl<T> Store for T where
         + SessionStore
         + JobQueue
         + ReadyCheck
+        + InteractionLog
         + StatusStore
         + RelationshipStore
         + PollStore

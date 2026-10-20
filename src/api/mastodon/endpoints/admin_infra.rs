@@ -932,14 +932,17 @@ pub async fn tags_update(State(state): State<ApiState>, auth: Auth, Path(id): Pa
 const METRIC_SCAN_CAP: usize = 200_000;
 const DAY_MS: u64 = 86_400_000;
 
-/// D39 refused keys (round 3): served-or-refused, never zero-filled. Each
-/// known-but-uncomputable key stays absent from the response array (upstream's
-/// `filter_map` drops unknown keys the same way); the reason lives here and
-/// in the dashboard note, not in the wire shape.
-pub const REFUSED_INTERACTIONS: &str =
-    "no unified interaction event log: posts, favourites, reblogs, votes and follows are not journaled as events (upstream `ActivityTracker('activity:interactions')`)";
+/// D39 refused keys (round 3, narrowed round 4): served-or-refused, never
+/// zero-filled. Each known-but-uncomputable key stays absent from the response
+/// array (upstream's `filter_map` drops unknown keys the same way); the reason
+/// lives here and in the dashboard note, not in the wire shape.
+///
+/// `interactions` was refused until the unified event journal landed; it is
+/// served since round 4 (writers: non-self replies, favourites, reblogs,
+/// votes, new follows/requests — the five upstream tracker call sites), so
+/// its reason constant is gone.
 pub const REFUSED_SOFTWARE_VERSIONS: &str =
-    "no component-version census is collected (upstream reports mastodon/ruby/postgresql/redis/search/libvips/ffmpeg)";
+    "no component-version census is collected: upstream `software_versions` reports mastodon/ruby/postgresql/redis/[elasticsearch|opensearch]/libvips/ffmpeg per row (`app/lib/admin/metrics/dimension/software_versions_dimension.rb:13-19`), each probed live (SELECT VERSION(), redis INFO, Chewy client info, Vips.version_string, ffprobe output). This server has no postgresql/redis/search processes to probe and collects no ruby/libvips/ffmpeg version rows, so the key stays absent rather than fabricated";
 /// `tag_*` measures and dimensions require `<key>[id]` (upstream
 /// `params.require(key).permit(:id)` → 400 when missing). Without the id the
 /// key is omitted (lenient where upstream is strict); the reason is recorded
@@ -1372,8 +1375,49 @@ pub async fn measures(State(state): State<ApiState>, auth: Auth, LenientForm(bod
                     "data": daily_data(&buckets, &counts),
                 }));
             }
+            "interactions" => {
+                // D39 served (round 4): the unified interaction journal —
+                // non-self replies, favourites, reblogs, votes and new
+                // follows/requests (upstream's five `activity:interactions`
+                // tracker call sites). Shape matches upstream's
+                // `MeasureSerializer` (`key/unit/total/previous_total/data`,
+                // daily values as strings): totals are sums of the daily
+                // buckets, like `active_users` above. One bounded range scan
+                // per bucket plus one for the previous window; the end bound
+                // is inclusive on the wire, exclusive in the store call.
+                let end_excl = end.saturating_add(1);
+                let mut counts = Vec::with_capacity(buckets.len());
+                for &day in &buckets {
+                    let low = day.max(start);
+                    let high = day.saturating_add(DAY_MS).min(end_excl);
+                    let bucket_count = if low < high {
+                        match store.count_interactions(None, low, high) {
+                            Ok(bucket_count) => bucket_count,
+                            Err(err) => return ApiError::from(err).into_response(),
+                        }
+                    } else {
+                        0
+                    };
+                    counts.push(bucket_count);
+                }
+                let total: u64 = counts.iter().sum();
+                let previous = match store.count_interactions(
+                    None,
+                    prev_start,
+                    prev_end.saturating_add(1),
+                ) {
+                    Ok(previous) => previous,
+                    Err(err) => return ApiError::from(err).into_response(),
+                };
+                out.push(json!({
+                    "key": "interactions",
+                    "unit": Value::Null,
+                    "total": total.to_string(),
+                    "previous_total": previous.to_string(),
+                    "data": daily_data(&buckets, &counts),
+                }));
+            }
             _ => {
-                // `interactions` stays refused (D39, [`REFUSED_INTERACTIONS`]).
                 // `tag_accounts`, `tag_uses` and `tag_servers` are served
                 // above when `<key>[id]>` names a tag; without a resolvable id
                 // they stay omitted ([`REFUSED_TAG_NO_ID`] /
@@ -1477,7 +1521,7 @@ pub async fn measures(State(state): State<ApiState>, auth: Auth, LenientForm(bod
                     }
                 }
                 // Omitted like unknown keys upstream (`filter_map` drops
-                // them): `interactions` ([`REFUSED_INTERACTIONS`]).
+                // them).
             }
         }
     }

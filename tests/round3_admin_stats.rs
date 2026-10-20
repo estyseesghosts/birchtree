@@ -291,14 +291,16 @@ async fn tag_dimensions_served_with_id() {
 #[tokio::test]
 async fn refused_keys_stay_absent_with_reasons() {
     let (srv, _app, admin_token) = admin_fixture().await;
+    // Round 4 serves `interactions` from the unified journal (D39); it is
+    // present with the upstream measure shape once any action is journaled.
     let rows = admin_measures(&srv.router, &admin_token, "keys[]=interactions&keys[]=new_users").await;
-    assert!(by_key(&rows, "interactions").is_none(), "no event log: {rows}");
+    let interactions = by_key(&rows, "interactions").expect("interactions served");
+    assert_eq!(interactions["total"], "0");
     assert!(by_key(&rows, "new_users").is_some());
     let rows = admin_dimensions(&srv.router, &admin_token, "keys[]=software_versions&keys[]=servers").await;
     assert!(by_key(&rows, "software_versions").is_none(), "no census: {rows}");
     assert!(by_key(&rows, "servers").is_some());
-    // The reasons are locked as constants (dashboard note cites them).
-    assert!(birchtree::api::mastodon::endpoints::admin_infra::REFUSED_INTERACTIONS.contains("event log"));
+    // The remaining reason is locked as a constant (dashboard note cites it).
     assert!(
         birchtree::api::mastodon::endpoints::admin_infra::REFUSED_SOFTWARE_VERSIONS
             .contains("census")

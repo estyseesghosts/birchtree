@@ -33,9 +33,9 @@ use crate::application::crypto;
 use crate::application::ports::{AccountStore, NewLocalAccount, OAuthStore};
 use crate::domain::account::{normalize_username, validate_username};
 use crate::domain::user::{
-    INVITE_COMMENT_LIMIT, Invite, InviteRefusal, invite_code_from_seed,
+    INVITE_COMMENT_LIMIT, EmailTokenKind, Invite, InviteRefusal, invite_code_from_seed,
 };
-use crate::domain::{AccessToken, Account, Error, Id, OAuthApplication, Result};
+use crate::domain::{AccessToken, Account, Error, Id, LocalUser, OAuthApplication, Result};
 use crate::mailer::{MailError, Mailer};
 
 /// Minimum password length (Mastodon requires at least 8 characters).
@@ -115,6 +115,10 @@ pub fn create_account(
         send_confirmation_email: false,
         // Operator-created accounts are usable immediately.
         approved: true,
+        // The CLI is not an OAuth application, so there is no signup-app
+        // attribution (the ownership check grandfathers `None`; see
+        // `check_confirmation_ownership`).
+        created_by_application: None,
     })
 }
 
@@ -175,6 +179,11 @@ pub fn register_account(
         now_ms,
         send_confirmation_email: true,
         approved: !require_approval,
+        // Signup-app attribution (D12): records which OAuth application
+        // performed the signup so the email-confirmation endpoints can
+        // enforce upstream's `require_user_owned_by_application!`. See
+        // `check_confirmation_ownership` for the grandfather rule.
+        created_by_application: Some(app.id),
     })?;
 
     let (token_plaintext, token) =
@@ -324,6 +333,69 @@ pub fn invite_status(store: &dyn InviteStore, code: &str, now_ms: u64) -> Result
 /// Redeem an invite token (check usable + increment `uses` atomically).
 pub fn redeem_invite(store: &dyn InviteStore, code: &str, now_ms: u64) -> Result<Invite> {
     store.redeem_invite(code, now_ms)
+}
+
+/// Redeem an email-confirmation token: consume the single-use bearer and flip
+/// `email_verified` on the owning account.
+///
+/// - Unknown or already-used tokens → `NotFound` (the HTTP layer answers the
+///   invalid/used shape; no oracle distinguishes the two).
+/// - A `PasswordReset` token presented here → `InvalidInput` with a reason
+///   (wrong flow, never silently accepted). The bearer is still consumed:
+///   tokens are single-use regardless of which endpoint reads them, so a
+///   wrong-endpoint paste cannot be probed twice.
+/// - Otherwise the account's `email_verified` flips to `true` and the updated
+///   credential row is returned.
+/// Password-reset tokens expire 6 hours after issue (upstream Devise
+/// `reset_password_within`; confirmation tokens never expire, matching
+/// Devise's default `confirm_within`).
+pub const PASSWORD_RESET_TTL_MS: u64 = 6 * 3_600_000;
+
+pub fn confirm_email(
+    store: &dyn AccountStore,
+    token: &str,
+    // Confirmation bearers never expire (Devise default); the clock stays
+    // in the signature for symmetry with the reset flow (`email_token_live`).
+    _now_ms: u64,
+) -> Result<LocalUser> {
+    let record = store
+        .redeem_email_token(token)?
+        .ok_or_else(|| Error::NotFound("confirmation token is invalid or has already been used".into()))?;
+    if record.kind != EmailTokenKind::Confirmation {
+        return Err(Error::InvalidInput(
+            "this token is for password reset, not email confirmation".into(),
+        ));
+    }
+    store.set_email_verified(record.account_id, true)
+}
+
+/// Whether a stored token is still live at `now_ms`.
+pub fn email_token_live(kind: EmailTokenKind, created_at_ms: u64, now_ms: u64) -> bool {
+    match kind {
+        EmailTokenKind::Confirmation => true,
+        EmailTokenKind::PasswordReset => {
+            now_ms.saturating_sub(created_at_ms) <= PASSWORD_RESET_TTL_MS
+        }
+    }
+}
+
+/// Enforce upstream's `require_user_owned_by_application!`
+/// (`app/controllers/api/v1/emails/confirmations_controller.rb:8-10`): the
+/// confirmation resend/check endpoints serve only the user whose account was
+/// created through the calling OAuth application.
+///
+/// Grandfather rule: accounts created before attribution existed
+/// (`created_by_application == None`: every CLI-created and pre-D12 row)
+/// are served to any calling app. A recorded id that differs from the
+/// caller's app id is `Forbidden` (upstream answers 403).
+pub fn check_confirmation_ownership(user: &LocalUser, app_id: Id) -> Result<()> {
+    match user.created_by_application {
+        None => Ok(()),
+        Some(owner) if owner == app_id => Ok(()),
+        Some(_) => Err(Error::Forbidden(
+            "this confirmation belongs to another application".into(),
+        )),
+    }
 }
 
 /// Whether registration may proceed: open registrations OR a usable invite.

@@ -37,10 +37,11 @@ pub use account::Account;
 pub use admin_infra::{
     AdminAccountOverview, AdminAuditRecord, AdminCanonicalEmailBlock, AdminDomainAllow,
     AdminDomainBlock, AdminDomainSeverity, AdminEmailDomainBlock, AdminIpBlock, AdminIpSeverity,
-    AdminMediaOwner, AdminReportTarget, AdminTag, FollowMetricRow,
+    AdminMediaOwner, AdminReportTarget, AdminTag, FollowMetricRow, InteractionEvent,
+    InteractionEventKind,
 };
 pub use oauth::{AccessToken, AuthorizationCode, OAuthApplication};
-pub use user::{LocalUser, LoginSession, SignInEvent, UserRole};
+pub use user::{EmailToken, EmailTokenKind, LocalUser, LoginSession, SignInEvent, UserRole};
 pub use job::{Job, JobKind, JobState};
 pub use follow::{Follow, FollowState};
 pub use relationship::{

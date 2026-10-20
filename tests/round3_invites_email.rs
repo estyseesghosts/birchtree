@@ -120,7 +120,9 @@ fn test_app() -> OAuthApplication {
 fn register_cmd(username: &str, invite_code: Option<&str>) -> RegisterAccountCommand {
     RegisterAccountCommand {
         username: username.to_string(),
-        email: "user@example.com".to_string(),
+        // Unique address per registration: duplicate emails are refused
+        // (round 4, upstream email uniqueness).
+        email: format!("{username}@example.com"),
         password: "password123".to_string(),
         agreement: true,
         locale: None,

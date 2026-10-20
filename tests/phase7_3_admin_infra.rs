@@ -71,6 +71,9 @@ fn admin_router(srv: &TestServer, trusted_proxies: Vec<IpAddr>) -> axum::Router 
         federation,
         rate_limit_multiplier: 1,
         mail_env: std::sync::Arc::new(birchtree::mailer::MailEnv::disabled()),
+        invites: std::sync::Arc::new(
+            birchtree::application::accounts::MemoryInviteStore::default(),
+        ),
     };
     admin_infra::routes().with_state(state)
 }
@@ -552,6 +555,9 @@ fn probe_parts(srv: &TestServer, trusted_proxies: Vec<IpAddr>) -> (axum::Router,
         federation,
         rate_limit_multiplier: 1,
         mail_env: std::sync::Arc::new(birchtree::mailer::MailEnv::disabled()),
+        invites: std::sync::Arc::new(
+            birchtree::application::accounts::MemoryInviteStore::default(),
+        ),
     };
     let router = axum::Router::new()
         .route("/probe", get(|| async { "ok" }))
@@ -784,7 +790,7 @@ async fn admin_measures_read_scope_and_real_keys() {
     let keys: Vec<&str> = rows.iter().map(|row| row["key"].as_str().expect("key")).collect();
     assert!(keys.contains(&"active_users"), "{body}");
     assert!(keys.contains(&"resolved_reports"), "{body}");
-    assert!(!keys.contains(&"interactions"), "{body}");
+    assert!(keys.contains(&"interactions"), "{body}");
     assert!(!keys.contains(&"tag_uses"), "{body}");
 }
 

@@ -443,7 +443,7 @@ fn receiver_decrypt(
 ) -> Vec<u8> {
     use base64::Engine as _;
     let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    let (_salt, rs, sender_pub, mut ciphertext) = push_crypto::parse_body(body).expect("parse");
+    let (salt, rs, sender_pub, mut ciphertext) = push_crypto::parse_body(body).expect("parse");
     assert_eq!(rs, push_crypto::RECORD_SIZE);
     let auth_raw = enc.decode(auth_b64).expect("auth");
     let receiver_raw = enc.decode(receiver_pub_b64).expect("p256dh");
@@ -453,8 +453,9 @@ fn receiver_decrypt(
         private,
         &ring::agreement::UnparsedPublicKey::new(&ring::agreement::ECDH_P256, &sender_pub),
         |shared| {
+            // The header salt feeds the second KDF stage (RFC 8291 §3.4).
             let (cek, nonce) =
-                push_crypto::derive_content_keys(&auth_raw, shared, &receiver_point, &sender_pub)
+                push_crypto::derive_content_keys(&salt, &auth_raw, shared, &receiver_point, &sender_pub)
                     .expect("kdf");
             push_crypto::open_record(&cek, &nonce, &mut ciphertext).expect("open");
             assert_eq!(ciphertext.last(), Some(&0x02), "final-record delimiter");
@@ -466,12 +467,75 @@ fn receiver_decrypt(
 
 #[test]
 fn push_encrypt_round_trip() {
+
     let (private, p256dh, auth) = test_receiver_keys();
     let plaintext = br#"{"notification_id":"42","notification_type":"mention","title":"t","body":"b"}"#;
     let payload = push_crypto::encrypt_aes128gcm(&p256dh, &auth, plaintext).expect("encrypt");
     assert_eq!(payload.content_encoding, "aes128gcm");
     let opened = receiver_decrypt(private, &p256dh, &auth, &payload.body);
     assert_eq!(opened, plaintext);
+}
+
+/// RFC 8291 Appendix A intermediates (independent of our encrypt path: the
+/// ECDH secret is taken straight from the RFC, so this locks the KDF +
+/// framing byte-exact against the published vector).
+fn rfc8291_a() -> (Vec<u8>, Vec<u8>, [u8; 16], [u8; 65], [u8; 65], Vec<u8>) {
+    use base64::Engine as _;
+    let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let no_ws = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    let salt = enc.decode("DGv6ra1nlYgDCS1FRnbzlw").expect("salt");
+    let auth = enc.decode("BTBZMqHH6r4Tts7J_aSIgg").expect("auth");
+    let ecdh = enc.decode("kyrL1jIIOHEzg3sM2ZWRHDRB62YACZhhSlknJ672kSs").expect("ecdh");
+    let mut rx = [0u8; 65];
+    let rx_raw = enc
+        .decode(no_ws(
+            "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4",
+        ))
+        .expect("rx");
+    rx.copy_from_slice(&rx_raw);
+    let mut tx = [0u8; 65];
+    let tx_raw = enc
+        .decode(no_ws(
+            "BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8",
+        ))
+        .expect("tx");
+    tx.copy_from_slice(&tx_raw);
+    let mut salt_arr = [0u8; 16];
+    salt_arr.copy_from_slice(&salt);
+    (salt, auth, salt_arr, rx, tx, ecdh)
+}
+
+#[test]
+fn rfc8291_appendix_a_intermediates() {
+    use base64::Engine as _;
+    let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let (salt_vec, auth, salt, rx, tx, ecdh) = rfc8291_a();
+    assert_eq!(salt_vec, salt.to_vec());
+    let (cek, nonce) =
+        push_crypto::derive_content_keys(&salt, &auth, &ecdh, &rx, &tx).expect("kdf");
+    assert_eq!(enc.encode(cek), "oIhVW04MRdy2XN9CiKLxTg");
+    assert_eq!(enc.encode(nonce), "4h_95klXJ5E_qnoN");
+}
+
+#[test]
+fn rfc8291_section5_example_decrypts() {
+    let (_salt_vec, _auth, salt, rx, tx, ecdh) = rfc8291_a();
+    // auth needed for the KDF; re-derive from the helper inputs.
+    use base64::Engine as _;
+    let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let auth = enc.decode("BTBZMqHH6r4Tts7J_aSIgg").expect("auth");
+    let (cek, nonce) =
+        push_crypto::derive_content_keys(&salt, &auth, &ecdh, &rx, &tx).expect("kdf");
+    let body_b64 = "DGv6ra1nlYgDCS1FRnbzlwAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A_yl95bQpu6cVPTpK4Mqgkf1CXztLVBSt2Ks3oZwbuwXPXLWyouBWLVWGNWQexSgSxsj_Qulcy4a-fN";
+    let body = enc.decode(body_b64).expect("body");
+    let (_parsed_salt, _rs, _sender, mut ciphertext) =
+        push_crypto::parse_body(&body).expect("parse");
+    push_crypto::open_record(&cek, &nonce, &mut ciphertext).expect("open");
+    assert_eq!(ciphertext.last(), Some(&0x02));
+    assert_eq!(
+        &ciphertext[..ciphertext.len() - 1],
+        b"When I grow up, I want to be a watermelon"
+    );
 }
 
 #[derive(Debug, Clone, Default)]

@@ -2,7 +2,7 @@
 
 use crate::application::ports::{PairState, Store, VoteRejection};
 use crate::application::policy;
-use crate::domain::{Error, Id, Poll, Result};
+use crate::domain::{Error, Id, InteractionEvent, InteractionEventKind, Poll, Result};
 
 /// Why a vote was refused, in the shape the REST layer maps onto Mastodon
 /// responses: `NotFound` -> 404, `NotPermitted` -> 403 "This action is not
@@ -93,7 +93,20 @@ pub fn vote(
     if choices.is_empty() {
         return Err(PollVoteError::Rejected(VoteRejection::InvalidChoice));
     }
-    store
+    let poll = store
         .vote_poll(poll_id, viewer_id, choices, now_ms)
-        .map_err(PollVoteError::Rejected)
+        .map_err(PollVoteError::Rejected)?;
+    // D39 `interactions` journal: upstream increments on every vote call that
+    // reaches the tracker (`VoteService#call`, `app/services/vote_service.rb:33`;
+    // duplicate/expiry/self rejections never reach it because the store errs
+    // first — same shape here: only `Ok` journals). Federation inbound tallies
+    // remote votes via `sync_remote_poll`, never this path, so remote votes
+    // stay out. Journal failures never fail the vote (fire-and-forget, like
+    // `record_sign_in`).
+    let _ = store.record_interaction(InteractionEvent::for_journal(
+        viewer_id,
+        InteractionEventKind::Vote,
+        now_ms,
+    ));
+    Ok(poll)
 }

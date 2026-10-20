@@ -376,6 +376,23 @@ pub const ACCOUNT_WARNINGS: TableDefinition<u64, &[u8]> =
 /// `active_users` telemetry; one row per completed browser password login).
 pub const SIGN_INS: TableDefinition<u64, &[u8]> = TableDefinition::new("sign_ins");
 
+/// Invite tokens by code -> JSON `Invite` (D12 remainder; durable backend
+/// replacing the in-memory store).
+pub const INVITES: TableDefinition<&str, &[u8]> = TableDefinition::new("invites");
+
+/// Normalized-lowercase email -> account id (D12 public forgot-password and
+/// duplicate checks; backfilled from existing credential rows in v12).
+pub const EMAIL_INDEX: TableDefinition<&str, u64> = TableDefinition::new("email_index");
+
+/// Pending email tokens by token -> JSON `EmailToken` (D12 redemption;
+/// consumed on use, single-use).
+pub const EMAIL_TOKENS: TableDefinition<&str, &[u8]> = TableDefinition::new("email_tokens");
+
+/// Interaction events by event id -> JSON `InteractionEvent` (D39
+/// `interactions` measure; one row per local interaction).
+pub const INTERACTION_EVENTS: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("interaction_events");
+
 // ---------------------------------------------------------------------------
 // Phase 7.3 (schema v8): admin infrastructure rows (subagent C). Global
 // ordered tables use `desc_id(row_id)` keys so a forward scan yields newest
@@ -507,7 +524,7 @@ pub fn audit_target_prefix(target_type: &str, target_id: &str) -> Vec<u8> {
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// Current schema version. Bump with a new migration step.
-pub const SCHEMA_VERSION: u64 = 11;
+pub const SCHEMA_VERSION: u64 = 12;
 
 /// All table names, for diagnostics and migration verification.
 pub const TABLE_NAMES: &[&str] = &[
@@ -600,6 +617,10 @@ pub const TABLE_NAMES: &[&str] = &[
     "web_push_subscriptions",
     "tag_follows",
     "featured_tags",
+    "invites",
+    "email_index",
+    "email_tokens",
+    "interaction_events",
 ];
 
 /// Build the fixed 16-byte scheduling key used by [`JOBS_INDEX`].
