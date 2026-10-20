@@ -19,6 +19,7 @@ pub mod quotes;
 pub mod polls;
 pub mod media;
 pub mod notifications;
+pub mod places;
 
 // Phase 4 storage modules: timelines, lists, markers, filters, scheduled
 // statuses and custom emoji.

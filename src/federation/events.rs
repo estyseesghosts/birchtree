@@ -42,8 +42,8 @@ pub async fn run(config: &FederationConfig<FedContext>, job: &crate::domain::Job
         "create" | "update" | "delete" => {
             let status = status_of(store, uint("status_id"))?;
             let body = match event.as_str() {
-                "create" => outgoing::create(store, public, &status, now).map_err(retry)?,
-                "update" => outgoing::update(store, public, &status, now).map_err(retry)?,
+                "create" => outgoing::create(store, public, &status, now, &ctx.license_policy, &ctx.place_policy).map_err(retry)?,
+                "update" => outgoing::update(store, public, &status, now, &ctx.license_policy, &ctx.place_policy).map_err(retry)?,
                 _ => outgoing::delete(&author, &status),
             };
             (vec![body], status_audience(store, &author, &status).map_err(retry)?)
@@ -101,7 +101,7 @@ pub async fn run(config: &FederationConfig<FedContext>, job: &crate::domain::Job
                 // Hidden totals are never distributed (Mastodon parity).
                 return Ok(());
             }
-            let body = outgoing::question_update(store, public, &status, now).map_err(retry)?;
+            let body = outgoing::question_update(store, public, &status, now, &ctx.license_policy, &ctx.place_policy).map_err(retry)?;
             (vec![body], status_audience(store, &author, &status).map_err(retry)?)
         }
         "announce" => {
@@ -154,7 +154,17 @@ pub async fn run(config: &FederationConfig<FedContext>, job: &crate::domain::Job
                     uri
                 }
             };
-            let request = outgoing::quote_request(store, public, &request_uri, &quoting, &quoted, now).map_err(retry)?;
+            let request = outgoing::quote_request(
+                store,
+                public,
+                &request_uri,
+                &quoting,
+                &quoted,
+                now,
+                &ctx.license_policy,
+                &ctx.place_policy,
+            )
+            .map_err(retry)?;
             match event.as_str() {
                 "quote_request" => (vec![request], outgoing::inboxes_of(store, &[quote.quoted_account_id]).map_err(retry)?),
                 "quote_accept" => {

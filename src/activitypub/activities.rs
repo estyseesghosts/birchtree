@@ -423,9 +423,37 @@ pub fn note_input_for(note: &Note, author_id: Id, author_domain: &str, author_se
                     source_url: a.url.as_ref()?.to_string(),
                     media_type: a.media_type.clone().unwrap_or_default(),
                     description: a.name.clone().unwrap_or_default(),
+                    // Core extension CORE-L: valid ids round-trip; anything
+                    // else is untrusted input and lands as NULL.
+                    license: a.license.and_then(|raw| {
+                        (raw >= 1 && raw <= u8::MAX as i64)
+                            .then(|| raw as u8)
+                            .filter(|id| {
+                                crate::domain::license::is_valid_license(*id)
+                            })
+                    }),
                 })
             })
             .collect(),
+        location: note.location.as_ref().and_then(|wire| {
+            // Core extension CORE-P: validate value-by-value; invalid
+            // locations are dropped, never fatal.
+            let place = crate::domain::Place {
+                // Temporary id: the use case mints the stored row.
+                id: crate::domain::Id::new(0),
+                name: wire.name.clone(),
+                lon: wire.longitude,
+                lat: wire.latitude,
+                country: wire.country.clone(),
+            };
+            place.validate().ok()?;
+            Some(inbound::RemotePlace {
+                name: place.name,
+                lon: place.lon,
+                lat: place.lat,
+                country: place.country,
+            })
+        }),
         emojis: note
             .tag
             .iter()
@@ -530,6 +558,7 @@ pub fn question_input_for(question: &Question, author_id: Id, author_sensitized:
         tags: Vec::new(),
         attachments: Vec::new(),
         emojis: Vec::new(),
+        location: None,
         quote_uri: None,
         poll: None,
     };

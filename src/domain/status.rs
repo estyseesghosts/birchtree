@@ -47,6 +47,11 @@ pub struct Status {
     pub reblog_of_id: Option<Id>,
     /// Attached media ids, in the author-chosen order.
     pub media_ids: Vec<Id>,
+    /// Core extension CORE-P: attached place id (`None` = no place).
+    /// Rides inline in the `statuses` JSON blob (schema v18); pre-v18 rows
+    /// decode as `None`.
+    #[serde(default)]
+    pub place_id: Option<Id>,
     pub poll_id: Option<Id>,
     /// Who may quote this status (`public`/`followers`/`nobody`; forced to
     /// `nobody` for private/direct).

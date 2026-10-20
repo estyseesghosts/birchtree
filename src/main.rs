@@ -614,6 +614,8 @@ async fn serve(cfg: Config) {
         lab,
         Some(&instance),
         cfg.federation_authorized_fetch,
+        &cfg.license_policy,
+        &cfg.place_policy,
     )
     .await
     .unwrap_or_else(|err| {

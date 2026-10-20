@@ -93,6 +93,7 @@ fn remote_note(author: Id, uri: &str, text: &str) -> RemoteNote {
         tags: Vec::new(),
         attachments: Vec::new(),
         emojis: Vec::new(),
+        location: None,
         quote_uri: None,
         poll: None,
     }

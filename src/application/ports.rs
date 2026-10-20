@@ -406,6 +406,8 @@ pub struct NewStatus {
     pub in_reply_to_account_id: Option<Id>,
     /// Attached media ids, in the author's order.
     pub media_ids: Vec<Id>,
+    /// Core extension CORE-P: attached place id (`None` = no place).
+    pub place_id: Option<Id>,
     /// Resolved mention account ids, in mention order (serialized).
     pub mentions: Vec<Id>,
     /// Resolved silent mentions (quote access grants): visibility only.
@@ -445,6 +447,9 @@ pub struct StatusUpdate {
     pub sensitive: Option<bool>,
     pub language: Option<String>,
     pub media_ids: Option<Vec<Id>>,
+    /// Core extension CORE-P: replace the attached place (`None` leaves it
+    /// unchanged; `Some(None)` clears; `Some(Some(id))` sets).
+    pub place_id: Option<Option<Id>>,
     /// Replace poll options/multiple (resets all votes, per Mastodon).
     pub poll: Option<NewPollSpec>,
     /// Extend poll expiry without resetting votes.
@@ -1561,6 +1566,23 @@ pub struct MediaPatch {
     pub license: Option<Option<u8>>,
 }
 
+/// Core extension CORE-P: the place registry (`places` / `places_by_name`,
+/// schema v18). Places are seeded by tests/operators and remote ingest;
+/// there is no public proximity/discover/geo-search surface (stub).
+pub trait PlaceStore: Send + Sync {
+    /// Validate and upsert a place row + its name-index entry in ONE
+    /// transaction, returning the stored row.
+    fn upsert_place(&self, place: crate::domain::Place) -> Result<crate::domain::Place>;
+    /// Read a place row by id.
+    fn place_by_id(&self, id: Id) -> Result<Option<crate::domain::Place>>;
+    /// Places by id in ONE transaction (page loader; missing ids omitted).
+    fn places_by_ids(&self, ids: &[Id]) -> Result<HashMap<Id, crate::domain::Place>>;
+    /// Link a validated remote place: a same-name local row wins (returned
+    /// as-is, so remote input can neither hijack nor duplicate local
+    /// names); otherwise mint a local row in ONE transaction.
+    fn link_remote_place(&self, place: &crate::domain::Place) -> Result<crate::domain::Place>;
+}
+
 pub trait MediaStore: Send + Sync {
     fn create_media(&self, input: NewMedia) -> Result<MediaAttachment>;
     /// The subset of `ids` owned by `owner_id` and unattached (or already
@@ -2139,6 +2161,7 @@ pub trait Store:
     + QuoteStore
     + NotificationStore
     + MediaStore
+    + PlaceStore
     + ListStore
     + MarkerStore
     + SuggestionStore
@@ -2172,6 +2195,7 @@ impl<T> Store for T where
         + QuoteStore
         + NotificationStore
         + MediaStore
+        + PlaceStore
         + ListStore
         + MarkerStore
         + SuggestionStore

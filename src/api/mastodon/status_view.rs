@@ -102,6 +102,8 @@ pub struct StatusViewContext<'a> {
     media: HashMap<Id, MediaAttachment>,
     polls: HashMap<Id, Poll>,
     ballots: HashMap<Id, Vec<u64>>,
+    /// Core extension CORE-P: places by id, batch-loaded per page.
+    places: HashMap<Id, crate::domain::Place>,
     /// Viewer flags keyed by row-exact status id.
     flags: HashMap<Id, StatusViewFlags>,
     /// Conversation-mute flags keyed by row-exact status id (Phase 7).
@@ -132,6 +134,7 @@ impl<'a> StatusViewContext<'a> {
             media: HashMap::new(),
             polls: HashMap::new(),
             ballots: HashMap::new(),
+            places: HashMap::new(),
             flags: HashMap::new(),
             muted_by_status: HashMap::new(),
             pairs: HashMap::new(),
@@ -234,6 +237,18 @@ impl<'a> StatusViewContext<'a> {
         poll_ids.dedup();
         self.media.extend(self.store.media_by_ids(&media_ids)?);
         self.polls.extend(self.store.polls_by_ids(&poll_ids)?);
+        // Core extension CORE-P: places attached to the page's statuses,
+        // batched once (missing rows read as no place at pack time).
+        let mut place_ids: Vec<Id> = self
+            .statuses
+            .values()
+            .filter_map(|status| status.place_id)
+            .collect();
+        place_ids.sort_unstable();
+        place_ids.dedup();
+        if !place_ids.is_empty() {
+            self.places.extend(self.store.places_by_ids(&place_ids)?);
+        }
         if let Some(viewer) = self.viewer {
             self.ballots.extend(self.store.ballots(&poll_ids, viewer)?);
             // Conversation mutes for the whole page in ONE batched call.
@@ -412,7 +427,7 @@ impl<'a> StatusViewContext<'a> {
             .collect();
 
         Ok(dto::StatusView {
-            status,
+            status: status.clone(),
             account,
             account_stats: Some(account_stats),
             flags,
@@ -426,6 +441,9 @@ impl<'a> StatusViewContext<'a> {
             shallow_quote: false,
             filtered: Vec::new(),
             emojis,
+            // Core extension CORE-P: the attached place (batched above;
+            // dangling ids read as no place).
+            place: status.place_id.and_then(|id| self.places.get(&id).cloned()),
         })
     }
 

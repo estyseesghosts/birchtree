@@ -66,6 +66,10 @@ pub struct Note {
     /// Replies, as a collection URI or an inline collection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replies: Option<serde_json::Value>,
+    /// Core extension CORE-P: attached place. Rendered only when the
+    /// sender's `place_policy` is enabled; omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<WirePlace>,
 }
 
 impl Note {
@@ -208,6 +212,26 @@ pub struct Attachment {
     pub width: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height: Option<u32>,
+    /// Core extension CORE-L: Pixelfed license id (FEP-6757 minimal).
+    /// Absent = all rights reserved. Rendered only when the sender's
+    /// `license_policy` is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<i64>,
+}
+
+/// A wired place (`location` on a `Note`, core extension CORE-P stub).
+///
+/// `id` is the sender-local numeric id, opaque to receivers (receivers mint
+/// their own rows and link by value, never by id).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WirePlace {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub name: String,
+    pub longitude: f64,
+    pub latitude: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
 }
 
 /// The `type` of a `Question`: a literal string, checked on parse.

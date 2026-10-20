@@ -173,6 +173,8 @@ pub fn create_status(
     cmd: CreateStatusCommand,
     max_chars: usize,
     license_policy: &str,
+    place_policy: &str,
+    place_id: Option<Id>,
 ) -> Result<CreateStatusResult> {
     let CreateStatusCommand {
         account_id,
@@ -343,6 +345,23 @@ pub fn create_status(
 
     let poll = poll.map(|p| build_poll_spec(now_ms, p)).transpose()?;
 
+    // Core extension CORE-P: the place gate mirrors the license gate above.
+    // Under `off` the param is accepted-and-ignored (stored NULL); otherwise
+    // an unknown id takes the existing 422 path, and `enforced` additionally
+    // requires a resolvable place on top-level non-DM statuses. Replies and
+    // DMs are exempt.
+    let place_resolves = match place_id {
+        None => false,
+        Some(id) => store.place_by_id(id)?.is_some(),
+    };
+    let place_id = crate::application::place_policy::check_place_policy(
+        place_policy,
+        visibility == Visibility::Direct,
+        in_reply_to.is_some(),
+        place_id,
+        place_resolves,
+    )?;
+
     // Core extension CORE-L: under `enforced`, a top-level non-DM status
     // carrying media needs an effective license (per-attachment else author
     // default) on every attachment. Replies and DMs are exempt; the media
@@ -396,6 +415,7 @@ pub fn create_status(
             silent_mentions: Vec::new(),
             tags,
             media_ids,
+            place_id,
             poll,
             quote,
             application: application_name.map(|name| StatusApplication {
@@ -686,6 +706,8 @@ pub fn update_status(
     now_ms: u64,
     cmd: UpdateStatusCommand,
     license_policy: &str,
+    place_policy: &str,
+    place_id: Option<Option<Id>>,
 ) -> Result<Option<Status>> {
     let status = store
         .status_by_id(cmd.status_id)?
@@ -715,6 +737,22 @@ pub fn update_status(
             return Err(Error::InvalidInput(ERR_LANGUAGE.into()));
         }
         update.language = Some(language);
+    }
+    // Core extension CORE-P: same place gate as creation (`None` leaves
+    // the stored place unchanged; independent of media edits). Replies
+    // and DMs exempt.
+    if let Some(raw_place) = place_id {
+        let resolves = match raw_place {
+            None => false,
+            Some(id) => store.place_by_id(id)?.is_some(),
+        };
+        update.place_id = Some(crate::application::place_policy::check_place_policy(
+            place_policy,
+            status.visibility == Visibility::Direct,
+            status.in_reply_to_id.is_some(),
+            raw_place,
+            resolves,
+        )?);
     }
     if let Some(media_ids) = cmd.media_ids {
         // Core extension CORE-L: same enforced gate as creation, evaluated

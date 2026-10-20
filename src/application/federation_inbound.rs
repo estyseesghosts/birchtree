@@ -29,6 +29,19 @@ pub struct RemoteAttachment {
     /// The ActivityStreams media type (`image/png`, `video/mp4`, ...).
     pub media_type: String,
     pub description: String,
+    /// Core extension CORE-L: sender's license id, when present and valid.
+    /// Out-of-enum values are dropped (stored NULL) at ingest; federation
+    /// input is untrusted, so ingest never 422s on licenses.
+    pub license: Option<u8>,
+}
+
+/// A wired place attached to a received Note (core extension CORE-P).
+#[derive(Debug, Clone)]
+pub struct RemotePlace {
+    pub name: String,
+    pub lon: f64,
+    pub lat: f64,
+    pub country: Option<String>,
 }
 
 /// A received Note, already verified and parsed by the adapter.
@@ -44,6 +57,9 @@ pub struct RemoteNote {
     pub sensitive: bool,
     pub language: Option<String>,
     pub in_reply_to_uri: Option<String>,
+    /// Core extension CORE-P: the Note's `location`, when present and valid.
+    /// Invalid values are dropped (stored NULL); ingest never 422s on places.
+    pub location: Option<RemotePlace>,
     /// The `actor` URIs of the Note's mentions.
     pub mention_uris: Vec<String>,
     pub tags: Vec<String>,
@@ -134,14 +150,32 @@ pub fn ingest_note(store: &dyn Store, note: RemoteNote, poll: Option<RemotePoll>
             account_id: note.author_id,
             r#type: media_kind(&attachment.media_type).into(),
             description: attachment.description.clone(),
-            // CORE-L: federation wire license parsing lands with the AP
-            // wire slice; remote rows store NULL until then.
-            license: None,
+            // CORE-L: validated at the adapter boundary; `None` when the
+            // sender omitted it or sent garbage.
+            license: attachment.license,
         })?;
         store.set_remote_media_source(media.id, &attachment.source_url)?;
         media_ids.push(media.id);
         pending_fetches.push(media.id);
     }
+    // Core extension CORE-P: a valid remote `location` mints a local place
+    // row (sender ids are opaque, never reused). A same-name local row wins
+    // (dedupe by name) so remote input can neither hijack nor duplicate
+    // local names.
+    let place_id = match &note.location {
+        None => None,
+        Some(remote) => {
+            let candidate = crate::domain::Place {
+                // Temporary id: `link_remote_place` mints the stored row.
+                id: crate::domain::Id::new(0),
+                name: remote.name.clone(),
+                lon: remote.lon,
+                lat: remote.lat,
+                country: remote.country.clone(),
+            };
+            Some(store.link_remote_place(&candidate)?.id)
+        }
+    };
     let status = store.create_status(
         NewStatus {
             remote: Some(RemoteStatusIdentity {
@@ -158,6 +192,7 @@ pub fn ingest_note(store: &dyn Store, note: RemoteNote, poll: Option<RemotePoll>
             in_reply_to_id: parent.as_ref().map(|p| p.id),
             in_reply_to_account_id: parent.as_ref().map(|p| p.account_id),
             media_ids,
+            place_id,
             mentions,
             // D25: inbound tags land normalized (same rule as local
             // writes), so remote `#café` and local `#cafe` are one tag.

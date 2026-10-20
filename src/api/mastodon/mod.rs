@@ -90,6 +90,10 @@ pub struct ServerInfo {
     /// `off`). The DTO layer consults it to decide whether `license` /
     /// `preferredLicense` render.
     pub license_policy: String,
+    /// Core extension CORE-P (mirrors `Config::place_policy`, default
+    /// `off`). Gates `place_id` on writes; the DTO layer omits `location`
+    /// when `off`.
+    pub place_policy: String,
 }
 
 /// Host and optional explicit port of a separately configured streaming base.
@@ -215,6 +219,7 @@ impl ServerInfo {
             local_topic_feed_access: cfg.local_topic_feed_access.clone(),
             remote_topic_feed_access: cfg.remote_topic_feed_access.clone(),
             license_policy: cfg.license_policy.clone(),
+            place_policy: cfg.place_policy.clone(),
         }
     }
 }

@@ -442,6 +442,20 @@ pub async fn create(
         .filter_map(|raw| raw.parse::<Id>().ok())
         .collect();
 
+    // Core extension CORE-P: optional `place_id` (unknown ids take the
+    // 422 path unless the policy is `off`, which ignores the param).
+    // A present-but-unparsable id behaves like an unknown one.
+    let place_id = match field("place_id") {
+        None => None,
+        Some(raw) => match raw.parse::<Id>() {
+            Ok(id) => Some(id),
+            Err(_) => {
+                return ApiError::unprocessable("Validation failed: Place not found")
+                    .into_response()
+            }
+        },
+    };
+
     let idempotency_key = headers
         .get("Idempotency-Key")
         .and_then(|value| value.to_str().ok())
@@ -490,6 +504,8 @@ pub async fn create(
             scheduled_at_ms,
             state.server.max_status_chars,
             &state.server.license_policy,
+            &state.server.place_policy,
+            place_id,
         ) {
             Ok(row) => {
                 let media = store
@@ -510,7 +526,7 @@ pub async fn create(
         };
     }
 
-    match statuses::create_status(store, &state.server.public_url, state.context.now_ms(), cmd, state.server.max_status_chars, &state.server.license_policy) {
+    match statuses::create_status(store, &state.server.public_url, state.context.now_ms(), cmd, state.server.max_status_chars, &state.server.license_policy, &state.server.place_policy, place_id) {
         Ok(created) => {
             // An idempotent replay committed nothing new, so nothing streams.
             if !created.replayed {
@@ -599,6 +615,24 @@ pub async fn update(
             .filter_map(|raw| raw.parse::<Id>().ok())
             .collect::<Vec<_>>()
     });
+    // Core extension CORE-P: `place_id` present replaces (blank clears),
+    // absent leaves unchanged. Present-but-unparsable is a 422 unless the
+    // policy is `off` (ignored).
+    let place_id = match field("place_id") {
+        None => None,
+        Some(raw) if raw.trim().is_empty() => Some(None),
+        Some(raw) => match raw.trim().parse::<Id>() {
+            Ok(id) => Some(Some(id)),
+            Err(_) => {
+                if state.server.place_policy == "off" {
+                    None
+                } else {
+                    return ApiError::unprocessable("Validation failed: Place not found")
+                        .into_response();
+                }
+            }
+        },
+    };
 
     let cmd = UpdateStatusCommand {
         account_id: viewer,
@@ -612,7 +646,7 @@ pub async fn update(
         quote_approval_policy: field("quote_approval_policy"),
     };
     let store: &dyn Store = &*state.context.store;
-    match statuses::update_status(store, state.context.now_ms(), cmd, &state.server.license_policy) {
+    match statuses::update_status(store, state.context.now_ms(), cmd, &state.server.license_policy, &state.server.place_policy, place_id) {
         Ok(maybe_status) => {
             // No changes: reload and answer 200 with the unchanged status.
             let status = match maybe_status {

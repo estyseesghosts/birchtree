@@ -273,6 +273,8 @@ pub fn federation_config_with(
                 debug,
                 None,
                 false,
+                "off",
+                "off",
             ))
             .expect("federation config")
     })

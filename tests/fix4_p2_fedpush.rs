@@ -227,6 +227,7 @@ fn test_note(to: Vec<url::Url>) -> Note {
         content_map: None,
         url: None,
         replies: None,
+        location: None,
     }
 }
 

@@ -34,6 +34,12 @@ pub struct FedContext {
     pub public_url: Arc<str>,
     /// Whether public registration is open (advertised in NodeInfo).
     pub registrations_open: bool,
+    /// Core extension CORE-L policy (`off`/`unenforced`/`enforced`): gates
+    /// `license` emission on outgoing attachments (omitted when `off`).
+    pub license_policy: Arc<str>,
+    /// Core extension CORE-P policy (`off`/`unenforced`/`enforced`): gates
+    /// `location` emission on outgoing Notes (omitted when `off`).
+    pub place_policy: Arc<str>,
     /// Instance title/description (advertised in NodeInfo `metadata`;
     /// upstream `NodeInfo::Serializer#metadata`).
     pub site_title: Arc<str>,
@@ -62,6 +68,8 @@ pub async fn build_config(
     debug: bool,
     instance: Option<&instance::InstanceActor>,
     authorized_fetch: bool,
+    license_policy: &str,
+    place_policy: &str,
 ) -> Result<FederationConfig<FedContext>, String> {
     let domain = host_of(public_url).ok_or_else(|| format!("public url has no host: {public_url}"))?;
     let client = net::middleware_client(http)?;
@@ -79,6 +87,8 @@ pub async fn build_config(
             registrations_open,
             site_title: Arc::from(site_title),
             site_description: Arc::from(site_description),
+            license_policy: Arc::from(license_policy),
+            place_policy: Arc::from(place_policy),
             http: Arc::new(http.clone()),
             media_client,
             authorized_fetch,

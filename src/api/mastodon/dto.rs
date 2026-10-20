@@ -14,8 +14,8 @@ use serde_json::{Map, Value, json};
 use crate::api::mastodon::ServerInfo;
 use crate::application::ports::StatusViewFlags;
 use crate::domain::{
-    Account, AccountStats, AnnualReport, LocalUser, MediaAttachment, OAuthApplication, Poll, Status,
-    StatusApplication, TrendLink, TrendPublisher, TrendTagFlag,
+    Account, AccountStats, AnnualReport, LocalUser, MediaAttachment, OAuthApplication, Place, Poll,
+    Status, StatusApplication, TrendLink, TrendPublisher, TrendTagFlag,
 };
 
 /// Mastodon's default missing avatar/header asset path.
@@ -631,6 +631,9 @@ pub struct StatusView {
     pub filtered: Vec<Value>,
     /// Custom emoji referenced by the status text (batch-loaded per page).
     pub emojis: Vec<Value>,
+    /// Core extension CORE-P: the attached place, if any (batch-loaded per
+    /// page; dangling ids read as `None`).
+    pub place: Option<Place>,
 }
 
 /// Local file path of an attachment blob key under the media route.
@@ -893,6 +896,24 @@ pub fn status_json(
         .map(|attachment| media_attachment_json(server, attachment))
         .collect();
     object.insert("media_attachments".into(), json!(media));
+    // Core extension CORE-P: `location` renders only when the policy is
+    // enabled (omitted when `off` or when the status has no place).
+    // Shape: `{"id","name","longitude","latitude","country"}` (`country`
+    // `null` when unknown); `id` is the local numeric place id.
+    if server.place_policy != "off"
+        && let Some(place) = &view.place
+    {
+        object.insert(
+            "location".into(),
+            json!({
+                "id": place.id.to_string(),
+                "name": place.name,
+                "longitude": place.lon,
+                "latitude": place.lat,
+                "country": place.country,
+            }),
+        );
+    }
     let mentions: Vec<Value> = view
         .mentions
         .iter()
