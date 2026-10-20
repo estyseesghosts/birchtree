@@ -13,6 +13,66 @@ Sequencing: lands after the in-flight D12/D39/D42 workers (adjacent files),
 one fix round, severity order. Gate per item: contract test + register row
 where a divergence remains.
 
+## Status 2026-10-20 (fix round, parent log)
+
+- **Step 0 triage DONE (read-only worker).** Every P2 bullet re-verified
+  against the pin (`8ff11c2b`; the checkout HEAD `7f90e0fd` was never read).
+  CONFIRMED queue (severity order within group): paging — quotes cursor→quote
+  id (#2), follow-request cursor namespace + `since_id` (#13a), endorsements
+  `unlimited?` + `without_suspended` (#14c); serializers — credential source
+  real fields/discoverable/hide_collections/indexable/attribution + real role
+  (#11a), preferences language source + `expand:media` values (#11c),
+  instance DTO config values + real `source_url` (#17a), quotes-revoke renders
+  quoting status (#3b), VAPID exp 24h (#16b), nodeinfo `metadata` key (#17c);
+  params — `update_credentials` bot/fields/attribution then avatar/header
+  (#11d), followers/following hide-gate (#12e), notification types (#21i),
+  search/lookup/`with_suspended` (#12a–c), notification params (#21h), tag
+  any/all/none (#21a), reports category/forward/rules/collections (#18),
+  `allowed_mentions` (#21k), poll empty-choices (#9a), scheduled empty no-op
+  (#10b), authorize notification (#13b), conversation-mute 422 (#21j),
+  markers `lock_version` wire-through (#10a), filter PUT/PATCH + deprecation
+  headers (#14d/e); media/push — cleanup all-4xx-except-408/429 (#16a),
+  `Unsubscribe-URL` (#16c); timelines — locked-down auth gates (#21d),
+  context self-reply promotion (#4, depth REFUTED); federation — audience
+  exact-match (#20d, sev 2), favourited/reblogged exclusion (#6) + quotes
+  mute/domain filter (#7) with F2, notification `without_suspended` (#8a),
+  outbox/followers paging or amend D30 (#19), bounded dedup + D33 (#20b),
+  webfinger 410 (#20c), retry budget re-budget-or-register (#20a), sensitized
+  forcing (#20e), language/caps/timestamps (#20f), poll additive re-vote
+  (#9b). REFUTED with record (drop, don't recode): unfav/unbookmark
+  overlays (sync commit ⇒ equal values), quotes revoke authz, context depth,
+  multi-fetch order, notification 404 body, `allow_nonfunctional`,
+  `state`/`spoiler_field` (auditor hallucination), self-follow 403,
+  media preview/guard, push invalid-row destroy, home `local`, link 404-gate,
+  list replies-policy, trends locale; list `limit=0`/unknown-ids + endorsements
+  paging downgraded to test-only (manifest claims parity).
+  Federation MISSING vs D32: refuse stands for ingest; individual rows needed
+  for Move, remote emoji, relays, follower-sync counts, note/featured
+  collections. Stale flags fixed 2026-10-20: D30 reopened (count-only, no
+  pages), webfinger/nodeinfo rows → implemented, D32 scoped to ingest,
+  quotes/manifest pointers added, "not yet rowed" list pruned.
+- **P0 DONE 2026-10-20.** F1 (default-privacy reblog incl. hidden-target
+  wins over explicit param), F2 (viewer-side + mute + domain gates; three
+  beyond-upstream strictness deltas registered as D45/D46/D47), F3
+  (unreblog no gate on destroy). Evidence: `tests/fix4_p0_privacy.rs`
+  (13 pass) + `application::policy` unit (7 pass). Seams for parent/P2:
+  `PairState` extension snippet deferred (impl works via `viewer_side_facts`);
+  F3/P2 overlay wiring (`reblogs_map:false` + decremented count,
+  `favourites_map:false`, `bookmarks_map:false`) belongs in the status
+  DTO/presenter layer — P2 queue covers the reblog overlay; unfav/unbookmark
+  overlays REFUTED above.
+- **P1/P3 build workers DONE 2026-10-20** (suggestions+directory+userinfo,
+  announcements, instance/donation/metrics/admin-stores, all green on
+  return). Parent merges (same session): durable suggestion dismissals
+  (schema v13, member DELETE, v2 destroy removed); durable announcements
+  (schema v14, admin routes mounted); instance sub-resources (10 routes +
+  3 config flags); donation 204→404; metrics moderator widening; admin
+  identity stores (locale/invite-request/INVITE_USES schema v15/login IPs,
+  serializer + `invited_by`/`ip` filters). Incidental parent fix: HTTP
+  registration now consumes invites (`register_account_with_invite` was
+  dead code — D12 claim made real). P2 fix workers launch on the
+  CONFIRMED queue above when the worktree is quiet.
+
 ## P0 — privacy bugs (verified, fix unconditionally)
 
 ### F1. Reblog defaults to Public instead of the user's default privacy

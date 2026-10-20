@@ -102,6 +102,14 @@ pub struct LocalUser {
     /// id must equal the caller's app id, otherwise `403 Forbidden`.
     #[serde(default)]
     pub created_by_application: Option<Id>,
+    /// Account locale captured at registration (upstream `user.locale`;
+    /// web-settings changes are out of profile).
+    #[serde(default)]
+    pub locale: Option<String>,
+    /// Invite-request text captured at registration (`reason` param, upstream
+    /// `user.invite_request.text`).
+    #[serde(default)]
+    pub invite_request: Option<String>,
 }
 
 /// Invite-token validity and code generation (round 3, area A).
@@ -242,6 +250,10 @@ pub struct SignInEvent {
     pub id: Id,
     pub account_id: Id,
     pub created_at_ms: u64,
+    /// Client IP of the password login, when the adapter supplied one
+    /// (upstream `user.ips`; backfills as `None` via `#[serde(default)]`).
+    #[serde(default)]
+    pub ip: Option<std::net::IpAddr>,
 }
 
 /// A pending email token (confirmation or password reset): the bearer the

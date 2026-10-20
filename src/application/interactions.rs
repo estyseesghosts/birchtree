@@ -13,8 +13,11 @@ use crate::domain::{Error, Id, InteractionEvent, InteractionEventKind, Result, S
 /// Load `status_id` as `viewer_id` under the show gate.
 ///
 /// Missing, deleted and otherwise non-visible statuses are indistinguishable
-/// (`NotFound("status")`, as in Mastodon's status sub-routes). Returns the
-/// status together with the viewer/author pair state for interaction gates.
+/// (`NotFound("status")`, as in Mastodon's status sub-routes). The full
+/// show-equivalent gate ([`policy::can_fetch_full`]) also refuses when the
+/// viewer blocks/mutes the author or either side domain-blocks the other
+/// (F2). Returns the status together with the viewer/author pair state for
+/// interaction gates.
 fn fetch_visible(
     store: &dyn Store,
     viewer_id: Id,
@@ -25,7 +28,8 @@ fn fetch_visible(
         .status_by_id(status_id)?
         .ok_or_else(|| Error::NotFound("status".into()))?;
     let pair = store.pair_state(status.account_id, viewer_id, now_ms)?;
-    if !policy::can_fetch(Some(viewer_id), &status, pair) {
+    let facts = policy::viewer_side_facts(store, viewer_id, status.account_id, now_ms)?;
+    if !policy::can_fetch_full(Some(viewer_id), &status, pair, facts) {
         return Err(Error::NotFound("status".into()));
     }
     Ok((status, pair))
@@ -95,7 +99,12 @@ pub fn unbookmark(store: &dyn Store, viewer_id: Id, status_id: Id, now_ms: u64) 
 /// `POST /api/v1/statuses/:id/reblog` — returns the NEW reblog record.
 ///
 /// Reblogging an existing reblog operates on its target (Mastodon unwraps).
-/// `visibility` defaults to `public`; reblogs may never be `direct`.
+/// Visibility follows `ReblogService` (`app/services/reblog_service.rb:23-26`
+/// at pin `8ff11c2b`): a non-distributable (hidden) target keeps the
+/// target's visibility even over an explicit param; otherwise the explicit
+/// param wins, falling back to the viewer's `default_privacy` (explicit >
+/// user default > locked-account `private` > `public`, the same chain as
+/// status creation), and reblogs may never be `direct`.
 pub fn reblog(
     store: &dyn Store,
     viewer_id: Id,
@@ -109,15 +118,19 @@ pub fn reblog(
     if !policy::can_reblog(viewer_id, &target, pair) {
         return Err(Error::Forbidden("This action is not allowed".into()));
     }
-    let visibility = match visibility {
-        None => Visibility::Public,
-        Some(raw) => Visibility::from_wire(raw)
-            .filter(|value| value.is_rebloggable())
-            .ok_or_else(|| {
-                Error::InvalidInput(
-                    "Validation failed: Visibility must be public, unlisted or private".into(),
-                )
-            })?,
+    let visibility = if !target.visibility.is_distributable() {
+        target.visibility
+    } else {
+        match visibility {
+            Some(raw) => Visibility::from_wire(raw)
+                .filter(|value| value.is_rebloggable())
+                .ok_or_else(|| {
+                    Error::InvalidInput(
+                        "Validation failed: Visibility must be public, unlisted or private".into(),
+                    )
+                })?,
+            None => default_reblog_visibility(store, viewer_id)?,
+        }
     };
     // D39 journal, same newness rule as favourite (upstream
     // `reblog_service.rb` counts only the create).
@@ -136,16 +149,57 @@ pub fn reblog(
     Ok(reblog)
 }
 
+/// The reblog visibility when no explicit value is passed: the viewer's
+/// stored `default_privacy`, falling back to `private` for locked accounts
+/// and `public` otherwise — the same chain as status creation
+/// (`PostStatusService` `@options[:visibility] || @account.user&.setting_default_privacy`
+/// with `setting_default_privacy = settings['default_privacy'] || locked? private : public`).
+/// A corrupt stored value falls back to the locked-rule default rather than
+/// failing the reblog.
+fn default_reblog_visibility(store: &dyn Store, viewer_id: Id) -> Result<Visibility> {
+    let viewer = store
+        .account_by_id(viewer_id)?
+        .ok_or_else(|| Error::NotFound("account".into()))?;
+    let stored = store
+        .user_by_account_id(viewer_id)?
+        .and_then(|user| user.default_privacy);
+    let raw = stored.unwrap_or_else(|| {
+        if viewer.locked {
+            "private".to_string()
+        } else {
+            "public".to_string()
+        }
+    });
+    Ok(Visibility::from_wire(&raw).unwrap_or(if viewer.locked {
+        Visibility::Private
+    } else {
+        Visibility::Public
+    }))
+}
+
 /// `POST /api/v1/statuses/:id/unreblog` — deletes the viewer's reblog of the
 /// (unwrapped) target and returns the ORIGINAL; 200 no-op when the viewer
 /// never reblogged it.
+///
+/// The destroy path carries NO reblog gate (upstream `reblogs_controller.rb`
+/// `destroy` at pin `8ff11c2b` authorizes `:unreblog?`/`:show?` only, never
+/// `:reblog?`): an existing reblog is deleted even when the target is no
+/// longer rebloggable by the viewer. Only the no-op path show-gates the
+/// target before returning the original.
 pub fn unreblog(store: &dyn Store, viewer_id: Id, status_id: Id, now_ms: u64) -> Result<Status> {
-    let (status, _) = fetch_visible(store, viewer_id, status_id, now_ms)?;
+    let status = store
+        .status_by_id(status_id)?
+        .filter(|status| !status.is_deleted())
+        .ok_or_else(|| Error::NotFound("status".into()))?;
     let target = reblog_target(store, status)?;
-    let pair = store.pair_state(target.account_id, viewer_id, now_ms)?;
-    if !policy::can_reblog(viewer_id, &target, pair) {
-        return Err(Error::Forbidden("This action is not allowed".into()));
+    let reblogged = store
+        .viewer_status_flags(viewer_id, &[target.id])
+        .map(|flags| flags.get(&target.id).is_some_and(|f| f.reblogged))
+        .unwrap_or(false);
+    if reblogged {
+        return store.unreblog_status(viewer_id, target.id, now_ms);
     }
+    let _ = fetch_visible(store, viewer_id, target.id, now_ms)?;
     store.unreblog_status(viewer_id, target.id, now_ms)
 }
 

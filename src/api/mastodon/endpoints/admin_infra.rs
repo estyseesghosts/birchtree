@@ -5,12 +5,18 @@
 //! (including the read-scoped `test` action), admin tag flags, and the
 //! read-scoped measures/dimensions/retention analytics.
 //!
-//! Auth: user token + **admin role only** (moderators are denied with `403
-//! Forbidden`, like upstream's role gate) checked **before** the scope check.
+//! Auth: user token + role gate (checked **before** the scope check).
 //! Reads take `admin:read` (or the listed sub-scope); writes take
 //! `admin:write` (or the listed sub-scope). `measures`, `dimensions`,
 //! `retention` and canonical-email `test` take the read scope upstream, kept
 //! here.
+//!
+//! Role split: most routes admit **admins only** ([`require_admin`]);
+//! `measures`, `dimensions` and `retention` additionally admit **moderators**
+//! ([`require_metrics`]) — the P3 operator decision (moderators read
+//! analytics; upstream admits them through the dashboard policy, see the
+//! helper). Tags stay admin-only (the finer D35 roadmap split is intact:
+//! moderators are still refused everywhere else in this module).
 //!
 //! Enforcement gaps (recorded in `docs/endpoint-manifest.md`, never stubbed):
 //! domain blocks wait for federation (Phase 6); email-domain and canonical
@@ -48,7 +54,7 @@ use crate::application::ports::{
 use crate::domain::{
     AdminAccountOverview, AdminCanonicalEmailBlock, AdminDomainAllow, AdminDomainBlock,
     AdminDomainSeverity, AdminEmailDomainBlock, AdminIpBlock, AdminIpSeverity, AdminMediaOwner,
-    AdminReportTarget, AdminTag, FollowMetricRow, Id, Status,
+    AdminReportTarget, AdminTag, FollowMetricRow, Id, Status, UserRole,
 };
 
 /// Scope alternatives for admin reads of a sub-scoped resource.
@@ -64,12 +70,44 @@ macro_rules! write_scopes {
     };
 }
 
-/// The one role gate for this module: user token, then **admin role only**,
-/// then scopes. Wraps [`Authenticated::require_admin`] pinned to
+/// The admin-only role gate for this module: user token, then **admin role
+/// only**, then scopes. Wraps [`Authenticated::require_admin`] pinned to
 /// [`AdminArea::AdminOnly`]; rename here if the permission split changes.
+/// (`measures`, `dimensions` and `retention` use [`require_metrics`]
+/// instead so moderators pass.)
 fn require_admin(auth: &Authenticated, store: &dyn Store, scopes: &[&str]) -> ApiResult<Id> {
     auth.require_admin(store, AdminArea::AdminOnly, scopes)?;
     auth.require_user()
+}
+
+/// The analytics role gate (`measures`, `dimensions`, `retention` only):
+/// user token, then **admin or moderator** role, then scopes.
+///
+/// Upstream admits moderators here. `Admin::PermissionsConcern`
+/// (`app/controllers/concerns/admin/permissions_concern.rb` at `8ff11c2b`)
+/// only requires a moderator-or-admin role (`Admin::BasePolicy#access?`,
+/// `app/policies/admin/base_policy.rb:1-6`: administrator, or any
+/// moderation/administration/devops flag), and the per-action
+/// `authorize :dashboard, :index?` (`measures_controller.rb:13`,
+/// `dimensions_controller.rb:15`, `retention_controller.rb:15`) checks
+/// `DashboardPolicy#index?` (`app/policies/dashboard_policy.rb:5-7`:
+/// `role.can?(:view_dashboard)`), which the default moderator holds
+/// (moderation category, `app/models/user_role.rb:64-77`). Birchtree roles
+/// carry no permission bitmask, so admin-or-moderator is the faithful
+/// coarse mapping. Every other route in this module keeps [`require_admin`].
+fn require_metrics(auth: &Authenticated, store: &dyn Store, scopes: &[&str]) -> ApiResult<Id> {
+    let user_id = auth.require_user()?;
+    let role = store
+        .user_by_account_id(user_id)
+        .map_err(ApiError::from)?
+        .map(|user| user.role)
+        .unwrap_or(UserRole::None);
+    match role {
+        UserRole::Admin | UserRole::Moderator => {}
+        UserRole::None => return Err(ApiError::role_forbidden()),
+    }
+    auth.require_scopes(scopes)?;
+    Ok(user_id)
 }
 
 /// Route fragment for the integrator (`router.rs` mounts it; this module must
@@ -1112,8 +1150,10 @@ fn sum_in_window(times: &[u64], start: u64, end: u64) -> u64 {
 /// only keys backed by stored data; unknown or uncomputable keys are omitted
 /// (upstream's `filter_map` also drops unknown keys — never fabricated).
 /// Uncomputable known keys are recorded as planned gaps in the manifest.
+/// Moderators pass ([`require_metrics`]); every other admin-infra route
+/// stays admin-only.
 pub async fn measures(State(state): State<ApiState>, auth: Auth, LenientForm(body): LenientForm) -> Response {
-    if let Err(err) = require_admin(&auth.0, &*state.context.store, &["admin:read"]) {
+    if let Err(err) = require_metrics(&auth.0, &*state.context.store, &["admin:read"]) {
         return err.into_response();
     }
     let store: &dyn Store = &*state.context.store;
@@ -1529,9 +1569,9 @@ pub async fn measures(State(state): State<ApiState>, auth: Auth, LenientForm(bod
 }
 
 /// `POST /api/v1/admin/dimensions` with read scope upstream (kept). Same
-/// omit-unknown-keys rule as measures.
+/// omit-unknown-keys rule as measures. Moderators pass ([`require_metrics`]).
 pub async fn dimensions(State(state): State<ApiState>, auth: Auth, LenientForm(body): LenientForm) -> Response {
-    if let Err(err) = require_admin(&auth.0, &*state.context.store, &["admin:read"]) {
+    if let Err(err) = require_metrics(&auth.0, &*state.context.store, &["admin:read"]) {
         return err.into_response();
     }
     let store: &dyn Store = &*state.context.store;
@@ -1780,8 +1820,9 @@ fn top_counts(counts: HashMap<String, u64>, limit: usize) -> Vec<Value> {
 /// `start_at`/`end_at` are required (upstream
 /// `params.require` → 400 when missing); `frequency` is `day` (default) or
 /// `month`. The window is clamped like upstream (31 days / 12 months back).
+/// Moderators pass ([`require_metrics`]).
 pub async fn retention(State(state): State<ApiState>, auth: Auth, LenientForm(body): LenientForm) -> Response {
-    if let Err(err) = require_admin(&auth.0, &*state.context.store, &["admin:read"]) {
+    if let Err(err) = require_metrics(&auth.0, &*state.context.store, &["admin:read"]) {
         return err.into_response();
     }
     let start_raw = forms::get(&body, "start_at").unwrap_or("").trim().to_string();

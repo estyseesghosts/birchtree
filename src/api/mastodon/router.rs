@@ -35,6 +35,10 @@ pub fn build_router(state: ApiState) -> Router {
         )
         .route("/oauth/token", post(token::token))
         .route("/oauth/revoke", post(token::revoke))
+        .route(
+            "/oauth/userinfo",
+            get(crate::api::oauth::userinfo::show).post(crate::api::oauth::userinfo::show),
+        )
         // Email confirmation redemption (D12): browser link from the mailed
         // token; success vs invalid/used shapes, no JS.
         .route(
@@ -44,6 +48,17 @@ pub fn build_router(state: ApiState) -> Router {
         // Instance.
         .route("/api/v1/instance", get(endpoints::instance::v1))
         .route("/api/v2/instance", get(endpoints::instance::v2))
+        // Instance sub-resources (fix round; all v1-only upstream).
+        .route("/api/v1/instance/peers", get(endpoints::instance::peers_index))
+        .route("/api/v1/instance/rules", get(endpoints::instance::rules_index))
+        .route("/api/v1/instance/domain_blocks", get(endpoints::instance::domain_blocks_index))
+        .route("/api/v1/instance/terms_of_service", get(endpoints::instance::terms_of_service_index))
+        .route("/api/v1/instance/terms_of_service/:date", get(endpoints::instance::terms_of_service_show))
+        .route("/api/v1/instance/privacy_policy", get(endpoints::instance::privacy_policy_show))
+        .route("/api/v1/instance/extended_description", get(endpoints::instance::extended_description_show))
+        .route("/api/v1/instance/translation_languages", get(endpoints::instance::translation_languages_show))
+        .route("/api/v1/instance/languages", get(endpoints::instance::languages_show))
+        .route("/api/v1/instance/activity", get(endpoints::instance::activity_show))
         // Applications.
         .route("/api/v1/apps", post(endpoints::apps::create_app))
         // Accounts: static sub-paths before the `{id}` form.
@@ -169,13 +184,24 @@ pub fn build_router(state: ApiState) -> Router {
         // Preferences.
         .route("/api/v1/preferences", get(endpoints::preferences::index))
 
-        // Suggestions (Phase 7).
-        .route("/api/v1/suggestions", get(endpoints::suggestions::v1).delete(endpoints::suggestions::delete_v1))
-        .route("/api/v2/suggestions", get(endpoints::suggestions::v2).delete(endpoints::suggestions::delete_v2))
+        // Suggestions (Phase 7): v1 member delete; v2 has no destroy route
+        // upstream (`config/routes/api.rb:265`).
+        .route("/api/v1/suggestions", get(endpoints::suggestions::v1))
+        .route("/api/v1/suggestions/:id", delete(endpoints::suggestions::delete_v1))
+        .route("/api/v2/suggestions", get(endpoints::suggestions::v2))
+        // Profile directory (P1/S1).
+        .route("/api/v1/directory", get(endpoints::directory::show))
         // Announcements (Phase 7).
         .route("/api/v1/announcements", get(endpoints::announcements::index))
         .route("/api/v1/announcements/:id/dismiss", post(endpoints::announcements::dismiss))
         .route("/api/v1/announcements/:announcement_id/reactions/:id", put(endpoints::announcements::reaction_put).patch(endpoints::announcements::reaction_put).delete(endpoints::announcements::reaction_delete))
+        // Announcements admin authoring (new API surface; upstream is HTML
+        // only). Administration-only (Admin/Owner; Moderator lacks
+        // `manage_announcements` — `config/roles.yml` at the pin).
+        .route("/api/v1/admin/announcements", get(endpoints::announcements::admin_index).post(endpoints::announcements::admin_create))
+        .route("/api/v1/admin/announcements/:id", get(endpoints::announcements::admin_show).put(endpoints::announcements::admin_update).patch(endpoints::announcements::admin_update).delete(endpoints::announcements::admin_destroy))
+        .route("/api/v1/admin/announcements/:id/publish", post(endpoints::announcements::admin_publish))
+        .route("/api/v1/admin/announcements/:id/unpublish", post(endpoints::announcements::admin_unpublish))
         // Donation campaigns (Phase 7).
         .route("/api/v1/donation_campaigns", get(endpoints::donation_campaigns::index))
         // Statuses: multi-fetch + CRUD (static `{id}` sub-routes after the

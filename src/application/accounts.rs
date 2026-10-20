@@ -119,6 +119,10 @@ pub fn create_account(
         // attribution (the ownership check grandfathers `None`; see
         // `check_confirmation_ownership`).
         created_by_application: None,
+        // The CLI takes no locale, invite request or invite code.
+        locale: None,
+        invite_request: None,
+        invite_code: None,
     })
 }
 
@@ -184,6 +188,12 @@ pub fn register_account(
         // enforce upstream's `require_user_owned_by_application!`. See
         // `check_confirmation_ownership` for the grandfather rule.
         created_by_application: Some(app.id),
+        // Registration captures (fix round P1/P3): locale, invite-request
+        // text and the consumed invite code land on the credential row /
+        // INVITE_USES in the same transaction as the account.
+        locale: cmd.locale.filter(|locale| !locale.trim().is_empty()),
+        invite_request: cmd.reason.filter(|reason| !reason.trim().is_empty()),
+        invite_code: cmd.invite_code.filter(|code| !code.trim().is_empty()),
     })?;
 
     let (token_plaintext, token) =
@@ -445,6 +455,10 @@ pub fn register_account_with_invite(
     if !allowed_registration(registration_open, usable_invite.is_some()) {
         return Err(Error::Forbidden("Registrations are closed".into()));
     }
+    // Record only a usable invite's code: an unknown/unusable code while open
+    // is ignored (upstream parity), so it must not attribute the account.
+    let mut cmd = cmd;
+    cmd.invite_code = usable_invite.as_ref().map(|invite| invite.code.clone());
     // An unknown/unusable code while open is ignored (upstream parity).
     let bypass_approval = usable_invite.as_ref().is_some_and(|i| i.created_by_staff);
     let registered = register_account(

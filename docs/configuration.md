@@ -52,7 +52,9 @@ mails only reach the log. Mail bodies/subjects mirror upstream
 ## File-only keys
 
 These have no CLI flag and can only be set via the file: `max_file_size`,
-`worker_poll_interval_ms`, `trends_enabled`, `invites_enabled`.
+`worker_poll_interval_ms`, `trends_enabled`, `invites_enabled`,
+`peers_api_enabled` (default true), `activity_api_enabled` (default true),
+`domain_blocks_public` (default false, upstream default hidden).
 
 ## Reloading
 

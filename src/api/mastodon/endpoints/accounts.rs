@@ -105,13 +105,19 @@ pub async fn register(
     };
 
     let store: &dyn Store = &*state.context.store;
-    match accounts::register_account(
+    // Invite-aware registration (D12): a usable invite opens closed
+    // registrations and attributes the account; unknown/unusable codes are
+    // ignored while open. `state.invites` is the durable redb store in
+    // production.
+    match accounts::register_account_with_invite(
         store,
         store,
+        &*state.invites,
         &state.server.public_url,
         state.context.now_ms(),
         state.server.registrations_open,
         state.server.registrations_require_approval,
+        state.server.invites_enabled,
         &auth.0.app,
         cmd,
     ) {

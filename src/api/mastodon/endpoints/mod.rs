@@ -26,6 +26,7 @@ pub mod scheduled_statuses;
 pub mod search;
 pub mod statuses;
 pub mod suggestions;
+pub mod directory;
 pub mod timelines;
 pub mod trends;
 pub mod donation_campaigns;

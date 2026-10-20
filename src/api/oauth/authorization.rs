@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use axum::extract::{Query, RawForm, State};
+use axum::extract::{ConnectInfo, Query, RawForm, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
@@ -255,6 +255,7 @@ fn query_to_pairs(query: AuthorizeQuery) -> Vec<(String, String)> {
 pub async fn authorize_post(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    peer: Option<ConnectInfo<std::net::SocketAddr>>,
     RawForm(body): RawForm,
 ) -> Response {
     let pairs = forms::parse(&body);
@@ -268,8 +269,17 @@ pub async fn authorize_post(
             Ok(Some(user)) => {
                 // D39: one sign-in event per completed password login (the
                 // admin `active_users` telemetry). Recording is best-effort:
-                // the login itself already succeeded.
-                let _ = store.record_sign_in(user.account_id, state.context.now_ms());
+                // the login itself already succeeded. The client IP backs
+                // the admin `ip`/`ips` fields (upstream `user.ips`); without
+                // a peer address nothing is recorded (never fabricated).
+                let client = peer.map(|info| info.0.ip()).map(|peer_ip| {
+                    crate::api::mastodon::request::client_ip(
+                        &headers,
+                        peer_ip,
+                        state.trusted_proxies.as_slice(),
+                    )
+                });
+                let _ = store.record_sign_in(user.account_id, state.context.now_ms(), client);
                 match auth::create_login_session(store, user.account_id, state.context.now_ms()) {
                     Ok((plaintext, _session)) => {
                         let prepared = match prepare(&state, &pairs) {

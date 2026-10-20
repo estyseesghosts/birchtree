@@ -179,7 +179,7 @@ async fn nodeinfo_usage_counts_match_seeded_locals() {
     // One real password sign-in in the log (round-2 telemetry).
     let now = Arc::new(SystemClock).now_ms();
     let accounts: &dyn AccountStore = &*srv.store;
-    accounts.record_sign_in(alice.id, now).expect("sign-in");
+    accounts.record_sign_in(alice.id, now, None).expect("sign-in");
 
     let (status, _, bytes) = send(
         &srv.router,
@@ -320,7 +320,7 @@ async fn retention_counts_signin_cohorts() {
     // would be silent; the sign-in log must count them.
     let now = Arc::new(SystemClock).now_ms();
     let accounts: &dyn AccountStore = &*srv.store;
-    accounts.record_sign_in(alice_id, now).expect("sign-in");
+    accounts.record_sign_in(alice_id, now, None).expect("sign-in");
 
     let body = format!("start_at={}&end_at={}&frequency=day", now - 86_400_000, now + 60_000);
     let (status, _h, bytes) = send(

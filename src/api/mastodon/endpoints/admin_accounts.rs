@@ -58,17 +58,18 @@ fn opt_or_null(value: Option<String>) -> Value {
 /// `REST::Admin::AccountSerializer` (verified field list from
 /// `app/serializers/rest/admin/account_serializer.rb`).
 ///
-/// Gaps (all recorded as planned gaps, never fabricated rows):
-/// - `ip`/`ips`: birchtree stores no login IPs → `null`/`[]`.
-/// - `locale`/`invite_request`/`created_by_application_id`/
-///   `invited_by_account_id`: no invite/locale storage → `null`.
-/// - `approved`: the credential's approval state (D36; `null` for remote
-///   accounts, which have no credential row — upstream `user_approved?`
-///   with `allow_nil`).
+/// Gaps (never fabricated rows):
 /// - `role`: birchtree roles have no numeric ids or permission bitmask; the
 ///   id is the role name and permissions stay empty.
+///
+/// Served since the fix round: `ip` (latest login IP or `null`), `ips`
+/// (`[{ip, used_at}]`, newest first), `locale`, `invite_request`,
+/// `created_by_application_id`, `invited_by_account_id` (all `null` when the
+/// credential/attribution row is absent — e.g. remote accounts).
 pub fn admin_account_json(
     server: &crate::api::mastodon::ServerInfo,
+    store: &dyn Store,
+    invites: &dyn crate::application::accounts::InviteStore,
     account: &Account,
     user: Option<&LocalUser>,
 ) -> Value {
@@ -77,24 +78,47 @@ pub fn admin_account_json(
         UserRole::Moderator => ("moderator", "Moderator"),
         UserRole::None => ("user", "User"),
     };
+    // Login IPs, newest first (upstream `user.ips`, `IpSerializer`
+    // `ip, used_at`); `ip` is the latest entry. Store errors degrade to the
+    // absent shape rather than failing the row.
+    let ips: Vec<Value> = store
+        .login_ips_for(account.id, 16)
+        .map(|rows| {
+            rows.iter()
+                .map(|(ip, used_at)| {
+                    json!({ "ip": ip.to_string(), "used_at": iso(*used_at) })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // Invite attribution: the code consumed at registration resolves to its
+    // issuing account (upstream `user.invite.user.account_id`). Expiry and
+    // use-counts don't matter for attribution — only the issuer does — so
+    // this reads the row, not the usability gate.
+    let invited_by_account_id = store
+        .invite_code_for_account(account.id)
+        .ok()
+        .flatten()
+        .and_then(|code| invites.invite_by_code(&code).ok().flatten())
+        .map(|invite| invite.created_by_account_id.to_string());
     json!({
         "id": account.id.to_string(),
         "username": account.username,
         "domain": account.domain,
         "created_at": iso(account.created_at_ms),
         "email": opt_or_null(user.and_then(|u| u.email.clone())),
-        "ip": Value::Null,
+        "ip": ips.first().and_then(|entry| entry.get("ip").cloned()).unwrap_or(Value::Null),
         "confirmed": user.map(|u| json!(u.email_verified)).unwrap_or(Value::Null),
         "suspended": account.suspended,
         "silenced": account.silenced,
         "sensitized": account.sensitized,
         "disabled": user.map(|u| json!(u.disabled)).unwrap_or(Value::Null),
         "approved": user.map(|u| json!(u.approved)).unwrap_or(Value::Null),
-        "locale": Value::Null,
-        "invite_request": Value::Null,
-        "created_by_application_id": Value::Null,
-        "invited_by_account_id": Value::Null,
-        "ips": [],
+        "locale": opt_or_null(user.and_then(|u| u.locale.clone())),
+        "invite_request": opt_or_null(user.and_then(|u| u.invite_request.clone())),
+        "created_by_application_id": opt_or_null(user.and_then(|u| u.created_by_application.map(|id| id.to_string()))),
+        "invited_by_account_id": invited_by_account_id.map(Value::String).unwrap_or(Value::Null),
+        "ips": ips,
         "account": dto::account_json(server, account),
         "role": {
             "id": role_id,
@@ -155,7 +179,7 @@ fn index_response(
     };
     let body: Vec<Value> = rows
         .iter()
-        .map(|(account, user)| admin_account_json(&state.server, account, user.as_ref()))
+        .map(|(account, user)| admin_account_json(&state.server, store, &*state.invites, account, user.as_ref()))
         .collect();
     let next = (rows.len() == page.limit)
         .then(|| rows.last().map(|(a, _)| a.id))
@@ -214,6 +238,7 @@ pub async fn index_v1(State(state): State<ApiState>, auth: Auth, uri: Uri) -> Re
             ip_sub: forms::get(&pairs, "ip").map(str::to_string),
             staff_only: present(&pairs, "staff"),
             role_names: Vec::new(),
+            invited_by: None,
         },
     )
 }
@@ -236,10 +261,18 @@ pub async fn index_v2(State(state): State<ApiState>, auth: Auth, uri: Uri) -> Re
         Some("remote") => Some(false),
         _ => None,
     };
-    // `invited_by`: no invite model exists, so a non-empty value matches
-    // nothing (documented gap).
-    let invited_by = forms::get(&pairs, "invited_by");
-    let mut filter = AdminAccountFilter {
+    // `invited_by`: upstream `AccountFilter#invited_by` joins invites by
+    // user id — absent/empty means no constraint, while a present garbage
+    // value matches nothing (empty page, never an error, never unrelated
+    // rows).
+    let invited_by = match forms::get(&pairs, "invited_by").filter(|v| !v.is_empty()) {
+        None => None,
+        Some(raw) => match admin_uc::parse_invited_by(raw) {
+            Some(id) => Some(id),
+            None => return axum::Json(serde_json::json!([])).into_response(),
+        },
+    };
+    let filter = AdminAccountFilter {
         local_only,
         by_domain: forms::get(&pairs, "by_domain").map(str::to_string),
         status: admin_uc::parse_status(forms::get(&pairs, "status")),
@@ -252,12 +285,8 @@ pub async fn index_v2(State(state): State<ApiState>, auth: Auth, uri: Uri) -> Re
             .into_iter()
             .map(str::to_string)
             .collect(),
+        invited_by,
     };
-    if invited_by.is_some_and(|v| !v.is_empty()) {
-        // No invite model: force an empty page honestly instead of ignoring
-        // the filter (which would leak unrelated rows).
-        filter.username_sub = Some("\u{10FFFF}".to_string());
-    }
     index_response(&state, &uri, page, filter)
 }
 
@@ -276,10 +305,12 @@ async fn load_target(
 
 fn account_response(
     state: &ApiState,
+    store: &dyn Store,
     account: &Account,
     user: Option<&LocalUser>,
 ) -> Response {
-    axum::Json(admin_account_json(&state.server, account, user)).into_response()
+    axum::Json(admin_account_json(&state.server, store, &*state.invites, account, user))
+        .into_response()
 }
 
 /// `GET /api/v1/admin/accounts/:id`.
@@ -293,7 +324,7 @@ pub async fn show(
     }
     let store: &dyn Store = &*state.context.store;
     match load_target(store, &id).await {
-        Ok((account, user)) => account_response(&state, &account, user.as_ref()),
+        Ok((account, user)) => account_response(&state, store, &account, user.as_ref()),
         Err(err) => err.into_response(),
     }
 }
@@ -372,7 +403,7 @@ async fn patch_flag(
             if kills {
                 kill_tokens(&state, account.id);
             }
-            account_response(&state, &account, user.as_ref())
+            account_response(&state, store, &account, user.as_ref())
         }
         Err(err) => ApiError::from(err).into_response(),
     }
@@ -502,7 +533,7 @@ pub async fn approve(
         },
         state.context.now_ms(),
     ) {
-        Ok((account, user)) => account_response(&state, &account, user.as_ref()),
+        Ok((account, user)) => account_response(&state, store, &account, user.as_ref()),
         Err(err) => ApiError::from(err).into_response(),
     }
 }

@@ -130,9 +130,11 @@ impl TestServer {
             federation,
             rate_limit_multiplier: 1,
             mail_env: std::sync::Arc::new(birchtree::mailer::MailEnv::disabled()),
-            invites: std::sync::Arc::new(
-                birchtree::application::accounts::MemoryInviteStore::default(),
-            ),
+            // Durable redb invites, like production (`main.rs`): the
+            // harness's store is the invite store, so invite-gated
+            // registration paths are exercisable end to end.
+            invites: store.clone()
+                as std::sync::Arc<dyn birchtree::application::accounts::InviteStore>,
         });
         Self {
             dir,

@@ -67,6 +67,17 @@ pub struct ServerInfo {
     pub transcode_wall_time_secs: u64,
     pub transcode_max_output_bytes: u64,
     pub transcode_max_memory_bytes: u64,
+    /// Whether `GET /api/v1/instance/peers` serves (mirrors
+    /// `Config::peers_api_enabled`, upstream default true).
+    pub peers_api_enabled: bool,
+    /// Whether `GET /api/v1/instance/activity` serves (mirrors
+    /// `Config::activity_api_enabled`, upstream default true).
+    pub activity_api_enabled: bool,
+    /// Whether `GET /api/v1/instance/domain_blocks` serves (mirrors
+    /// `Config::domain_blocks_public`, upstream default hidden).
+    pub domain_blocks_public: bool,
+    /// Whether invite tokens are honored (mirrors `Config::invites_enabled`).
+    pub invites_enabled: bool,
 }
 
 /// Host and optional explicit port of a separately configured streaming base.
@@ -183,6 +194,10 @@ impl ServerInfo {
             transcode_wall_time_secs: cfg.transcode_wall_time_secs,
             transcode_max_output_bytes: cfg.transcode_max_output_bytes,
             transcode_max_memory_bytes: cfg.transcode_max_memory_bytes,
+            peers_api_enabled: cfg.peers_api_enabled,
+            activity_api_enabled: cfg.activity_api_enabled,
+            domain_blocks_public: cfg.domain_blocks_public,
+            invites_enabled: cfg.invites_enabled,
         }
     }
 }

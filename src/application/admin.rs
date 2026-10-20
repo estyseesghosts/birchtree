@@ -5,6 +5,7 @@
 //! rules and translate store results into domain errors. No HTTP or `redb`
 //! types here.
 
+use super::accounts::InviteStore;
 use crate::application::ports::{
     AdminAccountFilter, AdminAccountPatch, AdminAccountStatus, AdminReportFilter, AdminReportPatch,
     AdminInfraStore, AdminStore, OAuthStore, Store, StreamingSink,
@@ -233,4 +234,38 @@ pub fn list_reports(
     limit: usize,
 ) -> Result<Vec<Report>> {
     store.admin_reports_page(&filter, max_id, since_id, min_id, ascending, limit)
+}
+
+// ---------------------------------------------------------------------------
+// Invited-by attribution (fix-4, P3: admin `invited_by` filter +
+// `invited_by_account_id` serializer field).
+// ---------------------------------------------------------------------------
+
+/// Strictly parse an `invited_by` filter value to an inviter account id.
+///
+/// Upstream (`app/models/account_filter.rb:106-108` at `8ff11c2b`) scopes
+/// with `Invite.where(user_id: value)`: a value naming no inviter matches
+/// nothing. `None` therefore means "match nothing" (never "match
+/// everything"); the endpoint layer maps it to an empty page.
+///
+/// Our invites record the issuing *account*
+/// (`Invite.created_by_account_id`, `domain/user.rs`) where upstream's
+/// `Invite` belongs to a *user* row; the account id is the faithful
+/// equivalent here (one credential row per local account).
+pub fn parse_invited_by(raw: &str) -> Option<Id> {
+    raw.trim().parse::<Id>().ok()
+}
+
+/// Resolve an invite code to its issuing account.
+///
+/// This backs the `invited_by_account_id` serializer field: upstream renders
+/// `user.invite.user.account_id`
+/// (`app/serializers/rest/admin/account_serializer.rb:78-80` at `8ff11c2b`).
+/// `None` for unknown codes (or store errors — attribution must never fail
+/// the row; the field renders `null`).
+pub fn inviter_account_id(invites: &dyn InviteStore, invite_code: &str) -> Option<Id> {
+    match invites.invite_by_code(invite_code) {
+        Ok(Some(invite)) => Some(invite.created_by_account_id),
+        _ => None,
+    }
 }

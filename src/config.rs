@@ -98,8 +98,7 @@ pub struct Config {
     /// Whether the ffmpeg transcode pipeline runs (Phase 7.1). On by
     /// default; `--no-transcode` disables it (uploads keep the Phase 4
     /// passthrough behavior).
-    pub transcoding_enabled: bool,
-    /// ffmpeg binary path (Phase 7.1).
+    pub transcoding_enabled: bool,    /// ffmpeg binary path (Phase 7.1).
     pub ffmpeg_path: String,
     /// libwebp `-quality` 0–100 (Phase 7.1; still-image pipeline).
     pub webp_quality: u8,
@@ -129,14 +128,26 @@ pub struct Config {
     /// Whether invite tokens are honored (round 3, area A). When false, a
     /// supplied `invite_code` is refused with reason and invites never open
     /// closed registrations. On by default (upstream always models invites).
-    pub invites_enabled: bool,
-    /// SMTP provider URL (`smtp://` or `smtps://`). `None` (default) means
+    pub invites_enabled: bool,    /// SMTP provider URL (`smtp://` or `smtps://`). `None` (default) means
     /// outbound mail is explicitly disabled: confirmation/reset sends fail
     /// with `503 Email delivery is not configured`, never a silent success.
     pub smtp_url: Option<String>,
     /// Envelope sender for outbound mail. Required when `smtp_url` is set;
     /// setting it without `smtp_url` is a configuration error.
     pub mail_from: Option<String>,
+    /// Whether `GET /api/v1/instance/peers` serves the known remote domains
+    /// (upstream `Setting.peers_api_enabled`, default true). File-only, no
+    /// CLI flag yet (same posture as `trends_enabled`).
+    pub peers_api_enabled: bool,
+    /// Whether `GET /api/v1/instance/activity` serves weekly local activity
+    /// (upstream `Setting.activity_api_enabled`, default true). File-only.
+    pub activity_api_enabled: bool,
+    /// Whether `GET /api/v1/instance/domain_blocks` serves the user-facing
+    /// domain-block list (upstream `Setting.show_domain_blocks`, default
+    /// `disabled`). Unupstream granularity (`users`/`all` + rationale scope)
+    /// is not modeled; `true` serves silence/suspend rows with public
+    /// digests. File-only.
+    pub domain_blocks_public: bool,
 }
 
 impl Default for Config {
@@ -179,6 +190,9 @@ impl Default for Config {
             invites_enabled: true,
             smtp_url: None,
             mail_from: None,
+            peers_api_enabled: true,
+            activity_api_enabled: true,
+            domain_blocks_public: false,
         }
     }
 }

@@ -53,6 +53,15 @@ pub struct NewLocalAccount {
     /// and pre-attribution records). Recorded on the credential row for the
     /// email-confirmation ownership check (D12 remainder).
     pub created_by_application: Option<Id>,
+    /// Account locale captured at registration (upstream `user.locale`).
+    pub locale: Option<String>,
+    /// Invite-request text captured at registration (`reason` param, upstream
+    /// `user.invite_request.text`).
+    pub invite_request: Option<String>,
+    /// Invite code consumed at registration (`None` when no usable invite was
+    /// supplied). Recorded in `INVITE_USES` in the same transaction as the
+    /// account (backs `invited_by_account_id` + the `invited_by` filter).
+    pub invite_code: Option<String>,
 }
 
 /// Input for registering an OAuth application.
@@ -169,7 +178,32 @@ pub trait AccountStore: Send + Sync {
     /// Record one password sign-in event for the admin `active_users`
     /// telemetry (D39). Called once when a local user completes the browser
     /// password login; API calls on an existing token are not sign-ins.
-    fn record_sign_in(&self, account_id: Id, now_ms: u64) -> Result<()>;
+    /// `ip` is the client IP when the adapter supplied one (backs the admin
+    /// `ip`/`ips` fields; upstream `user.ips`).
+    fn record_sign_in(
+        &self,
+        account_id: Id,
+        now_ms: u64,
+        ip: Option<std::net::IpAddr>,
+    ) -> Result<()>;
+
+    /// Invite code consumed at registration, if any (fix round P1/P3; backs
+    /// `invited_by_account_id` + the v2 `invited_by` filter). `None` when the
+    /// account was not invite-created.
+    fn invite_code_for_account(&self, account_id: Id) -> Result<Option<String>>;
+
+    /// Accounts created with an invite issued by `inviter_id`, oldest first,
+    /// bounded by `cap` (fix round P1/P3; backs the v2 `invited_by` filter).
+    fn accounts_for_inviter(&self, inviter_id: Id, cap: usize) -> Result<Vec<Id>>;
+
+    /// Login IPs for `account_id`, newest first, bounded by `cap`
+    /// (fix round P1/P3; backs the admin `ips` field as `(ip, used_at)`
+    /// pairs; `ip` is the latest entry).
+    fn login_ips_for(
+        &self,
+        account_id: Id,
+        cap: usize,
+    ) -> Result<Vec<(std::net::IpAddr, u64)>>;
 
     /// Resolve a local account by email address (normalized lowercase; D12
     /// public forgot-password). `None` for unknown addresses — the caller,
@@ -747,6 +781,16 @@ pub trait RelationshipStore: Send + Sync {
     fn blocks_of(&self, account_id: Id, max_id: Option<Id>, limit: usize) -> Result<Vec<Id>>;
     /// Mute rows, newest first (cursor = muted account id).
     fn mutes_of(&self, account_id: Id, max_id: Option<Id>, limit: usize) -> Result<Vec<Mute>>;
+}
+
+/// Dismissed follow suggestions (fix round P1/S1; upstream
+/// `follow_recommendation_mutes`). One row per (viewer, target) dismissal;
+/// the ranking engine reads the set back into its exclusion list.
+pub trait SuggestionStore: Send + Sync {
+    /// Record a dismissal; returns `true` when the row is new.
+    fn dismiss_suggestion(&self, viewer_id: Id, target_id: Id, now_ms: u64) -> Result<bool>;
+    /// Dismissed target ids for `viewer_id`, bounded by `cap`.
+    fn dismissed_suggestions(&self, viewer_id: Id, cap: usize) -> Result<Vec<Id>>;
 }
 
 /// A tag follow (`TagFollow`): unique per (account, normalized tag).
@@ -1801,11 +1845,17 @@ pub struct AdminAccountFilter {
     pub display_name_sub: Option<String>,
     /// Substring match on the credential email (`email`; local accounts only).
     pub email_sub: Option<String>,
-    /// Substring match on a login IP (`ip`). Birchtree stores no login IPs,
-    /// so a non-empty filter matches nothing (documented gap).
+    /// Substring match on a login IP (`ip`). Matches when any recorded login
+    /// IP contains the substring (fix round P1/P3; IPs recorded since schema
+    /// v15, older rows have none).
     pub ip_sub: Option<String>,
     /// Only staff accounts (`staff`, v2 `permissions=staff`).
     pub staff_only: bool,
+    /// Only accounts created with an invite issued by this account (v2
+    /// `invited_by`; upstream `AccountFilter#invited_by`). `None` = no
+    /// constraint. A garbage `invited_by` value parses to `None` at the
+    /// endpoint and matches nothing (see `index_v2`).
+    pub invited_by: Option<Id>,
     /// v2 `role_ids`: matched against the role name (`admin`/`moderator`).
     /// Birchtree has no numeric role ids (documented gap).
     pub role_names: Vec<String>,
@@ -2055,6 +2105,7 @@ pub trait Store:
     + MediaStore
     + ListStore
     + MarkerStore
+    + SuggestionStore
     + FilterStore
     + ScheduledStore
     + EmojiStore
@@ -2066,6 +2117,7 @@ pub trait Store:
     + crate::application::federation_ports::FederationContentStore
     + AdminInfraStore
     + AdminStore
+    + crate::application::announcements::AnnouncementStore
     + crate::application::conversations::ConversationStore
     + crate::application::push::PushSubscriptionStore
     + WebStore
@@ -2086,6 +2138,7 @@ impl<T> Store for T where
         + MediaStore
         + ListStore
         + MarkerStore
+        + SuggestionStore
         + FilterStore
         + ScheduledStore
         + EmojiStore
@@ -2097,6 +2150,7 @@ impl<T> Store for T where
     + crate::application::federation_ports::FederationContentStore
     + AdminInfraStore
     + AdminStore
+    + crate::application::announcements::AnnouncementStore
     + crate::application::conversations::ConversationStore
     + crate::application::push::PushSubscriptionStore
     + WebStore

@@ -5,8 +5,8 @@
 //! gate. `PairState` is the viewer/author relationship input computed by the
 //! `RelationshipStore`.
 
-use crate::application::ports::PairState;
-use crate::domain::{Id, QuotePolicy, Status, Visibility};
+use crate::application::ports::{PairState, Store};
+use crate::domain::{Error, Id, QuotePolicy, Result, Status, Visibility};
 
 /// Whether the viewer is mentioned by the status (visible or silent mentions).
 pub fn is_mentioned(viewer: Option<Id>, status: &Status) -> bool {
@@ -18,19 +18,98 @@ pub fn is_mentioned(viewer: Option<Id>, status: &Status) -> bool {
     }
 }
 
+/// Viewer-side facts that `PairState` does not carry (mute expiry and domain
+/// blocks live outside the account-pair tables). Resolved from the store by
+/// [`viewer_side_facts`]; [`can_fetch_full`] folds them into the
+/// show-equivalent gate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FetchFacts {
+    /// The viewer mutes the author (unexpired).
+    pub viewer_mutes_author: bool,
+    /// The viewer domain-blocks the author's domain.
+    pub viewer_domain_blocks_author: bool,
+    /// The author domain-blocks the viewer's domain (remote viewers only;
+    /// upstream `author_blocking_domain?` is false for local viewers whose
+    /// domain is nil — `status_policy.rb:62-66` at pin `8ff11c2b`).
+    pub author_domain_blocks_viewer: bool,
+}
+
+impl FetchFacts {
+    /// Whether any viewer/domain fact refuses the fetch.
+    pub fn denies(self) -> bool {
+        self.viewer_mutes_author
+            || self.viewer_domain_blocks_author
+            || self.author_domain_blocks_viewer
+    }
+}
+
+/// Page size for the author-domain-block membership scan in
+/// [`viewer_side_facts`]. Domain-block lists are tiny; one page suffices.
+const DOMAIN_BLOCK_SCAN_LIMIT: usize = 1024;
+
+/// Resolve the [`FetchFacts`] for a viewer/author pair from the store.
+///
+/// Viewer mute/domain-block come from the viewer's relationship to the
+/// author (one `relationships` lookup); author-domain-blocks-viewer scans
+/// the author's domain-block list for the viewer's domain and applies only
+/// to remote viewers. A viewer never carries facts against themselves.
+pub fn viewer_side_facts(
+    store: &dyn Store,
+    viewer_id: Id,
+    author_id: Id,
+    now_ms: u64,
+) -> Result<FetchFacts> {
+    if viewer_id == author_id {
+        return Ok(FetchFacts::default());
+    }
+    let author = store
+        .account_by_id(author_id)?
+        .ok_or_else(|| Error::NotFound("status".into()))?;
+    let viewer = store
+        .account_by_id(viewer_id)?
+        .ok_or_else(|| Error::NotFound("status".into()))?;
+    let mut facts = FetchFacts::default();
+    let rels = store.relationships(viewer_id, &[(author_id, author.domain.clone())], now_ms)?;
+    if let Some(rel) = rels.first() {
+        facts.viewer_mutes_author = rel.muting;
+        facts.viewer_domain_blocks_author = rel.domain_blocking;
+    }
+    if !viewer.local {
+        let blocks = store.domain_blocks(author_id, None, None, DOMAIN_BLOCK_SCAN_LIMIT)?;
+        let viewer_domain = viewer.domain.to_ascii_lowercase();
+        facts.author_domain_blocks_viewer = blocks
+            .iter()
+            .any(|b| b.domain.to_ascii_lowercase() == viewer_domain);
+    }
+    Ok(facts)
+}
+
 /// Predicate 1: can this viewer fetch this status?
 ///
-/// Mirrors Mastodon v4.7.3 `StatusPolicy#show?` for local statuses:
+/// Mirrors Mastodon v4.7.3 `StatusPolicy#show?` for local statuses
+/// (`app/policies/status_policy.rb:1-30` at pin `8ff11c2b`):
 /// deleted -> never; `public`/`unlisted` -> anyone except when the author
 /// blocks the viewer; `private` -> author, followers, mentioned; `direct` ->
 /// author or mentioned only.
+///
+/// F2 hardening: the fetch additionally refuses when the VIEWER blocks the
+/// author (`PairState::blocked_by`). Upstream `show?` does NOT include the
+/// viewer-side check (only `reblog?`/`favourite?`/`quote?` deny on
+/// `blocking_author?` — `status_policy.rb:17,21,25` at the pin) and never
+/// checks mutes, so this gate is deliberately stricter than upstream.
+/// Mute and domain-block facts (likewise stricter than upstream `show?`)
+/// fold in via [`can_fetch_full`].
 pub fn can_fetch(viewer: Option<Id>, status: &Status, pair: PairState) -> bool {
     if status.is_deleted() {
         return false;
     }
+    // Either direction of account block refuses the fetch.
+    if pair.blocking || pair.blocked_by {
+        return false;
+    }
     match status.visibility {
-        // Anonymous OK; a blocked viewer is refused (author-side block).
-        Visibility::Public | Visibility::Unlisted => !pair.blocking,
+        // Anonymous OK.
+        Visibility::Public | Visibility::Unlisted => true,
         Visibility::Private => {
             viewer == Some(status.account_id) || pair.followed_by || is_mentioned(viewer, status)
         }
@@ -38,22 +117,42 @@ pub fn can_fetch(viewer: Option<Id>, status: &Status, pair: PairState) -> bool {
     }
 }
 
-/// `StatusPolicy#reblog?`: not direct, private only by owner, fetchable, and
-/// the author does not block the viewer (`can_fetch` covers the block).
+/// Predicate 1 with viewer-side facts: [`can_fetch`] plus the mute and
+/// domain-block refuses (see [`FetchFacts`]). This is the full
+/// show-equivalent gate the fetch paths enforce.
+pub fn can_fetch_full(
+    viewer: Option<Id>,
+    status: &Status,
+    pair: PairState,
+    facts: FetchFacts,
+) -> bool {
+    can_fetch(viewer, status, pair) && !facts.denies()
+}
+
+/// `StatusPolicy#reblog?` (`status_policy.rb:21` at pin `8ff11c2b`): not
+/// direct, private only by owner, fetchable, the author does not block the
+/// viewer (`can_fetch` covers the author-side block) and the viewer does
+/// not block the author (`!blocking_author?`).
 pub fn can_reblog(viewer: Id, status: &Status, pair: PairState) -> bool {
-    status.visibility.is_rebloggable()
+    !pair.blocked_by
+        && status.visibility.is_rebloggable()
         && (status.visibility != Visibility::Private || viewer == status.account_id)
         && can_fetch(Some(viewer), status, pair)
 }
 
-/// `StatusPolicy#favourite?` = `show?` (blocks included via the pair state).
+/// `StatusPolicy#favourite?` (`status_policy.rb:25` at pin `8ff11c2b`) =
+/// `show?` plus the viewer-side block check. (Upstream has no mute check
+/// here; mutes refuse earlier at the fetch layer via [`can_fetch_full`].)
 pub fn can_favourite(viewer: Id, status: &Status, pair: PairState) -> bool {
-    can_fetch(Some(viewer), status, pair)
+    !pair.blocked_by && can_fetch(Some(viewer), status, pair)
 }
 
-/// `StatusPolicy#bookmark?` = `show?`.
+/// Bookmark create is show-gated upstream (the bookmarks controller only
+/// authorizes `:show?`); the viewer-side block check here is the F2
+/// hardening shared with the other action gates, deliberately stricter
+/// than upstream.
 pub fn can_bookmark(viewer: Id, status: &Status, pair: PairState) -> bool {
-    can_fetch(Some(viewer), status, pair)
+    !pair.blocked_by && can_fetch(Some(viewer), status, pair)
 }
 
 /// D22: how the viewer's home feed treats statuses that mention an account
@@ -211,10 +310,15 @@ pub enum QuotePermission {
 }
 
 /// Compute the viewer's quote permission (`StatusPolicy#quote?` folded with
-/// the status's `quote_approval_policy`).
+/// the status's `quote_approval_policy`; `status_policy.rb:15-18` at pin
+/// `8ff11c2b`). The viewer-side block check is `quote?`'s
+/// `!blocking_author?`; `can_fetch` already covers the author-side block.
 pub fn quote_permission(viewer: Option<Id>, status: &Status, pair: PairState) -> QuotePermission {
     // Direct messages and reblogs are never quotable.
     if status.visibility == Visibility::Direct || status.is_reblog() {
+        return QuotePermission::Denied;
+    }
+    if pair.blocked_by {
         return QuotePermission::Denied;
     }
     if !can_fetch(viewer, status, pair) {
@@ -338,5 +442,53 @@ mod tests {
             quote_permission(Some(Id::new(2)), &s, follows),
             QuotePermission::Denied
         );
+    }
+
+    #[test]
+    fn viewer_blocking_author_denies_fetch_and_actions() {
+        let s = status(Visibility::Public, 1);
+        let pair = PairState {
+            blocked_by: true,
+            ..PairState::default()
+        };
+        assert!(!can_fetch(Some(Id::new(2)), &s, pair));
+        assert!(!can_reblog(Id::new(2), &s, pair));
+        assert!(!can_favourite(Id::new(2), &s, pair));
+        assert!(!can_bookmark(Id::new(2), &s, pair));
+        assert_eq!(
+            quote_permission(Some(Id::new(2)), &s, pair),
+            QuotePermission::Denied
+        );
+    }
+
+    #[test]
+    fn fetch_facts_deny_on_mute_or_domain() {
+        let s = status(Visibility::Public, 1);
+        let pair = PairState::default();
+        assert!(can_fetch_full(
+            Some(Id::new(2)),
+            &s,
+            pair,
+            FetchFacts::default()
+        ));
+        for facts in [
+            FetchFacts {
+                viewer_mutes_author: true,
+                ..FetchFacts::default()
+            },
+            FetchFacts {
+                viewer_domain_blocks_author: true,
+                ..FetchFacts::default()
+            },
+            FetchFacts {
+                author_domain_blocks_viewer: true,
+                ..FetchFacts::default()
+            },
+        ] {
+            assert!(facts.denies());
+            assert!(!can_fetch_full(Some(Id::new(2)), &s, pair, facts));
+        }
+        // Anonymous viewers carry no viewer-side facts.
+        assert!(!FetchFacts::default().denies());
     }
 }

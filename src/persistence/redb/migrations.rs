@@ -436,6 +436,29 @@ pub fn apply(db: &Database) -> Result<u64, StoreError> {
             }
         }
 
+        // Step v13: dismissed follow suggestions (fix round P1/S1). Fresh
+        // databases already have the table from the v1 step; this opens it
+        // for pre-v13 databases. No backfill: dismissals are new state.
+        if current < 13 {
+            let _ = write.open_table(schema::SUGGESTION_MUTES)?;
+        }
+
+        // Step v14: announcements (fix round P1/S2). Same open-only shape;
+        // no backfill.
+        if current < 14 {
+            let _ = write.open_table(schema::ANNOUNCEMENTS)?;
+            let _ = write.open_table(schema::ANNOUNCEMENT_MUTES)?;
+            let _ = write.open_table(schema::ANNOUNCEMENT_REACTIONS)?;
+            let _ = write.open_table(schema::ANNOUNCEMENT_REACTIONS_BY_ANNOUNCEMENT)?;
+            let _ = write.open_table(schema::ANNOUNCEMENT_REACTIONS_BY_VIEWER)?;
+        }
+
+        // Step v15: invite attribution (fix round P1/P3). Same open-only
+        // shape; no backfill (pre-v15 accounts have no recorded code).
+        if current < 15 {
+            let _ = write.open_table(schema::INVITE_USES)?;
+        }
+
         {
             let mut meta = write.open_table(META)?;
             meta.insert(

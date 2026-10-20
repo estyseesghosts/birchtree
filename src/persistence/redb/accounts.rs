@@ -11,7 +11,9 @@ use crate::application::ports::{
 use crate::domain::user::{EmailToken, Invite};
 use crate::domain::{Account, Error, Id, LocalUser, Result, SignInEvent, UserRole};
 
-use super::schema::{ACCOUNTS, EMAIL_INDEX, EMAIL_TOKENS, HANDLE_INDEX, INVITES, LOCAL_USERS};
+use super::schema::{
+    ACCOUNTS, EMAIL_INDEX, EMAIL_TOKENS, HANDLE_INDEX, INVITES, LOCAL_USERS,
+};
 use super::{decode, encode, RedbStore, StoreResult};
 
 /// Normalize an email address for the [`EMAIL_INDEX`](super::schema::EMAIL_INDEX)
@@ -96,6 +98,10 @@ impl AccountStore for RedbStore {
             role: UserRole::None,
             // Signup-app attribution (D12 remainder; None for CLI/bootstrap).
             created_by_application: input.created_by_application,
+            // Registration captures (fix round P1/P3): locale, invite-request
+            // text and consumed invite code (INVITE_USES, same transaction).
+            locale: input.locale,
+            invite_request: input.invite_request,
         };
 
         {
@@ -132,6 +138,19 @@ impl AccountStore for RedbStore {
                     )));
                 }
                 index.insert(normalized.as_str(), account_id.value())?;
+            }
+        }
+
+        // Invite attribution shares the account-creation transaction: the
+        // consumed invite code is recorded under the new account id (backs
+        // `invited_by_account_id` + the v2 `invited_by` filter). Only a
+        // usable invite's code reaches `NewLocalAccount::invite_code` (the
+        // application layer clears unusable codes), so every row here is a
+        // genuine redemption.
+        if let Some(code) = input.invite_code.as_deref() {
+            if !code.trim().is_empty() {
+                let mut uses = write.open_table(super::schema::INVITE_USES)?;
+                uses.insert(account_id.value(), code)?;
             }
         }
 
@@ -331,7 +350,12 @@ impl AccountStore for RedbStore {
         Ok(user)
     }
 
-    fn record_sign_in(&self, account_id: Id, now_ms: u64) -> Result<()> {
+    fn record_sign_in(
+        &self,
+        account_id: Id,
+        now_ms: u64,
+        ip: Option<std::net::IpAddr>,
+    ) -> Result<()> {
         let write = self.begin_write()?;
         // Only real local users leave sign-in telemetry; a missing
         // credential row (or a remote id) records nothing, never an error.
@@ -344,6 +368,7 @@ impl AccountStore for RedbStore {
             id: self.next_id(),
             account_id,
             created_at_ms: now_ms,
+            ip,
         };
         {
             let mut table = write.open_table(super::schema::SIGN_INS)?;
@@ -351,6 +376,75 @@ impl AccountStore for RedbStore {
         }
         write.commit()?;
         Ok(())
+    }
+
+    fn invite_code_for_account(&self, account_id: Id) -> Result<Option<String>> {
+        let read = self.begin_read()?;
+        let table = read.open_table(super::schema::INVITE_USES)?;
+        match table.get(account_id.value())? {
+            Some(guard) => Ok(Some(guard.value().to_string())),
+            None => Ok(None),
+        }
+    }
+
+    fn accounts_for_inviter(&self, inviter_id: Id, cap: usize) -> Result<Vec<Id>> {
+        // INVITE_USES is keyed by created account; the scan is bounded and
+        // the invite lookup resolves the issuing account per row.
+        let read = self.begin_read()?;
+        let uses = read.open_table(super::schema::INVITE_USES)?;
+        let invites = read.open_table(super::schema::INVITES)?;
+        let mut out = Vec::new();
+        for entry in uses.range(0u64..=u64::MAX)? {
+            let (account_key, code_guard) = entry?;
+            let code = code_guard.value();
+            let matched = match invites.get(code)? {
+                Some(guard) => {
+                    let invite: Invite = decode(guard.value())?;
+                    invite.created_by_account_id == inviter_id
+                }
+                None => false,
+            };
+            if matched {
+                out.push(Id::new(account_key.value()));
+                if out.len() >= cap {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn login_ips_for(
+        &self,
+        account_id: Id,
+        cap: usize,
+    ) -> Result<Vec<(std::net::IpAddr, u64)>> {
+        // SIGN_INS is keyed by event id (timestamp-ordered); the scan is
+        // bounded and newest-first so the latest login wins `ip`.
+        let read = self.begin_read()?;
+        let table = read.open_table(super::schema::SIGN_INS)?;
+        let mut out = Vec::new();
+        let mut events: Vec<SignInEvent> = Vec::new();
+        for entry in table.range(0u64..=u64::MAX)? {
+            let (_, value) = entry?;
+            let event: SignInEvent = decode(value.value())?;
+            if event.account_id == account_id {
+                events.push(event);
+            }
+            if events.len() >= cap {
+                break;
+            }
+        }
+        events.sort_by_key(|event| std::cmp::Reverse(event.created_at_ms));
+        for event in events {
+            if let Some(ip) = event.ip {
+                out.push((ip, event.created_at_ms));
+                if out.len() >= cap {
+                    break;
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn account_by_email(&self, normalized_email: &str) -> Result<Option<Account>> {

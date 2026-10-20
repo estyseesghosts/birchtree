@@ -12,9 +12,9 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| GET | `/.well-known/webfinger` | none | — | planned (Phase 6) | In | WebFinger `acct:` resolution |
-| GET | `/.well-known/nodeinfo` | none | — | planned (Phase 6) | In | NodeInfo discovery |
-| GET | `/nodeinfo/2.0` | none | — | planned (Phase 6) | In | NodeInfo 2.0 document |
+| GET | `/.well-known/webfinger` | none | — | implemented (Phase 6) | In | WebFinger `acct:` resolution |
+| GET | `/.well-known/nodeinfo` | none | — | implemented (Phase 6) | In | NodeInfo discovery |
+| GET | `/nodeinfo/2.0` | none | — | implemented (Phase 6) | In | NodeInfo 2.0 document (real local-only `usage`, D31) |
 | GET/POST | `/oauth/authorize` | session | — | implemented (Phase 2) | In | Doorkeeper authorize; login + consent rendered server-side |
 | POST | `/oauth/token` | basic/client | — | implemented (Phase 2) | In | `authorization_code` (PKCE S256) + `client_credentials` |
 | POST | `/oauth/revoke` | basic/client | — | implemented (Phase 2) | In | Always `200 {}`; wrong client `403 unauthorized_client` |
@@ -27,6 +27,16 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 |---|---|---|---|---|---|---|
 | GET | `/api/v1/instance` | none | — | implemented (Phase 2) | In | instance discovery, `REST::V1::InstanceSerializer` |
 | GET | `/api/v2/instance` | none | — | implemented (Phase 2) | In | instance discovery v2, `REST::InstanceSerializer` |
+| GET | `/api/v1/instance/peers` | none | — | implemented (fix round) | In | distinct remote domains, sorted; 404 when `peers_api_enabled` is off (default on) |
+| GET | `/api/v1/instance/rules` | none | — | implemented (fix round) | In | server rules id-ordered, `translations:{}` (no translations stored) |
+| GET | `/api/v1/instance/domain_blocks` | none | — | implemented (fix round) | In | 404 while `domain_blocks_public` is off (default, as upstream); serves silence/suspend rows with public digests when on |
+| GET | `/api/v1/instance/languages` | none | — | implemented (fix round) | In | distinct status languages; `name` = code (no locale catalog — recorded divergence) |
+| GET | `/api/v1/instance/activity` | none | — | implemented (fix round) | In | 12 trailing 7-day `{week, statuses, logins, registrations}` windows, string values; 404 when `activity_api_enabled` is off (default on) |
+| GET | `/api/v1/instance/extended_description` | none | — | implemented (fix round) | In | unset shape `{updated_at:null,content:""}` (no authoring surface yet) |
+| GET | `/api/v1/instance/translation_languages` | none | — | implemented (fix round) | In | `{}` (no translation provider configured) |
+| GET | `/api/v1/instance/privacy_policy` | none | — | planned | In | 404 until the policy-text setting lands |
+| GET | `/api/v1/instance/terms_of_service` | none | — | planned | In | 404 until the terms-text setting lands |
+| GET | `/api/v1/instance/terms_of_service/:date` | none | — | planned | In | as above |
 | GET | `/api/v1/accounts` | optional | read \| read:accounts | implemented (Phase 7) | In | multi-fetch `id[]` (up to 40; above that `422 Mastodon::ValidationError`); unapproved and pending-deletion accounts omitted (upstream `set_accounts`) |
 | POST | `/api/v1/accounts` | app | write \| write:accounts | implemented (Phase 2) | In | registration; returns a user token |
 | GET | `/api/v1/accounts/verify_credentials` | user | profile \| read \| read:accounts | implemented (Phase 2) | In | `CredentialAccountSerializer` (real counters) |
@@ -101,7 +111,7 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 | POST | `/api/v1/statuses/:id/unpin` | user | write \| write:accounts | implemented (Phase 3) | In | 200 no-op when not pinned |
 | GET | `/api/v1/statuses/:id/favourited_by` | optional | read \| read:accounts | implemented (Phase 3) | In | accounts; cursor = favourite id (hidden in `Link`) |
 | GET | `/api/v1/statuses/:id/reblogged_by` | optional | read \| read:accounts | implemented (Phase 3) | In | accounts; cursor = reblog id |
-| GET | `/api/v1/statuses/:id/quotes` | user | read \| read:statuses | implemented (Phase 3) | In | 401 without token; accepted quotes only; cursor = quoting status id |
+| GET | `/api/v1/statuses/:id/quotes` | user | read \| read:statuses | implemented (Phase 3) | In | 401 without token; accepted quotes only; cursor = quoting status id (DIVERGES from upstream quote-id cursor — triage 2026-10-20, queued in `docs/fix-plan.md` P2) |
 | POST | `/api/v1/statuses/:id/quotes/:quoting_status_id/revoke` | user | write \| write:statuses | implemented (Phase 3) | In | quoted author only; 200 = quoting status |
 | POST | `/api/v1/statuses/:id/mute` | user | write \| write:mutes | implemented (Phase 7) | In | conversation mute; the status DTO `muted` reflects it |
 | POST | `/api/v1/statuses/:id/unmute` | user | write \| write:mutes | implemented (Phase 7) | In | as above |
@@ -188,26 +198,32 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| GET | `/api/v1/suggestions` | user | read \| read:accounts | implemented (Phase 7) | In | deprecated upstream (`Deprecation` and `Sunset` headers from 2021-05-16); `limit` and `offset` |
-| DELETE | `/api/v1/suggestions/:id` | user | write \| write:accounts | implemented (Phase 7) | In | `:id` is the suggested account id; `render_empty` |
-| GET | `/api/v2/suggestions` | user | read \| read:accounts | implemented (Phase 7) | In | `REST::SuggestionSerializer[]`; `Mastodon-Async-Refresh` when a FASP retrieval runs (feature-flagged upstream). FASP-sourced entries are out of profile until a FASP integration exists; never fabricated |
-| DELETE | `/api/v2/suggestions/:id` | user | write \| write:accounts | implemented (Phase 7) | In | `:id` is the suggested account id |
+| GET | `/api/v1/suggestions` | user | read \| read:accounts | implemented (fix round) | In | deprecated upstream (`Deprecation: @1621123200` only — no `Sunset` at the pin); `limit`/`offset`; honest local ranking (FoF then global fill, `SUGGESTION_MUTES` exclusions); app-only token → 422 |
+| DELETE | `/api/v1/suggestions/:id` | user | write \| write:accounts | implemented (fix round) | In | `:id` is the suggested account id; persists the dismissal; `200 {}` (`render_empty`) |
+| GET | `/api/v2/suggestions` | user | read \| read:accounts | implemented (fix round) | In | `REST::SuggestionSerializer[]` (`source` legacy map, `sources`); same ranking; FASP-sourced entries out of profile until a FASP integration exists; never fabricated |
+| DELETE | `/api/v2/suggestions` | — | — | absent (fix round) | In | no such route upstream (`config/routes/api.rb:265`); Axum answers 405 on the GET path where Rails answers 404 |
+| GET | `/api/v1/directory` | optional | read \| read:accounts (authed only) | implemented (fix round) | In | anonymous list; `local`/`order` (`new`/`active`)/`offset`/`limit`; always enabled (no `Setting.profile_directory` gate here); authed viewers exclude blocked/muted |
+| GET/POST | `/oauth/userinfo` | user | profile | implemented (fix round) | In | OIDC claims (`sub`, `preferred_username`, `profile`, `picture`); wrong scope → 403, anonymous → 401 |
 
 ### Announcements (Phase 7)
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| GET | `/api/v1/announcements` | user (any scope) | — | implemented (Phase 7) | In | `require_user!` only (no scope check); published announcements, chronological; authored by CLI |
-| POST | `/api/v1/announcements/:id/dismiss` | user | write \| write:accounts | implemented (Phase 7) | In | `render_empty` |
-| PUT | `/api/v1/announcements/:announcement_id/reactions/:id` | user | write \| write:favourites | implemented (Phase 7) | In | `:id` is the reaction name; `render_empty` |
-| PATCH | `/api/v1/announcements/:announcement_id/reactions/:id` | user | write \| write:favourites | implemented (Phase 7) | In | alias of PUT |
-| DELETE | `/api/v1/announcements/:announcement_id/reactions/:id` | user | write \| write:favourites | implemented (Phase 7) | In | removes the viewer's reaction by name |
+| GET | `/api/v1/announcements` | user (any scope) | — | implemented (fix round) | In | `require_user!` only (no scope check); published announcements, chronological; durable rows (schema v14) |
+| POST | `/api/v1/announcements/:id/dismiss` | user | write \| write:accounts | implemented (fix round) | In | `200 {}` (`render_empty`); 404 unless published |
+| PUT | `/api/v1/announcements/:announcement_id/reactions/:id` | user | write \| write:favourites | implemented (fix round) | In | `:id` is the reaction name; `200 {}`; 404 unless published; 422 on invalid emoji; max 8 distinct names; PUT is idempotent |
+| PATCH | `/api/v1/announcements/:announcement_id/reactions/:id` | user | write \| write:favourites | implemented (fix round) | In | alias of PUT |
+| DELETE | `/api/v1/announcements/:announcement_id/reactions/:id` | user | write \| write:favourites | implemented (fix round) | In | removes the viewer's reaction by name; 404 when missing |
+| GET/POST | `/api/v1/admin/announcements` | admin | admin:read / admin:write | implemented (fix round) | In | new API surface (upstream authoring is HTML-only); administration-only, Moderator refused; scheduled publish is manual (no publish job yet) |
+| GET/PUT/PATCH/DELETE | `/api/v1/admin/announcements/:id` | admin | admin:read / admin:write | implemented (fix round) | In | as above; update never flips `published` by itself |
+| POST | `/api/v1/admin/announcements/:id/publish` | admin | admin:write | implemented (fix round) | In | as above |
+| POST | `/api/v1/admin/announcements/:id/unpublish` | admin | admin:write | implemented (fix round) | In | as above |
 
 ### Donation campaigns (Phase 7)
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| GET | `/api/v1/donation_campaigns` | user (any scope) | — | implemented (Phase 7) | In | `204` when no campaign API URL is configured, or when no campaign is returned. Otherwise an outbound GET to the operator-configured URL through the safe client, cached 1 h, circuit-broken after repeated failures |
+| GET | `/api/v1/donation_campaigns` | user (any scope) | — | implemented (fix round) | In | honest absence: outbound campaign fetch unbuilt, so 404 (`Record not found`) — never a success-shaped 204 |
 
 ### Web Push (Phase 7)
 
@@ -290,7 +306,7 @@ All admin rows: auth `user + role`. The role is `admin` (every admin route) or `
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| GET | `/api/v1/admin/accounts` | user + role | admin:read \| admin:read:accounts | implemented (Phase 7.3) | In | `REST::Admin::AccountSerializer[]` |
+| GET | `/api/v1/admin/accounts` | user + role | admin:read \| admin:read:accounts | implemented (Phase 7.3, identity stores fix round) | In | `REST::Admin::AccountSerializer[]`; `locale`/`invite_request`/`created_by_application_id`/`invited_by_account_id` served from registration attribution (null when absent); `ip`/`ips` from password-login telemetry (recorded since schema v15); `ip` filter substring-matches recorded logins |
 | GET | `/api/v1/admin/accounts/:id` | user + role | admin:read \| admin:read:accounts | implemented (Phase 7.3) | In | |
 | DELETE | `/api/v1/admin/accounts/:id` | user + role | admin:write \| admin:write:accounts | implemented (Phase 7.3; worker D38) | In | suspends+disables immediately and enqueues the bounded restartable deletion batches plus the federated `Delete` of the actor in the same transaction (upstream: async worker). Revokes the account's tokens and closes its open streams (D24) |
 | POST | `/api/v1/admin/accounts/:id/enable` | user + role | admin:write \| admin:write:accounts | implemented (Phase 7.3) | In | local accounts only (`require_local_account!`). Does not restore tokens revoked by an earlier kill (D24) |
@@ -360,9 +376,9 @@ All admin rows: auth `user + role`. The role is `admin` (every admin route) or `
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| POST | `/api/v1/admin/measures` | user + role | admin:read | implemented (Phase 7.3, keys round 2, extended round 3) | In | POST with a read scope upstream (kept). Served: `new_users`, `opened_reports`, `resolved_reports`, `active_users` (password-login telemetry), `instance_follows`, `instance_followers`, `instance_statuses`, `instance_reports`, `instance_accounts`, `instance_media_attachments`, `tag_accounts`/`tag_uses`/`tag_servers` (need `<key>[id]>`; omitted without a resolvable id, never zero-filled), `interactions` (unified journal: non-self replies, created favourites/reblogs, votes, new follows/requests). Omitted with reasons (never fabricated): `software_versions` (no version census) |
-| POST | `/api/v1/admin/dimensions` | user + role | admin:read | implemented (Phase 7.3, keys round 2, extended round 3) | In | POST with a read scope upstream. Served: `languages`, `sources`, `servers`, `space_usage` (media + measured redb `database` bytes; no postgres/redis/search), `instance_accounts`, `instance_languages` (bare-code `human_key`), `tag_servers`/`tag_languages` (need `<key>[id]>`). Omitted with reasons: `software_versions` (no version census) |
-| POST | `/api/v1/admin/retention` | user + role | admin:read | implemented (Phase 7.3, cohorts round 3) | In | POST with a read scope upstream (kept). Cohorts are sign-in-unioned-with-authorship (superset of upstream sign-in-only; pure sign-in would break the authorship cohort test) |
+| POST | `/api/v1/admin/measures` | user + role (admin or moderator, fix round) | admin:read | implemented (Phase 7.3, keys round 2, extended round 3) | In | POST with a read scope upstream (kept). Served: `new_users`, `opened_reports`, `resolved_reports`, `active_users` (password-login telemetry), `instance_follows`, `instance_followers`, `instance_statuses`, `instance_reports`, `instance_accounts`, `instance_media_attachments`, `tag_accounts`/`tag_uses`/`tag_servers` (need `<key>[id]>`; omitted without a resolvable id, never zero-filled), `interactions` (unified journal: non-self replies, created favourites/reblogs, votes, new follows/requests). Omitted with reasons (never fabricated): `software_versions` (no version census) |
+| POST | `/api/v1/admin/dimensions` | user + role (admin or moderator, fix round) | admin:read | implemented (Phase 7.3, keys round 2, extended round 3) | In | POST with a read scope upstream. Served: `languages`, `sources`, `servers`, `space_usage` (media + measured redb `database` bytes; no postgres/redis/search), `instance_accounts`, `instance_languages` (bare-code `human_key`), `tag_servers`/`tag_languages` (need `<key>[id]>`). Omitted with reasons: `software_versions` (no version census) |
+| POST | `/api/v1/admin/retention` | user + role (admin or moderator, fix round) | admin:read | implemented (Phase 7.3, cohorts round 3) | In | POST with a read scope upstream (kept). Cohorts are sign-in-unioned-with-authorship (superset of upstream sign-in-only; pure sign-in would break the authorship cohort test) |
 
 #### Canonical email blocks and tags
 
@@ -382,7 +398,7 @@ All admin rows: auth `user + role`. The role is `admin` (every admin route) or `
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| GET | `/api/v2/admin/accounts` | user + role | admin:read \| admin:read:accounts | implemented (Phase 7.3) | In | v1 admin accounts index with filter parameters (`origin`, `status`, `permissions`, `username`, `by_domain`, `display_name`, `email`, `ip`, `invited_by`, `role_ids`); `Link` cursors (`max_id`, `min_id`) |
+| GET | `/api/v2/admin/accounts` | user + role | admin:read \| admin:read:accounts | implemented (Phase 7.3, identity stores fix round) | In | v1 admin accounts index with filter parameters (`origin`, `status`, `permissions`, `username`, `by_domain`, `display_name`, `email`, `ip`, `invited_by`, `role_ids`); `invited_by` resolves through invite attribution (garbage → empty page, as upstream); `Link` cursors (`max_id`, `min_id`) |
 
 ### Bullet-only entries (excluded, or not yet rowed)
 
@@ -483,8 +499,8 @@ Recorded, not fixed. Each needs a decision or a contract-review pass.
    - `instance` sub-resources (`peers`, `rules`, `domain_blocks`, `terms_of_service` with `:date`, `privacy_policy`, `extended_description`, `translation_languages`, `languages`, `activity`), and `peers/search`;
    - `emails/confirmations` (`POST`) and `emails/check_confirmation` — rowed (round 3, area A); redemption + ownership remain (D12);
    - `domain_blocks/preview`;
-   - `tags` (`GET /api/v1/tags/:id`; `follow`, `unfollow`, `feature`, `unfeature`) and `followed_tags`; `featured_tags` (top-level and per-account);
-   - accounts sub-resources: `lists`, `identity_proofs`, `familiar_followers`, `email_subscriptions`, `collections`, `in_collections`; top-level `collections` (`GET`/`POST`/`PUT`/`DELETE`, and `items`/`revoke`);
+   - `tags` (`GET /api/v1/tags/:id`; `follow`, `unfollow`, `feature`, `unfeature`), `followed_tags`, `featured_tags` (top-level and per-account) — already rowed above (Phase 7);
+   - accounts sub-resources: `lists`, `identity_proofs`, `email_subscriptions`, `collections`, `in_collections` still to row; `familiar_followers` already rowed above (Phase 7); top-level `collections` (`GET`/`POST`/`PUT`/`DELETE`, and `items`/`revoke`) still to row;
    - notifications: `requests/:id` (show), `requests/:id/accept|dismiss`, the bulk `requests/accept|dismiss`, and `notifications/policy` (`GET`/`PUT`) — all rowed (round 3, area C);
    - `GET /api/v2/notifications` and its `clear`, `unread_count`, `dismiss`, `:group_key/accounts`, and `policy` sub-routes.
 3. **`GET /api/v1/accounts` (index) had no row.** Resolved in the 2026-10-17 follow-up: the row is in profile at Phase 7, as the account multi-fetch (`id[]`, up to 40).

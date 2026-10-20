@@ -120,7 +120,9 @@ fn report_json(
         None => None,
     };
     let admin_json = |account: Option<Account>, user: Option<LocalUser>| match account {
-        Some(account) => admin_account_json(&state.server, &account, user.as_ref()),
+        Some(account) => {
+            admin_account_json(&state.server, store, &*state.invites, &account, user.as_ref())
+        }
         None => Value::Null,
     };
 

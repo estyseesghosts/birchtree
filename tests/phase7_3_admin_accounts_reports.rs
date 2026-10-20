@@ -275,7 +275,7 @@ async fn admin_accounts_show_shape_and_404() {
     assert_eq!(body["sensitized"], false);
     assert_eq!(body["disabled"], false);
     assert_eq!(body["approved"], true);
-    assert_eq!(body["locale"], serde_json::Value::Null);
+    assert_eq!(body["locale"], serde_json::json!("en"));
     assert_eq!(body["account"]["id"], f.user_id.to_string());
     assert_eq!(body["account"]["username"], "plain");
     assert_eq!(body["role"]["id"], "user");

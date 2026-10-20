@@ -29,6 +29,8 @@ pub mod markers;
 pub mod filters;
 pub mod scheduled;
 pub mod emoji;
+pub mod suggestions;
+pub mod announcements;
 pub mod search;
 
 // Phase 6: federation keys, remote accounts, inbound dedup and follow commands.

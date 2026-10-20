@@ -9,8 +9,8 @@
 use redb::{ReadableTable, WriteTransaction};
 
 use crate::application::ports::{
-    AdminAccountFilter, AdminAccountPatch, AdminAccountStatus, AdminReportFilter, AdminReportPatch,
-    AdminStore,
+    AccountStore, AdminAccountFilter, AdminAccountPatch, AdminAccountStatus, AdminReportFilter,
+    AdminReportPatch, AdminStore,
 };
 use crate::domain::{
     Account, AccountWarning, AdminAuditRecord, Error, Id, Job, JobKind, LocalUser, Report, Result,
@@ -130,7 +130,30 @@ fn status_matches(account: &Account, user: Option<&LocalUser>, status: AdminAcco
     }
 }
 
-fn account_matches(account: &Account, user: Option<&LocalUser>, filter: &AdminAccountFilter) -> bool {
+/// Bound on the `invited_by` attribution pre-resolution (fix round P1/P3).
+const INVITED_SCAN_CAP: usize = 1000;
+/// Bound on the per-row login-IP read behind the admin `ip` filter.
+const IP_LOOKUP_CAP: usize = 16;
+
+/// Substring match of the admin `ip` filter against recorded login IPs.
+/// `None` needle = no constraint. Needs store access, so it runs per
+/// candidate row (bounded by the page limit upstream of the scan).
+fn ip_matches(store: &RedbStore, account_id: Id, needle: Option<&str>) -> bool {
+    let Some(needle) = needle else {
+        return true;
+    };
+    match AccountStore::login_ips_for(store, account_id, IP_LOOKUP_CAP) {
+        Ok(ips) => ips.iter().any(|(ip, _)| ip.to_string().contains(needle)),
+        Err(_) => false,
+    }
+}
+
+fn account_matches(
+    account: &Account,
+    user: Option<&LocalUser>,
+    filter: &AdminAccountFilter,
+    invited: Option<&std::collections::HashSet<crate::domain::Id>>,
+) -> bool {
     if let Some(local) = filter.local_only {
         if account.local != local {
             return false;
@@ -162,10 +185,14 @@ fn account_matches(account: &Account, user: Option<&LocalUser>, filter: &AdminAc
             return false;
         }
     }
-    // No login IPs are stored, so a non-empty `ip` filter matches nothing.
-    if filter.ip_sub.as_deref().is_some_and(|s| !s.is_empty()) {
-        return false;
+    // Invite attribution is resolved by the caller (needs store access).
+    if let Some(set) = invited {
+        if !set.contains(&account.id) {
+            return false;
+        }
     }
+    // `ip` is matched per candidate row by the caller (`ip_matches`: needs
+    // store access for the login-IP read), not here.
     if !role_matches(user, filter) {
         return false;
     }
@@ -210,6 +237,16 @@ impl AdminStore for RedbStore {
         limit: usize,
     ) -> Result<Vec<(Account, Option<LocalUser>)>> {
         let budget = scan_budget(limit.max(1));
+        // `invited_by` needs store access (invite attribution), so it is
+        // resolved once before the scan; `ip` needs per-row login-IP reads.
+        let invited: Option<std::collections::HashSet<Id>> = filter
+            .invited_by
+            .map(|inviter| {
+                AccountStore::accounts_for_inviter(self, inviter, INVITED_SCAN_CAP)
+                    .map(|ids| ids.into_iter().collect())
+            })
+            .transpose()?;
+        let ip_needle = filter.ip_sub.clone().filter(|s| !s.is_empty());
         let read = self.begin_read()?;
         let accounts = read.open_table(ACCOUNTS)?;
         let users = read.open_table(LOCAL_USERS)?;
@@ -239,7 +276,9 @@ impl AdminStore for RedbStore {
                     Some(guard) => Some(decode::<LocalUser>(guard.value())?),
                     None => None,
                 };
-                if account_matches(&account, user.as_ref(), filter) {
+                if account_matches(&account, user.as_ref(), filter, invited.as_ref())
+                    && ip_matches(self, account.id, ip_needle.as_deref())
+                {
                     out.push((account, user));
                     if out.len() >= limit {
                         break;
@@ -274,7 +313,9 @@ impl AdminStore for RedbStore {
                     Some(guard) => Some(decode::<LocalUser>(guard.value())?),
                     None => None,
                 };
-                if account_matches(&account, user.as_ref(), filter) {
+                if account_matches(&account, user.as_ref(), filter, invited.as_ref())
+                    && ip_matches(self, account.id, ip_needle.as_deref())
+                {
                     out.push((account, user));
                     if out.len() >= limit {
                         break;

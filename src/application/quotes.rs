@@ -26,7 +26,11 @@ pub fn quotes_of(
         Some(viewer) => store.pair_state(root.account_id, viewer, now_ms)?,
         None => PairState::default(),
     };
-    if !policy::can_fetch(viewer_id, &root, root_pair) {
+    let root_facts = match viewer_id {
+        Some(viewer) => policy::viewer_side_facts(store, viewer, root.account_id, now_ms)?,
+        None => policy::FetchFacts::default(),
+    };
+    if !policy::can_fetch_full(viewer_id, &root, root_pair, root_facts) {
         return Err(Error::NotFound("status".into()));
     }
 
@@ -37,11 +41,14 @@ pub fn quotes_of(
 
     let mut visible = Vec::with_capacity(quotes.len());
     for (quote, quoting_status) in quotes {
-        let pair = match viewer_id {
-            Some(viewer) => store.pair_state(quoting_status.account_id, viewer, now_ms)?,
-            None => PairState::default(),
+        let (pair, facts) = match viewer_id {
+            Some(viewer) => (
+                store.pair_state(quoting_status.account_id, viewer, now_ms)?,
+                policy::viewer_side_facts(store, viewer, quoting_status.account_id, now_ms)?,
+            ),
+            None => (PairState::default(), policy::FetchFacts::default()),
         };
-        if policy::can_fetch(viewer_id, &quoting_status, pair) {
+        if policy::can_fetch_full(viewer_id, &quoting_status, pair, facts) {
             visible.push((quote, quoting_status));
         }
     }

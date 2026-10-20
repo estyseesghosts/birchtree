@@ -117,6 +117,33 @@ pub const MUTES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mutes");
 /// Reverse mutes index: `(muted_id_be || muter_id_be)` -> ().
 pub const MUTES_BY_MUTED: TableDefinition<&[u8], ()> = TableDefinition::new("mutes_by_muted");
 
+/// Dismissed follow suggestions: `(viewer_id_be || target_id_be)` ->
+/// `created_at_ms` (upstream `follow_recommendation_mutes`, fix round P1/S1).
+/// One row per dismissal; no counters or jobs attach to the write.
+pub const SUGGESTION_MUTES: TableDefinition<&[u8], u64> =
+    TableDefinition::new("suggestion_mutes");
+
+/// Announcements (fix round P1/S2): id -> JSON `AnnouncementRecord`.
+pub const ANNOUNCEMENTS: TableDefinition<u64, &[u8]> = TableDefinition::new("announcements");
+
+/// Announcement dismissals: `(announcement_id_be || account_id_be)` -> ().
+pub const ANNOUNCEMENT_MUTES: TableDefinition<&[u8], ()> =
+    TableDefinition::new("announcement_mutes");
+
+/// Announcement reactions: reaction id -> JSON `AnnouncementReaction`.
+pub const ANNOUNCEMENT_REACTIONS: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("announcement_reactions");
+
+/// Reactions by announcement: `(announcement_id_be || created_at_be ||
+/// reaction_id_be)` -> () (ascending scan = oldest first).
+pub const ANNOUNCEMENT_REACTIONS_BY_ANNOUNCEMENT: TableDefinition<&[u8], ()> =
+    TableDefinition::new("announcement_reactions_by_announcement");
+
+/// Reactions by viewer: `(announcement_id_be || account_id_be || name)` ->
+/// reaction id (16-byte prefix scan + exact name-suffix match).
+pub const ANNOUNCEMENT_REACTIONS_BY_VIEWER: TableDefinition<&[u8], u64> =
+    TableDefinition::new("announcement_reactions_by_viewer");
+
 /// Private per-viewer account notes: `(viewer_id_be || target_id_be)` -> JSON note.
 pub const ACCOUNT_NOTES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("account_notes");
 
@@ -376,6 +403,11 @@ pub const ACCOUNT_WARNINGS: TableDefinition<u64, &[u8]> =
 /// `active_users` telemetry; one row per completed browser password login).
 pub const SIGN_INS: TableDefinition<u64, &[u8]> = TableDefinition::new("sign_ins");
 
+/// Invite attribution: account id -> invite code consumed at registration
+/// (fix round P1/P3; backs `invited_by_account_id` + the v2 `invited_by`
+/// filter). Written in the account-creation transaction.
+pub const INVITE_USES: TableDefinition<u64, &str> = TableDefinition::new("invite_uses");
+
 /// Invite tokens by code -> JSON `Invite` (D12 remainder; durable backend
 /// replacing the in-memory store).
 pub const INVITES: TableDefinition<&str, &[u8]> = TableDefinition::new("invites");
@@ -524,7 +556,7 @@ pub fn audit_target_prefix(target_type: &str, target_id: &str) -> Vec<u8> {
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// Current schema version. Bump with a new migration step.
-pub const SCHEMA_VERSION: u64 = 12;
+pub const SCHEMA_VERSION: u64 = 15;
 
 /// All table names, for diagnostics and migration verification.
 pub const TABLE_NAMES: &[&str] = &[
@@ -590,6 +622,13 @@ pub const TABLE_NAMES: &[&str] = &[
     "domain_blocks_by_id",
     "mutes",
     "mutes_by_muted",
+    "suggestion_mutes",
+    "announcements",
+    "announcement_mutes",
+    "announcement_reactions",
+    "announcement_reactions_by_announcement",
+    "announcement_reactions_by_viewer",
+    "invite_uses",
     "account_notes",
     "endorsements",
     "endorsements_by_endorsed",
