@@ -5,9 +5,12 @@
 //!
 //! - GIF (animated or not) → WebM with VP9, wire type `video`. `gifv` is
 //!   never produced (deviations D1, D2).
-//! - Video → WebM with VP9 and Opus audio (D3). Passthrough when the file is
-//!   already VP9 video in a WebM container, with Opus audio or no audio, and
-//!   within the upload size limit.
+//! - Video → WebM with VP9 and Opus audio (D3). Passthrough bound is
+//!   codec-based (like upstream's `eligible_to_passthrough?`, which checks
+//!   codecs, never the container): VP9 video with Opus audio or no audio
+//!   within the upload size limit keeps its codecs — byte-identical when
+//!   already WebM, stream-copied (`-c copy`, no re-encode) into WebM
+//!   otherwise, so served bytes are always WebM.
 //! - Still images (JPEG, PNG, BMP, ...) → WebP (D4). WebP passes through.
 //!   The generated `small` preview is WebP too.
 //! - Audio is not transcoded and keeps the legacy processing path.
@@ -300,10 +303,10 @@ fn list_names(path: &str, flag: &str) -> std::result::Result<Vec<String>, String
 // Transcode decision.
 // ---------------------------------------------------------------------------
 
-/// What a stored upload needs. The video passthrough bound (already VP9
-/// WebM, Opus-or-silent, within the size limit) is decided at job time by
-/// probing the bytes ([`probe_is_passthrough`]); the static plan only says
-/// the target shape.
+/// What a stored upload needs. The video codec bound (VP9 + Opus-or-silent
+/// within the size limit) is decided at job time by probing the bytes
+/// ([`probe_video`]); WebM keeps its bytes, other containers remux. The
+/// static plan only says the target shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscodePlan {
     /// Already in target shape, or a class transcoding never touches
@@ -313,8 +316,16 @@ pub enum TranscodePlan {
     ImageToWebp,
     /// GIF (animated or not) → WebM/VP9 (wire type becomes `video`).
     GifToWebm,
-    /// Video → WebM/VP9 + Opus (wire type stays `video`).
+    /// Video → WebM/VP9 + Opus (wire type stays `video`). At job time the
+    /// bytes are probed first: VP9 + Opus-or-silent within the size limit
+    /// keeps its codecs — byte-identical when already WebM, stream-copied
+    /// (`-c copy`, no re-encode) into WebM otherwise.
     VideoToWebm,
+    /// Job-time refinement of [`TranscodePlan::VideoToWebm`], never returned
+    /// by [`plan_for_mime`]: codecs are already VP9 + Opus-or-silent but the
+    /// container is not WebM, so remux with stream copy (no re-encode, no
+    /// quality loss) into WebM.
+    VideoRemux,
 }
 
 /// Static plan for a sniffed content type. Probe-dependent passthrough (VP9
@@ -342,7 +353,7 @@ pub fn needs_transcode(mime_type: &str) -> bool {
 pub fn derived_extension(plan: TranscodePlan) -> &'static str {
     match plan {
         TranscodePlan::ImageToWebp | TranscodePlan::Passthrough => "webp",
-        TranscodePlan::GifToWebm | TranscodePlan::VideoToWebm => "webm",
+        TranscodePlan::GifToWebm | TranscodePlan::VideoToWebm | TranscodePlan::VideoRemux => "webm",
     }
 }
 
@@ -358,14 +369,32 @@ pub struct Probe {
     pub video_codec: Option<String>,
     /// First audio stream codec (`opus`, `aac`, ...).
     pub audio_codec: Option<String>,
+    /// Container format list from the `Input #0, ...` line
+    /// (`matroska,webm`, `mov,mp4,m4a,3gp,3g2,mj2`, ...).
+    pub container: Option<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub duration_ms: Option<u64>,
 }
 
-/// VP9/WebM passthrough bound (D3): VP9 video, Opus-or-silent audio, within
-/// the upload size limit. Positive identification only — an inconclusive
-/// probe transcodes (never a silent passthrough of unknown bytes).
+impl Probe {
+    /// True when the probed container is WebM (`Input #0` format list
+    /// contains `webm`). An unknown container is never WebM.
+    pub fn container_is_webm(&self) -> bool {
+        self.container
+            .as_deref()
+            .is_some_and(|formats| formats.split(',').any(|f| f.trim() == "webm"))
+    }
+}
+
+/// Codec/size bound for video passthrough (D3): VP9 video, Opus-or-silent
+/// audio, within the upload size limit. Positive identification only — an
+/// inconclusive probe transcodes (never a silent passthrough of unknown
+/// bytes). The container is decided separately: WebM keeps its bytes (see
+/// [`Probe::container_is_webm`]), any other container is remuxed with
+/// stream-copy into WebM (no re-encode). Like upstream Mastodon's
+/// `eligible_to_passthrough?` (codec-based, no container check), with a
+/// cheap remux on top so served bytes are always WebM.
 pub fn probe_is_passthrough(probe: &Probe, file_size: u64, max_file_size: u64) -> bool {
     file_size <= max_file_size
         && probe.video_codec.as_deref() == Some("vp9")
@@ -379,6 +408,19 @@ pub fn parse_probe_stderr(stderr: &str) -> Probe {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("Duration:") {
             probe.duration_ms = parse_duration_ms(rest);
+        }
+        if let Some(rest) = line.strip_prefix("Input #") {
+            // `Input #0, matroska,webm, from 'in.webm':` → `matroska,webm`.
+            if probe.container.is_none()
+                && let Some(formats) = rest.split_once(',').map(|(_, tail)| tail)
+                && let Some(formats) = formats.rsplit_once(", from").map(|(head, _)| head)
+            {
+                let formats = formats.trim();
+                if !formats.is_empty() {
+                    probe.container = Some(formats.to_lowercase());
+                }
+            }
+            continue;
         }
         if !line.contains("Stream #") {
             continue;
@@ -572,6 +614,18 @@ pub fn build_argv(
             } else {
                 argv.push("-an".to_string());
             }
+        }
+        TranscodePlan::VideoRemux => {
+            // Stream copy into the output container (`.webm` via
+            // `derived_extension`): no re-encode, no quality loss, metadata
+            // rides along with `-map_metadata 0`. `with_audio` is ignored —
+            // every stream is copied.
+            argv.extend([
+                "-map".to_string(),
+                "0".to_string(),
+                "-c".to_string(),
+                "copy".to_string(),
+            ]);
         }
     }
     argv.push(output.to_string_lossy().into_owned());
@@ -993,19 +1047,22 @@ fn run_transcode_plan(
     now_ms: u64,
     config: &TranscodeConfig,
 ) -> Result<()> {
-    // Video probes the original first: an already-VP9/WebM/Opus-or-silent
-    // file within the size limit passes through (D3).
+    // Video probes the original first: VP9 + Opus-or-silent within the size
+    // limit keeps its codecs (D3) — byte-identical when already WebM,
+    // stream-copied into WebM otherwise.
     if plan == TranscodePlan::VideoToWebm
-        && let Some(passthrough) = probe_passthrough(bytes, config)
-        && passthrough
+        && let Some(probe) = probe_video(bytes, config)
     {
-        return commit_passthrough_video(store, media, bytes, now_ms, config);
+        if probe.container_is_webm() {
+            return commit_passthrough_video(store, media, bytes, now_ms, config);
+        }
+        return run_remux_to_webm(store, blobs, media, bytes, now_ms, config);
     }
     let with_audio = plan == TranscodePlan::VideoToWebm && probe_has_audio(bytes, config);
     let input_ext = match plan {
         TranscodePlan::ImageToWebp => "img",
         TranscodePlan::GifToWebm => "gif",
-        TranscodePlan::VideoToWebm => "vid",
+        TranscodePlan::VideoToWebm | TranscodePlan::VideoRemux => "vid",
         TranscodePlan::Passthrough => "bin",
     };
     match transcode_bytes(bytes, input_ext, plan, with_audio, config) {
@@ -1023,14 +1080,53 @@ fn run_transcode_plan(
     }
 }
 
-/// Probe `bytes` for the D3 passthrough bound. Any probe failure is "not
-/// provably passthrough" → `None` → the job transcodes.
-fn probe_passthrough(bytes: &[u8], config: &TranscodeConfig) -> Option<bool> {
+/// Probe `bytes` for the D3 codec bound. Returns the probe when the codecs
+/// are already VP9 + Opus-or-silent within the size limit (`None` otherwise,
+/// including any probe failure → the job transcodes). The caller splits
+/// WebM (byte passthrough) from other containers (stream-copy remux).
+fn probe_video(bytes: &[u8], config: &TranscodeConfig) -> Option<Probe> {
     let input_path = temp_path("probe", "vid");
     let _guard = TempGuard::new(vec![input_path.clone()]);
     std::fs::write(&input_path, bytes).ok()?;
     let probe = probe_file(&config.ffmpeg_path, &input_path).ok()?;
-    Some(probe_is_passthrough(&probe, bytes.len() as u64, config.max_file_size))
+    probe_is_passthrough(&probe, bytes.len() as u64, config.max_file_size).then_some(probe)
+}
+
+/// Remux VP9 + Opus-or-silent bytes from a non-WebM container into WebM
+/// with stream copy (no re-encode), then commit exactly like a transcode:
+/// derived replaces the original, meta comes from the remuxed bytes. A
+/// remux failure is deterministic input → `Failed`, never a quiet keep of
+/// the non-WebM bytes.
+fn run_remux_to_webm(
+    store: &dyn Store,
+    blobs: &dyn BlobStore,
+    media: &crate::domain::MediaAttachment,
+    bytes: &[u8],
+    now_ms: u64,
+    config: &TranscodeConfig,
+) -> Result<()> {
+    match transcode_bytes(bytes, "vid", TranscodePlan::VideoRemux, false, config) {
+        Ok((derived, _stats)) => commit_derived(
+            store,
+            blobs,
+            media,
+            bytes,
+            &derived,
+            TranscodePlan::VideoToWebm,
+            now_ms,
+            config,
+        ),
+        Err(err) => match err {
+            TranscodeError::Spawn(detail) | TranscodeError::Io(detail) => Err(Error::Storage(
+                format!("remux of media {} failed transiently: {detail}", media.id.value()),
+            )),
+            other => {
+                tracing::warn!(media = media.id.value(), error = %other, "media remux failed");
+                mark_failed(store, media, &format!("remux failed: {other}"), now_ms)?;
+                Ok(())
+            }
+        },
+    }
 }
 
 /// Whether the original carries an audio stream (decides the `-map 0:a:0`
@@ -1125,7 +1221,7 @@ fn commit_derived(
                 return Ok(());
             }
         },
-        TranscodePlan::GifToWebm | TranscodePlan::VideoToWebm => {
+        TranscodePlan::GifToWebm | TranscodePlan::VideoToWebm | TranscodePlan::VideoRemux => {
             let (width, height, duration_ms) = probe_derived(derived, config);
             (width, height, None, None, duration_ms)
         }
@@ -1297,11 +1393,21 @@ mod tests {
         let base = Probe {
             video_codec: Some("vp9".to_string()),
             audio_codec: Some("opus".to_string()),
+            container: Some("matroska,webm".to_string()),
             width: Some(640),
             height: Some(480),
             duration_ms: Some(2_500),
         };
         assert!(probe_is_passthrough(&base, 1024, DEFAULT_MAX_FILE_SIZE));
+        assert!(base.container_is_webm());
+        // The codec bound ignores the container: VP9+Opus in MP4 passes the
+        // codec check (the job remuxes it into WebM with stream copy).
+        let mp4 = Probe {
+            container: Some("mov,mp4,m4a,3gp,3g2,mj2".to_string()),
+            ..base.clone()
+        };
+        assert!(probe_is_passthrough(&mp4, 1024, DEFAULT_MAX_FILE_SIZE));
+        assert!(!mp4.container_is_webm());
         // Silent is fine.
         let silent = Probe {
             audio_codec: None,
@@ -1342,17 +1448,49 @@ mod tests {
         let probe = parse_probe_stderr(stderr);
         assert_eq!(probe.video_codec.as_deref(), Some("vp9"));
         assert_eq!(probe.audio_codec.as_deref(), Some("opus"));
+        assert_eq!(probe.container.as_deref(), Some("matroska,webm"));
+        assert!(probe.container_is_webm());
         assert_eq!((probe.width, probe.height), (Some(640), Some(480)));
         assert_eq!(probe.duration_ms, Some(2_500));
+        // MP4 container: same codecs, not WebM.
+        let mp4 = "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'in.mp4':\n\
+             Stream #0:0: Video: vp9 (Profile 0), yuv420p, 1280x720\n\
+             Stream #0:1: Audio: opus, 48000 Hz, stereo\n";
+        let probe = parse_probe_stderr(mp4);
+        assert_eq!(probe.container.as_deref(), Some("mov,mp4,m4a,3gp,3g2,mj2"));
+        assert!(!probe.container_is_webm());
+        assert!(probe_is_passthrough(&probe, 1024, DEFAULT_MAX_FILE_SIZE));
         // Silent input: no audio stream, no duration.
         let silent = "  Stream #0:0: Video: h264, yuv420p, 1280x720\n";
         let probe = parse_probe_stderr(silent);
         assert_eq!(probe.video_codec.as_deref(), Some("h264"));
         assert_eq!(probe.audio_codec, None);
+        assert_eq!(probe.container, None);
+        assert!(!probe.container_is_webm());
         assert_eq!((probe.width, probe.height), (Some(1280), Some(720)));
         assert_eq!(probe.duration_ms, None);
         // Garbage parses to honest unknowns.
         assert_eq!(parse_probe_stderr(""), Probe::default());
+    }
+
+    #[test]
+    fn remux_argv_copies_streams_without_reencode() {
+        let config = TranscodeConfig::default();
+        let argv = build_argv(
+            "ffmpeg",
+            std::path::Path::new("in.vid"),
+            std::path::Path::new("out.webm"),
+            TranscodePlan::VideoRemux,
+            true,
+            &config,
+        );
+        let joined = argv.join(" ");
+        assert!(joined.contains("-map 0"), "{joined}");
+        assert!(joined.contains("-c copy"), "{joined}");
+        assert!(!joined.contains("libvpx"), "{joined}");
+        assert!(!joined.contains("libopus"), "{joined}");
+        assert!(joined.ends_with("out.webm"));
+        assert_eq!(derived_extension(TranscodePlan::VideoRemux), "webm");
     }
 
     #[test]

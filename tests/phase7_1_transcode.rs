@@ -196,6 +196,51 @@ for a in "$@"; do
   esac
 done
 if [ "$#" -eq 3 ]; then
+  echo "  Input #0, matroska,webm, from 'in.webm':" >&2
+  echo "  Duration: 00:00:02.50, start: 0.000000, bitrate: 100 kb/s" >&2
+  echo "  Stream #0:0: Video: vp9 (Profile 0), yuv420p(tv), 640x480 [SAR 1:1 DAR 4:3], 25 fps" >&2
+  echo "  Stream #0:1(eng): Audio: opus, 48000 Hz, stereo, fltp" >&2
+  exit 0
+fi
+in=""
+prev=""
+out=""
+for a in "$@"; do
+  if [ "$prev" = "-i" ]; then in="$a"; fi
+  prev="$a"
+  out="$a"
+done
+cp "$in" "$out"
+"#;
+
+/// Same as [`FAKE_VP9_PROBE`] but the probe reports a MP4 container: VP9
+/// video + Opus audio in `mov,mp4,...` (the remux shape — stream copy into
+/// WebM, no re-encode).
+const FAKE_VP9_MP4_PROBE: &str = r#"#!/bin/sh
+for a in "$@"; do
+  case "$a" in
+    -version)
+      echo "ffmpeg version 9.0.1-fake-test Copyright (c) 2000-2026"
+      exit 0
+      ;;
+    -encoders)
+      echo "Encoders:"
+      echo " V..... libvpx-vp9           libvpx VP9 (codec vp9)"
+      echo " A..... libopus             libopus Opus (codec opus)"
+      echo " V..... libwebp             libwebp WebP image (codec webp)"
+      exit 0
+      ;;
+    -decoders)
+      echo "Decoders:"
+      for d in png mjpeg gif bmp webp tiff h264 hevc mpeg4 vp8 vp9 aac opus vorbis mp3 flac pcm_s16le; do
+        echo " V..... $d                  fake decoder"
+      done
+      exit 0
+      ;;
+  esac
+done
+if [ "$#" -eq 3 ]; then
+  echo "  Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'in.mp4':" >&2
   echo "  Duration: 00:00:02.50, start: 0.000000, bitrate: 100 kb/s" >&2
   echo "  Stream #0:0: Video: vp9 (Profile 0), yuv420p(tv), 640x480 [SAR 1:1 DAR 4:3], 25 fps" >&2
   echo "  Stream #0:1(eng): Audio: opus, 48000 Hz, stereo, fltp" >&2
@@ -321,6 +366,7 @@ fn vp9_webm_passthrough_bound() {
     let base = birchtree::media::transcode::Probe {
         video_codec: Some("vp9".to_string()),
         audio_codec: Some("opus".to_string()),
+        container: Some("matroska,webm".to_string()),
         width: Some(640),
         height: Some(480),
         duration_ms: Some(2_500),
@@ -631,6 +677,45 @@ fn vp9_webm_passthrough_needs_no_transcode() {
     assert_eq!(blobs.get(&ready.file_key).unwrap().as_deref(), Some(webm.as_slice()));
     assert_eq!((ready.width, ready.height), (Some(640), Some(480)));
     assert_eq!(ready.duration_ms, Some(2_500));
+    assert!(attachment_url(&ready).is_string());
+}
+
+#[test]
+fn vp9_opus_in_mp4_is_remuxed_into_webm_without_reencode() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Codecs are already VP9 + Opus but the container is MP4: the job must
+    // stream-copy into WebM (the fake copies bytes, like `-c copy` of
+    // already-correct streams) instead of keeping the MP4 bytes or
+    // re-encoding. Assert the remux ran by checking the derived staging
+    // extension path commits Ready with probed meta.
+    let fake = write_script(dir.path(), "ffmpeg", FAKE_VP9_MP4_PROBE);
+    let config = config_with(&fake);
+    let (_tmp, store) = common::temp_store();
+    let blobs = test_blobs(_tmp.path());
+    let owner = Id::new(7_112);
+    let mp4 = vec![0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p', 0, 0, 0, 0];
+
+    let media = stage_pending(
+        &*store,
+        &blobs,
+        owner,
+        "aa/bb/cc/original.mp4",
+        "video",
+        "video/mp4",
+        &mp4,
+    );
+    birchtree::media::transcode::run_transcode_job(&*store, &blobs, media.id, T0 + 1, &config)
+        .expect("remux job");
+    let ready = store.media_by_id(media.id).unwrap().expect("row");
+    assert_eq!(ready.state, MediaState::Ready);
+    assert_eq!(ready.r#type, "video");
+    // The fake remux copies streams, so served bytes equal the input here;
+    // meta comes from the (remuxed) output probe, and no staging orphan stays.
+    assert_eq!(blobs.get(&ready.file_key).unwrap().as_deref(), Some(mp4.as_slice()));
+    assert_eq!((ready.width, ready.height), (Some(640), Some(480)));
+    assert_eq!(ready.duration_ms, Some(2_500));
+    let staging = staging_key_for(&ready.file_key, "webm").expect("staging key");
+    assert_eq!(blobs.get(&staging).unwrap(), None);
     assert!(attachment_url(&ready).is_string());
 }
 
