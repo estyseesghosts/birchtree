@@ -86,8 +86,8 @@ Conventions: `D##` = row in `docs/compatibility-profile.md`;
 - **D35 roadmap:** fine-grained per-action permission flags on the upstream
   `Admin::BasePolicy` model (shipped: two-role split, moderator covers
   accounts+reports only).
-- **Role serializer:** role ids are names and permissions are empty (no
-  numeric ids / bitmask census).
+- **Role serializer:** role ids are names (no numeric ids). Permissions are
+  a real bitmask since the fix round.
 
 ## Deliberately out of profile (not TODO, listed so nobody re-files them)
 
@@ -98,6 +98,100 @@ Conventions: `D##` = row in `docs/compatibility-profile.md`;
   announcements HTML authoring (API surface built instead).
 - FASP-sourced suggestions (`Mastodon-Async-Refresh` on v2).
 - PostgreSQL/Redis/external broker, multi-node/cluster.
+- Donation campaigns as real campaigns (honest 404 absence by decision).
+- `GET /api/v1/oembed` (explicitly out of the initial profile).
+
+## Accounts, auth, and moderation open items
+
+- **MFA login unsupported.** No TOTP/WebAuthn second factor; password +
+  (optional) approval only.
+- **Registration `time_zone` / `date_of_birth` ignored; no min-age policy.**
+  `locale` and invite text are captured; the other two fields are accepted
+  and dropped.
+- **First-party token-vs-session question (still open).** Whether
+  first-party `/api/v1/*` calls use OAuth tokens (proposed default) or the
+  browser session (endpoint-manifest web section).
+- **Media caps policy.** Status length decided (500 default,
+  `--max-status-chars` to 3000); the operator-facing media caps story
+  beyond the upload size limit is unsettled.
+- **IP-block client-IP verification.** Enforcement reads the trusted-proxy
+  client IP; verify it sees the true client IP in all deployment shapes
+  (no-access blocks depend on it).
+- **Email-domain / canonical-email block enforcement vs confirmation
+  state.** Registration-time enforcement is documented as needing email
+  confirmation; confirm it works now that confirmation redemption is live,
+  or record the remaining gap.
+
+## Federation / remote-media fidelity
+
+- **Remote media fidelity.** `REMOTE_MEDIA_SOURCE` stores each remote
+  attachment's original URL but nothing surfaces it (`remote_url` is
+  hardcoded null); no remote previews are generated (`preview_url` null
+  for remote rows). Per-media blob keys already shard correctly.
+- **Remote thread completion.** Ingest-time parent jobs (hop cap, fetch
+  budget, never-promote-to-root), read-time descendant crawl with
+  `Mastodon-Async-Refresh` + cooldown/dedup/caps, read-time ancestor
+  completion for logged-in viewers (D5), signed-fetch instance key.
+- **Live webfinger resolve.** Unknown remote accounts 404; resolving them
+  over live webfinger is a federation follow-up.
+- **Web embeds remote fetch/sanitize.** `GET /api/web/embeds/:id` answers
+  404 for signed-in remote reads; the remote fetch/sanitize pass is unbuilt.
+
+## Remote-media cache program (`docs/remote-media-cache-plan.md`, still a stub)
+
+- Cache lifecycle: budgets + eviction (time expiry AND a global byte cap),
+  per-class limits with a hard global cap (512 MiB proposed).
+- Lazy fetch by default (metadata-first, fetch on first request) instead of
+  ingest-time fetch.
+- Durable-uploads isolation: separate remote-cache store + migration of
+  existing `remote/*` keys; metadata model (source URL, blob key, class,
+  size, fetch/last-access/expiry, ETag validators); no content-addressed
+  sharing (frozen decision).
+- Bounded ingest + periodic idempotent reconciler; accounting (total +
+  per-class bytes incl. in-flight reservations); safe eviction (never touch
+  local media); observability routing (interim log/health vs admin metrics).
+- Acceptance tests (cap under concurrency, local survival, oversize abort,
+  evicted re-fetch); normatives to
+  `federation-contract.md`/`persistence-conformance.md`.
+- Open questions: media-fetch signing (unsigned GET vs instance-actor
+  dereference requirement); per-file ceiling reconciliation (40 MiB
+  `MAX_REMOTE_MEDIA_BYTES` vs class caps); direct/streaming proxy delivery
+  (disabled mode has no design).
+
+## Verification debt (tests, metrics, contract freeze)
+
+- **Test suites:** API schema snapshots; request-parser suite
+  (URL-encoded/multipart/JSON, nesting, bounds, Unicode); visibility policy
+  matrix across reads/timelines/search/quotes/notifications/streaming;
+  crash-test full matrix (during workers, joint durability, no-duplicate
+  side effects); federation fixtures/interop suite; real-client automation;
+  performance/abuse suite (high-degree graphs, sparse indexes, big bodies,
+  upload exhaustion, slow hosts, retry storms). Test files live flat in
+  `tests/` (the planned `tests/api_contract/` etc. subdirectories were
+  never created).
+- **Cross-surface visibility parity suite + wall-time measurement** (Phase 4
+  exit carry-overs): one matrix spanning every read surface; loader
+  wall-time, not just counts.
+- **Operational metrics endpoint (Phase 8).** Admin analytics (`measures`/`
+  dimensions`/`retention`) exist; a Prometheus-style operational endpoint
+  does not.
+- **Phase 8 perf qualification.** Release-build p50/p95/throughput/memory/
+  contention/index/queue numbers on every surface incl. transcode, search,
+  admin and fan-out-vs-materialized comparison; restart/kill/rebuild/replay
+  robustness; latency/resource acceptance thresholds.
+- **Contract freeze + source-audit review.** All contract docs still read
+  `Draft` (operator approval pending); the endpoint-by-endpoint review
+  against `config/routes/api.rb` was never recorded
+  (`source-audit-v4.7.3.md: "None recorded yet"`).
+- **Scheduled announcement publish job.** Scheduled rows stay drafts until
+  manually published (no `PublishScheduledAnnouncement` job).
+- **`indexable_statuses_page` port.** Historical unlisted rows join the
+  search index only through the incremental job; the backfill underserves
+  them until the port lands.
+- **Tantivy search upgrade path.** Recorded future option behind the same
+  backend port; not started.
+- **Upload size cap conflated with multipart body limit.** `ApiState`
+  carries no separate configured media cap.
 
 ## Performance follow-ups (deferred, not correctness)
 

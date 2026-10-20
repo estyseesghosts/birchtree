@@ -111,7 +111,7 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 | POST | `/api/v1/statuses/:id/unpin` | user | write \| write:accounts | implemented (Phase 3) | In | 200 no-op when not pinned |
 | GET | `/api/v1/statuses/:id/favourited_by` | optional | read \| read:accounts | implemented (Phase 3) | In | accounts; cursor = favourite id (hidden in `Link`) |
 | GET | `/api/v1/statuses/:id/reblogged_by` | optional | read \| read:accounts | implemented (Phase 3) | In | accounts; cursor = reblog id |
-| GET | `/api/v1/statuses/:id/quotes` | user | read \| read:statuses | implemented (Phase 3) | In | 401 without token; accepted quotes only; cursor = quoting status id (DIVERGES from upstream quote-id cursor — triage 2026-10-20, queued in `docs/fix-plan.md` P2) |
+| GET | `/api/v1/statuses/:id/quotes` | user | read \| read:statuses | implemented (Phase 3, cursor fix round) | In | 401 without token; accepted quotes only; cursor = quote id (upstream `paginate_by_max_id`; rekeyed + migrated in schema v16) |
 | POST | `/api/v1/statuses/:id/quotes/:quoting_status_id/revoke` | user | write \| write:statuses | implemented (Phase 3) | In | quoted author only; 200 = quoting status |
 | POST | `/api/v1/statuses/:id/mute` | user | write \| write:mutes | implemented (Phase 7) | In | conversation mute; the status DTO `muted` reflects it |
 | POST | `/api/v1/statuses/:id/unmute` | user | write \| write:mutes | implemented (Phase 7) | In | as above |
@@ -270,6 +270,7 @@ Bullets in the old inventory that are now rows. Upstream sources: `app/controlle
 | POST | `/api/v1/tags/:id/unfollow` | user | write \| write:follows | implemented (Phase 7) | In | |
 | POST | `/api/v1/tags/:id/feature` | user | write \| write:accounts | implemented (Phase 7) | In | |
 | POST | `/api/v1/tags/:id/unfeature` | user | write \| write:accounts | implemented (Phase 7) | In | |
+| GET | `/api/v1/custom_emojis` | none | — | implemented (Phase 4) | In | public index over local + enabled + picker-visible emoji (CLI-managed; no admin API). Status-payload `emojis` arrays served; account-payload emoji remain `[]` (remote emoji ingest is federation tail) |
 
 ### Trends, public (Phase 7.3)
 
@@ -406,7 +407,7 @@ Removed from this section in the 2026-10-17 re-scope: `annual_reports`, `announc
 
 - `GET /api/v1/oembed` — public oEmbed; not in initial profile (record as gap if clients need it). **Out.**
 - `namespace :v1_alpha` — experimental/legacy (`accounts/collections`, `collections/*`); explicitly **Out**.
-- `GET /api/v1/custom_emojis` — **implemented (Phase 4)**: public index over local + enabled + picker-visible emoji (CLI-managed; no admin API in this milestone). Emoji embedding in status payloads is implemented; account-payload emoji remain `[]` (Phase 7). Listed here for historical reasons; it has no row yet (see discrepancies).
+- `GET /api/v1/custom_emojis` — rowed above (was listed here for historical reasons).
 - `GET /api/v1/blocks`, `GET /api/v1/mutes`, `GET /api/v1/favourites`, `GET /api/v1/bookmarks` — relation collection reads; **implemented (Phase 7)** (rows above).
 - `accounts/familiar_followers`, `featured_tags`, `tags` follow/feature, `followed_tags` — **implemented (Phase 7)** (rows above). Still out: `identity_proofs` (needs cryptographic proof verification), `email_subscriptions`, `collections` (experimental `v1_alpha`).
 - `translate` (statuses) — **Out** unless a translation provider is configured (row above).
@@ -478,14 +479,14 @@ Implemented 2026-10-17 (D10a, D10b, D11). Evidence: `tests/phase4_1_json_parity.
 - **Tag feed excludes reblog wrappers, matching upstream (closed 2026-10-17).** Wrappers carry no hashtags of their own, and upstream's `ReblogService` creates reblog rows with no tag rows, so upstream's tag feed also excludes them. Pinned by `tag_timeline_normalizes_case_and_keeps_replies`.
 - **Public feed keeps self-replies by policy, not by the store**: the store scans replies and the filter keeps only self-replies and originals.
 - **Per-request account facts are capped at 2000 distinct accounts** (`ACCOUNT_CACHE_CAP`; was 500). The home follows fill the first 1000 entries, and reblog targets and reply parents use the rest, so a viewer at the home cap still sees reblogs of strangers. Past the cap, an unresolved account fails closed: its statuses are excluded, never shown. The store's author cap is 1001 (the viewer plus 1000 follows; was 500, which silently dropped the oldest follows).
-- **Remote accounts do not exist yet** (federation is Phase 6). `remote=true` is therefore only exercised as empty, and the domain-block rule is exercised through the local domain.
+- **Remote accounts exist since federation (D19, closed round 3).** `remote=true` serves federated remote statuses on the public timeline and `public:remote` streams; the domain-block rule applies to the viewer's domain blocks. Remote emoji ingest and remote counts remain federation-tail gaps.
 - **`replies_policy=none` on lists** keeps only self-replies and replies to the viewer; `followed` keeps replies to followed parents; `list` keeps replies to members. Replies to the viewer pass under every policy.
 
 ## Phase 5: streaming (honesty list)
 
 - **Source-derived, not run against upstream.** The stream names, scope rules, refusal texts, envelopes, heartbeat and redirect come from the pinned source (`streaming/index.js`, `streaming_controller.rb`, the fan-out and feed services at `8ff11c2b`). No live v4.7.3 instance was run: see the Phase 5 verification log.
 - **Birchtree-only refusals:** `429 Too many streaming connections for this token`, `503 Too many streaming connections`, `429 Too many streaming subscriptions` (D14).
-- **Not emitted:** `conversation`, `announcement`, `announcement.reaction`, `announcement.delete` (Phase 7), and `kill` on suspension or disablement (D24). `filters_changed` is never transmitted, as upstream never transmits it (no payload). `notifications_merged` is emitted on real merges only (round 3, D20).
+- **Not emitted:** `announcement`, `announcement.reaction`, `announcement.delete` (reads/dismissals/reactions are REST-only so far). `conversation` events emit on `direct` (D18, closed Phase 7); `kill` is sent on suspension/disablement (D24). `filters_changed` is never transmitted, as upstream never transmits it (no payload). `notifications_merged` is emitted on real merges only (round 3, D20).
 - **Silent by design until their phases:** `direct` (D18, closed Phase 7).
 
 ## Route inventory discrepancies and gaps (found 2026-10-17)

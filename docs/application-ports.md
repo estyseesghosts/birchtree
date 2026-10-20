@@ -30,11 +30,12 @@ Mutation rule: one storage transaction commits primary records, indexes, local c
 `OAuthStore`, `SessionStore`, `JobQueue`, and `ReadyCheck` are implemented by
 `persistence::redb::RedbStore`, which also satisfies the bundled `Store`
 supertrait assembled into `application::context::Context`. `MailSender` is
-declared in `application::ports` and implemented by
-`mail::LoggingMailSender` (no SMTP transport yet). `StatusStore`,
-`RelationshipStore`, `PollStore`, `MediaStore`, `NotificationStore`,
-`ActivityDedup`, `BlobStore`, `StreamingSink`, and `FederationHttp` remain to be
-implemented in their phases.
+declared in `application::ports` and delivered for real via `lettre` when
+SMTP is configured (round 4; unconfigured = explicit 503, never fake
+success). Every store port named below shipped in its phase
+(`StatusStore`/`RelationshipStore`/`PollStore`/`MediaStore`/
+`NotificationStore` incl. the Phase 4 read surface, `ActivityDedup`,
+`BlobStore`, `StreamingSink`, `FederationHttp`).
 
 Phase 2 additions to the narrow ports:
 
@@ -75,11 +76,10 @@ Implemented by `persistence::redb::RedbStore` and bundled into `Store`:
   key `(recipient, type, actor, status, created_at)` deduplicates replays of
   one interaction while allowing a fresh interaction to notify again.
 - `MediaStore` — attachment metadata rows + ownership/attachment validation
-  used by status create/edit (bytes remain Phase 4).
+  used by status create/edit (bytes staged since Phase 4; transcoding
+  pipeline since Phase 7.1).
 
-`ActivityDedup`, `BlobStore`, `StreamingSink`, `FederationHttp` remain to be
-implemented in their phases; `NotificationStore`'s read surface (index,
-grouping) is Phase 4.
+All narrow ports shipped in their phases (see the phase exit criteria).
 
 ## Implementation status (Phase 5)
 

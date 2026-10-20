@@ -63,7 +63,7 @@ Payloads:
 | Stream | Carries | Gate (the same policy the REST surface applies) |
 |---|---|---|
 | `user` | `update`, `status.update`, `delete`; `notification` (with notifications in scope); `status.update` for an edit that mentions the viewer (upstream's notifications channel, folded in) | Home gate: own statuses; statuses from followed authors; direct only to mentioned viewers; reply rules; reblogs only where the follow shows reblogs and the target passes; exclusive-list members left out (D10b); blocks, mutes and domain blocks (author); `delete` on the pre-deletion snapshot |
-| `user:notification` | `notification`; `status.update` for an edit that mentions the viewer | Recipient is the viewer. Birchtree does not drop notifications from blocked or muted accounts (upstream does; D26) |
+| `user:notification` | `notification`; `status.update` for an edit that mentions the viewer | Recipient is the viewer. Blocked/muted/domain-blocked actors never produce notifications (creation gate, D26), so nothing is streamed for them either |
 | `public` | `update`, `status.update`, `delete` | Public visibility, not a reblog, the public reply rule (self-replies and top-level only); author not blocked, muted or domain-blocked; for a logged-in viewer, no mentioned account blocked or muted (upstream's streaming check). The viewer's `chosen_languages` filter `update`/`status.update` when set (D21). `delete` is sent without a viewer check, as upstream does |
 | `public:local`, `public:remote` | as `public` | Origin: local is the author's account being local; remote is not (D19, closed round 3) |
 | `public:media` and the local/remote media variants | as `public` | Only statuses with media attachments |
@@ -134,7 +134,7 @@ The register (`docs/compatibility-profile.md`) carries each row. In summary:
 - D23: the home gate applies a follow's language preference (`Follow.languages`) (2026-10-20).
 - D24: suspension/disablement revokes tokens and closes streams (revocation permanent).
 - D25: hashtag normalization is the REST normalizer, not upstream's `normalizeHashtag`; the streams and the REST tag timeline agree with each other, not with upstream, for accented or compatibility-form tags.
-- D26: notifications from blocked, muted or domain-blocked accounts are created and streamed; upstream drops them.
+- D26: notifications are never created where the recipient blocks / is blocked by / mutes / domain-blocks the actor (upstream `NotifyService` drop conditions); nothing blocked/muted is streamed because nothing is created.
 
 ## Verification
 

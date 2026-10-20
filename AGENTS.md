@@ -16,16 +16,17 @@ Source of truth: `birchtree.md` (revised plan, pinned to Mastodon **v4.7.3**, co
 
 ActivityPub federation is delegated to the `activitypub-federation-rust` crate rather than hand-rolled. Add it as a dependency when federation work (Phase 6) begins; until then the `federation/` module is a thin port/adaptation layer, not a custom ActivityPub implementation.
 
-## Current phase: Phase 5 — streaming
+## Current phase: fix round complete (2026-10-20), Phase 8 next
 
-Exit: `birchtree.md` §7 (Phase 5).
-Phase 4 is complete and green — see `docs/phase-4-exit-criteria.md` (Phase 4
-exit; open items listed there: cross-surface visibility parity suite,
-wall-time measurement, exclusive lists on home, tag-feed reblogs question).
-Phases 1–3 remain green (`docs/phase-1-exit-criteria.md`,
-`docs/phase-2-exit-criteria.md`, `docs/phase-3-exit-criteria.md`). The
-Phase 0 route-inventory review against the Mastodon v4.7.3 source remains open
-(`docs/phase-0-exit-criteria.md`).
+Exit: `birchtree.md` §7 (Phase 8: performance qualification).
+Phases 0–4 are green (`docs/phase-0-exit-criteria.md` keeps the
+route-inventory review open; the rest is checklist debt, not code gaps;
+`docs/phase-1-exit-criteria.md`, `docs/phase-2-exit-criteria.md`,
+`docs/phase-3-exit-criteria.md`, `docs/phase-4-exit-criteria.md`).
+Phase 4.1, 5, 6 (partial: content flows; thread-completion + tail phased),
+7, 7.1, 7.2 and 7.3 are shipped and green (see their exit criteria and
+`docs/fix-plan.md` for the 2026-10-20 fix round: P0 privacy, P1 builds, P2
+confirmed rows, all gated and committed).
 
 ## State maintenance (required every work session)
 
