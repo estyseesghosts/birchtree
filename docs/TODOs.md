@@ -57,6 +57,10 @@ Conventions: `D##` = row in `docs/compatibility-profile.md`;
 - **`Unsubscribe-URL` on pre-token push rows.** Subscriptions created
   before the fix round carry no token/URL and send no header (never
   fabricated). New subscriptions are complete.
+- **`include_filtered` / `supported_types` honored in name only.** Both
+  params parse, but filtered rows are never served into the v1 index and the
+  `supported_types` fallback rendering is unbuilt — same observable result
+  as upstream with no filtered content, but the knobs don't turn yet.
 
 ## Federation tail (own phase — D32 refuse-position stands)
 
@@ -67,6 +71,8 @@ Conventions: `D##` = row in `docs/compatibility-profile.md`;
 - Note / featured collections.
 - Quote re-verify workers, remote counts, note collections.
 - Poll `collection_update` notifications.
+- Report forwarding as Flag to remote servers (Phase 6; local reports and
+  the moderator queue are done).
 - Live interop proofs (no live services in this environment — recorded,
   not chased).
 
