@@ -199,6 +199,46 @@ Conventions: `D##` = row in `docs/compatibility-profile.md`;
 - **Upload size cap conflated with multipart body limit.** `ApiState`
   carries no separate configured media cap.
 
+## Post-parity programs (own phases, after the 98% bar)
+
+Late-stage, config-gated, default-off. Absence verified 2026-10-20: zero
+hits in `src/` for `aperture|antenna|ClipStore|AntennaStore|PageStore|
+place_id|preferredLicense`, no `clips_enabled|antennas_enabled|
+pages_enabled|aperture_mode` keys in `src/config.rs`, no such routes in the
+router (`clip|page` hits are link-preview bodies and collection pagination
+only). Full slice plans live in their own docs; the rows below are pointers,
+not duplicates.
+
+- **Aperture mode — photo-first Birchtree (`docs/aperture.md`, Draft).**
+  Config switch (`aperture_mode`, default off): top-level posts require
+  media (text-only → 422 local / silent drop on ingest), replies may be
+  text-only, timelines photo-only, DMs exempt, poll-only top-levels
+  dropped. Slices: A flag + write gate, B read path (timelines/context/
+  search), C FEP-6757 licenses (minimal), D Places stub store +
+  round-trip (no geo-search), E federation ingest policy + filter-name
+  passthrough, F docs/gates/rollout. Parity must stay green with the
+  flag off. Explicit non-goals: Pixelfed API imports, Stories, Groups,
+  Portfolios, Discover namespace, server-side filter processing.
+- **Clips module (`docs/misstodon.md`, plan; build after Batch Q lands).**
+  MastoAPI-convention REST (`/api/v1/clips`, members, favourites),
+  bookmarks become the private unrenamable system clip (two-way
+  migration: forward into the clip, reverse via per-user export +
+  bookmarks re-derived, user clips dormant), federation with pinetree
+  (`OrderedCollection`, Add/Remove/Update/Delete, tombstones), owner-
+  follower fan-out for Listed tiers, `ClipUpdated` notifications. Only
+  the owner ever sees a private clip (404 to others).
+- **Antennas module (`docs/misstodon.md`, plan).** Local-only (no peer
+  implementation exists): keyword-group matching at read time, pull
+  matched-statuses timeline (`/api/v1/antennas`), no streaming channel
+  or push in v1. Explicitly not Mastodon filters (collect vs hide).
+- **Pages module (`docs/misstodon.md`, plan).** `Article` + documented
+  `source` extension (no new object type), visibility-gated reads (a
+  documented divergence — pages are world-readable upstream), gated
+  Article ingest mapping, origin fidelity (published/updated preserved),
+  like/unlike + featured, `PageLiked` notifications, federation with
+  pinetree (Create/Update/Delete fan-out, Like round-trip). Script
+  stored, never executed, never federated.
+
 ## Performance follow-ups (deferred, not correctness)
 
 - `PairState` extension (carry mute/domain facts in the pair row instead of
