@@ -38,4 +38,8 @@ pub enum StreamEvent {
     Retract { viewer: Id, statuses: Vec<Status> },
     /// An access token was revoked. Its connections close (upstream `kill`).
     TokenRevoked { token_id: Id },
+    /// A direct-visibility status changed a conversation thread (Phase 7,
+    /// closes D18). Delivered as `conversation` on the `direct` stream of
+    /// the thread's participants.
+    Conversation { viewer_id: Id, status_id: Id },
 }

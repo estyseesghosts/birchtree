@@ -56,6 +56,107 @@ pub fn can_bookmark(viewer: Id, status: &Status, pair: PairState) -> bool {
     can_fetch(Some(viewer), status, pair)
 }
 
+/// D22: how the viewer's home feed treats statuses that mention an account
+/// the viewer blocks or mutes.
+///
+/// Upstream `FeedManager#filter_from_home` always drops such statuses from
+/// home. Birchtree keeps them by default (operator decision D22) and offers
+/// per-user options: show everything, collapse the status behind a
+/// content-warning-style fold (rendered by the status DTO), or remove it
+/// entirely. Stored on the local user as `home_mention_policy`
+/// (`show`/`collapse`/`filter`); unknown or missing values mean `Show`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HomeMentionPolicy {
+    /// Show everything (current behavior, default).
+    #[default]
+    Show,
+    /// Keep the status; clients fold it (DTO `filtered` entry + CW-style fold).
+    Collapse,
+    /// Remove the status from home (upstream-like).
+    Filter,
+}
+
+impl HomeMentionPolicy {
+    /// Parse the stored wire value; `None`/unknown means `Show`.
+    pub fn from_stored(raw: Option<&str>) -> Self {
+        match raw {
+            Some("collapse" | "fold") => HomeMentionPolicy::Collapse,
+            Some("filter" | "hide" | "remove") => HomeMentionPolicy::Filter,
+            _ => HomeMentionPolicy::Show,
+        }
+    }
+
+    /// Stable wire value for the stored preference.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HomeMentionPolicy::Show => "show",
+            HomeMentionPolicy::Collapse => "collapse",
+            HomeMentionPolicy::Filter => "filter",
+        }
+    }
+}
+
+/// D23: upstream `filter_from_home` language rule.
+///
+/// A follow row may carry `languages` (Mastodon `follow.languages`); when the
+/// follow names languages and the status names a language the follow does not
+/// list, the status is filtered from home. No follow preference, or a status
+/// without a language, is always kept. Comparison is ASCII case-insensitive
+/// (stored tags are normalized at write time; see
+/// [`normalize_follow_languages`]).
+pub fn follow_language_allows(
+    follow_languages: Option<&[String]>,
+    status_language: Option<&str>,
+) -> bool {
+    let Some(status_language) = status_language else {
+        return true;
+    };
+    let Some(langs) = follow_languages else {
+        return true;
+    };
+    if langs.is_empty() {
+        return true;
+    }
+    langs
+        .iter()
+        .any(|l| l.eq_ignore_ascii_case(status_language))
+}
+
+/// D23: keep the valid BCP-47-ish language tags (same shape as the status
+/// `language` validator), lowercased, deduplicated, order-preserving.
+/// Invalid entries are dropped, never stored.
+pub fn normalize_follow_languages(raw: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for tag in raw {
+        let tag = tag.trim().to_ascii_lowercase();
+        if tag.is_empty() || !is_valid_follow_language(&tag) {
+            continue;
+        }
+        if !out.contains(&tag) {
+            out.push(tag);
+        }
+    }
+    out
+}
+
+/// D23: whether `tag` is a storable follow language (letters/digits/`-`,
+/// e.g. `en`, `pt-BR`). Mirrors the status `language` validator.
+pub fn is_valid_follow_language(tag: &str) -> bool {
+    let mut parts = tag.split('-');
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    if !(2..=8).contains(&first.len()) || !first.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return false;
+    }
+    for part in parts {
+        if !(1..=8).contains(&part.len()) || !part.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return false;
+        }
+    }
+    true
+}
+
 /// How the viewer may quote a status (`quote_policy_for_account`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuotePermission {

@@ -22,6 +22,18 @@ use super::handlers;
 /// How many jobs a worker claims per poll.
 pub const DEFAULT_BATCH: usize = 32;
 
+/// Worker-threaded resources for the async job kinds (Phase 7): the push
+/// delivery client + VAPID identity, and the ffmpeg toolchain config.
+/// Built once in `main.rs` from `Config`.
+#[derive(Debug, Clone)]
+pub struct WorkerExtra {
+    pub push_client: reqwest::Client,
+    pub vapid: crate::application::push::VapidKeys,
+    /// VAPID `sub` claim (contact URI of the instance).
+    pub push_subject: String,
+    pub transcode: crate::media::transcode::TranscodeConfig,
+}
+
 /// Create the signing key of the account a `user_created` job names, in a detached task.
 fn spawn_user_keys(federation: FederationConfig<FedContext>, job: &crate::domain::Job) {
     let Some(account_id) = job.payload.get("account_id").and_then(serde_json::Value::as_u64) else {
@@ -46,6 +58,7 @@ pub async fn run(
     blobs: Arc<dyn BlobStore>,
     streaming: Arc<dyn StreamingSink>,
     federation: FederationConfig<FedContext>,
+    extra: WorkerExtra,
     poll_interval: Duration,
     batch: usize,
     mut shutdown: watch::Receiver<bool>,
@@ -69,9 +82,59 @@ pub async fn run(
                         JobKind::ResolveParent => threads::resolve_parent(&federation, &job).await,
                         JobKind::CrawlReplies => threads::crawl_replies(&federation, &job).await,
                         JobKind::FetchRemoteMedia => media::fetch(&federation, &job).await,
+                        JobKind::WebPushDelivery => {
+                            crate::application::push::run_push_job_record(
+                                &*store,
+                                &extra.push_client,
+                                &extra.vapid,
+                                &extra.push_subject,
+                                &job,
+                                clock.now_ms(),
+                            )
+                            .await
+                            .map_err(|(quarantine, message)| {
+                                if quarantine {
+                                    DeliveryError::Quarantine(message)
+                                } else {
+                                    DeliveryError::Retry(message)
+                                }
+                            })
+                        }
+                        JobKind::TranscodeMedia => {
+                            // ffmpeg blocks: run it off the async runtime.
+                            // The job is self-describing (`{media_id}`); the
+                            // toolchain comes from the worker context.
+                            let store = Arc::clone(&store);
+                            let blobs = Arc::clone(&blobs);
+                            let job = job.clone();
+                            let due_at_ms = clock.now_ms();
+                            let config = extra.transcode.clone();
+                            let sync = tokio::task::spawn_blocking(move || {
+                                let media_id = crate::media::transcode::TranscodeJobPayload::media_id_from_json(&job.payload)
+                                    .map_err(|err| DeliveryError::Quarantine(err.to_string()))?;
+                                crate::media::transcode::run_transcode_job(
+                                    &*store, &*blobs, media_id, due_at_ms, &config,
+                                )
+                                .map_err(|err| DeliveryError::Retry(err.to_string()))
+                            })
+                            .await
+                            .unwrap_or_else(|err| {
+                                Err(DeliveryError::Retry(format!("transcode join: {err}")))
+                            });
+                            // `ProcessMedia` also funnels here on rows that
+                            // need a transcode, so keep the arm total.
+                            sync
+                        }
                         _ => {
-                            let sync = handlers::handle(&job, &*store, &*mailer, &*blobs, &*streaming)
-                                .map_err(|err| DeliveryError::Retry(err.to_string()));
+                            let sync = handlers::handle_with_transcode(
+                                &job,
+                                &*store,
+                                &*mailer,
+                                &*blobs,
+                                &*streaming,
+                                Some(&extra.transcode),
+                            )
+                            .map_err(|err| DeliveryError::Retry(err.to_string()));
                             if job.kind == JobKind::UserCreated && sync.is_ok() {
                                 // The local signing key is made ahead of the first remote request.
                                 // It takes seconds in a debug build, so it runs detached: the

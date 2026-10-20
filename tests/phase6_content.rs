@@ -860,7 +860,7 @@ fn a_reblog_wrapper_is_addressed_on_the_booster_domain() {
     let (_dir, store) = temp_store();
     let alice = mk_account(&store, "alice");
     let (remote_id, _) = remote(&store, "far");
-    let target = local_status(&store, alice.id, "boost me", Visibility::Public);
+    let _target = local_status(&store, alice.id, "boost me", Visibility::Public);
     // Ingest a remote copy as the booster would see it, then reblog it.
     let remote_note = RemoteNote {
         uri: "https://remote.example/notes/1".into(),

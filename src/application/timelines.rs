@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::application::lists;
-use crate::application::policy::is_mentioned;
+use crate::application::policy::{self, HomeMentionPolicy, is_mentioned};
 use crate::application::ports::{
     PairState, Relationship, Store, TimelineFilter, TimelinePage, TimelineQuery,
 };
@@ -57,6 +57,12 @@ struct ViewerScope<'a> {
     /// Accounts on one of the viewer's exclusive lists, among the home
     /// authors (loaded by [`ViewerScope::seed_exclusive`]).
     exclusive: Mutex<HashSet<Id>>,
+    /// D22: the viewer's home mention policy, resolved lazily from the
+    /// stored user preference (`Show` when unset).
+    mention_policy: Mutex<Option<HomeMentionPolicy>>,
+    /// D23: the viewer's follow-languages preference per author, resolved
+    /// lazily from `follow_of` (`None` = no row or no preference).
+    follow_langs: Mutex<HashMap<Id, Option<Vec<String>>>>,
     error: Mutex<Option<Error>>,
 }
 
@@ -69,6 +75,8 @@ impl<'a> ViewerScope<'a> {
             facts: Mutex::new(HashMap::new()),
             reblog_authors: Mutex::new(HashMap::new()),
             exclusive: Mutex::new(HashSet::new()),
+            mention_policy: Mutex::new(None),
+            follow_langs: Mutex::new(HashMap::new()),
             error: Mutex::new(None),
         }
     }
@@ -174,6 +182,45 @@ impl<'a> ViewerScope<'a> {
     /// The viewer's follow of `account` asks for its reblogs.
     fn shows_reblogs_of(&self, account: Id) -> bool {
         self.facts(account).is_some_and(|f| f.show_reblogs)
+    }
+
+    /// D22: the viewer's stored home mention policy, loaded once per scope
+    /// (`Show` when the viewer is anonymous or has no preference stored).
+    fn mention_policy(&self) -> HomeMentionPolicy {
+        if let Some(policy) = *lock(&self.mention_policy) {
+            return policy;
+        }
+        let policy = self
+            .viewer
+            .map_or(HomeMentionPolicy::Show, |v| home_mention_policy_of(self.store, v));
+        *lock(&self.mention_policy) = Some(policy);
+        policy
+    }
+
+    /// D23: upstream `filter_from_home`'s `crutches[:languages]` rule — the
+    /// viewer's follow of `author` may restrict which status languages appear
+    /// on home. Own statuses and language-less statuses always pass; so does
+    /// anything when the follow names no languages.
+    fn follow_language_allows(&self, author: Id, language: Option<&str>) -> bool {
+        let Some(viewer) = self.viewer else {
+            return true;
+        };
+        if viewer == author || language.is_none() {
+            return true;
+        }
+        if let Some(cached) = lock(&self.follow_langs).get(&author).cloned() {
+            return policy::follow_language_allows(cached.as_deref(), language);
+        }
+        let loaded = self
+            .store
+            .follow_of(viewer, author)
+            .map(|row| row.and_then(|follow| follow.languages))
+            .unwrap_or_else(|err| {
+                self.fail(err);
+                None
+            });
+        lock(&self.follow_langs).insert(author, loaded.clone());
+        policy::follow_language_allows(loaded.as_deref(), language)
     }
 
     /// A reblog wrapper is shown only when the reblogged author passes the
@@ -295,6 +342,21 @@ impl TimelineFilter for HomeFilter<'_> {
         {
             return false;
         }
+        // D23: the viewer's follow of the author may restrict languages.
+        if !self
+            .scope
+            .follow_language_allows(author, status.language.as_deref())
+        {
+            return false;
+        }
+        // D22: in `Filter` mode, statuses mentioning a blocked/muted account
+        // leave home (upstream behavior, opt-in here). `Show` (default) and
+        // `Collapse` (DTO fold) keep them.
+        if self.scope.mention_policy() == HomeMentionPolicy::Filter
+            && home_mentions_filtered(&self.scope, status)
+        {
+            return false;
+        }
         true
     }
 }
@@ -378,6 +440,9 @@ impl TimelineFilter for ListFilter<'_> {
 /// Home timeline: the viewer's own statuses and their active follows, newest
 /// first. Only the most recent [`HOME_AUTHOR_CAP`] follows are read. Members
 /// of the viewer's exclusive lists are left out (upstream `:skip_home`).
+/// D23 per-follow language preferences and the D22 `Filter` mention policy
+/// apply here as well (see [`HomeMentionPolicy`]); the home stream gate
+/// ([`home_includes`]) shares this filter.
 pub fn home(
     store: &dyn Store,
     viewer: Id,
@@ -474,6 +539,55 @@ fn mentions_blocked_or_muted(scope: &ViewerScope<'_>, status: &Status) -> bool {
             .mentions
             .iter()
             .any(|mention| scope.facts(*mention).is_some_and(|f| f.pair.blocking || f.pair.muting))
+}
+
+/// D22: whether `status` mentions someone the viewer blocks or mutes — or
+/// (for reblogs) the reblogged status does. Upstream's `filter_from_home`
+/// `check_for_blocks` also covers the author and the reblog author, but those
+/// are already gated by `author_allowed` / `reblog_target_allowed` here, so
+/// only mentions remain.
+fn home_mentions_filtered(scope: &ViewerScope<'_>, status: &Status) -> bool {
+    if mentions_blocked_or_muted(scope, status) {
+        return true;
+    }
+    let Some(target_id) = status.reblog_of_id else {
+        return false;
+    };
+    match scope.store.status_by_id(target_id) {
+        Ok(Some(target)) => mentions_blocked_or_muted(scope, &target),
+        // An unloadable reblog target fails closed in
+        // `reblog_target_allowed`; it must not filter here.
+        Ok(None) | Err(_) => false,
+    }
+}
+
+/// D22: the viewer's stored home mention policy (`Show` when unset).
+/// Reads the `home_mention_policy` user preference; unknown values fall back
+/// to `Show` (see [`HomeMentionPolicy::from_stored`]).
+pub fn home_mention_policy_of(store: &dyn Store, viewer: Id) -> HomeMentionPolicy {
+    store
+        .user_by_account_id(viewer)
+        .ok()
+        .flatten()
+        .map(|user| HomeMentionPolicy::from_stored(user.home_mention_policy.as_deref()))
+        .unwrap_or(HomeMentionPolicy::Show)
+}
+
+/// D22 `Collapse`-mode helper for the status DTO and stream rendering:
+/// whether `status` in `viewer`'s home feed should render folded behind a
+/// content-warning-style fold. True only when the viewer chose `Collapse` and
+/// the status mentions a blocked/muted account.
+pub fn home_mention_fold(
+    store: &dyn Store,
+    viewer: Id,
+    status: &Status,
+    now_ms: u64,
+) -> Result<bool> {
+    let scope = ViewerScope::new(store, Some(viewer), now_ms);
+    let fold = scope.mention_policy() == HomeMentionPolicy::Collapse
+        && home_mentions_filtered(&scope, status);
+    scope.finish()?;
+    Ok(fold)
 }
 
 /// Home stream gate: whether `viewer`'s home feed would carry `status`.

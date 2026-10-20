@@ -488,6 +488,8 @@ impl StatusStore for RedbStore {
         };
         write_status_txn(&write, &status)?;
         super::federation_content::federation_event_txn(&write, self.next_id(), input.account_id, serde_json::json!({"event": "create", "status_id": status_id.value()}), now_ms)?;
+        // Phase 7.2: incremental search indexing rides the same commit.
+        super::jobs::insert_job(&write, &Job::new(self.next_id(), JobKind::SearchIndexStatus, crate::jobs::search_index::index_payload(status_id), now_ms, now_ms))?;
 
         // -- Idempotency record, committed with the mutation it protects.
         if let Some(raw) = input.idempotency_key.as_deref() {
@@ -828,6 +830,8 @@ impl StatusStore for RedbStore {
 
         write_status_txn(&write, &status)?;
         super::federation_content::federation_event_txn(&write, self.next_id(), account_id, serde_json::json!({"event": "update", "status_id": id.value()}), now_ms)?;
+        // Phase 7.2: incremental search indexing rides the same commit.
+        super::jobs::insert_job(&write, &Job::new(self.next_id(), JobKind::SearchIndexStatus, crate::jobs::search_index::index_payload(id), now_ms, now_ms))?;
         write.commit()?;
         Ok(Some(status))
     }
@@ -868,8 +872,8 @@ impl StatusStore for RedbStore {
                 }
             }
         }
-        for reblog_id in reblog_ids {
-            let Some(mut reblog) = read_status_txn(&write, reblog_id)? else {
+        for reblog_id in &reblog_ids {
+            let Some(mut reblog) = read_status_txn(&write, *reblog_id)? else {
                 continue;
             };
             if reblog.is_deleted() {
@@ -926,6 +930,12 @@ impl StatusStore for RedbStore {
             write.open_table(REBLOGS_BY_ACCOUNT)?
                 .remove(schema::pair_key(account_id.value(), target_id.value()).as_slice())?;
             super::federation_content::federation_event_txn(&write, self.next_id(), account_id, serde_json::json!({"event": "undo_announce", "status_id": target_id.value(), "announce_uri": snapshot.uri.clone()}), now_ms)?;
+        }
+        // Phase 7.2: incremental search indexing rides the same commit
+        // (tombstoned rows and their cascaded reblogs leave the index).
+        super::jobs::insert_job(&write, &Job::new(self.next_id(), JobKind::SearchIndexStatus, crate::jobs::search_index::index_payload(id), now_ms, now_ms))?;
+        for reblog_id in &reblog_ids {
+            super::jobs::insert_job(&write, &Job::new(self.next_id(), JobKind::SearchIndexStatus, crate::jobs::search_index::index_payload(*reblog_id), now_ms, now_ms))?;
         }
         write.commit()?;
         Ok(DeletedStatus {
@@ -1142,6 +1152,9 @@ impl StatusStore for RedbStore {
                 pinned: pins
                     .get(schema::pair_key(viewer_id.value(), id.value()).as_slice())?
                     .is_some(),
+                // Conversation mutes ride the status-view map (Phase 7); the
+                // port total stays neutral here and the map overrides per page.
+                muted: false,
             };
             out.insert(*id, flags);
         }
@@ -1668,5 +1681,145 @@ impl StatusStore for RedbStore {
             out.push((reblog.account_id, reblog_id));
         }
         Ok(out)
+    }
+
+    fn favourited_statuses(
+        &self,
+        account_id: Id,
+        max_id: Option<Id>,
+        since_id: Option<Id>,
+        min_id: Option<Id>,
+        limit: usize,
+    ) -> Result<Vec<Favourite>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let read = self.begin_read()?;
+        let table = read.open_table(FAVOURITES)?;
+        let lo = schema::pair_key(account_id.value(), 0);
+        let hi = schema::pair_key(account_id.value(), u64::MAX);
+        let mut rows: Vec<Favourite> = Vec::new();
+        for entry in table.range(lo.as_slice()..=hi.as_slice())? {
+            let (_key, value) = entry?;
+            rows.push(decode(value.value())?);
+            if rows.len() >= INTERACTION_SCAN_CAP {
+                break;
+            }
+        }
+        rows.sort_by(|a, b| b.id.cmp(&a.id));
+        Ok(rows
+            .into_iter()
+            .filter(|fav| max_id.is_none_or(|m| fav.id < m))
+            .filter(|fav| since_id.is_none_or(|m| fav.id > m))
+            .filter(|fav| min_id.is_none_or(|m| fav.id > m))
+            .take(limit)
+            .collect())
+    }
+
+    fn bookmarked_statuses(
+        &self,
+        account_id: Id,
+        max_id: Option<Id>,
+        since_id: Option<Id>,
+        min_id: Option<Id>,
+        limit: usize,
+    ) -> Result<Vec<Bookmark>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let read = self.begin_read()?;
+        let table = read.open_table(BOOKMARKS)?;
+        let lo = schema::pair_key(account_id.value(), 0);
+        let hi = schema::pair_key(account_id.value(), u64::MAX);
+        let mut rows: Vec<Bookmark> = Vec::new();
+        for entry in table.range(lo.as_slice()..=hi.as_slice())? {
+            let (_key, value) = entry?;
+            rows.push(decode(value.value())?);
+            if rows.len() >= INTERACTION_SCAN_CAP {
+                break;
+            }
+        }
+        rows.sort_by(|a, b| b.id.cmp(&a.id));
+        Ok(rows
+            .into_iter()
+            .filter(|mark| max_id.is_none_or(|m| mark.id < m))
+            .filter(|mark| since_id.is_none_or(|m| mark.id > m))
+            .filter(|mark| min_id.is_none_or(|m| mark.id > m))
+            .take(limit)
+            .collect())
+    }
+
+    fn backfill_tag_batch(
+        &self,
+        after: Option<Id>,
+        cap: usize,
+    ) -> Result<Vec<(Id, Vec<String>, String)>> {
+        let cap = cap.clamp(1, 2_000);
+        let read = self.begin_read()?;
+        let table = read.open_table(STATUSES)?;
+        // Newest first: descending scan, exclusive of the resume cursor.
+        let mut out = Vec::new();
+        for entry in table.iter()?.rev() {
+            let (key, value) = entry?;
+            let id = Id::new(key.value());
+            if after.is_some_and(|cursor| id >= cursor) {
+                continue;
+            }
+            let status: Status = decode(value.value())?;
+            if status.is_deleted() {
+                continue;
+            }
+            out.push((id, status.tags.clone(), status.source_text.clone()));
+            if out.len() >= cap {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    fn rewrite_status_tags(&self, status_id: Id, new_tags: &[String]) -> Result<()> {
+        let write = self.begin_write()?;
+        let old_tags: Vec<String> = {
+            let table = write.open_table(STATUSES)?;
+            match table.get(status_id.value())? {
+                Some(guard) => {
+                    let status: Status = decode(guard.value())?;
+                    status.tags.clone()
+                }
+                None => return Ok(()),
+            }
+        };
+        {
+            let mut index = write.open_table(HASHTAG_INDEX)?;
+            for tag in &old_tags {
+                if !new_tags.contains(tag) {
+                    index.remove(schema::hashtag_key(tag, status_id.value()).as_slice())?;
+                }
+            }
+            for tag in new_tags {
+                if !old_tags.contains(tag) {
+                    index.insert(
+                        schema::hashtag_key(tag, status_id.value()).as_slice(),
+                        status_id.value(),
+                    )?;
+                }
+            }
+        }
+        {
+            let mut table = write.open_table(STATUSES)?;
+            let updated: Option<Status> = table
+                .get(status_id.value())?
+                .map(|guard| {
+                    let mut status: Status = decode(guard.value())?;
+                    status.tags = new_tags.to_vec();
+                    Ok::<_, crate::domain::Error>(status)
+                })
+                .transpose()?;
+            if let Some(status) = updated {
+                table.insert(status_id.value(), encode(&status)?.as_slice())?;
+            }
+        }
+        write.commit()?;
+        Ok(())
     }
 }

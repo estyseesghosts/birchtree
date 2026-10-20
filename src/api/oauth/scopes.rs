@@ -42,6 +42,25 @@ pub const KNOWN_SCOPES: &[&str] = &[
     "write:statuses",
     "follow",
     "push",
+    // Admin API families (Doorkeeper `config/initializers/doorkeeper.rb`).
+    // Trends/tags/measures/dimensions/retention use the bare `admin:read` /
+    // `admin:write` upstream — no sub-scopes are invented for those here.
+    "admin:read",
+    "admin:write",
+    "admin:read:accounts",
+    "admin:write:accounts",
+    "admin:read:reports",
+    "admin:write:reports",
+    "admin:read:domain_allows",
+    "admin:write:domain_allows",
+    "admin:read:domain_blocks",
+    "admin:write:domain_blocks",
+    "admin:read:ip_blocks",
+    "admin:write:ip_blocks",
+    "admin:read:email_domain_blocks",
+    "admin:write:email_domain_blocks",
+    "admin:read:canonical_email_blocks",
+    "admin:write:canonical_email_blocks",
 ];
 
 /// Split a scope string into a de-duplicated, ordered list.

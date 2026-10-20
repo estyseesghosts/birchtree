@@ -6,7 +6,7 @@ Route inventory from Mastodon v4.7.3 `config/routes/api.rb` (commit `8ff11c2b`),
 
 Scope expansion (2026-10-17): the admin/moderation API, reports, Web Push, conversations, suggestions, announcements, trends, annual reports, donation campaigns, and the `/api/web/*` routes are `In` with planned phases (see `birchtree.md` §7). Their rows are in the sections below. Known inventory gaps and one route-shape discrepancy are listed at the end.
 
-Auth scopes are Mastodon conventions from the source/docs. They are enforced centrally (Phase 2) at the route boundary: a missing/invalid token yields `401 {"error":"The access token is invalid"}`, an insufficient scope yields `403 {"error":"This action is outside the authorized scopes"}`, and a user endpoint reached with an app-only token yields `422 {"error":"This method requires an authenticated user"}` (or `403 {"error":"This method requires an client credentials authentication"}` for the reverse case on registration). Scope lists are "any-of" (broad OR granular), matching Doorkeeper's `any?`. Admin routes additionally require a moderator-or-admin role (Mastodon's `Admin::PermissionsConcern`); the role model is Phase 7.3 work.
+Auth scopes are Mastodon conventions from the source/docs. They are enforced centrally (Phase 2) at the route boundary: a missing/invalid token yields `401 {"error":"The access token is invalid"}`, an insufficient scope yields `403 {"error":"This action is outside the authorized scopes"}`, and a user endpoint reached with an app-only token yields `422 {"error":"This method requires an authenticated user"}` (or `403 {"error":"This method requires an client credentials authentication"}` for the reverse case on registration). Scope lists are "any-of" (broad OR granular), matching Doorkeeper's `any?`. Admin routes additionally require a moderator-or-admin role (Mastodon's `Admin::PermissionsConcern`), checked before the scope check; a missing role yields `403 {"error":"Forbidden"}` (upstream `ErrorResponses#forbidden`). Roles (`admin`, `moderator`) are CLI-granted; moderator covers the `accounts` and `reports` admin areas, admin covers all.
 
 ## OAuth / discovery (public, not in config/routes/api.rb)
 
@@ -27,12 +27,12 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 |---|---|---|---|---|---|---|
 | GET | `/api/v1/instance` | none | — | implemented (Phase 2) | In | instance discovery, `REST::V1::InstanceSerializer` |
 | GET | `/api/v2/instance` | none | — | implemented (Phase 2) | In | instance discovery v2, `REST::InstanceSerializer` |
-| GET | `/api/v1/accounts` | optional | read \| read:accounts | planned (Phase 7) | In | multi-fetch `id[]` (up to 40; above that `422 Mastodon::ValidationError`); unapproved and pending-deletion accounts omitted (upstream `set_accounts`) |
+| GET | `/api/v1/accounts` | optional | read \| read:accounts | implemented (Phase 7) | In | multi-fetch `id[]` (up to 40; above that `422 Mastodon::ValidationError`); unapproved and pending-deletion accounts omitted (upstream `set_accounts`) |
 | POST | `/api/v1/accounts` | app | write \| write:accounts | implemented (Phase 2) | In | registration; returns a user token |
 | GET | `/api/v1/accounts/verify_credentials` | user | profile \| read \| read:accounts | implemented (Phase 2) | In | `CredentialAccountSerializer` (real counters) |
 | PATCH | `/api/v1/accounts/update_credentials` | user | write \| write:accounts | implemented (Phase 2) | In | incl. `source[quote_policy]` |
-| GET | `/api/v1/accounts/lookup` | user | read | planned (Phase 7) | In | acct → account resolution |
-| GET | `/api/v1/accounts/search` | user | read | planned (Phase 7) | In | |
+| GET | `/api/v1/accounts/lookup` | user | read | implemented (Phase 7) | In | acct → account resolution |
+| GET | `/api/v1/accounts/search` | user | read | implemented (Phase 7) | In | |
 | GET | `/api/v1/accounts/relationships` | user | read \| read:follows | implemented (Phase 2, real data Phase 3) | In | real per-viewer relationship aggregates |
 | GET | `/api/v1/accounts/:id` | none | — | implemented (Phase 2, real counters Phase 3) | In | public profile |
 | GET | `/api/v1/accounts/:id/statuses` | optional | read | implemented (Phase 3) | In | `pinned`/`exclude_replies`/`exclude_reblogs` filters, `Link` cursors |
@@ -53,7 +53,7 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 | GET | `/api/v1/accounts/:id/endorsements` | optional | read \| read:accounts | implemented (Phase 3) | In | empty array for unknown accounts |
 | GET | `/api/v1/endorsements` | user | read \| read:accounts | implemented (Phase 3) | In | own endorsed accounts |
 | POST | `/api/v1/apps` | none | — | implemented (Phase 2) | In | app registration; returns `client_secret` once |
-| GET | `/api/v1/apps/verify_credentials` | app | — | planned (Phase 7) | In | |
+| GET | `/api/v1/apps/verify_credentials` | app | — | implemented (Phase 7) | In | valid-token check only; `REST::ApplicationSerializer` without secret |
 
 ### Follow requests
 
@@ -98,8 +98,8 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 | GET | `/api/v1/statuses/:id/reblogged_by` | optional | read \| read:accounts | implemented (Phase 3) | In | accounts; cursor = reblog id |
 | GET | `/api/v1/statuses/:id/quotes` | user | read \| read:statuses | implemented (Phase 3) | In | 401 without token; accepted quotes only; cursor = quoting status id |
 | POST | `/api/v1/statuses/:id/quotes/:quoting_status_id/revoke` | user | write \| write:statuses | implemented (Phase 3) | In | quoted author only; 200 = quoting status |
-| POST | `/api/v1/statuses/:id/mute` | user | write \| write:mutes | planned (Phase 7) | In | conversation mute; ships with `conversations` (Phase 7) |
-| POST | `/api/v1/statuses/:id/unmute` | user | write \| write:mutes | planned (Phase 7) | In | as above |
+| POST | `/api/v1/statuses/:id/mute` | user | write \| write:mutes | implemented (Phase 7) | In | conversation mute; the status DTO `muted` reflects it |
+| POST | `/api/v1/statuses/:id/unmute` | user | write \| write:mutes | implemented (Phase 7) | In | as above |
 | POST | `/api/v1/statuses/:id/translate` | — | — | out of profile | Out | translation provider not configured |
 
 ### Polls
@@ -117,7 +117,7 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 | GET | `/api/v1/timelines/public` | optional | read \| read:statuses | implemented (Phase 4) | In | public visibility only; self-replies kept, replies to others and reblogs dropped; `local`/`remote`/`only_media`; anonymous → `max-age=15, public, stale-while-revalidate=30, stale-if-error=86400`, authenticated → `private, no-store` |
 | GET | `/api/v1/timelines/tag/{tag}` | optional | read \| read:statuses | implemented (Phase 4) | In | tag normalized (case-insensitive, leading `#` stripped); unknown or empty tag → `200 []` with no `Link`; public visibility only; replies kept; reblog wrappers not indexed (matches upstream, see deviations); `local`/`remote`/`only_media`; cache header as `public` above |
 | GET | `/api/v1/timelines/list/{id}` | user | read \| read:lists | implemented (Phase 4) | In | members' statuses under the home gates; the list's `replies_policy` (`list`/`followed`/`none`) governs replies; not owned or unparsable id → 404 `{"error":"Record not found"}`; app-only token → 422; `Cache-Control: private, no-store` |
-| GET | `/api/v1/timelines/link` | optional | read | planned (Phase 7) | In | |
+| GET | `/api/v1/timelines/link` | optional | read | implemented (Phase 7) | In | link timeline over `PreviewCard` URLs (`?url=`) |
 | GET | `/api/v1/media/:id` | user | write \| write:media | implemented (Phase 4) | In | 206 while unprocessed; 422 on processing failure (Mastodon's controller authorizes write on every action, `show` included) |
 | POST | `/api/v1/media` | user | write \| write:media | implemented (Phase 4) | In | media v1 (multipart, inline processing → 200) |
 | PUT | `/api/v1/media/:id` | user | write \| write:media | implemented (Phase 4) | In | description/focus/thumbnail; 206 while unprocessed |
@@ -159,7 +159,7 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 | PUT | `/api/v1/scheduled_statuses/:id` | user | write | implemented (Phase 4) | In | also PATCH; `scheduled_at` only; blank → 422 |
 | DELETE | `/api/v1/scheduled_statuses/:id` | user | write | implemented (Phase 4) | In | `200 {}`; the publish job becomes a no-op |
 | GET | `/api/v1/search` | — | — | out of profile (route absent in v4.7.3) | Out | removed upstream in Mastodon 3.0 (commit `18331fefa2`); only v2 exists in the pinned tag |
-| GET | `/api/v2/search` | optional | read:search | implemented (Phase 4) | In | local corpus only: accounts by handle/display name, hashtags by prefix, statuses by bounded recent scan (authenticated only, like `status_searchable?`); `resolve` without auth → pinned 401; `collections` always `[]`. Interim until the Phase 7.2 engine (see Search deviations) |
+| GET | `/api/v2/search` | optional | read:search | implemented (Phase 7.2) | In | accounts by handle/display name and hashtags by prefix on the database path in every mode; statuses switch by configuration (`embedded` default / `database` / `off`; authenticated only, like `status_searchable?`); `resolve` without auth → pinned 401; `collections` always `[]` |
 | GET | `/api/v1/streaming` | user | read \| read:statuses (user:notification: read \| read:notifications) | implemented (Phase 5) | In | WebSocket upgrade (subscribe by `?stream=` or message; any path under the prefix). Without an upgrade, `/api/v1/streaming` alone has no channel and answers `400 Unknown channel requested`. Host redirect when `--streaming-url` names another host (`301`). Contract: `docs/streaming-contract.md` |
 | GET | `/api/v1/streaming/(*any)` | user | read \| read:statuses (user:notification: read \| read:notifications) | implemented (Phase 5) | In | SSE for `user`, `user/notification`, `public`, `public/local`, `public/remote` (`?only_media=true` for media), `hashtag`, `hashtag/local` (`?tag=`), `direct`, `list` (`?list=`); `GET …/health` answers `OK` unauthenticated. Refusals and texts: the contract. `direct` and `public/remote` are silent until Phases 7 and 6 (D18, D19) |
 
@@ -167,45 +167,45 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| GET | `/api/v1/conversations` | user | read \| read:statuses | planned (Phase 7) | In | per-viewer conversation list |
-| DELETE | `/api/v1/conversations/:id` | user | write \| write:conversations | planned (Phase 7) | In | per-viewer state |
-| POST | `/api/v1/conversations/:id/read` | user | write \| write:conversations | planned (Phase 7) | In | |
-| POST | `/api/v1/conversations/:id/unread` | user | write \| write:conversations | planned (Phase 7) | In | |
+| GET | `/api/v1/conversations` | user | read \| read:statuses | implemented (Phase 7) | In | per-viewer conversation list; id = thread-root status id |
+| DELETE | `/api/v1/conversations/:id` | user | write \| write:conversations | implemented (Phase 7) | In | per-viewer state |
+| POST | `/api/v1/conversations/:id/read` | user | write \| write:conversations | implemented (Phase 7) | In | |
+| POST | `/api/v1/conversations/:id/unread` | user | write \| write:conversations | implemented (Phase 7) | In | |
 
 ### Suggestions (Phase 7)
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| GET | `/api/v1/suggestions` | user | read \| read:accounts | planned (Phase 7) | In | deprecated upstream (`Deprecation` and `Sunset` headers from 2021-05-16); `limit` and `offset` |
-| DELETE | `/api/v1/suggestions/:id` | user | write \| write:accounts | planned (Phase 7) | In | `:id` is the suggested account id; `render_empty` |
-| GET | `/api/v2/suggestions` | user | read \| read:accounts | planned (Phase 7) | In | `REST::SuggestionSerializer[]`; `Mastodon-Async-Refresh` when a FASP retrieval runs (feature-flagged upstream). FASP-sourced entries are out of profile until a FASP integration exists; never fabricated |
-| DELETE | `/api/v2/suggestions/:id` | user | write \| write:accounts | planned (Phase 7) | In | `:id` is the suggested account id |
+| GET | `/api/v1/suggestions` | user | read \| read:accounts | implemented (Phase 7) | In | deprecated upstream (`Deprecation` and `Sunset` headers from 2021-05-16); `limit` and `offset` |
+| DELETE | `/api/v1/suggestions/:id` | user | write \| write:accounts | implemented (Phase 7) | In | `:id` is the suggested account id; `render_empty` |
+| GET | `/api/v2/suggestions` | user | read \| read:accounts | implemented (Phase 7) | In | `REST::SuggestionSerializer[]`; `Mastodon-Async-Refresh` when a FASP retrieval runs (feature-flagged upstream). FASP-sourced entries are out of profile until a FASP integration exists; never fabricated |
+| DELETE | `/api/v2/suggestions/:id` | user | write \| write:accounts | implemented (Phase 7) | In | `:id` is the suggested account id |
 
 ### Announcements (Phase 7)
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| GET | `/api/v1/announcements` | user (any scope) | — | planned (Phase 7) | In | `require_user!` only (no scope check); published announcements, chronological; authored by CLI |
-| POST | `/api/v1/announcements/:id/dismiss` | user | write \| write:accounts | planned (Phase 7) | In | `render_empty` |
-| PUT | `/api/v1/announcements/:announcement_id/reactions/:id` | user | write \| write:favourites | planned (Phase 7) | In | `:id` is the reaction name; `render_empty` |
-| PATCH | `/api/v1/announcements/:announcement_id/reactions/:id` | user | write \| write:favourites | planned (Phase 7) | In | alias of PUT |
-| DELETE | `/api/v1/announcements/:announcement_id/reactions/:id` | user | write \| write:favourites | planned (Phase 7) | In | removes the viewer's reaction by name |
+| GET | `/api/v1/announcements` | user (any scope) | — | implemented (Phase 7) | In | `require_user!` only (no scope check); published announcements, chronological; authored by CLI |
+| POST | `/api/v1/announcements/:id/dismiss` | user | write \| write:accounts | implemented (Phase 7) | In | `render_empty` |
+| PUT | `/api/v1/announcements/:announcement_id/reactions/:id` | user | write \| write:favourites | implemented (Phase 7) | In | `:id` is the reaction name; `render_empty` |
+| PATCH | `/api/v1/announcements/:announcement_id/reactions/:id` | user | write \| write:favourites | implemented (Phase 7) | In | alias of PUT |
+| DELETE | `/api/v1/announcements/:announcement_id/reactions/:id` | user | write \| write:favourites | implemented (Phase 7) | In | removes the viewer's reaction by name |
 
 ### Donation campaigns (Phase 7)
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| GET | `/api/v1/donation_campaigns` | user (any scope) | — | planned (Phase 7) | In | `204` when no campaign API URL is configured, or when no campaign is returned. Otherwise an outbound GET to the operator-configured URL through the safe client, cached 1 h, circuit-broken after repeated failures |
+| GET | `/api/v1/donation_campaigns` | user (any scope) | — | implemented (Phase 7) | In | `204` when no campaign API URL is configured, or when no campaign is returned. Otherwise an outbound GET to the operator-configured URL through the safe client, cached 1 h, circuit-broken after repeated failures |
 
 ### Web Push (Phase 7)
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| POST | `/api/v1/push/subscription` | user | push | planned (Phase 7) | In | subscription bound to the access token; VAPID keys from configuration |
-| GET | `/api/v1/push/subscription` | user | push | planned (Phase 7) | In | |
-| PUT | `/api/v1/push/subscription` | user | push | planned (Phase 7) | In | update; `check_push_subscription` guard |
-| PATCH | `/api/v1/push/subscription` | user | push | planned (Phase 7) | In | alias of PUT |
-| DELETE | `/api/v1/push/subscription` | user | push | planned (Phase 7) | In | |
+| POST | `/api/v1/push/subscription` | user | push | implemented (Phase 7) | In | subscription bound to the access token; VAPID keys from configuration; tickle-only delivery (no encrypted payload yet) |
+| GET | `/api/v1/push/subscription` | user | push | implemented (Phase 7) | In | |
+| PUT | `/api/v1/push/subscription` | user | push | implemented (Phase 7) | In | update; `check_push_subscription` guard |
+| PATCH | `/api/v1/push/subscription` | user | push | implemented (Phase 7) | In | alias of PUT |
+| DELETE | `/api/v1/push/subscription` | user | push | implemented (Phase 7) | In | |
 
 ### `/api/web/*` (Phase 7)
 
@@ -213,13 +213,35 @@ These routes serve keystodon's first-party mode. Upstream guards them with the D
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| PUT | `/api/web/settings` | session + CSRF | — | planned (Phase 7) | In | web UI settings sync; `require_user!` |
-| PATCH | `/api/web/settings` | session + CSRF | — | planned (Phase 7) | In | alias of PUT |
-| GET | `/api/web/embeds/:id` | none | — | planned (Phase 7) | In | local status: OEmbed JSON, `show?` authorization. Remote status: requires a signed-in session and performs an outbound oEmbed fetch through the safe client |
-| POST | `/api/web/push_subscriptions` | session + CSRF | — | planned (Phase 7) | In | `require_user!` |
-| PUT | `/api/web/push_subscriptions/:id` | session + CSRF | — | planned (Phase 7) | In | `require_user!` |
-| PATCH | `/api/web/push_subscriptions/:id` | session + CSRF | — | planned (Phase 7) | In | alias of PUT |
-| DELETE | `/api/web/push_subscriptions/:id` | session + CSRF | — | planned (Phase 7) | In | no `require_user!` guard upstream (destroy only) |
+| PUT | `/api/web/settings` | session + CSRF | — | implemented (Phase 7) | In | web UI settings sync; `require_user!` |
+| PATCH | `/api/web/settings` | session + CSRF | — | implemented (Phase 7) | In | alias of PUT |
+| GET | `/api/web/embeds/:id` | none | — | implemented (Phase 7) | In | local status: OEmbed JSON, `show?` authorization. Remote fetch/sanitize pass not built yet: signed-in remote reads answer 404 (fetch-failure equivalent) |
+| POST | `/api/web/push_subscriptions` | session + CSRF | — | implemented (Phase 7) | In | `require_user!` |
+| PUT | `/api/web/push_subscriptions/:id` | session + CSRF | — | implemented (Phase 7) | In | `require_user!` |
+| PATCH | `/api/web/push_subscriptions/:id` | session + CSRF | — | implemented (Phase 7) | In | alias of PUT |
+| DELETE | `/api/web/push_subscriptions/:id` | session + CSRF | — | implemented (Phase 7) | In | no `require_user!` guard upstream (destroy only); also accepts the numeric id with a session |
+
+### Relation collection reads + tag surface (Phase 7)
+
+Bullets in the old inventory that are now rows. Upstream sources: `app/controllers/api/v1/{blocks,mutes,favourites,bookmarks}_controller.rb`, `accounts/familiar_followers_controller.rb` (+ presenter), `featured_tags_controller.rb`, `followed_tags_controller.rb`, `tags_controller.rb` at v4.7.3.
+
+| Method | Path | Auth | Scope | Status | Profile | Notes |
+|---|---|---|---|---|---|---|
+| GET | `/api/v1/blocks` | user | follow \| read \| read:blocks | implemented (Phase 7) | In | real read over BLOCKS; `Link` cursors |
+| GET | `/api/v1/mutes` | user | follow \| read \| read:mutes | implemented (Phase 7) | In | real read over MUTES with `MutedAccountSerializer` (`mute_expires_at`) |
+| GET | `/api/v1/favourites` | user | read \| read:favourites | implemented (Phase 7) | In | real read over FAVOURITES; `min_id` ignored (only `max_id`/`since_id` honored) |
+| GET | `/api/v1/bookmarks` | user | read \| read:bookmarks | implemented (Phase 7) | In | real read over BOOKMARKS; `min_id` ignored (as above) |
+| GET | `/api/v1/accounts/familiar_followers` | user | read \| read:accounts | implemented (Phase 7) | In | computed from real follows; input ids capped at 40 (upstream unbounded); unknown/suspended skipped; no `hide_collections` concept (no collections surface) |
+| GET | `/api/v1/featured_tags` | user | read | implemented (Phase 7) | In | real rows + live usage counts from bounded tag scans |
+| POST | `/api/v1/featured_tags` | user | write | implemented (Phase 7) | In | feature by name |
+| DELETE | `/api/v1/featured_tags/:id` | user | write | implemented (Phase 7) | In | `:id` is the numeric featured-tag row |
+| GET | `/api/v1/accounts/:id/featured_tags` | optional | read | implemented (Phase 7) | In | the account's featured tags |
+| GET | `/api/v1/followed_tags` | user | read | implemented (Phase 7) | In | real read over TAG_FOLLOWS (limit 100); `min_id` ignored |
+| GET | `/api/v1/tags/:id` | optional | read | implemented (Phase 7) | In | tag name as id (matches the recorded tag deviation); 404 when never used |
+| POST | `/api/v1/tags/:id/follow` | user | write \| write:follows | implemented (Phase 7) | In | |
+| POST | `/api/v1/tags/:id/unfollow` | user | write \| write:follows | implemented (Phase 7) | In | |
+| POST | `/api/v1/tags/:id/feature` | user | write \| write:accounts | implemented (Phase 7) | In | |
+| POST | `/api/v1/tags/:id/unfeature` | user | write \| write:accounts | implemented (Phase 7) | In | |
 
 ### Trends, public (Phase 7.3)
 
@@ -227,26 +249,26 @@ Upstream serves only admin-approved items (`Trends.*.query.allowed`) and returns
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| GET | `/api/v1/trends` | optional | — | planned (Phase 7.3) | In | deprecated alias of `/api/v1/trends/tags` (`Deprecation` from 2022-03-30); `cache_if_unauthenticated!` |
-| GET | `/api/v1/trends/tags` | optional | — | planned (Phase 7.3) | In | approved tags, locale-filtered; authenticated viewers get `filtered_for` |
-| GET | `/api/v1/trends/links` | optional | — | planned (Phase 7.3) | In | approved preview cards only; needs link-preview crawling (safe client) |
-| GET | `/api/v1/trends/statuses` | optional | — | planned (Phase 7.3) | In | approved statuses only |
+| GET | `/api/v1/trends` | optional | — | implemented (Phase 7.3) | In | deprecated alias of `/api/v1/trends/tags` (`Deprecation` from 2022-03-30); `cache_if_unauthenticated!` |
+| GET | `/api/v1/trends/tags` | optional | — | implemented (Phase 7.3) | In | approved tags, locale-filtered; authenticated viewers get `filtered_for` |
+| GET | `/api/v1/trends/links` | optional | — | implemented (Phase 7.3) | In | approved preview cards only; needs link-preview crawling (safe client) |
+| GET | `/api/v1/trends/statuses` | optional | — | implemented (Phase 7.3) | In | approved statuses only |
 
 ### Reports (Phase 7.3)
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| POST | `/api/v1/reports` | user | write \| write:reports | planned (Phase 7.3) | In | creates a report (`require_user!`); remote forwarding as Flag is Phase 6 |
+| POST | `/api/v1/reports` | user | write \| write:reports | implemented (Phase 6) | In | creates a report (`require_user!`); remote forwarding as Flag is Phase 6 |
 
 ### Annual reports (Phase 7.3)
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| GET | `/api/v1/annual_reports` | user | read \| read:accounts | planned (Phase 7.3) | In | index of the viewer's annual reports |
-| GET | `/api/v1/annual_reports/:id` | user | read \| read:accounts | planned (Phase 7.3) | In | |
-| POST | `/api/v1/annual_reports/:id/read` | user | write \| write:accounts | planned (Phase 7.3) | In | marks the report read |
-| POST | `/api/v1/annual_reports/:id/generate` | user | write \| write:accounts | planned (Phase 7.3) | In | enqueues generation as a durable job |
-| GET | `/api/v1/annual_reports/:id/state` | user | read \| read:accounts | planned (Phase 7.3) | In | generation state |
+| GET | `/api/v1/annual_reports` | user | read \| read:accounts | implemented (Phase 7.3) | In | index of the viewer's annual reports |
+| GET | `/api/v1/annual_reports/:id` | user | read \| read:accounts | implemented (Phase 7.3) | In | |
+| POST | `/api/v1/annual_reports/:id/read` | user | write \| write:accounts | implemented (Phase 7.3) | In | marks the report read |
+| POST | `/api/v1/annual_reports/:id/generate` | user | write \| write:accounts | implemented (Phase 7.3) | In | enqueues generation as a durable job |
+| GET | `/api/v1/annual_reports/:id/state` | user | read \| read:accounts | implemented (Phase 7.3) | In | generation state |
 
 ### Admin API (Phase 7.3)
 
@@ -256,99 +278,99 @@ All admin rows: auth `user + role`. The role is `admin` (every admin route) or `
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| GET | `/api/v1/admin/accounts` | user + role | admin:read \| admin:read:accounts | planned (Phase 7.3) | In | `REST::Admin::AccountSerializer[]` |
-| GET | `/api/v1/admin/accounts/:id` | user + role | admin:read \| admin:read:accounts | planned (Phase 7.3) | In | |
-| DELETE | `/api/v1/admin/accounts/:id` | user + role | admin:write \| admin:write:accounts | planned (Phase 7.3) | In | enqueues account deletion (upstream: async worker) |
-| POST | `/api/v1/admin/accounts/:id/enable` | user + role | admin:write \| admin:write:accounts | planned (Phase 7.3) | In | local accounts only (`require_local_account!`) |
-| POST | `/api/v1/admin/accounts/:id/unsensitive` | user + role | admin:write \| admin:write:accounts | planned (Phase 7.3) | In | |
-| POST | `/api/v1/admin/accounts/:id/unsilence` | user + role | admin:write \| admin:write:accounts | planned (Phase 7.3) | In | |
-| POST | `/api/v1/admin/accounts/:id/unsuspend` | user + role | admin:write \| admin:write:accounts | planned (Phase 7.3) | In | enqueues unsuspension (upstream: async worker) |
-| POST | `/api/v1/admin/accounts/:id/approve` | user + role | admin:write \| admin:write:accounts | planned (Phase 7.3) | In | local accounts only; depends on approval registration modes (Phase 2 gap) |
-| POST | `/api/v1/admin/accounts/:id/reject` | user + role | admin:write \| admin:write:accounts | planned (Phase 7.3) | In | local accounts only; same dependency as `approve` |
-| POST | `/api/v1/admin/accounts/:account_id/action` | user + role | admin:write \| admin:write:accounts | planned (Phase 7.3) | In | account action (`Admin::AccountAction`); the nested path parameter is `:account_id` |
+| GET | `/api/v1/admin/accounts` | user + role | admin:read \| admin:read:accounts | implemented (Phase 7.3) | In | `REST::Admin::AccountSerializer[]` |
+| GET | `/api/v1/admin/accounts/:id` | user + role | admin:read \| admin:read:accounts | implemented (Phase 7.3) | In | |
+| DELETE | `/api/v1/admin/accounts/:id` | user + role | admin:write \| admin:write:accounts | implemented (Phase 7.3) | In | enqueues account deletion (upstream: async worker) |
+| POST | `/api/v1/admin/accounts/:id/enable` | user + role | admin:write \| admin:write:accounts | implemented (Phase 7.3) | In | local accounts only (`require_local_account!`) |
+| POST | `/api/v1/admin/accounts/:id/unsensitive` | user + role | admin:write \| admin:write:accounts | implemented (Phase 7.3) | In | |
+| POST | `/api/v1/admin/accounts/:id/unsilence` | user + role | admin:write \| admin:write:accounts | implemented (Phase 7.3) | In | |
+| POST | `/api/v1/admin/accounts/:id/unsuspend` | user + role | admin:write \| admin:write:accounts | implemented (Phase 7.3) | In | enqueues unsuspension (upstream: async worker) |
+| POST | `/api/v1/admin/accounts/:id/approve` | user + role | admin:write \| admin:write:accounts | implemented (Phase 7.3) | In | local accounts only; depends on approval registration modes (Phase 2 gap) |
+| POST | `/api/v1/admin/accounts/:id/reject` | user + role | admin:write \| admin:write:accounts | implemented (Phase 7.3) | In | local accounts only; same dependency as `approve` |
+| POST | `/api/v1/admin/accounts/:account_id/action` | user + role | admin:write \| admin:write:accounts | implemented (Phase 7.3) | In | account action (`Admin::AccountAction`); the nested path parameter is `:account_id` |
 
 #### Reports (moderator queue)
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| GET | `/api/v1/admin/reports` | user + role | admin:read \| admin:read:reports | planned (Phase 7.3) | In | |
-| GET | `/api/v1/admin/reports/:id` | user + role | admin:read \| admin:read:reports | planned (Phase 7.3) | In | |
-| PUT | `/api/v1/admin/reports/:id` | user + role | admin:write \| admin:write:reports | planned (Phase 7.3) | In | update |
-| PATCH | `/api/v1/admin/reports/:id` | user + role | admin:write \| admin:write:reports | planned (Phase 7.3) | In | alias of PUT |
-| POST | `/api/v1/admin/reports/:id/assign_to_self` | user + role | admin:write \| admin:write:reports | planned (Phase 7.3) | In | |
-| POST | `/api/v1/admin/reports/:id/unassign` | user + role | admin:write \| admin:write:reports | planned (Phase 7.3) | In | |
-| POST | `/api/v1/admin/reports/:id/reopen` | user + role | admin:write \| admin:write:reports | planned (Phase 7.3) | In | |
-| POST | `/api/v1/admin/reports/:id/resolve` | user + role | admin:write \| admin:write:reports | planned (Phase 7.3) | In | |
+| GET | `/api/v1/admin/reports` | user + role | admin:read \| admin:read:reports | implemented (Phase 7.3) | In | |
+| GET | `/api/v1/admin/reports/:id` | user + role | admin:read \| admin:read:reports | implemented (Phase 7.3) | In | |
+| PUT | `/api/v1/admin/reports/:id` | user + role | admin:write \| admin:write:reports | implemented (Phase 7.3) | In | update |
+| PATCH | `/api/v1/admin/reports/:id` | user + role | admin:write \| admin:write:reports | implemented (Phase 7.3) | In | alias of PUT |
+| POST | `/api/v1/admin/reports/:id/assign_to_self` | user + role | admin:write \| admin:write:reports | implemented (Phase 7.3) | In | |
+| POST | `/api/v1/admin/reports/:id/unassign` | user + role | admin:write \| admin:write:reports | implemented (Phase 7.3) | In | |
+| POST | `/api/v1/admin/reports/:id/reopen` | user + role | admin:write \| admin:write:reports | implemented (Phase 7.3) | In | |
+| POST | `/api/v1/admin/reports/:id/resolve` | user + role | admin:write \| admin:write:reports | implemented (Phase 7.3) | In | |
 
 #### Domain allows, domain blocks, email-domain blocks, IP blocks
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| GET | `/api/v1/admin/domain_allows` | user + role | admin:read \| admin:read:domain_allows | planned (Phase 7.3) | In | |
-| GET | `/api/v1/admin/domain_allows/:id` | user + role | admin:read \| admin:read:domain_allows | planned (Phase 7.3) | In | |
-| POST | `/api/v1/admin/domain_allows` | user + role | admin:write \| admin:write:domain_allows | planned (Phase 7.3) | In | |
-| DELETE | `/api/v1/admin/domain_allows/:id` | user + role | admin:write \| admin:write:domain_allows | planned (Phase 7.3) | In | |
-| GET | `/api/v1/admin/domain_blocks` | user + role | admin:read \| admin:read:domain_blocks | planned (Phase 7.3) | In | server-level blocks; enforced at federation ingress and egress (Phase 6) |
-| GET | `/api/v1/admin/domain_blocks/:id` | user + role | admin:read \| admin:read:domain_blocks | planned (Phase 7.3) | In | |
-| POST | `/api/v1/admin/domain_blocks` | user + role | admin:write \| admin:write:domain_blocks | planned (Phase 7.3) | In | |
-| PUT | `/api/v1/admin/domain_blocks/:id` | user + role | admin:write \| admin:write:domain_blocks | planned (Phase 7.3) | In | update |
-| PATCH | `/api/v1/admin/domain_blocks/:id` | user + role | admin:write \| admin:write:domain_blocks | planned (Phase 7.3) | In | alias of PUT |
-| DELETE | `/api/v1/admin/domain_blocks/:id` | user + role | admin:write \| admin:write:domain_blocks | planned (Phase 7.3) | In | |
-| GET | `/api/v1/admin/email_domain_blocks` | user + role | admin:read \| admin:read:email_domain_blocks | planned (Phase 7.3) | In | registration-time enforcement needs email confirmation (Phase 2 gap) |
-| GET | `/api/v1/admin/email_domain_blocks/:id` | user + role | admin:read \| admin:read:email_domain_blocks | planned (Phase 7.3) | In | |
-| POST | `/api/v1/admin/email_domain_blocks` | user + role | admin:write \| admin:write:email_domain_blocks | planned (Phase 7.3) | In | |
-| DELETE | `/api/v1/admin/email_domain_blocks/:id` | user + role | admin:write \| admin:write:email_domain_blocks | planned (Phase 7.3) | In | |
-| GET | `/api/v1/admin/ip_blocks` | user + role | admin:read \| admin:read:ip_blocks | planned (Phase 7.3) | In | enforcement needs a request-path check (trusted-proxy client IP, Phase 1) |
-| GET | `/api/v1/admin/ip_blocks/:id` | user + role | admin:read \| admin:read:ip_blocks | planned (Phase 7.3) | In | |
-| POST | `/api/v1/admin/ip_blocks` | user + role | admin:write \| admin:write:ip_blocks | planned (Phase 7.3) | In | |
-| PUT | `/api/v1/admin/ip_blocks/:id` | user + role | admin:write \| admin:write:ip_blocks | planned (Phase 7.3) | In | update |
-| PATCH | `/api/v1/admin/ip_blocks/:id` | user + role | admin:write \| admin:write:ip_blocks | planned (Phase 7.3) | In | alias of PUT |
-| DELETE | `/api/v1/admin/ip_blocks/:id` | user + role | admin:write \| admin:write:ip_blocks | planned (Phase 7.3) | In | |
+| GET | `/api/v1/admin/domain_allows` | user + role | admin:read \| admin:read:domain_allows | implemented (Phase 7.3) | In | |
+| GET | `/api/v1/admin/domain_allows/:id` | user + role | admin:read \| admin:read:domain_allows | implemented (Phase 7.3) | In | |
+| POST | `/api/v1/admin/domain_allows` | user + role | admin:write \| admin:write:domain_allows | implemented (Phase 7.3) | In | |
+| DELETE | `/api/v1/admin/domain_allows/:id` | user + role | admin:write \| admin:write:domain_allows | implemented (Phase 7.3) | In | |
+| GET | `/api/v1/admin/domain_blocks` | user + role | admin:read \| admin:read:domain_blocks | implemented (Phase 7.3) | In | server-level blocks; enforced at federation ingress and egress (Phase 6) |
+| GET | `/api/v1/admin/domain_blocks/:id` | user + role | admin:read \| admin:read:domain_blocks | implemented (Phase 7.3) | In | |
+| POST | `/api/v1/admin/domain_blocks` | user + role | admin:write \| admin:write:domain_blocks | implemented (Phase 7.3) | In | |
+| PUT | `/api/v1/admin/domain_blocks/:id` | user + role | admin:write \| admin:write:domain_blocks | implemented (Phase 7.3) | In | update |
+| PATCH | `/api/v1/admin/domain_blocks/:id` | user + role | admin:write \| admin:write:domain_blocks | implemented (Phase 7.3) | In | alias of PUT |
+| DELETE | `/api/v1/admin/domain_blocks/:id` | user + role | admin:write \| admin:write:domain_blocks | implemented (Phase 7.3) | In | |
+| GET | `/api/v1/admin/email_domain_blocks` | user + role | admin:read \| admin:read:email_domain_blocks | implemented (Phase 7.3) | In | registration-time enforcement needs email confirmation (Phase 2 gap) |
+| GET | `/api/v1/admin/email_domain_blocks/:id` | user + role | admin:read \| admin:read:email_domain_blocks | implemented (Phase 7.3) | In | |
+| POST | `/api/v1/admin/email_domain_blocks` | user + role | admin:write \| admin:write:email_domain_blocks | implemented (Phase 7.3) | In | |
+| DELETE | `/api/v1/admin/email_domain_blocks/:id` | user + role | admin:write \| admin:write:email_domain_blocks | implemented (Phase 7.3) | In | |
+| GET | `/api/v1/admin/ip_blocks` | user + role | admin:read \| admin:read:ip_blocks | implemented (Phase 7.3) | In | enforcement needs a request-path check (trusted-proxy client IP, Phase 1) |
+| GET | `/api/v1/admin/ip_blocks/:id` | user + role | admin:read \| admin:read:ip_blocks | implemented (Phase 7.3) | In | |
+| POST | `/api/v1/admin/ip_blocks` | user + role | admin:write \| admin:write:ip_blocks | implemented (Phase 7.3) | In | |
+| PUT | `/api/v1/admin/ip_blocks/:id` | user + role | admin:write \| admin:write:ip_blocks | implemented (Phase 7.3) | In | update |
+| PATCH | `/api/v1/admin/ip_blocks/:id` | user + role | admin:write \| admin:write:ip_blocks | implemented (Phase 7.3) | In | alias of PUT |
+| DELETE | `/api/v1/admin/ip_blocks/:id` | user + role | admin:write \| admin:write:ip_blocks | implemented (Phase 7.3) | In | |
 
 #### Trends approval
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| GET | `/api/v1/admin/trends/tags` | user + role | admin:read | planned (Phase 7.3) | In | no sub-scope upstream |
-| POST | `/api/v1/admin/trends/tags/:id/approve` | user + role | admin:write | planned (Phase 7.3) | In | |
-| POST | `/api/v1/admin/trends/tags/:id/reject` | user + role | admin:write | planned (Phase 7.3) | In | |
-| GET | `/api/v1/admin/trends/links` | user + role | admin:read | planned (Phase 7.3) | In | |
-| POST | `/api/v1/admin/trends/links/:id/approve` | user + role | admin:write | planned (Phase 7.3) | In | |
-| POST | `/api/v1/admin/trends/links/:id/reject` | user + role | admin:write | planned (Phase 7.3) | In | |
-| GET | `/api/v1/admin/trends/links/publishers` | user + role | admin:read | planned (Phase 7.3) | In | preview card providers (`path: :publishers` upstream) |
-| POST | `/api/v1/admin/trends/links/publishers/:id/approve` | user + role | admin:write | planned (Phase 7.3) | In | |
-| POST | `/api/v1/admin/trends/links/publishers/:id/reject` | user + role | admin:write | planned (Phase 7.3) | In | |
-| GET | `/api/v1/admin/trends/statuses` | user + role | admin:read | planned (Phase 7.3) | In | |
-| POST | `/api/v1/admin/trends/statuses/:id/approve` | user + role | admin:write | planned (Phase 7.3) | In | |
-| POST | `/api/v1/admin/trends/statuses/:id/reject` | user + role | admin:write | planned (Phase 7.3) | In | |
+| GET | `/api/v1/admin/trends/tags` | user + role | admin:read | implemented (Phase 7.3) | In | no sub-scope upstream |
+| POST | `/api/v1/admin/trends/tags/:id/approve` | user + role | admin:write | implemented (Phase 7.3) | In | |
+| POST | `/api/v1/admin/trends/tags/:id/reject` | user + role | admin:write | implemented (Phase 7.3) | In | |
+| GET | `/api/v1/admin/trends/links` | user + role | admin:read | implemented (Phase 7.3) | In | |
+| POST | `/api/v1/admin/trends/links/:id/approve` | user + role | admin:write | implemented (Phase 7.3) | In | |
+| POST | `/api/v1/admin/trends/links/:id/reject` | user + role | admin:write | implemented (Phase 7.3) | In | |
+| GET | `/api/v1/admin/trends/links/publishers` | user + role | admin:read | implemented (Phase 7.3) | In | preview card providers (`path: :publishers` upstream) |
+| POST | `/api/v1/admin/trends/links/publishers/:id/approve` | user + role | admin:write | implemented (Phase 7.3) | In | |
+| POST | `/api/v1/admin/trends/links/publishers/:id/reject` | user + role | admin:write | implemented (Phase 7.3) | In | |
+| GET | `/api/v1/admin/trends/statuses` | user + role | admin:read | implemented (Phase 7.3) | In | |
+| POST | `/api/v1/admin/trends/statuses/:id/approve` | user + role | admin:write | implemented (Phase 7.3) | In | |
+| POST | `/api/v1/admin/trends/statuses/:id/reject` | user + role | admin:write | implemented (Phase 7.3) | In | |
 
 #### Metrics
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| POST | `/api/v1/admin/measures` | user + role | admin:read | planned (Phase 7.3) | In | POST with a read scope upstream (kept as upstream) |
-| POST | `/api/v1/admin/dimensions` | user + role | admin:read | planned (Phase 7.3) | In | POST with a read scope upstream |
-| POST | `/api/v1/admin/retention` | user + role | admin:read | planned (Phase 7.3) | In | POST with a read scope upstream |
+| POST | `/api/v1/admin/measures` | user + role | admin:read | implemented (Phase 7.3) | In | POST with a read scope upstream (kept as upstream) |
+| POST | `/api/v1/admin/dimensions` | user + role | admin:read | implemented (Phase 7.3) | In | POST with a read scope upstream |
+| POST | `/api/v1/admin/retention` | user + role | admin:read | implemented (Phase 7.3) | In | POST with a read scope upstream |
 
 #### Canonical email blocks and tags
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| GET | `/api/v1/admin/canonical_email_blocks` | user + role | admin:read \| admin:read:canonical_email_blocks | planned (Phase 7.3) | In | registration-time enforcement needs email confirmation (Phase 2 gap) |
-| POST | `/api/v1/admin/canonical_email_blocks/test` | user + role | admin:read \| admin:read:canonical_email_blocks | planned (Phase 7.3) | In | read scope upstream (`test` is in the read guard) |
-| POST | `/api/v1/admin/canonical_email_blocks` | user + role | admin:write \| admin:write:canonical_email_blocks | planned (Phase 7.3) | In | |
-| GET | `/api/v1/admin/canonical_email_blocks/:id` | user + role | admin:read \| admin:read:canonical_email_blocks | planned (Phase 7.3) | In | |
-| DELETE | `/api/v1/admin/canonical_email_blocks/:id` | user + role | admin:write \| admin:write:canonical_email_blocks | planned (Phase 7.3) | In | |
-| GET | `/api/v1/admin/tags` | user + role | admin:read | planned (Phase 7.3) | In | |
-| GET | `/api/v1/admin/tags/:id` | user + role | admin:read | planned (Phase 7.3) | In | |
-| PUT | `/api/v1/admin/tags/:id` | user + role | admin:write | planned (Phase 7.3) | In | update |
-| PATCH | `/api/v1/admin/tags/:id` | user + role | admin:write | planned (Phase 7.3) | In | alias of PUT |
+| GET | `/api/v1/admin/canonical_email_blocks` | user + role | admin:read \| admin:read:canonical_email_blocks | implemented (Phase 7.3) | In | registration-time enforcement needs email confirmation (Phase 2 gap) |
+| POST | `/api/v1/admin/canonical_email_blocks/test` | user + role | admin:read \| admin:read:canonical_email_blocks | implemented (Phase 7.3) | In | read scope upstream (`test` is in the read guard) |
+| POST | `/api/v1/admin/canonical_email_blocks` | user + role | admin:write \| admin:write:canonical_email_blocks | implemented (Phase 7.3) | In | |
+| GET | `/api/v1/admin/canonical_email_blocks/:id` | user + role | admin:read \| admin:read:canonical_email_blocks | implemented (Phase 7.3) | In | |
+| DELETE | `/api/v1/admin/canonical_email_blocks/:id` | user + role | admin:write \| admin:write:canonical_email_blocks | implemented (Phase 7.3) | In | |
+| GET | `/api/v1/admin/tags` | user + role | admin:read | implemented (Phase 7.3) | In | |
+| GET | `/api/v1/admin/tags/:id` | user + role | admin:read | implemented (Phase 7.3) | In | |
+| PUT | `/api/v1/admin/tags/:id` | user + role | admin:write | implemented (Phase 7.3) | In | update |
+| PATCH | `/api/v1/admin/tags/:id` | user + role | admin:write | implemented (Phase 7.3) | In | alias of PUT |
 
 #### v2 admin accounts
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| GET | `/api/v2/admin/accounts` | user + role | admin:read \| admin:read:accounts | planned (Phase 7.3) | In | v1 admin accounts index with filter parameters (`origin`, `status`, `permissions`, `username`, `by_domain`, `display_name`, `email`, `ip`, `invited_by`, `role_ids`); `Link` cursors (`max_id`, `min_id`) |
+| GET | `/api/v2/admin/accounts` | user + role | admin:read \| admin:read:accounts | implemented (Phase 7.3) | In | v1 admin accounts index with filter parameters (`origin`, `status`, `permissions`, `username`, `by_domain`, `display_name`, `email`, `ip`, `invited_by`, `role_ids`); `Link` cursors (`max_id`, `min_id`) |
 
 ### Bullet-only entries (excluded, or not yet rowed)
 
@@ -357,8 +379,8 @@ Removed from this section in the 2026-10-17 re-scope: `annual_reports`, `announc
 - `GET /api/v1/oembed` — public oEmbed; not in initial profile (record as gap if clients need it). **Out.**
 - `namespace :v1_alpha` — experimental/legacy (`accounts/collections`, `collections/*`); explicitly **Out**.
 - `GET /api/v1/custom_emojis` — **implemented (Phase 4)**: public index over local + enabled + picker-visible emoji (CLI-managed; no admin API in this milestone). Emoji embedding in status payloads is implemented; account-payload emoji remain `[]` (Phase 7). Listed here for historical reasons; it has no row yet (see discrepancies).
-- `GET /api/v1/blocks`, `GET /api/v1/mutes`, `GET /api/v1/favourites`, `GET /api/v1/bookmarks` — relation collection reads; **planned (Phase 7)**. No rows yet (see discrepancies).
-- `accounts/familiar_followers`, `identity_proofs`, `featured_tags`, `email_subscriptions`, `collections`, `tags` follow/feature, `followed_tags` — **planned (Phase 7)**. No rows yet (see discrepancies).
+- `GET /api/v1/blocks`, `GET /api/v1/mutes`, `GET /api/v1/favourites`, `GET /api/v1/bookmarks` — relation collection reads; **implemented (Phase 7)** (rows above).
+- `accounts/familiar_followers`, `featured_tags`, `tags` follow/feature, `followed_tags` — **implemented (Phase 7)** (rows above). Still out: `identity_proofs` (needs cryptographic proof verification), `email_subscriptions`, `collections` (experimental `v1_alpha`).
 - `translate` (statuses) — **Out** unless a translation provider is configured (row above).
 
 ## Non-route contract items tracked separately
@@ -370,32 +392,33 @@ Removed from this section in the 2026-10-17 re-scope: `annual_reports`, `announc
 - Deprecation headers: `Deprecation` (`@<unix timestamp>`) and, where upstream sets it, `Sunset`. Applies to `GET /api/v1/suggestions` and `GET /api/v1/trends` (Phase 7 / 7.3).
 - Async-refresh header: `Mastodon-Async-Refresh: id="…", retry=3[, result_count=N]` (Phase 6 remote thread completion; Phase 7 suggestions FASP path).
 - Idempotency: `Idempotency-Key` header on `POST /api/v1/statuses` only (1-hour retention, per-account scoping — matches Mastodon's `SETEX 3600` namespace). Other write endpoints are naturally idempotent (unique rows) instead.
-- Admin scope families: `admin:read` and `admin:write`, with per-resource sub-scopes (`admin:read:accounts`, `admin:write:reports`, and so on), as registered by the pinned Doorkeeper configuration. Not yet in birchtree's scope registry (Phase 7.3).
+- Admin scope families: `admin:read` and `admin:write`, with per-resource sub-scopes (`admin:read:accounts`, `admin:write:reports`, and so on), as registered by the pinned Doorkeeper configuration. In birchtree's scope registry since Phase 7.3 (trends/tags/measures/dimensions/retention use the bare scopes upstream, with no sub-scopes).
 
 ## Known Phase 3 deviations / gaps (honesty list)
 
 - **JSON request bodies: resolved in Phase 4.1 (D11, 2026-10-17).** Every REST write endpoint that reads a body accepts `application/json` as well as form and empty bodies. See "Phase 4.1: JSON bodies and exclusive lists" below. The Phase 3 wording, "not accepted", no longer applies.
-- **Tag objects** in status payloads use the tag name as `id` (no tag table yet); `history`/`following`/`featuring` are contract-shaped defaults. Real tag rows land with the Phase 7 tag surface.
-- **Conversation mutes** (`POST /api/v1/statuses/:id/mute|unmute`) are planned with `conversations` (Phase 7). Until then, the status DTO's `muted` flag is emitted with its neutral `false` for authenticated viewers.
+- **Tag objects** in status payloads use the tag name as `id` (no tag table yet); `history`/`following`/`featuring` are contract-shaped defaults. Phase 7 added real tag follows/featured rows (D25 unified `#café`/`#cafe`); tag-row identity stays name-based.
+- **Conversation mutes** (`POST /api/v1/statuses/:id/mute|unmute`) shipped with `conversations` (Phase 7): the status DTO's `muted` flag reflects the viewer's conversation mute.
 - **`application` on statuses** is shown whenever present (Mastodon's `user_shows_application?` preference defaults to true and is not stored yet).
 - Media attachment DTOs render `url`/`preview_url` as `null` until the attachment is processed (Phase 4 upload + processing lifecycle are live) — contract-correct "not processed" state for queued/in-progress/failed rows.
 - Media file serving (`GET /system/media_attachments/files/{*path}`) serves the blob bytes with the sniffed content type and `Cache-Control: max-age=86400, public`.
 
 ## Known Phase 4 media deviations / gaps (honesty list)
 
-- **No transcoding toolchain (no ffmpeg), interim until Phase 7.1**: animated GIF uploads keep the wire type `image`. Mastodon produces `gifv` with an MP4 rendition (`lib/paperclip/gif_transcoder.rb`). **Deliberate deviations, decided 2026-10-17 (Phase 7.1):** animated GIF becomes WebM with VP9, typed `video`; video becomes WebM with VP9; still images become WebP (D4); a video already in VP9 WebM within the upload size limit passes through unchanged; the server never strips or rewrites metadata. `gifv` is never produced. Clients that give `gifv` autoplay and loop treatment will show these as ordinary videos. Until Phase 7.1 ships, video/audio keep their original bytes untouched; `meta.small`/`preview_url` exist only when an image preview was generated; duration/frame rate/bitrate stay `null` (MP4 `tkhd` dimensions are read when present).
+- **Phase 7.1 shipped (2026-10-20):** ffmpeg-backed post-commit transcode; GIF → WebM/VP9 typed `video`, video → WebM/VP9 + Opus (VP9/WebM + Opus-or-silent within `max_file_size` passes through), stills → WebP (WebP passes through), `small` preview is WebP; metadata carried via `-map_metadata 0`, never stripped; `gifv` never produced (D1–D4, accepted). v1 transcodes inline (`200`); v2 returns `202` for transcoded types, `GET /api/v1/media/:id` answers `206` until `Ready`, `422` on `Failed`. Evidence: `tests/phase7_1_transcode.rs`.
 - **Blob keys are sharded by a per-upload random 16-hex name** (`{aa}/{bb}/{random16}/original.{ext}`), not the attachment id: bytes must be staged *before* the id-minting commit (`birchtree.md` §5), so the id cannot appear in its own key. The wire URLs are unaffected.
 - **The upload size cap equals the multipart body limit** (`ApiState` carries no `Config`); `Config::validate` enforces `max_file_size ≤ max_body_size`, so the effective cap matches the default 16 MB. The 422 message formats the cap like Rails `number_to_human_size` ("16 MB", "1 KB", …).
 - **A non-numeric `focus` param answers `422 Validation failed: Focus is invalid`** instead of Ruby's `Float()` coercion to `0.0`; a blank focus is ignored (upload) or clears the point (update).
 - **An image upload carrying a thumbnail answers "Thumbnail must be blank"** before the thumbnail's own content-type/size checks (Mastodon's model validates the thumbnail's content type first); the pinned messages are otherwise exact.
 
-## Search deviations (interim until Phase 7.2)
+## Search deviations (Phase 7.2 engine, 2026-10-20)
 
-- **Local corpus only.** `GET /api/v2/search` searches the local database: accounts by handle and display name, hashtags by prefix, and statuses by a bounded recent scan.
-- **Upstream returns no status hits without a search engine.** Mastodon's `SearchService#status_searchable?` requires `Chewy.enabled?` (Elasticsearch). Birchtree's status results therefore exist where upstream's would be empty. This is interim, not parity. Phase 7.2 keeps this scan as the `database` mode and adds an `embedded` default (an in-process full-text library) and an `off` mode that matches upstream with no engine.
+- **Local corpus for accounts/hashtags in every mode.** Status search switches by configuration: `embedded` (default, in-process index), `database` (the Phase 4 bounded-scan behavior, kept as a selectable backend), `off` (no status hits, matching upstream with no engine).
+- **Upstream returns no status hits without a search engine** (`SearchService#status_searchable?` requires `Chewy.enabled?`). This server's `embedded` default returns hits (D6, accepted) while `off` matches upstream exactly; `database` keeps the interim scan (D7, kept as a selectable backend).
+- **Index scope is public + unlisted only** (private/direct never indexed, never leave the database through the index). Indexing is a post-commit durable job; a bounded restartable backfill covers existing rows. The index is derived state (rebuildable, in-memory with a startup re-seed chain); when cold/empty, status search degrades to the database scan.
 - **`resolve` (remote lookup)** depends on federation (Phase 6). Unauthenticated `resolve` returns the pinned 401.
 - **`collections`** is always `[]`.
-- **Default mode (D6, accepted 2026-10-17):** search is on by default (`embedded`), so status hits appear that Mastodon's default install (Elasticsearch disabled) does not show. An administrator can switch it off (`off`).
+- Library evaluation (license, maintenance, fit): shipped a purpose-built in-process inverted index (zero new deps; Tantivy recorded as the future upgrade path behind the same backend port). Evidence: `tests/phase7_2_search.rs`.
 
 ## Phase 4.1: JSON bodies and exclusive lists (honesty list)
 

@@ -14,8 +14,8 @@ use serde_json::{Map, Value, json};
 use crate::api::mastodon::ServerInfo;
 use crate::application::ports::StatusViewFlags;
 use crate::domain::{
-    Account, AccountStats, LocalUser, MediaAttachment, OAuthApplication, Poll, Status,
-    StatusApplication,
+    Account, AccountStats, AnnualReport, LocalUser, MediaAttachment, OAuthApplication, Poll, Status,
+    StatusApplication, TrendLink, TrendPublisher, TrendTagFlag,
 };
 
 /// Mastodon's default missing avatar/header asset path.
@@ -170,7 +170,12 @@ pub fn relationship_json(relationship: &crate::application::ports::Relationship)
         "following": relationship.following,
         "showing_reblogs": relationship.show_reblogs,
         "notifying": relationship.notifying,
-        "languages": Value::Null,
+        "languages": relationship
+            .languages
+            .clone()
+            .map(|l| l.into_iter().map(Value::String).collect::<Vec<_>>())
+            .map(Value::from)
+            .unwrap_or(Value::Null),
         "followed_by": relationship.followed_by,
         "blocking": relationship.blocking,
         "blocked_by": relationship.blocked_by,
@@ -498,6 +503,15 @@ pub fn media_file_url(server: &ServerInfo, file_key: &str) -> String {
 /// `remote_url`/`preview_remote_url`/`text_url` stay `null` for local media
 /// (Mastodon assigns no `shortcode` to modern uploads, so `text_url` is
 /// `null` there too).
+///
+/// Phase 7.1 packer rules: a transcoded attachment serves its *derived* blob
+/// (the derived bytes replace the original at the attachment's own
+/// `file_key`, so `url` needs no indirection); pending rows keep `url: null`
+/// (contract-correct — a partial derived blob is never surfaced); GIF rows
+/// that transcoded report `type: video` with `meta.original` dimensions read
+/// from the derived WebM (`duration` only when the probe knew it, otherwise
+/// honestly absent); converted stills carry derived dimensions, a WebP
+/// `small` preview and a blurhash hashed from the derived pixels.
 pub fn media_attachment_json(server: &ServerInfo, media: &MediaAttachment) -> Value {
     let processed = media.state == crate::domain::MediaState::Ready && !media.file_key.is_empty();
     let url = if processed {
@@ -670,9 +684,9 @@ pub fn status_json(
     if viewer.is_some() {
         object.insert("favourited".into(), json!(view.flags.favourited));
         object.insert("reblogged".into(), json!(view.flags.reblogged));
-        // Conversation mutes are out of profile; the field stays contract-
-        // complete with its neutral value.
-        object.insert("muted".into(), json!(false));
+        // Conversation mutes ride the status DTO (Phase 7): the mute map is
+        // pre-fetched per page; missing entries read neutral `false`.
+        object.insert("muted".into(), json!(view.flags.muted));
         object.insert("bookmarked".into(), json!(view.flags.bookmarked));
         object.insert("filtered".into(), json!(view.filtered.clone()));
     }
@@ -1123,5 +1137,154 @@ pub fn search_json(accounts: Vec<Value>, statuses: Vec<Value>, hashtags: Vec<Val
         "statuses": statuses,
         "hashtags": hashtags,
         "collections": [],
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7.3 DTOs: trend tags/links, the admin trend projections and annual
+// reports. Field names follow the pinned serializers
+// (`REST::TagSerializer`, `REST::PreviewCardSerializer` +
+// `REST::Trends::LinkSerializer`, `REST::Admin::TagSerializer`,
+// `REST::Admin::Trends::{Link,Status}Serializer`,
+// `REST::Admin::Trends::Links::PreviewCardProviderSerializer`,
+// `REST::AnnualReportSerializer` + `REST::AnnualReportsSerializer`).
+// ---------------------------------------------------------------------------
+
+/// `REST::TagSerializer` for a trend tag: the tag name is the id (no tag
+/// table yet, as recorded in the endpoint manifest); `history` is a
+/// contract-shaped empty array until per-day usage history lands;
+/// `following`/`featuring` appear for authenticated viewers only (there is
+/// no tag-follow store yet, so they are `false`).
+pub fn trend_tag_json(server: &ServerInfo, flag: &TrendTagFlag, viewer: Option<crate::domain::Id>) -> Value {
+    let mut object = Map::new();
+    // Upstream `REST::TagSerializer#id` is the numeric Tag row id (as a
+    // string), not the name; the flag row plays that role here.
+    object.insert("id".into(), json!(flag.id.to_string()));
+    object.insert("name".into(), json!(flag.name));
+    object.insert(
+        "url".into(),
+        json!(format!(
+            "{}/tags/{}",
+            server.public_url.trim_end_matches('/'),
+            flag.name
+        )),
+    );
+    object.insert("history".into(), json!([]));
+    if viewer.is_some() {
+        object.insert("following".into(), json!(false));
+        object.insert("featuring".into(), json!(false));
+    }
+    Value::Object(object)
+}
+
+/// `REST::Admin::TagSerializer` projection of a trend tag: the public shape
+/// plus `trendable` (`None` renders `null` = pending review) and
+/// `requires_review`.
+pub fn admin_trend_tag_json(
+    server: &ServerInfo,
+    flag: &TrendTagFlag,
+    viewer: Option<crate::domain::Id>,
+) -> Value {
+    let mut object = match trend_tag_json(server, flag, viewer) {
+        Value::Object(map) => map,
+        other => return other,
+    };
+    object.insert("trendable".into(), json!(flag.allowed));
+    object.insert(
+        "requires_review".into(),
+        json!(flag.reviewed_at_ms.is_none()),
+    );
+    Value::Object(object)
+}
+
+/// `REST::Trends::LinkSerializer` for a trend link: the preview-card shape
+/// plus `history`. Card metadata stays `null` until the preview-card crawler
+/// lands (planned gap); an approved link without fetched metadata is served
+/// with `null` card fields, never fabricated content.
+pub fn trend_link_json(link: &TrendLink) -> Value {
+    let opt = |value: &Option<String>| match value {
+        Some(text) => json!(text),
+        None => Value::Null,
+    };
+    json!({
+        "url": link.url,
+        "title": opt(&link.title),
+        "description": opt(&link.description),
+        "language": Value::Null,
+        "type": "link",
+        "author_name": Value::Null,
+        "author_url": Value::Null,
+        "provider_name": opt(&link.provider_name),
+        "provider_url": opt(&link.provider_url),
+        "html": Value::Null,
+        "width": Value::Null,
+        "height": Value::Null,
+        "image": opt(&link.image_url),
+        "image_description": Value::Null,
+        "embed_url": Value::Null,
+        "blurhash": Value::Null,
+        "published_at": Value::Null,
+        "authors": [],
+        "history": [],
+    })
+}
+
+/// `REST::Admin::Trends::LinkSerializer` projection: the public link shape
+/// plus the numeric `id` and `requires_review` (upstream carries no
+/// `trendable` key here).
+pub fn admin_trend_link_json(link: &TrendLink) -> Value {
+    let mut object = match trend_link_json(link) {
+        Value::Object(map) => map,
+        other => return other,
+    };
+    object.insert("id".into(), json!(link.id.to_string()));
+    object.insert(
+        "requires_review".into(),
+        json!(link.reviewed_at_ms.is_none()),
+    );
+    Value::Object(object)
+}
+
+/// `REST::Admin::Trends::Links::PreviewCardProviderSerializer` projection of
+/// a trend publisher.
+pub fn admin_trend_publisher_json(publisher: &TrendPublisher) -> Value {
+    json!({
+        "id": publisher.id.to_string(),
+        "domain": publisher.domain,
+        "trendable": publisher.allowed,
+        "reviewed_at": publisher
+            .reviewed_at_ms
+            .map(rfc3339_ms)
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+        "requested_review_at": Value::Null,
+        "requires_review": publisher.reviewed_at_ms.is_none(),
+    })
+}
+
+/// `REST::AnnualReportSerializer`: `{year, data, schema_version, share_url,
+/// account_id}`. Sharing is out of profile (no public wrapstodon route), so
+/// `share_url` is always `null`.
+pub fn annual_report_json(report: &AnnualReport) -> Value {
+    json!({
+        "year": report.year,
+        "data": report.data,
+        "schema_version": report.schema_version,
+        "share_url": Value::Null,
+        "account_id": report.account_id.to_string(),
+    })
+}
+
+/// `REST::AnnualReportsSerializer`: the viewer's reports with the referenced
+/// accounts and top statuses embedded.
+pub fn annual_reports_json(
+    reports: &[AnnualReport],
+    accounts: Vec<Value>,
+    statuses: Vec<Value>,
+) -> Value {
+    json!({
+        "annual_reports": reports.iter().map(annual_report_json).collect::<Vec<_>>(),
+        "accounts": accounts,
+        "statuses": statuses,
     })
 }

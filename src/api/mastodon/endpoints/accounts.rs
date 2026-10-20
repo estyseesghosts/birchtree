@@ -6,8 +6,8 @@
 //! endpoints accept `read`/`read:accounts`; `verify_credentials` and
 //! `update_credentials` require a user token.
 
-use axum::extract::{Path, RawQuery, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::extract::{ConnectInfo, Path, RawQuery, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
@@ -48,6 +48,8 @@ fn bool_cast(value: &str) -> bool {
 pub async fn register(
     State(state): State<ApiState>,
     auth: Auth,
+    headers: HeaderMap,
+    peer: Option<ConnectInfo<std::net::SocketAddr>>,
     FormBody(pairs): FormBody,
 ) -> Response {
     if let Err(err) = auth.0.require_scopes(WRITE_SCOPES) {
@@ -64,6 +66,20 @@ pub async fn register(
     // Mastodon's `check_enabled_registrations` answers 403 Forbidden.
     if !state.server.registrations_open {
         return ApiError::forbidden("Forbidden").into_response();
+    }
+    // Phase 7.3 IP sign-up blocks (`sign_up_block` severity): refuse
+    // registration from a blocked client IP with the same 403.
+    {
+        use crate::api::mastodon::endpoints::admin_infra;
+        let peer_ip = peer.map(|info| info.0.ip());
+        let client = admin_infra::request_client_ip(
+            &headers,
+            peer_ip,
+            state.trusted_proxies.as_slice(),
+        );
+        if client.is_some_and(|ip| admin_infra::is_sign_up_blocked_for(&state, ip)) {
+            return ApiError::forbidden("Forbidden").into_response();
+        }
     }
 
     let field = |key: &str| forms::get(&pairs, key).map(str::to_string);
@@ -199,12 +215,18 @@ pub async fn update_credentials(
         || source("source[sensitive]").is_some()
         || source("source[language]").is_some()
         || source("source[quote_policy]").is_some()
+        || field("home_mention_policy").is_some()
     {
         let update = UserSettingsUpdate {
             default_privacy: source("source[privacy]").map(str::to_string),
             default_sensitive: source("source[sensitive]").map(bool_cast),
             default_language: source("source[language]").map(str::to_string),
             default_quote_policy: source("source[quote_policy]").map(str::to_string),
+            home_mention_policy: field("home_mention_policy").map(|v| {
+                crate::application::policy::HomeMentionPolicy::from_stored(Some(&v))
+                    .as_str()
+                    .to_string()
+            }),
         };
         if let Err(err) = store.update_user_settings(account_id, update) {
             return ApiError::from(err).into_response();

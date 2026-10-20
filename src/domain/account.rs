@@ -66,6 +66,12 @@ pub struct Account {
     pub local: bool,
     pub locked: bool,
     pub suspended: bool,
+    /// Moderation states (Phase 7.3 admin API). Older rows decode as false
+    /// (`#[serde(default)]`).
+    #[serde(default)]
+    pub silenced: bool,
+    #[serde(default)]
+    pub sensitized: bool,
     pub moved_to: Option<Id>,
     pub created_at_ms: u64,
 }
@@ -126,6 +132,8 @@ mod tests {
             local: true,
             locked: false,
             suspended: false,
+            silenced: false,
+            sensitized: false,
             moved_to: None,
             created_at_ms: 0,
         };

@@ -75,6 +75,7 @@ fn follow(store: &RedbStore, follower: Id, target: Id, now_ms: u64) {
             target_id: target,
             show_reblogs: None,
             notify: None,
+            languages: None,
         },
     )
     .expect("follow");

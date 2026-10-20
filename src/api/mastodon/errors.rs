@@ -49,6 +49,13 @@ impl ApiError {
         )
     }
 
+    /// A valid user token was presented but the account lacks the staff role
+    /// for an admin route. Upstream's `ErrorResponses#respond_with_error`
+    /// renders the Rack status text for the code, so a 403 is `Forbidden`.
+    pub fn role_forbidden() -> Self {
+        Self::forbidden("Forbidden")
+    }
+
     pub fn forbidden(message: impl Into<String>) -> Self {
         Self::new(StatusCode::FORBIDDEN, message)
     }

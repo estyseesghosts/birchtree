@@ -187,10 +187,27 @@ async fn upload(state: &ApiState, auth: &Auth, request: Request, delay: bool) ->
     // file-size cap (`Config::validate` enforces `max_file_size <=
     // max_body_size`, so this is the effective configured limit).
     let max_file_size = state.max_body_size as u64;
-    match media::upload_media(
+    // Phase 7.1: the worker-threaded toolchain, built from `ServerInfo` when
+    // the operator left transcoding on. Startup validation already proved
+    // the toolchain, so a failure here is a programmer error, never a
+    // silent passthrough.
+    let transcode = if state.server.transcoding_enabled {
+        Some(crate::media::transcode::TranscodeConfig {
+            enabled: true,
+            ffmpeg_path: state.server.ffmpeg_path.clone(),
+            wall_time_secs: state.server.transcode_wall_time_secs,
+            max_output_bytes: state.server.transcode_max_output_bytes,
+            max_memory_bytes: state.server.transcode_max_memory_bytes,
+            max_file_size: state.server.max_file_size,
+            ..crate::media::transcode::TranscodeConfig::default()
+        })
+    } else {
+        None
+    };
+    let transcode_ref = transcode.as_ref();
+    match media::upload_media_with_config(
         &*state.context.store,
         &*state.context.blobs,
-        &state.server.public_url,
         state.context.now_ms(),
         account_id,
         &fields.file,
@@ -199,6 +216,7 @@ async fn upload(state: &ApiState, auth: &Auth, request: Request, delay: bool) ->
         fields.focus.as_deref(),
         delay,
         max_file_size,
+        transcode_ref,
     ) {
         Ok(media) => {
             let status = if delay && media.state != MediaState::Ready {

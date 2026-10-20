@@ -39,6 +39,30 @@ pub struct ServerInfo {
     /// on this server redirect there when it differs (upstream's
     /// `StreamingController`). `None` when streams are served here.
     pub streaming_host: Option<StreamingHost>,
+    /// Whether the public trends endpoints serve approved items (mirrors
+    /// `Config::trends_enabled`, upstream `Setting.trends`).
+    // TEMP placement (Subagent A): sibling D declared this on `ApiState` but
+    // set it in `ServerInfo::from_config`; every `ApiState` literal on disk
+    // predates the field, so it lives here until D wires the routes.
+    pub trends_enabled: bool,
+    /// Search backend switch (Phase 7.2; mirrors `Config::search_mode`).
+    pub search_mode: crate::search::SearchMode,
+    /// VAPID public key for push serializers (mirrors
+    /// `Config::vapid_public_key`).
+    pub vapid_public_key: String,
+    /// keystodon bundle directory (mirrors `Config::web_client_dir`).
+    pub web_client_dir: Option<std::path::PathBuf>,
+    /// Whether the ffmpeg transcode pipeline runs (Phase 7.1).
+    pub transcoding_enabled: bool,
+    /// ffmpeg binary path (Phase 7.1).
+    pub ffmpeg_path: String,
+    /// Maximum media upload size in bytes (mirrors `Config::max_file_size`;
+    /// the VP9/WebM passthrough bound and the transcode input cap).
+    pub max_file_size: u64,
+    /// Per-job transcode limits (Phase 7.1).
+    pub transcode_wall_time_secs: u64,
+    pub transcode_max_output_bytes: u64,
+    pub transcode_max_memory_bytes: u64,
 }
 
 /// Host and optional explicit port of a separately configured streaming base.
@@ -144,6 +168,16 @@ impl ServerInfo {
             max_status_chars: cfg.max_status_chars,
             streaming_url,
             streaming_host,
+            trends_enabled: cfg.trends_enabled,
+            search_mode: cfg.search_mode,
+            vapid_public_key: cfg.vapid_public_key.clone(),
+            web_client_dir: cfg.web_client_dir.clone(),
+            transcoding_enabled: cfg.transcoding_enabled,
+            ffmpeg_path: cfg.ffmpeg_path.clone(),
+            max_file_size: cfg.max_file_size,
+            transcode_wall_time_secs: cfg.transcode_wall_time_secs,
+            transcode_max_output_bytes: cfg.transcode_max_output_bytes,
+            transcode_max_memory_bytes: cfg.transcode_max_memory_bytes,
         }
     }
 }

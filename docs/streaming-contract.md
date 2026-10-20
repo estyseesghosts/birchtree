@@ -69,7 +69,7 @@ Payloads:
 | `public:media` and the local/remote media variants | as `public` | Only statuses with media attachments |
 | `hashtag`, `hashtag:local` | `update`, `status.update`, `delete` | Public, not a reblog, carries the normalized tag (`normalize_tag`, as the REST tag timeline; not upstream's `normalizeHashtag`, D25); replies kept (upstream's hashtag streams keep them); author and mention block or mute check; `local` also requires a local author |
 | `list` | `update`, `status.update`, `delete` | The list timeline's rules (`ListFilter`): members only, the list's replies policy, the home reblog rules; the owner's own statuses |
-| `direct` | nothing in Phase 5 | Authorized and held open. Conversation events arrive with Phase 7 (D18) |
+| `direct` | `conversation` (Phase 7, D18 closed) | Authorized and held open; one `conversation` event per participant thread change |
 
 ## What publishes, and when
 
@@ -126,12 +126,12 @@ The register (`docs/compatibility-profile.md`) carries each row. In summary:
 - D15: the retraction cap.
 - D16: a streaming path on the configured streaming host's own origin is served, not `404`.
 - D17: `Vary: Authorization` on streaming responses (upstream's Node service sends none; no client reads it).
-- D18: the `direct` stream is silent until Phase 7.
+- D18: the `direct` stream carried `conversation` events since Phase 7 (2026-10-20).
 - D19: the `public:remote` streams are silent until Phase 6.
 - D20: `notifications_merged` is never sent (no notification-request filter).
 - D21: no `chosen_languages` filter on public and hashtag streams (the setting does not exist in birchtree; upstream applies no filter when it is unset).
-- D22: home and streams ignore blocks and mutes on a status's mentions. Upstream's `FeedManager#filter_from_home` applies them. This is a Phase 4 policy gap, shared with the REST home timeline; escalated.
-- D23: the home gate does not apply a follow's language preference (`Follow.languages`); upstream does. Also a Phase 4 gap, shared with REST.
+- D22: home keeps mention-blocked/muted statuses by default; per-user `Collapse` (fold) or `Filter` (upstream-like removal) via `home_mention_policy` (2026-10-20).
+- D23: the home gate applies a follow's language preference (`Follow.languages`) (2026-10-20).
 - D24: no `kill` on account suspension or disablement (no suspension exists before Phase 7.3).
 - D25: hashtag normalization is the REST normalizer, not upstream's `normalizeHashtag`; the streams and the REST tag timeline agree with each other, not with upstream, for accented or compatibility-form tags.
 - D26: notifications from blocked, muted or domain-blocked accounts are created and streamed; upstream drops them.

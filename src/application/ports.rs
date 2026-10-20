@@ -1,13 +1,24 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::application::streaming::StreamEvent;
+use crate::domain::bookmark::Bookmark;
+use crate::domain::favourite::Favourite;
 use crate::domain::{
-    AccessToken, Account, AccountNote, AccountStats, AuthorizationCode, Block, CustomEmoji,
-    CustomFilter, DomainBlock, Endorsement, FilterKeyword, FilterStatus, Follow, Id, Job, JobKind,
-    List, LocalUser, LoginSession, Marker, MediaAttachment, Mute, Notification, NotificationType,
-    OAuthApplication, Poll, QuotePolicy, QuoteRecord, RepliesPolicy, Result, ScheduledStatus,
-    Status, StatusApplication, StatusVersion, Visibility,
+    AccessToken, Account, AccountNote, AccountStats, AdminAccountOverview, AdminAuditRecord,
+    AdminCanonicalEmailBlock,
+    AdminDomainAllow, AdminDomainBlock, AdminDomainSeverity, AdminEmailDomainBlock, AdminIpBlock,
+    AdminIpSeverity, AdminMediaOwner, AdminReportTarget, AdminTag, AnnualReport,
+    AuthorizationCode, Block, CustomEmoji, CustomFilter,
+    DomainBlock,
+    Endorsement, FilterKeyword, FilterStatus, Follow, Id, Job, JobKind, List, LocalUser,
+    LoginSession, Marker, MediaAttachment, Mute, NewAnnualReport, Notification, NotificationType,
+    OAuthApplication,
+    Poll, QuotePolicy, QuoteRecord, RepliesPolicy, Report, Result, ScheduledStatus, Status,
+    StatusApplication, StatusVersion, TagUsage, TrendLink, TrendPublisher, TrendStatusFlag,
+    TrendTagFlag, UserRole, Visibility,
 };
 
 // Re-export the two kernel ports under their canonical names.
@@ -82,6 +93,8 @@ pub struct UserSettingsUpdate {
     pub default_sensitive: Option<bool>,
     pub default_language: Option<String>,
     pub default_quote_policy: Option<String>,
+    /// D22 home mention policy (`show`/`collapse`/`filter`; `None` = unchanged).
+    pub home_mention_policy: Option<String>,
 }
 
 /// Mutable subset of an account profile (`PATCH update_credentials`).
@@ -130,6 +143,11 @@ pub trait AccountStore: Send + Sync {
 
     /// Apply a preferences patch, returning the updated credential record.
     fn update_user_settings(&self, account_id: Id, update: UserSettingsUpdate) -> Result<LocalUser>;
+
+    /// Grant or clear a staff role (`admin`, `moderator`, `none`) in ONE
+    /// transaction, returning the updated credential record. `NotFound` when
+    /// no local user exists for `account_id` (wrong id or remote account).
+    fn set_user_role(&self, account_id: Id, role: UserRole) -> Result<LocalUser>;
 }
 
 /// OAuth applications, authorization codes and access tokens.
@@ -334,6 +352,8 @@ pub struct StatusViewFlags {
     pub reblogged: bool,
     /// The viewer has pinned the status.
     pub pinned: bool,
+    /// The viewer mutes the status's conversation (thread root).
+    pub muted: bool,
 }
 
 /// Cursor-bounded query for an account's statuses.
@@ -452,6 +472,37 @@ pub trait StatusStore: Send + Sync {
     /// `(account_id, reblog_status_id)` pairs; the reblog id is the cursor.
     fn reblogged_by(&self, status_id: Id, max_id: Option<Id>, limit: usize)
     -> Result<Vec<(Id, Id)>>;
+
+    /// The viewer's favourites, newest first (cursor = favourite row id).
+    fn favourited_statuses(
+        &self,
+        account_id: Id,
+        max_id: Option<Id>,
+        since_id: Option<Id>,
+        min_id: Option<Id>,
+        limit: usize,
+    ) -> Result<Vec<Favourite>>;
+    /// The viewer's bookmarks, newest first (cursor = bookmark row id).
+    fn bookmarked_statuses(
+        &self,
+        account_id: Id,
+        max_id: Option<Id>,
+        since_id: Option<Id>,
+        min_id: Option<Id>,
+        limit: usize,
+    ) -> Result<Vec<Bookmark>>;
+
+    /// One bounded page of the tag-normalization backfill (D25): newest
+    /// first, `(status id, stored tags, source text)`. `after` is the
+    /// exclusive resume cursor (`None` starts at the newest row).
+    fn backfill_tag_batch(
+        &self,
+        after: Option<Id>,
+        cap: usize,
+    ) -> Result<Vec<(Id, Vec<String>, String)>>;
+    /// Rewrite a status's stored tag list and move its hashtag-index keys in
+    /// ONE transaction (D25 backfill writer).
+    fn rewrite_status_tags(&self, status_id: Id, new_tags: &[String]) -> Result<()>;
 }
 
 /// Follows, follow requests, blocks, domain blocks, mutes, notes, endorsements
@@ -460,6 +511,8 @@ pub trait StatusStore: Send + Sync {
 pub struct FollowOptions {
     pub show_reblogs: bool,
     pub notify: bool,
+    /// D23 per-follow language filter (normalized BCP-47 codes).
+    pub languages: Option<Vec<String>>,
 }
 
 /// Outcome of a follow attempt (target locked => request).
@@ -476,6 +529,8 @@ pub struct Relationship {
     pub following: bool,
     pub show_reblogs: bool,
     pub notifying: bool,
+    /// D23 per-follow language filter (`None` = no preference).
+    pub languages: Option<Vec<String>>,
     pub followed_by: bool,
     pub blocking: bool,
     pub blocked_by: bool,
@@ -626,6 +681,413 @@ pub trait RelationshipStore: Send + Sync {
         others: &[Id],
         now_ms: u64,
     ) -> Result<HashMap<Id, (PairState, PairState)>>;
+
+    /// Blocked account ids, newest first (cursor = blocked account id).
+    fn blocks_of(&self, account_id: Id, max_id: Option<Id>, limit: usize) -> Result<Vec<Id>>;
+    /// Mute rows, newest first (cursor = muted account id).
+    fn mutes_of(&self, account_id: Id, max_id: Option<Id>, limit: usize) -> Result<Vec<Mute>>;
+}
+
+/// A tag follow (`TagFollow`): unique per (account, normalized tag).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagFollow {
+    pub id: Id,
+    pub account_id: Id,
+    pub tag: String,
+    pub created_at_ms: u64,
+}
+
+/// A featured tag on an account's profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeaturedTag {
+    pub id: Id,
+    pub account_id: Id,
+    pub tag: String,
+    pub created_at_ms: u64,
+}
+
+/// A session-bound first-party web push subscription.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebPushSubscription {
+    pub id: Id,
+    pub user_id: Id,
+    pub endpoint: String,
+    pub key_auth: String,
+    pub key_p256dh: String,
+    pub standard: bool,
+    pub data: String,
+    pub unsubscribe_token: String,
+    pub created_at_ms: u64,
+}
+
+/// Phase 7 web/tag rows (Subagent B): settings sync, web push
+/// subscriptions, tag follows and featured tags. One `redb` transaction
+/// per mutation; reads are bounded scans.
+pub trait WebStore: Send + Sync {
+    fn web_settings(&self, user_id: Id) -> Result<Option<String>>;
+    fn set_web_settings(&self, user_id: Id, data: &str) -> Result<String>;
+    fn web_push_subscriptions(&self, user_id: Id) -> Result<Vec<WebPushSubscription>>;
+    fn create_web_push_subscription(
+        &self,
+        user_id: Id,
+        endpoint: &str,
+        key_p256dh: &str,
+        key_auth: &str,
+        standard: bool,
+        data: &str,
+        now_ms: u64,
+    ) -> Result<WebPushSubscription>;
+    fn update_web_push_subscription(
+        &self,
+        user_id: Id,
+        id: Id,
+        data: &str,
+        now_ms: u64,
+    ) -> Result<Option<WebPushSubscription>>;
+    fn destroy_web_push_subscription(
+        &self,
+        user_id: Id,
+        id: Id,
+    ) -> Result<Option<WebPushSubscription>>;
+    fn destroy_web_push_subscription_by_token(&self, token: &str)
+        -> Result<Option<WebPushSubscription>>;
+    fn follow_tag(&self, account_id: Id, tag: &str, now_ms: u64) -> Result<TagFollow>;
+    fn unfollow_tag(&self, account_id: Id, tag: &str) -> Result<Option<TagFollow>>;
+    fn followed_tags(
+        &self,
+        account_id: Id,
+        max_id: Option<Id>,
+        since_id: Option<Id>,
+        limit: usize,
+    ) -> Result<Vec<TagFollow>>;
+    fn tag_follow(&self, account_id: Id, tag: &str) -> Result<Option<TagFollow>>;
+    fn feature_tag(&self, account_id: Id, tag: &str, now_ms: u64) -> Result<FeaturedTag>;
+    fn unfeature_tag(&self, account_id: Id, id: Id) -> Result<Option<FeaturedTag>>;
+    fn featured_tags_of(&self, account_id: Id) -> Result<Vec<FeaturedTag>>;
+    fn featured_tag(&self, account_id: Id, tag: &str) -> Result<Option<FeaturedTag>>;
+}
+
+/// A domain-block write (create or update).
+#[derive(Debug, Clone, Default)]
+pub struct AdminDomainBlockPatch {
+    pub severity: Option<AdminDomainSeverity>,
+    pub reject_media: Option<bool>,
+    pub reject_reports: Option<bool>,
+    /// `Some(None)` clears the comment; `None` leaves it unchanged.
+    pub private_comment: Option<Option<String>>,
+    pub public_comment: Option<Option<String>>,
+    pub obfuscate: Option<bool>,
+}
+
+/// An IP-block write (create or update).
+#[derive(Debug, Clone, Default)]
+pub struct AdminIpBlockPatch {
+    pub severity: Option<AdminIpSeverity>,
+    /// `Some(None)` clears the comment; `None` leaves it unchanged.
+    pub comment: Option<Option<String>>,
+    /// `Some(None)` clears the expiry; `None` leaves it unchanged.
+    pub expires_at_ms: Option<Option<u64>>,
+}
+
+/// A tag-moderation write.
+#[derive(Debug, Clone, Default)]
+pub struct AdminTagPatch {
+    pub display_name: Option<String>,
+    pub trendable: Option<bool>,
+    pub usable: Option<bool>,
+    pub listable: Option<bool>,
+}
+
+/// One status row projected for the metrics endpoints.
+#[derive(Debug, Clone)]
+pub struct StatusMetricRow {
+    pub account_id: Id,
+    pub created_at_ms: u64,
+    pub language: Option<String>,
+    pub application_name: Option<String>,
+}
+
+/// Admin infrastructure rows: domain allows/blocks, email-domain blocks, IP
+/// blocks, canonical email blocks, admin tag flags, the audit trail, and
+/// bounded metric scans (Phase 7.3, subagent C).
+///
+/// One `redb` transaction per method: the record mutation, its indexes and the
+/// audit row commit together.
+pub trait AdminInfraStore: Send + Sync {
+    // -- Domain allows --
+    /// Insert a domain allow (`NotFound`-free; duplicate domains return the
+    /// existing row, like upstream's `find_by || create!`). Invalid domains
+    /// are rejected with the pinned `Validation failed` messages.
+    fn admin_create_domain_allow(&self, domain: &str, now_ms: u64) -> Result<AdminDomainAllow>;
+    fn admin_domain_allow_by_id(&self, id: Id) -> Result<Option<AdminDomainAllow>>;
+    /// Global allow list, newest first; cursors exclusive over row ids.
+    fn admin_domain_allows_page(
+        &self,
+        max_id: Option<Id>,
+        since_id: Option<Id>,
+        min_id: Option<Id>,
+        limit: usize,
+    ) -> Result<Vec<AdminDomainAllow>>;
+    fn admin_delete_domain_allow(&self, id: Id) -> Result<Option<AdminDomainAllow>>;
+
+    // -- Domain blocks --
+    fn admin_create_domain_block(
+        &self,
+        domain: &str,
+        patch: AdminDomainBlockPatch,
+        now_ms: u64,
+    ) -> Result<AdminDomainBlock>;
+    fn admin_domain_block_by_id(&self, id: Id) -> Result<Option<AdminDomainBlock>>;
+    fn admin_domain_blocks_page(
+        &self,
+        max_id: Option<Id>,
+        since_id: Option<Id>,
+        min_id: Option<Id>,
+        limit: usize,
+    ) -> Result<Vec<AdminDomainBlock>>;
+    fn admin_update_domain_block(
+        &self,
+        id: Id,
+        patch: AdminDomainBlockPatch,
+        now_ms: u64,
+    ) -> Result<Option<AdminDomainBlock>>;
+    fn admin_delete_domain_block(&self, id: Id) -> Result<Option<AdminDomainBlock>>;
+
+    // -- Email-domain blocks --
+    fn admin_create_email_domain_block(
+        &self,
+        domain: &str,
+        allow_with_approval: bool,
+        now_ms: u64,
+    ) -> Result<AdminEmailDomainBlock>;
+    fn admin_email_domain_block_by_id(&self, id: Id) -> Result<Option<AdminEmailDomainBlock>>;
+    fn admin_email_domain_blocks_page(
+        &self,
+        max_id: Option<Id>,
+        since_id: Option<Id>,
+        min_id: Option<Id>,
+        limit: usize,
+    ) -> Result<Vec<AdminEmailDomainBlock>>;
+    fn admin_delete_email_domain_block(&self, id: Id) -> Result<Option<AdminEmailDomainBlock>>;
+
+    // -- IP blocks --
+    fn admin_create_ip_block(
+        &self,
+        ip: &str,
+        severity: AdminIpSeverity,
+        comment: &str,
+        expires_at_ms: Option<u64>,
+        now_ms: u64,
+    ) -> Result<AdminIpBlock>;
+    fn admin_ip_block_by_id(&self, id: Id) -> Result<Option<AdminIpBlock>>;
+    fn admin_ip_blocks_page(
+        &self,
+        max_id: Option<Id>,
+        since_id: Option<Id>,
+        min_id: Option<Id>,
+        limit: usize,
+    ) -> Result<Vec<AdminIpBlock>>;
+    /// All IP blocks (bounded by `cap`), for request-path enforcement.
+    fn admin_ip_blocks_all(&self, cap: usize) -> Result<Vec<AdminIpBlock>>;
+    fn admin_update_ip_block(
+        &self,
+        id: Id,
+        patch: AdminIpBlockPatch,
+        now_ms: u64,
+    ) -> Result<Option<AdminIpBlock>>;
+    fn admin_delete_ip_block(&self, id: Id) -> Result<Option<AdminIpBlock>>;
+
+    // -- Canonical email blocks --
+    fn admin_create_canonical_email_block(&self, email_hash: &str, now_ms: u64)
+    -> Result<AdminCanonicalEmailBlock>;
+    fn admin_canonical_email_block_by_id(&self, id: Id) -> Result<Option<AdminCanonicalEmailBlock>>;
+    fn admin_canonical_email_blocks_page(
+        &self,
+        max_id: Option<Id>,
+        since_id: Option<Id>,
+        min_id: Option<Id>,
+        limit: usize,
+    ) -> Result<Vec<AdminCanonicalEmailBlock>>;
+    /// Rows whose hash matches (the `test` endpoint), newest first.
+    fn admin_canonical_blocks_for_hash(&self, email_hash: &str) -> Result<Vec<AdminCanonicalEmailBlock>>;
+    fn admin_delete_canonical_email_block(&self, id: Id) -> Result<Option<AdminCanonicalEmailBlock>>;
+
+    // -- Tags --
+    /// Ensure a tag row for `name` (idempotent; materializes real hashtag
+    /// usage — never fabricated).
+    fn admin_ensure_tag(&self, name: &str, now_ms: u64) -> Result<AdminTag>;
+    fn admin_tags_page(
+        &self,
+        max_id: Option<Id>,
+        since_id: Option<Id>,
+        min_id: Option<Id>,
+        limit: usize,
+    ) -> Result<Vec<AdminTag>>;
+    fn admin_tag_by_id(&self, id: Id) -> Result<Option<AdminTag>>;
+    fn admin_update_tag(
+        &self,
+        id: Id,
+        patch: AdminTagPatch,
+        now_ms: u64,
+    ) -> Result<Option<AdminTag>>;
+
+    // -- Audit trail --
+    /// Append one audit record per admin write (proposed default: on).
+    fn admin_audit(
+        &self,
+        actor_account_id: Id,
+        action: &str,
+        target_type: &str,
+        target_id: &str,
+        now_ms: u64,
+    ) -> Result<AdminAuditRecord>;
+    /// Recent audit records, newest first, bounded by `limit`.
+    fn admin_audit_log(&self, limit: usize) -> Result<Vec<AdminAuditRecord>>;
+
+    // -- Bounded metric scans (measures/dimensions/retention) --
+    /// Account creation times, oldest first, bounded by `cap`.
+    fn admin_account_created_times(&self, cap: usize) -> Result<Vec<u64>>;
+    /// `(id, created_at, domain, local)` per account, bounded by `cap`.
+    fn admin_accounts_overview(&self, cap: usize) -> Result<Vec<AdminAccountOverview>>;
+    /// `(created_at_ms, language, application_name)` per status, oldest
+    /// first, bounded by `cap`.
+    fn admin_status_metrics(&self, cap: usize) -> Result<Vec<StatusMetricRow>>;
+    /// Report creation times, oldest first, bounded by `cap`.
+    fn admin_report_created_times(&self, cap: usize) -> Result<Vec<u64>>;
+    /// `(created_at, target_account_id)` per report, bounded by `cap`.
+    fn admin_report_targets(&self, cap: usize) -> Result<Vec<AdminReportTarget>>;
+    /// `(created_at_ms, file_size)` per media attachment, oldest first,
+    /// bounded by `cap`.
+    fn admin_media_metrics(&self, cap: usize) -> Result<Vec<(u64, u64)>>;
+    /// `(created_at, file_size, owner_id)` per media attachment, bounded.
+    fn admin_media_owners(&self, cap: usize) -> Result<Vec<AdminMediaOwner>>;
+    /// Distinct hashtag names from the hashtag index, bounded by `cap`
+    /// (tag registry materialization — real usage, never fabricated).
+    fn admin_hashtag_names(&self, cap: usize) -> Result<Vec<String>>;
+    /// `(domain, account_count)` for remote domains, bounded by `cap`.
+    fn admin_remote_domains(&self, cap: usize) -> Result<Vec<(String, u64)>>;
+    /// Local domain (bare host of the public URL) for instance scoping.
+    fn admin_local_domain(&self) -> String;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7.3 ports (Subagent D): trends, annual reports.
+//
+// Trend approvals share the audit record shape with `AdminInfraStore`
+// (`AdminAuditRecord`, one row per admin write), but live in their own
+// tables: trend candidates are read-time derivations from real usage
+// (hashtag index, recent public statuses, URLs in status text) joined to
+// small persisted approval-flag rows. `AdminTag.trendable` (subagent C's
+// admin-tags surface) and `TrendTagFlag.allowed` (here) model the same
+// upstream `Tag#trendable` column; synthesis unifies them into one store.
+// Until then both serialize the same `trendable` wire key.
+// ---------------------------------------------------------------------------
+
+/// Trend candidate and approval-flag storage.
+pub trait TrendStore: Send + Sync {
+    /// Distinct tag usage from the hashtag index, most-used first, bounded by
+    /// `cap` distinct tags (candidate input for tag trends and the admin tag
+    /// review queue).
+    fn trend_tag_usages(&self, cap: usize) -> Result<Vec<TagUsage>>;
+
+    /// Approval flag for one tag name, if reviewed.
+    fn trend_tag_flag(&self, name: &str) -> Result<Option<TrendTagFlag>>;
+    /// Every reviewed tag flag (the admin review queue joins these with
+    /// [`TrendStore::trend_tag_usages`]).
+    fn all_trend_tag_flags(&self) -> Result<Vec<TrendTagFlag>>;
+    /// Materialize a tag flag row for `name` (idempotent; pending when new),
+    /// minting its numeric admin `:id`.
+    fn ensure_trend_tag(&self, name: &str, now_ms: u64) -> Result<TrendTagFlag>;
+    /// Approve or reject a tag trend in ONE transaction (flag + audit row).
+    fn review_trend_tag(
+        &self,
+        id: Id,
+        allowed: bool,
+        actor_account_id: Id,
+        now_ms: u64,
+    ) -> Result<TrendTagFlag>;
+
+    /// Approval flag for one status, if reviewed (absence = pending).
+    fn trend_status_flag(&self, status_id: Id) -> Result<Option<TrendStatusFlag>>;
+    /// Every reviewed status flag.
+    fn all_trend_status_flags(&self) -> Result<Vec<TrendStatusFlag>>;
+    /// Approve or reject a status trend in ONE transaction (flag + audit
+    /// row). `NotFound` when the status is missing or deleted.
+    fn review_trend_status(
+        &self,
+        status_id: Id,
+        allowed: bool,
+        actor_account_id: Id,
+        now_ms: u64,
+    ) -> Result<TrendStatusFlag>;
+
+    /// Materialize link rows for `urls` (idempotent; pending when new),
+    /// minting numeric admin `:id`s and publisher rows for their hosts.
+    fn ensure_trend_links(&self, urls: &[String], now_ms: u64) -> Result<Vec<TrendLink>>;
+    /// One link row by its numeric id.
+    fn trend_link_by_id(&self, id: Id) -> Result<Option<TrendLink>>;
+    /// Every link row, newest first (both read paths page this in memory;
+    /// link candidates are bounded by the status scan that produced them).
+    fn all_trend_links(&self) -> Result<Vec<TrendLink>>;
+    /// Approve or reject a link trend in ONE transaction (flag + audit row).
+    fn review_trend_link(
+        &self,
+        id: Id,
+        allowed: bool,
+        actor_account_id: Id,
+        now_ms: u64,
+    ) -> Result<TrendLink>;
+
+    /// Every publisher row, newest first.
+    fn all_trend_publishers(&self) -> Result<Vec<TrendPublisher>>;
+    /// One publisher row by its numeric id.
+    fn trend_publisher_by_id(&self, id: Id) -> Result<Option<TrendPublisher>>;
+    /// Approve or reject a publisher in ONE transaction (flag + audit row).
+    fn review_trend_publisher(
+        &self,
+        id: Id,
+        allowed: bool,
+        actor_account_id: Id,
+        now_ms: u64,
+    ) -> Result<TrendPublisher>;
+
+    /// Audit records for one trend target, newest first (review history).
+    fn trend_audit_trail(
+        &self,
+        target_type: &str,
+        target_id: &str,
+    ) -> Result<Vec<AdminAuditRecord>>;
+}
+
+/// Annual-report storage (generation runs as a durable job).
+pub trait AnnualReportStore: Send + Sync {
+    /// This account's report for `year`, if generated.
+    fn annual_report(&self, account_id: Id, year: i32) -> Result<Option<AnnualReport>>;
+    /// This account's unread reports, newest year first (the index).
+    fn pending_annual_reports(&self, account_id: Id) -> Result<Vec<AnnualReport>>;
+    /// Insert a generated report; idempotent on (account, year) — returns the
+    /// existing row when one is already stored, so a retried generation job
+    /// never duplicates it.
+    fn insert_annual_report(&self, input: NewAnnualReport, now_ms: u64) -> Result<AnnualReport>;
+    /// Mark the account's report for `year` read; `None` when missing.
+    fn mark_annual_report_viewed(
+        &self,
+        account_id: Id,
+        year: i32,
+        now_ms: u64,
+    ) -> Result<Option<AnnualReport>>;
+    /// True when a `GenerateAnnualReport` job for (account, year) is still
+    /// pending or leased (the `generating` state).
+    fn has_pending_generate_report(&self, account_id: Id, year: i32) -> Result<bool>;
+    /// The account's non-deleted statuses created in `year`, oldest first,
+    /// bounded by `cap` (generation input; ids are time-ordered so the scan
+    /// stops at the year boundary).
+    fn account_statuses_in_year(
+        &self,
+        account_id: Id,
+        year: i32,
+        cap: usize,
+    ) -> Result<Vec<Status>>;
 }
 
 /// Why a poll vote was rejected (mapped to Mastodon 422 messages by the use
@@ -1101,6 +1563,174 @@ pub trait SearchStore: Send + Sync {
     ) -> Result<Vec<Status>>;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 7.3 ports: admin accounts moderation and the moderator report queue.
+//
+// Same invariants as the other ports: one `redb` transaction per method;
+// mutating methods commit the record change, its index/counter updates and
+// the audit-trail row atomically.
+// ---------------------------------------------------------------------------
+
+/// Moderation status filter for the admin account index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminAccountStatus {
+    /// No moderation flag and not disabled.
+    Active,
+    /// Awaiting approval. Birchtree has no pending-approval state (Phase 2
+    /// gap: approval registration modes), so this matches nothing.
+    Pending,
+    Disabled,
+    Sensitized,
+    Silenced,
+    Suspended,
+}
+
+/// Filters for the admin account index. The v1 and v2 endpoints map their
+/// (different) upstream parameter names onto this one struct.
+#[derive(Debug, Clone, Default)]
+pub struct AdminAccountFilter {
+    /// `Some(true)` = local only, `Some(false)` = remote only, `None` = either.
+    pub local_only: Option<bool>,
+    /// Substring match on the account domain (`by_domain`).
+    pub by_domain: Option<String>,
+    /// Moderation status (`active`/`pending`/`disabled`/`sensitized`/
+    /// `silenced`/`suspended`, v2 `status`).
+    pub status: Option<AdminAccountStatus>,
+    /// Substring match on the username (`username`).
+    pub username_sub: Option<String>,
+    /// Substring match on the display name (`display_name`).
+    pub display_name_sub: Option<String>,
+    /// Substring match on the credential email (`email`; local accounts only).
+    pub email_sub: Option<String>,
+    /// Substring match on a login IP (`ip`). Birchtree stores no login IPs,
+    /// so a non-empty filter matches nothing (documented gap).
+    pub ip_sub: Option<String>,
+    /// Only staff accounts (`staff`, v2 `permissions=staff`).
+    pub staff_only: bool,
+    /// v2 `role_ids`: matched against the role name (`admin`/`moderator`).
+    /// Birchtree has no numeric role ids (documented gap).
+    pub role_names: Vec<String>,
+}
+
+/// Field-level admin account patch. `None` = unchanged.
+#[derive(Debug, Clone, Default)]
+pub struct AdminAccountPatch {
+    pub suspended: Option<bool>,
+    pub silenced: Option<bool>,
+    pub sensitized: Option<bool>,
+    pub disabled: Option<bool>,
+    /// Audit action name recorded with the write (`enable`, `suspend`, ...).
+    pub audit_action: String,
+}
+
+/// Filters for the moderator report queue.
+#[derive(Debug, Clone, Default)]
+pub struct AdminReportFilter {
+    /// `Some(true)` = resolved only, `Some(false)` = unresolved only.
+    pub resolved: Option<bool>,
+    /// Only reports filed by this account (`account_id`).
+    pub reporter_id: Option<Id>,
+    /// Only reports about this account (`target_account_id`).
+    pub target_account_id: Option<Id>,
+}
+
+/// Field-level moderator report patch. `None` = unchanged.
+#[derive(Debug, Clone, Default)]
+pub struct AdminReportPatch {
+    /// New category (`spam`, `legal`, `other`, ...).
+    pub category: Option<String>,
+    /// Attached rule ids. Rules have no model yet: a non-empty list is
+    /// rejected by the use case; empty clears nothing (stored as given when
+    /// empty).
+    pub rule_ids: Option<Vec<String>>,
+    /// `Some(None)` unassigns; `None` leaves the assignee unchanged.
+    pub assigned_account_id: Option<Option<Id>>,
+    /// Resolve (`Some(true)`) or reopen (`Some(false)`).
+    pub action_taken: Option<bool>,
+    /// The moderator resolving; set when resolving.
+    pub action_taken_by_account_id: Option<Id>,
+    /// Audit action name recorded with the write (`update`, `resolve`, ...).
+    pub audit_action: String,
+}
+
+/// Admin account moderation and the moderator report queue.
+pub trait AdminStore: Send + Sync {
+    /// Admin account index, id-descending with exclusive cursors, bounded:
+    /// at most `limit` rows after scanning at most `limit * 20` (capped at
+    /// 5000) index entries. Each row carries its credential (`None` for
+    /// remote accounts, which have no local user).
+    fn admin_accounts_page(
+        &self,
+        filter: &AdminAccountFilter,
+        max_id: Option<Id>,
+        since_id: Option<Id>,
+        min_id: Option<Id>,
+        ascending: bool,
+        limit: usize,
+    ) -> Result<Vec<(Account, Option<LocalUser>)>>;
+
+    /// Apply an account moderation patch in ONE transaction (account row,
+    /// credential row when `disabled` changes, and the audit row). `NotFound`
+    /// when the account is missing.
+    fn admin_update_account(
+        &self,
+        actor_account_id: Id,
+        account_id: Id,
+        patch: AdminAccountPatch,
+        now_ms: u64,
+    ) -> Result<(Account, Option<LocalUser>)>;
+
+    /// Suspend and disable an account in ONE transaction (the audit row
+    /// records `audit_action`: `destroy` for DELETE, `reject` for reject).
+    /// Returns `false` when the account is missing. The account's statuses
+    /// are left in place (planned gap: no async deletion worker yet).
+    fn admin_delete_account(
+        &self,
+        actor_account_id: Id,
+        account_id: Id,
+        audit_action: &str,
+        now_ms: u64,
+    ) -> Result<bool>;
+
+    /// One account-action write in ONE transaction: the moderation flags, the
+    /// report resolutions it implies, and one audit row for the action plus
+    /// one per resolved report. `NotFound` when the account (or the named
+    /// report) is missing.
+    fn admin_account_action(
+        &self,
+        actor_account_id: Id,
+        account_id: Id,
+        action: &str,
+        report_id: Option<Id>,
+        now_ms: u64,
+    ) -> Result<()>;
+
+    /// Moderator report queue, id-descending with exclusive cursors, bounded
+    /// like [`AdminStore::admin_accounts_page`].
+    fn admin_reports_page(
+        &self,
+        filter: &AdminReportFilter,
+        max_id: Option<Id>,
+        since_id: Option<Id>,
+        min_id: Option<Id>,
+        ascending: bool,
+        limit: usize,
+    ) -> Result<Vec<Report>>;
+
+    /// Apply a moderator report patch in ONE transaction (report row + audit
+    /// row). `Ok(None)` when the report is missing.
+    fn admin_update_report(
+        &self,
+        actor_account_id: Id,
+        id: Id,
+        patch: AdminReportPatch,
+        now_ms: u64,
+    ) -> Result<Option<Report>>;
+
+    /// Audit records, newest first, bounded by `cap` (test and operator reads).
+    fn admin_audit_entries(&self, cap: usize) -> Result<Vec<AdminAuditRecord>>;
+}
+
 /// Filters a candidate status through the *viewer's* perspective while a
 /// bounded timeline scan fills a page. Implemented in
 /// `application::timelines` (the policy stays in the application layer); the
@@ -1186,8 +1816,15 @@ pub trait Store:
     + EmojiStore
     + TimelineStore
     + SearchStore
+    + TrendStore
+    + AnnualReportStore
     + crate::application::federation_ports::FederationStore
     + crate::application::federation_ports::FederationContentStore
+    + AdminInfraStore
+    + AdminStore
+    + crate::application::conversations::ConversationStore
+    + crate::application::push::PushSubscriptionStore
+    + WebStore
 {
 }
 impl<T> Store for T where
@@ -1209,8 +1846,15 @@ impl<T> Store for T where
         + EmojiStore
         + TimelineStore
         + SearchStore
+        + TrendStore
+        + AnnualReportStore
         + crate::application::federation_ports::FederationStore
     + crate::application::federation_ports::FederationContentStore
+    + AdminInfraStore
+    + AdminStore
+    + crate::application::conversations::ConversationStore
+    + crate::application::push::PushSubscriptionStore
+    + WebStore
 {
 }
 

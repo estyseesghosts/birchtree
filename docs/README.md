@@ -24,6 +24,7 @@ Each contract file carries a `Status:` line at the top: `Draft` or `Frozen`.
 | `persistence-conformance.md` | Draft | §5 |
 | `federation-contract.md` | Draft | §2.7, §6 (delegates ActivityPub to `activitypub-federation-rust`) |
 | `streaming-contract.md` | Draft | §2.6, §6 |
+| `remote-media-cache-plan.md` | Draft | §7 Phase 6 (from `storage-cache.md` review) |
 | `testing.md` | Draft | §8 |
 | `logs/` | append-only verification evidence | §3 |
 

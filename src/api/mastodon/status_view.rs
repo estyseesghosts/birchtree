@@ -73,6 +73,8 @@ pub fn status_view_flags(
         bookmarked: proper.bookmarked,
         reblogged: proper.reblogged,
         pinned: row.pinned,
+        muted: crate::application::conversations::status_muted(store, viewer, status)
+            .map_err(ApiError::from)?,
     })
 }
 
@@ -102,6 +104,8 @@ pub struct StatusViewContext<'a> {
     ballots: HashMap<Id, Vec<u64>>,
     /// Viewer flags keyed by row-exact status id.
     flags: HashMap<Id, StatusViewFlags>,
+    /// Conversation-mute flags keyed by row-exact status id (Phase 7).
+    muted_by_status: HashMap<Id, bool>,
     /// `(incoming, outgoing)` pair states keyed by the other account id.
     pairs: HashMap<Id, (PairState, PairState)>,
     /// Custom emoji referenced by the page's statuses, by shortcode.
@@ -129,6 +133,7 @@ impl<'a> StatusViewContext<'a> {
             polls: HashMap::new(),
             ballots: HashMap::new(),
             flags: HashMap::new(),
+            muted_by_status: HashMap::new(),
             pairs: HashMap::new(),
             emoji_entities: HashMap::new(),
         }
@@ -231,6 +236,16 @@ impl<'a> StatusViewContext<'a> {
         self.polls.extend(self.store.polls_by_ids(&poll_ids)?);
         if let Some(viewer) = self.viewer {
             self.ballots.extend(self.store.ballots(&poll_ids, viewer)?);
+            // Conversation mutes for the whole page in ONE batched call.
+            let page_statuses: Vec<Status> =
+                self.statuses.values().cloned().collect();
+            self.muted_by_status.extend(
+                crate::application::conversations::muted_map_for_statuses(
+                    self.store,
+                    viewer,
+                    &page_statuses,
+                )?,
+            );
         }
 
         // Viewer flags for every row and every proper target in ONE call.
@@ -450,7 +465,20 @@ impl<'a> StatusViewContext<'a> {
             bookmarked: proper.bookmarked,
             reblogged: proper.reblogged,
             pinned: row.pinned,
+            muted: self.muted_for(viewer, status)?,
         })
+    }
+
+    /// Conversation-mute flag for one status: the batched page map wins, with
+    /// a point lookup fallback (only reachable for chains beyond the prefetch
+    /// rounds).
+    fn muted_for(&mut self, viewer: Id, status: &Status) -> Result<bool, ApiError> {
+        if let Some(muted) = self.muted_by_status.get(&status.id) {
+            return Ok(*muted);
+        }
+        let muted = crate::application::conversations::status_muted(self.store, viewer, status)?;
+        self.muted_by_status.insert(status.id, muted);
+        Ok(muted)
     }
 
     /// Flags for one id, from the batched cache (point lookup on a miss —

@@ -1,23 +1,30 @@
-//! Real media processing (Phase 4): decoding, dimensions, blurhash and the
-//! `small` preview.
+//! Real media processing (Phase 4) plus the Phase 7.1 transcode decision
+//! points: decoding, dimensions, blurhash and the `small` preview.
 //!
-//! No ffmpeg/transcoding toolchain exists in this deployment, so processing is
-//! deliberately limited to what pure-Rust decoding gives us:
+//! The pure-Rust stage in this module is kept for two roles:
 //!
-//! - **images** (JPEG/PNG/GIF/WebP/BMP) are decoded for `width`/`height`,
-//!   hashed into a `blurhash`, and re-encoded into a 460x460-bounded `small`
-//!   preview (same format for JPEG/PNG/WebP; PNG for GIF/BMP). Animated GIFs
-//!   keep the wire type `image` — without an mp4 transcode there is no
-//!   `gifv` (documented deviation from Mastodon, which converts GIFs).
-//! - **video/audio** keep their original bytes untouched (no transcode, no
-//!   thumbnail generation); MP4/QuickTime dimensions are read from the `tkhd`
-//!   box when present, everything else stays `None`.
+//! - **passthrough rows** (WebP stills, audio) finish entirely here, as
+//!   before;
+//! - **transcoded stills** are decoded here *after* ffmpeg runs, so the
+//!   committed `width`/`height`, blurhash and `small` preview always describe
+//!   the derived WebP bytes, never the original.
+//!
+//! The transcode decision table, ffmpeg invocation, startup validation and
+//! the post-commit job live in [`crate::media::transcode`]:
+//!
+//! - GIF (animated or not) → WebM/VP9, wire type `video` (`gifv` never);
+//! - video → WebM/VP9 + Opus, except VP9/WebM + Opus-or-silent within the
+//!   upload size limit, which passes through;
+//! - stills → WebP (WebP passes through); the `small` preview is WebP too.
+//!
+//! Every ffmpeg command carries `-map_metadata 0` and no strip filter:
+//! metadata (EXIF, orientation tag) rides along, never applied to pixels.
 //!
 //! Failures are classified so the HTTP layer can reproduce Mastodon's two
 //! pinned bodies: [`ProcessError::Unidentifiable`] becomes
 //! `422 File type of uploaded media could not be verified` and
-//! [`ProcessError::Other`] becomes `500 Error processing thumbnail for
-//! uploaded media`.
+//! [`ProcessError::Other`] becomes
+//! `500 Error processing thumbnail for uploaded media`.
 
 use std::io::Cursor;
 

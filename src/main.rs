@@ -25,6 +25,7 @@ struct Args {
     password: Option<String>,
     email: Option<String>,
     display_name: Option<String>,
+    role: Option<String>,
     harness_mode: Option<String>,
 }
 
@@ -63,6 +64,8 @@ fn parse_args(cfg: &mut Config) -> Args {
             args.email = Some(v.to_string());
         } else if let Some(v) = arg.strip_prefix("--display-name=") {
             args.display_name = Some(v.to_string());
+        } else if let Some(v) = arg.strip_prefix("--role=") {
+            args.role = Some(v.to_string());
         } else if let Some(v) = arg.strip_prefix("--site-title=") {
             cfg.site_title = v.to_string();
         } else if let Some(v) = arg.strip_prefix("--site-description=") {
@@ -95,6 +98,37 @@ fn parse_args(cfg: &mut Config) -> Args {
             cfg.registration_open = true;
         } else if arg == "--registration-closed" {
             cfg.registration_open = false;
+        } else if let Some(v) = arg.strip_prefix("--search-mode=") {
+            cfg.search_mode =
+                birchtree::search::SearchMode::parse(v).unwrap_or_else(|| {
+                    eprintln!("invalid --search-mode (want embedded|database|off): {v}");
+                    std::process::exit(2);
+                });
+        } else if arg == "--no-transcode" {
+            cfg.transcoding_enabled = false;
+        } else if let Some(v) = arg.strip_prefix("--ffmpeg-path=") {
+            cfg.ffmpeg_path = v.to_string();
+        } else if let Some(v) = arg.strip_prefix("--transcode-wall-time-secs=") {
+            cfg.transcode_wall_time_secs = v.parse().unwrap_or_else(|_| {
+                eprintln!("invalid --transcode-wall-time-secs: {v}");
+                std::process::exit(2);
+            });
+        } else if let Some(v) = arg.strip_prefix("--transcode-max-output-bytes=") {
+            cfg.transcode_max_output_bytes = v.parse().unwrap_or_else(|_| {
+                eprintln!("invalid --transcode-max-output-bytes: {v}");
+                std::process::exit(2);
+            });
+        } else if let Some(v) = arg.strip_prefix("--transcode-max-memory-bytes=") {
+            cfg.transcode_max_memory_bytes = v.parse().unwrap_or_else(|_| {
+                eprintln!("invalid --transcode-max-memory-bytes: {v}");
+                std::process::exit(2);
+            });
+        } else if let Some(v) = arg.strip_prefix("--vapid-public-key=") {
+            cfg.vapid_public_key = v.to_string();
+        } else if let Some(v) = arg.strip_prefix("--vapid-private-key=") {
+            cfg.vapid_private_key = v.to_string();
+        } else if let Some(v) = arg.strip_prefix("--web-client-dir=") {
+            cfg.web_client_dir = Some(std::path::PathBuf::from(v));
         } else if let Some(v) = arg.strip_prefix("--mode=") {
             args.harness_mode = Some(v.to_string());
         } else if arg.starts_with("--") {
@@ -119,7 +153,9 @@ fn build_store(cfg: &Config) -> (Arc<RedbStore>, Arc<dyn Clock>, Arc<dyn IdGener
 }
 
 /// `create-account --username=<name> --password=<pw>`: create a local account
-/// from the CLI for operators (the Phase 1 bootstrap path).
+/// from the CLI for operators (the Phase 1 bootstrap path). With
+/// `--role=admin|moderator` the new account also gets that staff role for the
+/// admin API (Phase 7.3); the default is no role.
 fn run_create_account(cfg: &Config, args: &Args) -> ! {
     let username = args.username.clone().unwrap_or_else(|| {
         eprintln!("create-account requires --username=<name>");
@@ -133,6 +169,12 @@ fn run_create_account(cfg: &Config, args: &Args) -> ! {
             eprintln!("create-account requires --password=<pw> (or $BIRCHTREE_PASSWORD)");
             std::process::exit(2);
         });
+    let role = args.role.as_deref().map(|s| {
+        birchtree::domain::UserRole::parse_cli(s).unwrap_or_else(|| {
+            eprintln!("invalid --role=<admin|moderator> (got {s:?})");
+            std::process::exit(2);
+        })
+    });
 
     let (store, clock, _ids) = build_store(cfg);
     let cmd = CreateAccountCommand {
@@ -143,6 +185,13 @@ fn run_create_account(cfg: &Config, args: &Args) -> ! {
     };
     match create_account(&*store, &cfg.normalized_public_url(), clock.now_ms(), cmd) {
         Ok(account) => {
+            use birchtree::application::ports::AccountStore;
+            if let Some(role) = role.filter(|r| r.is_staff()) {
+                if let Err(err) = store.set_user_role(account.id, role) {
+                    eprintln!("create-account granted nothing: set role failed: {err}");
+                    std::process::exit(1);
+                }
+            }
             // IDs are decimal strings on the wire.
             println!("created account id={} username={}", account.id, account.username);
             std::process::exit(0);
@@ -152,6 +201,67 @@ fn run_create_account(cfg: &Config, args: &Args) -> ! {
             std::process::exit(1);
         }
     }
+}
+
+/// `grant-role --username=<name> --role=<admin|moderator|none>`: grant (or
+/// clear) a staff role on an existing local account (Phase 7.3). Operators use
+/// this to promote accounts created before roles existed.
+fn run_grant_role(cfg: &Config, args: &Args) -> ! {
+    use birchtree::application::ports::AccountStore;
+
+    let username = args.username.clone().unwrap_or_else(|| {
+        eprintln!("grant-role requires --username=<name>");
+        std::process::exit(2);
+    });
+    let role = args
+        .role
+        .as_deref()
+        .map(|s| {
+            birchtree::domain::UserRole::parse_cli(s).unwrap_or_else(|| {
+                eprintln!("grant-role requires --role=<admin|moderator|none> (got {s:?})");
+                std::process::exit(2);
+            })
+        })
+        .unwrap_or_else(|| {
+            eprintln!("grant-role requires --role=<admin|moderator|none>");
+            std::process::exit(2);
+        });
+
+    let (store, _clock, _ids) = build_store(cfg);
+    let base_url = cfg.normalized_public_url();
+    let domain = create_account_domain(&base_url);
+    let normalized = birchtree::domain::account::normalize_username(&username);
+    let account = match store.account_by_handle(&normalized, &domain) {
+        Ok(Some(account)) => account,
+        Ok(None) => {
+            eprintln!("grant-role failed: no account named {username:?}");
+            std::process::exit(1);
+        }
+        Err(err) => {
+            eprintln!("grant-role failed: {err}");
+            std::process::exit(1);
+        }
+    };
+    match store.set_user_role(account.id, role) {
+        Ok(_) => {
+            let label = match role {
+                birchtree::domain::UserRole::Admin => "admin",
+                birchtree::domain::UserRole::Moderator => "moderator",
+                birchtree::domain::UserRole::None => "none",
+            };
+            println!("granted role={label} account id={} username={}", account.id, account.username);
+            std::process::exit(0);
+        }
+        Err(err) => {
+            eprintln!("grant-role failed: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Bare host of the public base URL (the local account domain).
+fn create_account_domain(base_url: &str) -> String {
+    birchtree::application::accounts::host_from_url(base_url)
 }
 
 /// Test-only harness used by `tests/crash_recovery.rs` to exercise `kill -9`
@@ -232,7 +342,38 @@ async fn serve(cfg: Config) {
                 std::process::exit(1);
             }));
     let server = Arc::new(ServerInfo::from_config(&cfg));
-    let streams = birchtree::streaming::Hub::new(
+    // Phase 7.2/7.3 startup seeds: the search index is in-memory derived
+    // state, so a restart re-seeds its backfill chain when empty; the tag
+    // backfill re-scans until a pass plans nothing (idempotent, bounded).
+    // Seed failures only degrade reads until the next restart.
+    {
+        use birchtree::application::ports::JobQueue;
+        use birchtree::domain::JobKind;
+        if birchtree::search::global().is_empty()
+            && cfg.search_mode == birchtree::search::SearchMode::Embedded
+        {
+            if let Err(err) = store.enqueue(
+                JobKind::SearchBackfill,
+                birchtree::jobs::search_index::backfill_payload(
+                    None,
+                    birchtree::search::BACKFILL_DEFAULT_BATCH,
+                ),
+                clock.now_ms(),
+            ) {
+                tracing::warn!(error = %err, "search backfill seed failed");
+            }
+        }
+        if let Err(err) = store.enqueue(
+            JobKind::TagBackfill,
+            birchtree::jobs::search_index::backfill_payload(
+                None,
+                birchtree::jobs::tag_backfill::BACKFILL_BATCH_CAP,
+            ),
+            clock.now_ms(),
+        ) {
+            tracing::warn!(error = %err, "tag backfill seed failed");
+        }
+    }    let streams = birchtree::streaming::Hub::new(
         store.clone(),
         clock.clone(),
         server.clone(),
@@ -325,6 +466,29 @@ async fn serve(cfg: Config) {
     );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // Phase 7 worker resources: push delivery identity + ffmpeg toolchain.
+    // A missing/non-working ffmpeg with transcoding on is a startup error,
+    // never a silent passthrough (operator decision, Phase 7.1).
+    let transcode = cfg.transcode_config().unwrap_or_else(|err| {
+        eprintln!("configuration error: {err}");
+        std::process::exit(1);
+    });
+    let worker_extra = jobs::worker::WorkerExtra {
+        push_client: reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|err| {
+                eprintln!("build push http client: {err}");
+                std::process::exit(1);
+            }),
+        vapid: birchtree::application::push::VapidKeys {
+            public_b64: cfg.vapid_public_key.clone(),
+            private_b64: cfg.vapid_private_key.clone(),
+        },
+        push_subject: cfg.normalized_public_url(),
+        transcode,
+    };
     let worker = tokio::spawn(jobs::worker::run(
         store.clone(),
         clock.clone(),
@@ -332,6 +496,7 @@ async fn serve(cfg: Config) {
         blobs,
         streaming,
         federation,
+        worker_extra,
         cfg.worker_poll_interval,
         jobs::worker::DEFAULT_BATCH,
         shutdown_rx,
@@ -368,6 +533,7 @@ async fn main() {
 
     match args.positional.first().map(String::as_str) {
         Some("create-account") => run_create_account(&cfg, &args),
+        Some("grant-role") | Some("set-role") => run_grant_role(&cfg, &args),
         Some("crash-harness") => run_crash_harness(&cfg, &args),
         Some(other) => {
             eprintln!("unknown subcommand: {other}");

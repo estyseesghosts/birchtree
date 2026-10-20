@@ -7,6 +7,10 @@ pub mod crypto;
 pub mod policy;
 
 pub mod accounts;
+pub mod annual_reports;
+pub mod trends;
+pub mod admin;
+pub mod admin_infra;
 pub mod auth;
 pub mod statuses;
 pub mod interactions;
@@ -24,3 +28,6 @@ pub mod filters;
 pub mod instance;
 pub mod scheduled_statuses;
 pub mod streaming;
+pub mod conversations;
+pub mod push;
+pub mod web;

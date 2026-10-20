@@ -23,4 +23,31 @@ pub struct Report {
     /// The Flag activity's URI for a received report; `None` for a local report.
     pub activity_uri: Option<String>,
     pub created_at_ms: u64,
+    // --- Phase 7.3 moderator queue (defaulted so pre-7.3 rows decode). ---
+    /// Whether a moderator resolved the report (`action_taken`).
+    #[serde(default)]
+    pub action_taken: bool,
+    /// When the report was resolved (`action_taken_at`).
+    #[serde(default)]
+    pub action_taken_at_ms: Option<u64>,
+    /// The moderator who resolved it (`action_taken_by_account_id`).
+    #[serde(default)]
+    pub action_taken_by_account_id: Option<Id>,
+    /// The moderator the report is assigned to (`assigned_account_id`).
+    #[serde(default)]
+    pub assigned_account_id: Option<Id>,
+    /// Report category (`spam`, `legal`, `other`, ...; upstream default `other`).
+    #[serde(default = "default_category")]
+    pub category: String,
+    /// Instance-rule ids attached at update time (no Rule model yet; rendered
+    /// as `rules: []` with a documented gap).
+    #[serde(default)]
+    pub rule_ids: Vec<String>,
+    /// Last moderator-queue write (`updated_at`).
+    #[serde(default)]
+    pub updated_at_ms: u64,
+}
+
+fn default_category() -> String {
+    "other".to_string()
 }

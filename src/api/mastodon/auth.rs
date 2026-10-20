@@ -15,8 +15,8 @@ use axum::http::request::Parts;
 
 use crate::api::mastodon::ApiState;
 use crate::api::mastodon::errors::{ApiError, ApiResult};
-use crate::application::ports::Store;
-use crate::domain::{AccessToken, Id, OAuthApplication};
+use crate::application::ports::{AccountStore, Store};
+use crate::domain::{AccessToken, Id, OAuthApplication, UserRole};
 
 /// A validated bearer token and the application that owns it.
 #[derive(Clone)]
@@ -49,6 +49,82 @@ impl Authenticated {
     pub fn require_user(&self) -> ApiResult<Id> {
         self.token.user_id.ok_or_else(ApiError::requires_user)
     }
+
+    /// Role-before-scope gate for the admin API (`/api/v1/admin/*` and
+    /// `/api/v2/admin/accounts`).
+    ///
+    /// Check order mirrors upstream: `Admin::PermissionsConcern` runs its
+    /// `before_action` (role) before each controller's scope `before_action`,
+    /// and `verify_authorized` enforces the per-action policy last. Here:
+    ///
+    /// 1. `require_user` — an app-only token is rejected with `422
+    ///    {"error":"This method requires an authenticated user"}`;
+    /// 2. role — an account without a sufficient role is rejected with `403
+    ///    {"error":"Forbidden"}` (upstream renders the Rack status text);
+    /// 3. scope — a token without one of `scopes` is rejected with `403
+    ///    {"error":"This action is outside the authorized scopes"}`.
+    ///
+    /// `area` selects the permission split from `birchtree.md` §7 Phase 7.3:
+    /// `Accounts` and `Reports` admit moderators and admins; `AdminOnly`
+    /// (domain allows/blocks, email-domain blocks, IP blocks, canonical email
+    /// blocks, trends approvals, measures/dimensions/retention, tags) admits
+    /// admins only. Returns the caller's role for handlers that need it.
+    ///
+    /// Usage (other subagents: copy this shape):
+    ///
+    /// ```ignore
+    /// use crate::api::mastodon::auth::{AdminArea, Auth};
+    ///
+    /// async fn show(
+    ///     State(state): State<ApiState>,
+    ///     auth: Auth,
+    ///     Path(id): Path<String>,
+    /// ) -> Result<Json<Value>, ApiError> {
+    ///     let role = auth.0.require_admin(
+    ///         &*state.context.store,
+    ///         AdminArea::Accounts,
+    ///         &["admin:read", "admin:read:accounts"],
+    ///     )?;
+    ///     let _ = role; // `UserRole::Admin` or `UserRole::Moderator` here.
+    ///     // ... handler body ...
+    /// }
+    /// ```
+    pub fn require_admin(
+        &self,
+        store: &dyn AccountStore,
+        area: AdminArea,
+        scopes: &[&str],
+    ) -> ApiResult<UserRole> {
+        let user_id = self.require_user()?;
+        let role = store
+            .user_by_account_id(user_id)
+            .map_err(ApiError::from)?
+            .map(|user| user.role)
+            .unwrap_or(UserRole::None);
+        let allowed = match role {
+            UserRole::Admin => true,
+            UserRole::Moderator => matches!(area, AdminArea::Accounts | AdminArea::Reports),
+            UserRole::None => false,
+        };
+        if !allowed {
+            return Err(ApiError::role_forbidden());
+        }
+        self.require_scopes(scopes)?;
+        Ok(role)
+    }
+}
+
+/// Which admin area a route belongs to, for [`Authenticated::require_admin`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminArea {
+    /// Account moderation routes (`admin:*:accounts`): moderators and admins.
+    Accounts,
+    /// Moderator queue (`admin:*:reports`): moderators and admins.
+    Reports,
+    /// Everything else (domain allows/blocks, email-domain blocks, IP blocks,
+    /// canonical email blocks, trends approvals, measures/dimensions/retention,
+    /// tags): admins only.
+    AdminOnly,
 }
 
 fn bearer_token(parts: &Parts) -> Option<String> {

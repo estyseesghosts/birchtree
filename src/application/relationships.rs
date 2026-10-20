@@ -54,6 +54,8 @@ pub struct FollowCommand {
     pub show_reblogs: Option<bool>,
     /// `notify` query flag (default false).
     pub notify: Option<bool>,
+    /// D23 per-follow language filter (`languages[]`, normalized at the edge).
+    pub languages: Option<Vec<String>>,
 }
 
 /// Follow an account, or open a follow request when the target is locked.
@@ -77,6 +79,9 @@ pub fn follow(store: &dyn Store, now_ms: u64, cmd: FollowCommand) -> Result<Foll
     let opts = FollowOptions {
         show_reblogs: cmd.show_reblogs.unwrap_or(true),
         notify: cmd.notify.unwrap_or(false),
+        languages: cmd
+            .languages
+            .map(|l| crate::application::policy::normalize_follow_languages(&l)),
     };
     // A request only opens when there is no ACTIVE follow yet; an existing
     // row keeps its state (the store updates the options idempotently).

@@ -93,6 +93,14 @@ pub async fn follow(
         target_id: target.id,
         show_reblogs: forms::get(&pairs, "reblogs").map(bool_cast),
         notify: forms::get(&pairs, "notify").map(bool_cast),
+        languages: {
+            let langs = forms::all(&pairs, "languages[]");
+            if langs.is_empty() {
+                None
+            } else {
+                Some(langs.into_iter().map(str::to_string).collect())
+            }
+        },
     };
     match relationships::follow(store, state.context.now_ms(), cmd) {
         Ok(_) => relationship_response(&state, viewer, target.id),

@@ -55,6 +55,37 @@ pub struct Config {
     /// load tests on a debug node (`--debug-weak-rate-limits` or
     /// `--rate-limit-multiplier=N`).
     pub rate_limit_multiplier: u32,
+    /// Whether the public trends endpoints serve approved items (upstream
+    /// `Setting.trends`). On by default; when false the trends reads return
+    /// empty arrays. (No CLI flag yet; operators stop the server to change it
+    /// via configuration in a later phase.)
+    pub trends_enabled: bool,
+    /// Search backend switch (Phase 7.2): `embedded` (default, in-process
+    /// index), `database` (bounded local scan), or `off` (no status hits,
+    /// matching upstream with no engine).
+    pub search_mode: crate::search::SearchMode,
+    /// Whether the ffmpeg transcode pipeline runs (Phase 7.1). On by
+    /// default; `--no-transcode` disables it (uploads keep the Phase 4
+    /// passthrough behavior).
+    pub transcoding_enabled: bool,
+    /// ffmpeg binary path (Phase 7.1).
+    pub ffmpeg_path: String,
+    /// Per-job wall-time limit in seconds (Phase 7.1).
+    pub transcode_wall_time_secs: u64,
+    /// Per-job output-size limit in bytes (Phase 7.1).
+    pub transcode_max_output_bytes: u64,
+    /// Per-job memory limit in bytes (Phase 7.1).
+    pub transcode_max_memory_bytes: u64,
+    /// VAPID public key (base64url, 65-byte point) advertised by push
+    /// subscription serializers. Empty by default (delivery jobs
+    /// retry-then-quarantine until keys are configured).
+    pub vapid_public_key: String,
+    /// VAPID private key (base64url, 32-byte scalar) used to sign delivery
+    /// requests. Empty by default; never serialized.
+    pub vapid_private_key: String,
+    /// Directory holding keystodon's built first-party bundle. `None`
+    /// (default) means the bundle is not deployed: `/app/*` answers 404.
+    pub web_client_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -79,6 +110,16 @@ impl Default for Config {
             federation_extra_ca: None,
             federation_authorized_fetch: false,
             rate_limit_multiplier: 1,
+            trends_enabled: true,
+            search_mode: crate::search::SearchMode::Embedded,
+            transcoding_enabled: true,
+            ffmpeg_path: "ffmpeg".to_string(),
+            transcode_wall_time_secs: 120,
+            transcode_max_output_bytes: 64 * 1024 * 1024,
+            transcode_max_memory_bytes: 1024 * 1024 * 1024,
+            vapid_public_key: String::new(),
+            vapid_private_key: String::new(),
+            web_client_dir: None,
         }
     }
 }
@@ -113,6 +154,15 @@ impl Config {
         if self.worker_poll_interval.is_zero() {
             return Err("worker_poll_interval must be > 0".to_string());
         }
+        if self.transcode_wall_time_secs == 0 {
+            return Err("transcode_wall_time_secs must be > 0".to_string());
+        }
+        if self.transcode_max_output_bytes == 0 {
+            return Err("transcode_max_output_bytes must be > 0".to_string());
+        }
+        if self.transcode_max_memory_bytes == 0 {
+            return Err("transcode_max_memory_bytes must be > 0".to_string());
+        }
         if let Some(base) = &self.streaming_api_base_url {
             let valid = ["ws://", "wss://", "http://", "https://"]
                 .iter()
@@ -131,6 +181,28 @@ impl Config {
         self.public_url.trim_end_matches('/').to_string()
     }
 
+    /// Build the Phase 7.1 transcode configuration, proving the toolchain
+    /// when transcoding is enabled: a missing or non-working ffmpeg is an
+    /// error here (serve startup), never a silent passthrough. CLI and
+    /// harness paths never call this, so they never need ffmpeg.
+    pub fn transcode_config(&self) -> Result<crate::media::transcode::TranscodeConfig, String> {
+        let config = crate::media::transcode::TranscodeConfig {
+            enabled: self.transcoding_enabled,
+            ffmpeg_path: self.ffmpeg_path.clone(),
+            wall_time_secs: self.transcode_wall_time_secs,
+            max_output_bytes: self.transcode_max_output_bytes,
+            max_memory_bytes: self.transcode_max_memory_bytes,
+            max_file_size: self.max_file_size,
+            ..crate::media::transcode::TranscodeConfig::default()
+        };
+        if self.transcoding_enabled {
+            config
+                .validate()
+                .map_err(|e| format!("transcoding: {e}"))?;
+        }
+        Ok(config)
+    }
+
     /// Path of the `redb` database file.
     pub fn database_path(&self) -> PathBuf {
         self.data_dir.join("birchtree.redb")
@@ -143,7 +215,28 @@ mod tests {
 
     #[test]
     fn default_config_is_valid() {
-        assert!(Config::default().validate().is_ok());
+        // Transcoding is on by default, which needs a working ffmpeg; the
+        // hermetic default (unit tests, smoke scripts) disables it.
+        let cfg = Config {
+            transcoding_enabled: false,
+            ..Config::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn transcoding_requires_a_working_ffmpeg() {
+        // A missing binary is a startup error, never a silent passthrough.
+        let cfg = Config {
+            ffmpeg_path: "/nonexistent/birchtree-ffmpeg-xyz".into(),
+            ..Config::default()
+        };
+        assert!(cfg.transcode_config().is_err());
+        let off = Config {
+            transcoding_enabled: false,
+            ..Config::default()
+        };
+        assert!(off.transcode_config().is_ok());
     }
 
     #[test]
@@ -187,6 +280,7 @@ mod tests {
         assert!(cfg.validate().is_err());
         let cfg = Config {
             max_status_chars: 3000,
+            transcoding_enabled: false,
             ..Config::default()
         };
         assert!(cfg.validate().is_ok());

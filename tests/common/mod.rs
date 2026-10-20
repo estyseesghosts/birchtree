@@ -105,6 +105,10 @@ impl TestServer {
         let cfg = Config {
             public_url: TEST_PUBLIC_URL.to_string(),
             registration_open,
+            // Hermetic HTTP tests: no ffmpeg on the test machine, so the
+            // transcode pipeline stays off (unit coverage drives
+            // `run_transcode_job` directly with explicit configs).
+            transcoding_enabled: false,
             ..Config::default()
         };
         let server = Arc::new(ServerInfo::from_config(&cfg));

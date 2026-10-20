@@ -2,3 +2,6 @@ pub mod types;
 pub mod queue;
 pub mod worker;
 pub mod handlers;
+pub mod search_index;
+pub mod tag_backfill;
+pub mod transcode;

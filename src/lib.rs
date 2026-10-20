@@ -9,4 +9,5 @@ pub mod mail;
 pub mod media;
 pub mod observability;
 pub mod persistence;
+pub mod search;
 pub mod streaming;

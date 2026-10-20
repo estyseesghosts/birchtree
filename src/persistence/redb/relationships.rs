@@ -188,6 +188,9 @@ impl RelationshipStore for RedbStore {
             followed_id,
             show_reblogs: opts.show_reblogs,
             notify: opts.notify,
+            languages: opts
+                .languages
+                .or_else(|| existing.as_ref().and_then(|f| f.languages.clone())),
             state: new_state,
             created_at_ms: existing.as_ref().map_or(now_ms, |f| f.created_at_ms),
             uri: None,
@@ -887,6 +890,9 @@ impl RelationshipStore for RedbStore {
                 // row at all the serializer answers `false`.
                 show_reblogs: follow_out.as_ref().map_or(false, |f| f.show_reblogs),
                 notifying: follow_out.as_ref().is_some_and(|f| f.notify),
+                languages: follow_out
+                    .as_ref()
+                    .and_then(|f| f.languages.clone()),
                 followed_by: active_in,
                 blocking: blocking.is_some(),
                 blocked_by: blocked_by.is_some(),
@@ -1144,5 +1150,61 @@ impl RelationshipStore for RedbStore {
             );
         }
         Ok(out)
+    }
+
+    fn blocks_of(&self, account_id: Id, max_id: Option<Id>, limit: usize) -> Result<Vec<Id>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let read = self.begin_read()?;
+        let lower = schema::pair_key(account_id.value(), 0);
+        let upper = schema::pair_key(account_id.value(), u64::MAX);
+        let mut blocked: Vec<Id> = Vec::new();
+        {
+            let blocks = read.open_table(BLOCKS)?;
+            for entry in blocks.range(lower.as_slice()..=upper.as_slice())? {
+                let (key, _value) = entry?;
+                blocked.push(Id::new(u64::from_be_bytes(
+                    key.value()[8..].try_into().unwrap(),
+                )));
+                if blocked.len() >= FOLLOWER_SCAN_CAP {
+                    break;
+                }
+            }
+            self.note_scanned(blocked.len());
+        }
+        blocked.reverse();
+        Ok(blocked
+            .into_iter()
+            .filter(|id| max_id.is_none_or(|max| *id < max))
+            .take(limit)
+            .collect())
+    }
+
+    fn mutes_of(&self, account_id: Id, max_id: Option<Id>, limit: usize) -> Result<Vec<Mute>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let read = self.begin_read()?;
+        let lower = schema::pair_key(account_id.value(), 0);
+        let upper = schema::pair_key(account_id.value(), u64::MAX);
+        let mut rows: Vec<Mute> = Vec::new();
+        {
+            let mutes = read.open_table(MUTES)?;
+            for entry in mutes.range(lower.as_slice()..=upper.as_slice())? {
+                let (_key, value) = entry?;
+                rows.push(decode(value.value())?);
+                if rows.len() >= FOLLOWER_SCAN_CAP {
+                    break;
+                }
+            }
+            self.note_scanned(rows.len());
+        }
+        rows.sort_by(|a, b| b.muted_id.cmp(&a.muted_id));
+        Ok(rows
+            .into_iter()
+            .filter(|mute| max_id.is_none_or(|max| mute.muted_id < max))
+            .take(limit)
+            .collect())
     }
 }

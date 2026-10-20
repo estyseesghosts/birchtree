@@ -20,6 +20,7 @@ use crate::api::oauth::{authorization, token};
 pub fn build_router(state: ApiState) -> Router {
     let max_body = state.max_body_size;
     let rate_multiplier = state.rate_limit_multiplier;
+    let ip_block_state = state.clone();
     Router::new()
         // Runtime probes.
         .route("/health", get(health))
@@ -214,6 +215,83 @@ pub fn build_router(state: ApiState) -> Router {
         )
         // Reports (Phase 6): filed here; forwarded to a remote server as a Flag when asked.
         .route("/api/v1/reports", post(endpoints::reports::create))
+        // Conversations + conversation mutes (Phase 7).
+        .route("/api/v1/conversations", get(endpoints::conversations::index))
+        .route("/api/v1/conversations/:id", delete(endpoints::conversations::destroy))
+        .route("/api/v1/conversations/:id/read", post(endpoints::conversations::read))
+        .route("/api/v1/conversations/:id/unread", post(endpoints::conversations::unread))
+        .route("/api/v1/statuses/:id/mute", post(endpoints::conversations::mute_status))
+        .route("/api/v1/statuses/:id/unmute", post(endpoints::conversations::unmute_status))
+        // Web Push (Phase 7).
+        .route("/api/v1/push/subscription", post(endpoints::push::create).get(endpoints::push::show).put(endpoints::push::update).patch(endpoints::push::update).delete(endpoints::push::destroy))
+        // Phase 7 first-party web surface (session + CSRF).
+        .route("/api/web/settings", put(endpoints::web::settings_update).patch(endpoints::web::settings_update))
+        .route("/api/web/embeds/:id", get(endpoints::web::embeds_show))
+        .route("/api/web/push_subscriptions", post(endpoints::web::push_create))
+        .route("/api/web/push_subscriptions/:id", put(endpoints::web::push_update).patch(endpoints::web::push_update).delete(endpoints::web::push_destroy))
+        // Stray Phase 7 rows.
+        .route("/api/v1/timelines/link", get(endpoints::timelines_link::link))
+        .route("/api/v1/apps/verify_credentials", get(endpoints::timelines_link::verify_app_credentials))
+        // Relation collection reads + tag surface (Phase 7).
+        .route("/api/v1/accounts/familiar_followers", get(endpoints::relations_extra::familiar_followers))
+        .route("/api/v1/blocks", get(endpoints::relations_extra::blocks))
+        .route("/api/v1/mutes", get(endpoints::relations_extra::mutes))
+        .route("/api/v1/favourites", get(endpoints::relations_extra::favourites))
+        .route("/api/v1/bookmarks", get(endpoints::relations_extra::bookmarks))
+        .route("/api/v1/featured_tags", get(endpoints::relations_extra::featured_tags_index).post(endpoints::relations_extra::featured_tags_create))
+        .route("/api/v1/featured_tags/:id", delete(endpoints::relations_extra::featured_tags_destroy))
+        .route("/api/v1/followed_tags", get(endpoints::relations_extra::followed_tags))
+        .route("/api/v1/accounts/:id/featured_tags", get(endpoints::relations_extra::account_featured_tags))
+        .route("/api/v1/tags/:id", get(endpoints::relations_extra::tag_show))
+        .route("/api/v1/tags/:id/follow", post(endpoints::relations_extra::tag_follow))
+        .route("/api/v1/tags/:id/unfollow", post(endpoints::relations_extra::tag_unfollow))
+        .route("/api/v1/tags/:id/feature", post(endpoints::relations_extra::tag_feature))
+        .route("/api/v1/tags/:id/unfeature", post(endpoints::relations_extra::tag_unfeature))
+        // keystodon first-party bundle (404 unless configured).
+        .route("/app", get(endpoints::web::serve_bundle))
+        .route("/app/*path", get(endpoints::web::serve_bundle))
+        // Admin API (Phase 7.3): roles + scope families are enforced centrally
+        // in each handler (role before scope).
+        .route("/api/v1/admin/accounts", get(endpoints::admin_accounts::index_v1))
+        .route("/api/v2/admin/accounts", get(endpoints::admin_accounts::index_v2))
+        .route("/api/v1/admin/accounts/:id", get(endpoints::admin_accounts::show).delete(endpoints::admin_accounts::destroy))
+        .route("/api/v1/admin/accounts/:id/enable", post(endpoints::admin_accounts::enable))
+        .route("/api/v1/admin/accounts/:id/unsensitive", post(endpoints::admin_accounts::unsensitive))
+        .route("/api/v1/admin/accounts/:id/unsilence", post(endpoints::admin_accounts::unsilence))
+        .route("/api/v1/admin/accounts/:id/unsuspend", post(endpoints::admin_accounts::unsuspend))
+        .route("/api/v1/admin/accounts/:id/approve", post(endpoints::admin_accounts::approve))
+        .route("/api/v1/admin/accounts/:id/reject", post(endpoints::admin_accounts::reject))
+        .route("/api/v1/admin/accounts/:account_id/action", post(endpoints::admin_accounts::action))
+        .route("/api/v1/admin/reports", get(endpoints::admin_reports::index))
+        .route("/api/v1/admin/reports/:id", get(endpoints::admin_reports::show).put(endpoints::admin_reports::update).patch(endpoints::admin_reports::update))
+        .route("/api/v1/admin/reports/:id/assign_to_self", post(endpoints::admin_reports::assign_to_self))
+        .route("/api/v1/admin/reports/:id/unassign", post(endpoints::admin_reports::unassign))
+        .route("/api/v1/admin/reports/:id/reopen", post(endpoints::admin_reports::reopen))
+        .route("/api/v1/admin/reports/:id/resolve", post(endpoints::admin_reports::resolve))
+        .merge(endpoints::admin_infra::routes())
+        // Trends (Phase 7.3): public approved-only reads.
+        .route("/api/v1/trends", get(endpoints::trends::trends_alias))
+        .route("/api/v1/trends/tags", get(endpoints::trends::tags_index))
+        .route("/api/v1/trends/links", get(endpoints::trends::links_index))
+        .route("/api/v1/trends/statuses", get(endpoints::trends::statuses_index))
+        .route("/api/v1/admin/trends/tags", get(endpoints::admin_trends::tags_index))
+        .route("/api/v1/admin/trends/tags/:id/approve", post(endpoints::admin_trends::tags_approve))
+        .route("/api/v1/admin/trends/tags/:id/reject", post(endpoints::admin_trends::tags_reject))
+        .route("/api/v1/admin/trends/links", get(endpoints::admin_trends::links_index))
+        .route("/api/v1/admin/trends/links/:id/approve", post(endpoints::admin_trends::links_approve))
+        .route("/api/v1/admin/trends/links/:id/reject", post(endpoints::admin_trends::links_reject))
+        .route("/api/v1/admin/trends/links/publishers", get(endpoints::admin_trends::publishers_index))
+        .route("/api/v1/admin/trends/links/publishers/:id/approve", post(endpoints::admin_trends::publishers_approve))
+        .route("/api/v1/admin/trends/links/publishers/:id/reject", post(endpoints::admin_trends::publishers_reject))
+        .route("/api/v1/admin/trends/statuses", get(endpoints::admin_trends::statuses_index))
+        .route("/api/v1/admin/trends/statuses/:id/approve", post(endpoints::admin_trends::statuses_approve))
+        .route("/api/v1/admin/trends/statuses/:id/reject", post(endpoints::admin_trends::statuses_reject))
+        // Annual reports (Phase 7.3): `:id` is the year.
+        .route("/api/v1/annual_reports", get(endpoints::annual_reports::index))
+        .route("/api/v1/annual_reports/:id", get(endpoints::annual_reports::show))
+        .route("/api/v1/annual_reports/:id/state", get(endpoints::annual_reports::show_state))
+        .route("/api/v1/annual_reports/:id/generate", post(endpoints::annual_reports::generate))
+        .route("/api/v1/annual_reports/:id/read", post(endpoints::annual_reports::mark_read))
         .route(
             "/api/v1/statuses/:id/quotes",
             get(endpoints::statuses::quotes_index),
@@ -412,6 +490,7 @@ pub fn build_router(state: ApiState) -> Router {
         // Malformed JSON is refused before any handler runs (Rails parses
         // params before the action); this sits inside the rate limiter, which
         // runs first, as Rack::Attack does upstream.
+        .layer(middleware::from_fn_with_state(ip_block_state, endpoints::admin_infra::ip_block_middleware))
         .layer(middleware::from_fn(json_body::guard))
         .layer(middleware::from_fn_with_state(rate_multiplier, rate_limits::middleware))
         .layer(middleware::from_fn(vary_authorization))

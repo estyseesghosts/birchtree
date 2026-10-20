@@ -275,7 +275,17 @@ pub fn create_status(
     // Pre-resolved mentions and tags. The quoted author's silent mention is
     // added by the store via `NewQuoteSpec.quoted_account_id`, not here.
     let handles = extract_mention_handles(&text);
-    let tags = extract_tags(&text);
+    // D25: normalize at write — `#café` and `#cafe` store as one tag.
+    let tags = {
+        let mut normalized = Vec::new();
+        for raw in extract_tags(&text) {
+            let tag = normalize_tag(&raw);
+            if !tag.is_empty() && !normalized.contains(&tag) {
+                normalized.push(tag);
+            }
+        }
+        normalized
+    };
     let local_domain = host_from_url(base_url);
     let mentions = resolve_mentions(store, &handles, Some(&local_domain));
 
@@ -905,7 +915,10 @@ fn url_regex() -> &'static Regex {
 
 fn tag_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"#([A-Za-z0-9_]+)").expect("valid tag regex"))
+    // D25: the body admits Unicode letters/digits plus upstream's
+    // `HASHTAG_INVALID_CHARS_RE` extras; `normalize_tag` canonicalizes each
+    // capture at write time (so `#café` stores as `cafe`).
+    RE.get_or_init(|| Regex::new(r"#([\p{L}\p{N}_·・\u{200c}\u{0e47}-\u{0e4e}]+)").expect("valid tag regex"))
 }
 
 fn mention_regex() -> &'static Regex {
@@ -916,14 +929,94 @@ fn mention_regex() -> &'static Regex {
     })
 }
 
-/// Normalize a hashtag wire value the way tags are stored (lowercased,
-/// `#`-stripped, invalid characters removed) — mirrors Mastodon's
-/// `HashtagNormalizer` for the local profile.
+/// Normalize a hashtag wire value the way tags are stored — mirrors Mastodon
+/// v4.7.3 `HashtagNormalizer` (`cjk_width` + `lowercase` + `ascii_folding` +
+/// `remove_invalid_characters`):
+///
+/// 1. strip leading `#`/`＃`, apply NFKC *compatibility* folds that matter for
+///    hashtags (fullwidth ASCII `Ａ`→`A`, common ligatures `ﬁ`→`fi`, drop
+///    combining marks so `e`+`́` and `é` converge);
+/// 2. Unicode-lowercase;
+/// 3. ASCII-fold accented Latin (`é`→`e`, from upstream's `ASCIIFolding`
+///    table), so `#café` and `#cafe` are one tag;
+/// 4. drop everything outside letters/digits plus upstream
+///    `HASHTAG_INVALID_CHARS_RE`'s extras (`_`, `·`, `・`, ZWNJ, Thai
+///    `U+0E47`–`U+0E4E`).
+///
+/// This is a hand-rolled NFKC *subset*: full Han/emoji compatibility
+/// decompositions and halfwidth katakana are out of scope (see
+/// `DEPENDENCY-REQUEST` in the Phase 7 report — the `unicode-normalization`
+/// crate would replace steps 1–2 with true NFKC). Every behavior the old
+/// implementation had (ASCII lowercase + alnum/`_` keep) is preserved.
 pub fn normalize_tag(raw: &str) -> String {
-    raw.trim_start_matches('#')
-        .to_ascii_lowercase()
+    let stripped = raw.trim_start_matches(['#', '＃']);
+    let folded = nfkc_compat_fold(stripped);
+    ascii_fold(&folded.to_lowercase())
         .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '_')
+        .filter(|c| {
+            c.is_alphanumeric()
+                || *c == '_'
+                || *c == '·'
+                || *c == '・'
+                || *c == '\u{200c}'
+                || ('\u{0e47}'..='\u{0e4e}').contains(c)
+        })
+        .collect()
+}
+
+/// NFKC compatibility folding, hashtag-scoped subset (see [`normalize_tag`]).
+/// Fullwidth ASCII maps to ASCII, the ideographic space is dropped (it would
+/// be an invalid tag char anyway), common Latin ligatures expand, and
+/// combining marks are stripped so precomposed and decomposed forms converge.
+/// Anything unrecognized passes through to the invalid-character filter.
+fn nfkc_compat_fold(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        // Fullwidth ASCII `！`..`～` folds to ASCII by a fixed offset.
+        if ('\u{ff01}'..='\u{ff5e}').contains(&c) {
+            // `char` arithmetic: the offset is a compile-time constant and
+            // the range guarantees a valid scalar value.
+            let ascii = (c as u32).wrapping_sub(0xfee0);
+            out.push(char::from_u32(ascii).unwrap_or(c));
+        } else if c == '\u{3000}' {
+            // Ideographic space -> space -> dropped as invalid.
+        } else if ('\u{0300}'..='\u{036f}').contains(&c)
+            || ('\u{1ab0}'..='\u{1aff}').contains(&c)
+            || ('\u{1dc0}'..='\u{1dff}').contains(&c)
+            || ('\u{20d0}'..='\u{20ff}').contains(&c)
+            || ('\u{fe20}'..='\u{fe2f}').contains(&c)
+        {
+            // Combining mark: stripped.
+        } else {
+            match c {
+                'ﬁ' => out.push_str("fi"),
+                'ﬂ' => out.push_str("fl"),
+                'ﬀ' => out.push_str("ff"),
+                'ﬃ' => out.push_str("ffi"),
+                'ﬄ' => out.push_str("ffl"),
+                'ﬅ' => out.push_str("ft"),
+                'ﬆ' => out.push_str("st"),
+                _ => out.push(c),
+            }
+        }
+    }
+    out
+}
+
+/// Upstream `ASCIIFolding`: accented Latin maps to plain ASCII so tags that
+/// differ only by diacritics converge. Table copied from Mastodon v4.7.3
+/// `app/lib/ascii_folding.rb`.
+fn ascii_fold(input: &str) -> String {
+    const FROM: &str = "ÀÁÂÃÄÅàáâãäåĀāĂăĄąÇçĆćĈĉĊċČčÐðĎďĐđÈÉÊËèéêëĒēĔĕĖėĘęĚěĜĝĞğĠġĢģĤĥĦħÌÍÎÏìíîïĨĩĪīĬĭĮįİıĴĵĶķĸĹĺĻļĽľĿŀŁłÑñŃńŅņŇňŉŊŋÒÓÔÕÖØòóôõöøŌōŎŏŐőŔŕŖŗŘřŚśŜŝŞşŠšſŢţŤťŦŧÙÚÛÜùúûüŨũŪūŬŭŮůŰűŲųŴŵÝýÿŶŷŸŹźŻżŽž";
+    const TO: &str = "AAAAAAaaaaaaAaAaAaCcCcCcCcCcDdDdDdEEEEeeeeEeEeEeEeEeGgGgGgGgHhHhIIIIiiiiIiIiIiIiIiJjKkkLlLlLlLlLlNnNnNnNnnNnOOOOOOooooooOoOoOoRrRrRrSsSsSsSssTtTtTtUUUUuuuuUuUuUuUuUuUuWwYyyYyYZzZzZz";
+    input
+        .chars()
+        .map(|c| {
+            FROM.chars()
+                .zip(TO.chars())
+                .find_map(|(from, to)| (from == c).then_some(to))
+                .unwrap_or(c)
+        })
         .collect()
 }
 

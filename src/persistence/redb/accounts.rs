@@ -7,7 +7,7 @@ use redb::ReadableTable;
 use crate::application::ports::{
     AccountProfileUpdate, AccountStore, NewLocalAccount, UserSettingsUpdate,
 };
-use crate::domain::{Account, Error, Id, LocalUser, Result};
+use crate::domain::{Account, Error, Id, LocalUser, Result, UserRole};
 
 use super::schema::{ACCOUNTS, HANDLE_INDEX, LOCAL_USERS};
 use super::{decode, encode, RedbStore, StoreResult};
@@ -63,6 +63,8 @@ impl AccountStore for RedbStore {
             local: true,
             locked: false,
             suspended: false,
+            silenced: false,
+            sensitized: false,
             moved_to: None,
             created_at_ms: input.now_ms,
         };
@@ -78,6 +80,9 @@ impl AccountStore for RedbStore {
             default_sensitive: None,
             default_language: None,
             default_quote_policy: None,
+            home_mention_policy: None,
+            // New accounts start role-less; operators grant roles via the CLI.
+            role: UserRole::None,
         };
 
         {
@@ -254,6 +259,27 @@ impl AccountStore for RedbStore {
         if let Some(v) = update.default_quote_policy {
             user.default_quote_policy = Some(v);
         }
+        if let Some(v) = update.home_mention_policy {
+            user.home_mention_policy = Some(v);
+        }
+        {
+            let mut users = write.open_table(LOCAL_USERS)?;
+            users.insert(account_id.value(), encode(&user)?.as_slice())?;
+        }
+        write.commit()?;
+        Ok(user)
+    }
+
+    fn set_user_role(&self, account_id: Id, role: UserRole) -> Result<LocalUser> {
+        let write = self.begin_write()?;
+        let mut user: LocalUser = {
+            let users = write.open_table(LOCAL_USERS)?;
+            match users.get(account_id.value())? {
+                Some(guard) => decode(guard.value())?,
+                None => return Err(Error::NotFound(format!("local user for {account_id}"))),
+            }
+        };
+        user.role = role;
         {
             let mut users = write.open_table(LOCAL_USERS)?;
             users.insert(account_id.value(), encode(&user)?.as_slice())?;

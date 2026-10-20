@@ -154,9 +154,6 @@ pub fn parse_focus(value: &str) -> Result<Option<FocusPoint>> {
 pub fn upload_media(
     store: &dyn Store,
     blobs: &dyn BlobStore,
-    // Kept for signature symmetry with the other media use cases: attachment
-    // URLs are rendered by `dto::media_file_url` from the committed
-    // `file_key`, so the base URL is not needed while staging.
     _server_public_url: &str,
     now_ms: u64,
     account_id: Id,
@@ -166,6 +163,70 @@ pub fn upload_media(
     focus: Option<&str>,
     delay: bool,
     max_file_size: u64,
+) -> Result<MediaAttachment> {
+    stage_and_finish_upload(
+        store,
+        blobs,
+        now_ms,
+        account_id,
+        file_bytes,
+        thumbnail_bytes,
+        description,
+        focus,
+        delay,
+        max_file_size,
+        None,
+    )
+}
+
+/// Config-aware upload (Phase 7.1): when `config` is `Some` and enabled,
+/// formats that need a transcode defer on `delay` (v2 → 202) and transcode
+/// inline otherwise (v1 → 200). With `None` (or disabled) the legacy
+/// lifecycle is kept exactly.
+pub fn upload_media_with_config(
+    store: &dyn Store,
+    blobs: &dyn BlobStore,
+    now_ms: u64,
+    account_id: Id,
+    file_bytes: &[u8],
+    thumbnail_bytes: Option<&[u8]>,
+    description: &str,
+    focus: Option<&str>,
+    delay: bool,
+    max_file_size: u64,
+    config: Option<&crate::media::transcode::TranscodeConfig>,
+) -> Result<MediaAttachment> {
+    stage_and_finish_upload(
+        store,
+        blobs,
+        now_ms,
+        account_id,
+        file_bytes,
+        thumbnail_bytes,
+        description,
+        focus,
+        delay,
+        max_file_size,
+        config,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_and_finish_upload(
+    store: &dyn Store,
+    blobs: &dyn BlobStore,
+    // Kept for signature symmetry with the other media use cases: attachment
+    // URLs are rendered by `dto::media_file_url` from the committed
+    // `file_key`, so the base URL is not needed while staging.
+    now_ms: u64,
+    account_id: Id,
+    file_bytes: &[u8],
+    thumbnail_bytes: Option<&[u8]>,
+    description: &str,
+    focus: Option<&str>,
+    delay: bool,
+    max_file_size: u64,
+    config: Option<&crate::media::transcode::TranscodeConfig>,
 ) -> Result<MediaAttachment> {
     // 1. A missing/blank file param.
     if file_bytes.is_empty() {
@@ -237,13 +298,15 @@ pub fn upload_media(
         now_ms,
     )?;
 
-    // Inline processing (v1 always; v2 only when the format is not a larger
-    // one). The committed job stays queued and is a no-op when a worker
-    // replays it — `process_media_job` is idempotent.
-    if delay && media.larger_media_format() {
+    // Inline processing (v1 always; v2 only when the format needs no
+    // deferred work). The committed job stays queued and is a no-op when a
+    // worker replays it — processing is idempotent.
+    let transcode_deferred = config.is_some_and(|c| c.enabled)
+        && crate::media::transcode::needs_transcode(&media.mime_type);
+    if delay && (media.larger_media_format() || transcode_deferred) {
         return Ok(media);
     }
-    process_media_job(store, blobs, media.id, now_ms)?;
+    process_media_job_with_config(store, blobs, media.id, now_ms, config)?;
     let media = store
         .media_by_id(media.id)?
         .ok_or_else(|| Error::Internal("media row disappeared after upload".into()))?;
@@ -280,6 +343,42 @@ fn sniff_accepted(bytes: &[u8]) -> Option<Sniffed> {
 /// media type" style reason) and still complete the job; ONLY a missing
 /// staged blob returns `Err` so the job is retried (transient storage).
 pub fn process_media_job(
+    store: &dyn Store,
+    blobs: &dyn BlobStore,
+    media_id: Id,
+    now_ms: u64,
+) -> Result<()> {
+    process_media_job_with_config(store, blobs, media_id, now_ms, None)
+}
+
+/// Config-aware processing finish: rows whose MIME needs a transcode take
+/// the ffmpeg pipeline when `config` is `Some` and enabled (Phase 7.1);
+/// every other row — and every row when no config is threaded (sync drains,
+/// unit tests) — takes the legacy pure-Rust finish.
+pub fn process_media_job_with_config(
+    store: &dyn Store,
+    blobs: &dyn BlobStore,
+    media_id: Id,
+    now_ms: u64,
+    config: Option<&crate::media::transcode::TranscodeConfig>,
+) -> Result<()> {
+    if let Some(media) = store.media_by_id(media_id)? {
+        if !matches!(media.state, MediaState::Ready | MediaState::Failed)
+            && crate::media::transcode::needs_transcode(&media.mime_type)
+            && config.is_some_and(|c| c.enabled)
+        {
+            let config = config.expect("checked above");
+            return crate::media::transcode::run_transcode_job(
+                store, blobs, media_id, now_ms, config,
+            );
+        }
+    }
+    process_media_job_legacy(store, blobs, media_id, now_ms)
+}
+
+/// Legacy pure-Rust finish (pre-7.1 behavior, kept for untranscoded types
+/// and for callers without a toolchain).
+fn process_media_job_legacy(
     store: &dyn Store,
     blobs: &dyn BlobStore,
     media_id: Id,

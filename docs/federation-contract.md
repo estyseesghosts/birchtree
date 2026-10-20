@@ -174,3 +174,4 @@ were investigated with wire + code evidence and found not ours:
   code shape, only `mediaType`/count differ) is unexercised over
   federation. Cosmetic only: we emit `"name": ""` where Mastodon omits
   null `name` (harmless: `.presence` → nil).
+- Phase 7.1 transcodes local uploads (GIF → WebM/VP9 typed `video`, video → WebM/VP9 + Opus, stills → WebP; `gifv` never produced). Remote peers therefore receive attachment bytes, `url`s and `meta` that differ from what the uploading client sent, and remote caches keyed on the original bytes will miss. This is a deliberate, registered deviation (D1–D4): bytes legitimately change. Transcoding never alters visibility, ownership, or attachment ordering — only the stored bytes, wire `type` (GIF `image` → `video`), and derived `meta` — so quote authorization, fetchability, and thread linkage are unaffected.

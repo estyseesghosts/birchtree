@@ -34,6 +34,9 @@ pub(crate) fn process(core: &Core, event: StreamEvent) {
         StreamEvent::PolicyChanged { viewers } => core.bump_epochs(&viewers),
         StreamEvent::Retract { viewer, statuses } => retract(core, viewer, &statuses),
         StreamEvent::TokenRevoked { token_id } => core.close_token(token_id),
+        StreamEvent::Conversation { viewer_id, status_id } => {
+            conversation(core, viewer_id, status_id)
+        }
     }
 }
 
@@ -257,8 +260,29 @@ fn retract(core: &Core, viewer: Id, statuses: &[Status]) {
     }
 }
 
-fn deliver_json(core: &Core, conn: &Arc<Connection>, sub: &Subscription, event: &'static str, payload: &Value) {
-    match serde_json::to_string(payload) {
+/// A conversation thread changed: deliver a `conversation` event on the
+/// `direct` stream of the named viewer (Phase 7, closes D18).
+fn conversation(core: &Core, viewer: Id, status_id: Id) {
+    let now = core.clock.now_ms();
+    let payload = match crate::api::mastodon::endpoints::conversations::render_conversation_event(
+        &core.server,
+        &*core.store,
+        viewer,
+        status_id,
+        now,
+    ) {
+        Ok(Some(payload)) => payload,
+        Ok(None) => return,
+        Err(err) => return warn("conversation render", err),
+    };
+    for (conn, sub) in core.subscriptions() {
+        if sub.viewer == viewer && matches!(sub.kind, StreamKind::Direct) {
+            deliver_json(core, &conn, &sub, "conversation", &payload);
+        }
+    }
+}
+
+fn deliver_json(core: &Core, conn: &Arc<Connection>, sub: &Subscription, event: &'static str, payload: &Value) {    match serde_json::to_string(payload) {
         Ok(text) => core.deliver(conn, Frame::new(event, sub.names.clone(), Arc::from(text))),
         Err(err) => warn("payload encode", err),
     }

@@ -708,8 +708,17 @@ async fn direct_and_remote_public_streams_authorize_and_stay_quiet() {
     let mut direct = open_sse(addr, "/api/v1/streaming/direct", Some(&alice)).await;
     let mut remote = open_sse(addr, "/api/v1/streaming/public/remote", Some(&alice)).await;
     post(&srv, &alice, "nothing for direct", "direct").await;
+    // D18 closed (Phase 7): the author's own direct status opens a
+    // conversation thread, so `direct` carries one `conversation` event.
     let direct_events = events_only(&direct.collect(QUIET).await);
-    assert!(direct_events.is_empty(), "conversations arrive with Phase 7: {direct_events:?}");
+    let conversation_count = direct_events
+        .iter()
+        .filter(|block| matches!(block, Block::Event { name, .. } if name == "conversation"))
+        .count();
+    assert_eq!(
+        conversation_count, 1,
+        "direct carries the conversation event: {direct_events:?}"
+    );
     let remote_events = events_only(&remote.collect(QUIET).await);
     assert!(remote_events.is_empty(), "{remote_events:?}");
 }

@@ -335,6 +335,7 @@ async fn membership_requires_follow_and_cascades_on_unfollow() {
             birchtree::application::ports::FollowOptions {
                 show_reblogs: true,
                 notify: false,
+                languages: None,
             },
             false,
             1_700_000_000_000,

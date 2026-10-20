@@ -323,6 +323,63 @@ pub fn apply(db: &Database) -> Result<u64, StoreError> {
             }
         }
 
+        // Step v8: admin infrastructure rows (Phase 7.3, subagent C). Tables
+        // only; no backfill (the domain allow/block lists start empty, and
+        // tag rows materialize from hashtag usage on first admin read).
+        if current < 8 {
+            let _ = write.open_table(schema::ADMIN_DOMAIN_ALLOWS)?;
+            let _ = write.open_table(schema::ADMIN_DOMAIN_ALLOW_BY_DOMAIN)?;
+            let _ = write.open_table(schema::ADMIN_DOMAIN_BLOCKS)?;
+            let _ = write.open_table(schema::ADMIN_DOMAIN_BLOCK_BY_DOMAIN)?;
+            let _ = write.open_table(schema::ADMIN_EMAIL_DOMAIN_BLOCKS)?;
+            let _ = write.open_table(schema::ADMIN_EMAIL_DOMAIN_BLOCK_BY_DOMAIN)?;
+            let _ = write.open_table(schema::ADMIN_IP_BLOCKS)?;
+            let _ = write.open_table(schema::ADMIN_IP_BLOCK_BY_IP)?;
+            let _ = write.open_table(schema::ADMIN_CANONICAL_EMAIL_BLOCKS)?;
+            let _ = write.open_table(schema::ADMIN_CANONICAL_EMAIL_BLOCK_BY_HASH)?;
+            let _ = write.open_table(schema::ADMIN_TAGS)?;
+            let _ = write.open_table(schema::ADMIN_TAG_BY_NAME)?;
+        }
+
+        // Step v8: admin audit trail (Phase 7.3). REPORTS already exists
+        // (v7); the audit table is new. No backfill: pre-7.3 databases have
+        // no admin writes to record (the admin routes did not exist).
+        if current < 8 {
+            let _ = write.open_table(schema::ADMIN_AUDIT)?;
+        }
+
+        // Step v8: trend approval flags/candidates and annual reports (Phase
+        // 7.3, trends workstream). Tables only; candidate rows materialize
+        // from real usage on read (hashtag index, recent public statuses,
+        // URLs in status text), so there is nothing to backfill.
+        if current < 8 {
+            let _ = write.open_table(schema::TREND_TAG_FLAGS)?;
+            let _ = write.open_table(schema::TREND_STATUS_FLAGS)?;
+            let _ = write.open_table(schema::TREND_LINKS)?;
+            let _ = write.open_table(schema::TREND_LINKS_BY_URL)?;
+            let _ = write.open_table(schema::TREND_PUBLISHERS)?;
+            let _ = write.open_table(schema::TREND_PUBLISHERS_BY_DOMAIN)?;
+            let _ = write.open_table(schema::ANNUAL_REPORTS)?;
+            let _ = write.open_table(schema::ANNUAL_REPORTS_BY_ACCOUNT)?;
+            let _ = write.open_table(schema::ADMIN_AUDIT_BY_TARGET)?;
+        }
+
+        // Step v9: Phase 7 conversation state/mutes, push subscriptions, and
+        // web/tag rows. Tables only; per-viewer state, subscriptions, tag
+        // follows and featured tags materialize from real client writes, so
+        // there is nothing to backfill.
+        if current < 9 {
+            let _ = write.open_table(schema::CONVERSATION_STATE)?;
+            let _ = write.open_table(schema::CONVERSATION_MUTES)?;
+            let _ = write.open_table(schema::PUSH_SUBSCRIPTIONS)?;
+            let _ = write.open_table(schema::PUSH_SUBSCRIPTION_BY_TOKEN)?;
+            let _ = write.open_table(schema::PUSH_SUBSCRIPTIONS_BY_USER)?;
+            let _ = write.open_table(schema::WEB_SETTINGS)?;
+            let _ = write.open_table(schema::WEB_PUSH_SUBSCRIPTIONS)?;
+            let _ = write.open_table(schema::TAG_FOLLOWS)?;
+            let _ = write.open_table(schema::FEATURED_TAGS)?;
+        }
+
         {
             let mut meta = write.open_table(META)?;
             meta.insert(

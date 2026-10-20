@@ -10,8 +10,11 @@ pub mod accounts;
 pub mod oauth;
 pub mod jobs;
 
+pub mod admin_infra;
 pub mod statuses;
 pub mod relationships;
+pub mod conversations_push;
+pub mod web;
 pub mod quotes;
 pub mod polls;
 pub mod media;
@@ -20,6 +23,7 @@ pub mod notifications;
 // Phase 4 storage modules: timelines, lists, markers, filters, scheduled
 // statuses and custom emoji.
 pub mod timelines;
+pub mod trends;
 pub mod lists;
 pub mod markers;
 pub mod filters;
@@ -30,6 +34,12 @@ pub mod search;
 // Phase 6: federation keys, remote accounts, inbound dedup and follow commands.
 pub mod federation;
 pub mod federation_content;
+
+// Phase 7.3: admin account moderation, the moderator report queue and the
+// audit trail (subagent B). Shares the `ADMIN_AUDIT` table with subagent C's
+// `AdminInfraStore` audit writes (same record shape, `target_type`
+// distinguishes rows).
+pub mod admin;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

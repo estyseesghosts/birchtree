@@ -75,6 +75,15 @@ pub fn fan_out_from_payload(store: &dyn Store, payload: &Value) -> Result<Option
     if actor_id == Some(recipient_id) {
         return Ok(None);
     }
+    // D26 `NotifyService::DropCondition` parity: never create a notification
+    // across a block (either direction), a mute, or a domain block. A domain
+    // block still delivers when the recipient follows the actor, exactly as
+    // upstream's `domain_blocking?` requires `not_following?`.
+    if let Some(actor_id) = actor_id {
+        if notification_drop(store, recipient_id, actor_id, created_at_ms)? {
+            return Ok(None);
+        }
+    }
     let created = store.create_notification(NewNotification {
         recipient_id,
         r#type: kind,
@@ -83,6 +92,45 @@ pub fn fan_out_from_payload(store: &dyn Store, payload: &Value) -> Result<Option
         created_at_ms,
     })?;
     Ok(created.map(|notification| notification.id))
+}
+
+/// D26: whether a notification from `actor` to `recipient` must be dropped at
+/// creation (upstream `NotifyService::DropCondition`, minus the filter-policy,
+/// conversation-mute and staff branches, which have no birchtree counterpart).
+///
+/// Drops when the recipient blocks the actor, is blocked by the actor, mutes
+/// the actor (any active mute — deliberately broader than upstream, which
+/// only honors notification-hiding mutes; see the D26 report note), or
+/// domain-blocks the actor's domain while not following them. Missing actor
+/// accounts fail closed (drop): a notification from an unknown account is
+/// never deliverable.
+///
+/// Retroactive rule (operator question): pre-existing notifications are LEFT
+/// in place when a block/mute/domain-block lands later. Rationale: stored
+/// notifications are a historical record behind the `markers` read cursor
+/// (`unread_count` counts `id > last_read_id`); upstream's `NotifyService`
+/// has no retroactive deletion either, and open streams already retract via
+/// `retraction_candidates`. No cleanup job is wired.
+pub fn notification_drop(
+    store: &dyn Store,
+    recipient_id: Id,
+    actor_id: Id,
+    now_ms: u64,
+) -> Result<bool> {
+    let pair = store.pair_state(recipient_id, actor_id, now_ms)?;
+    if pair.blocking || pair.blocked_by || pair.muting {
+        return Ok(true);
+    }
+    let Some(actor) = store.account_by_id(actor_id)? else {
+        return Ok(true);
+    };
+    let rows = store.relationships(recipient_id, &[(actor_id, actor.domain)], now_ms)?;
+    if let Some(row) = rows.first() {
+        if row.domain_blocking && !row.following {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 // ---------------------------------------------------------------------------

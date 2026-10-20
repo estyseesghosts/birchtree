@@ -17,6 +17,7 @@ use crate::api::oauth::consent_page;
 use crate::api::oauth::pkce;
 use crate::api::oauth::scopes;
 use crate::application::auth;
+use crate::application::crypto;
 use crate::application::ports::Store;
 use crate::domain::{Id, OAuthApplication};
 
@@ -166,6 +167,17 @@ fn session_cookie(state: &ApiState, token: &str) -> String {
     format!("{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400{secure}")
 }
 
+/// Double-submit CSRF cookie for `/api/web/*` (readable by first-party JS;
+/// must be echoed back as `X-CSRF-Token` on state-changing requests).
+fn csrf_cookie(state: &ApiState, token: &str) -> String {
+    let secure = if state.server.public_url.starts_with("https://") {
+        "; Secure"
+    } else {
+        ""
+    };
+    format!("birchtree_csrf={token}; Path=/; SameSite=Lax; Max-Age=86400{secure}")
+}
+
 fn redirect_with(redirect_uri: &str, params: &[(&str, String)]) -> Response {
     let separator = if redirect_uri.contains('?') { '&' } else { '?' };
     let query = params
@@ -274,6 +286,14 @@ pub async fn authorize_post(
                             header::HeaderValue::from_str(&session_cookie(&state, &plaintext))
                         {
                             response.headers_mut().insert(header::SET_COOKIE, value);
+                        }
+                        // Double-submit CSRF cookie for `/api/web/*`
+                        // (readable by first-party JS; must be echoed back
+                        // as `X-CSRF-Token` on state-changing requests).
+                        let csrf = crypto::random_token_hex(32);
+                        if let Ok(value) = header::HeaderValue::from_str(&csrf_cookie(&state, &csrf))
+                        {
+                            response.headers_mut().append(header::SET_COOKIE, value);
                         }
                         return response;
                     }

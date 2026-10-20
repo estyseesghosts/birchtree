@@ -155,8 +155,10 @@ pub async fn index(State(state): State<ApiState>, auth: OptionalAuth, uri: Uri) 
     } else {
         None
     };
-    match search::search(
+    match search::search_with_mode(
+        state.server.search_mode,
         store,
+        Some(crate::search::global()),
         viewer,
         &query,
         kind.as_deref(),

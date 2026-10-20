@@ -51,6 +51,26 @@ pub enum JobKind {
     CrawlReplies,
     /// Fetch a remote attachment's bytes and stage them for processing (Phase 6).
     FetchRemoteMedia,
+    /// Generate an annual report for one account and year (Phase 7.3). The
+    /// handler computes real stats from local records and inserts the row
+    /// idempotently; a retry after commit is a no-op.
+    GenerateAnnualReport,
+    /// Re-index (or remove) one status in the embedded search index
+    /// (Phase 7.2). Create/edit/delete/visibility-change all converge here;
+    /// the handler is idempotent.
+    SearchIndexStatus,
+    /// One bounded batch of the search backfill (Phase 7.2). The payload
+    /// carries the resume cursor; each batch enqueues its follow-up.
+    SearchBackfill,
+    /// Run the Phase 7.1 ffmpeg transcode for one attachment.
+    TranscodeMedia,
+    /// Deliver one Web Push tickle (Phase 7):
+    /// `{subscription_id, notification_id}`.
+    WebPushDelivery,
+    /// One bounded batch of the tag-normalization backfill (Phase 7, D25).
+    /// The payload carries the resume cursor; each batch enqueues its
+    /// follow-up until a pass plans nothing.
+    TagBackfill,
 }
 
 impl JobKind {
@@ -68,6 +88,12 @@ impl JobKind {
             JobKind::ResolveParent => "resolve_parent",
             JobKind::CrawlReplies => "crawl_replies",
             JobKind::FetchRemoteMedia => "fetch_remote_media",
+            JobKind::GenerateAnnualReport => "generate_annual_report",
+            JobKind::SearchIndexStatus => "search_index_status",
+            JobKind::SearchBackfill => "search_backfill",
+            JobKind::TranscodeMedia => "transcode_media",
+            JobKind::WebPushDelivery => "web_push_delivery",
+            JobKind::TagBackfill => "tag_backfill",
         }
     }
 }

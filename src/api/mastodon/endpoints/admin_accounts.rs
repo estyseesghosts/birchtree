@@ -1,0 +1,531 @@
+//! Admin account moderation (`GET /api/v1/admin/accounts*`,
+//! `GET /api/v2/admin/accounts`, and the per-account member actions).
+//!
+//! Contracts follow Mastodon v4.7.3
+//! (`app/controllers/api/v1/admin/accounts_controller.rb` and
+//! `app/controllers/api/v2/admin/accounts_controller.rb`):
+//! user token + moderator-or-admin role (role check before scope check),
+//! `admin:read`/`admin:read:accounts` for reads and
+//! `admin:write`/`admin:write:accounts` for writes, `Link` cursors, and
+//! `REST::Admin::AccountSerializer` rows.
+//!
+//! The role gate lives in [`gate`] (one small function; if subagent A's
+//! `Authenticated::require_admin` shape changes, only it needs an edit).
+
+use axum::extract::{Path, State};
+use axum::http::{header, HeaderValue, Uri};
+use axum::response::{IntoResponse, Response};
+use serde_json::{Value, json};
+
+use crate::api::forms::{self, LenientForm};
+use crate::api::mastodon::auth::{AdminArea, Auth, Authenticated};
+use crate::api::mastodon::dto;
+use crate::api::mastodon::errors::{ApiError, ApiResult};
+use crate::api::mastodon::pagination;
+use crate::api::mastodon::ApiState;
+use crate::application::admin as admin_uc;
+use crate::application::ports::{AccountStore, AdminAccountFilter, AdminAccountPatch, Store};
+use crate::domain::{Account, Id, LocalUser, UserRole};
+
+const READ_SCOPES: &[&str] = &["admin:read", "admin:read:accounts"];
+const WRITE_SCOPES: &[&str] = &["admin:write", "admin:write:accounts"];
+
+/// Role-before-scope gate for every route in this module: app-only tokens
+/// get `422`, role-less users `403 {"error":"Forbidden"}`, and in-scope
+/// failures `403` with the scopes message. Returns the actor and its role.
+fn gate(
+    auth: &Authenticated,
+    store: &dyn Store,
+    scopes: &[&str],
+) -> ApiResult<(Id, UserRole)> {
+    let store: &dyn AccountStore = store;
+    let role = auth.require_admin(store, AdminArea::Accounts, scopes)?;
+    let viewer = auth.require_user()?;
+    Ok((viewer, role))
+}
+
+/// Mastodon's ISO-8601 with milliseconds (`created_at` on the wire).
+fn iso(ms: u64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64)
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+        .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string())
+}
+
+fn opt_or_null(value: Option<String>) -> Value {
+    value.map(Value::String).unwrap_or(Value::Null)
+}
+
+/// `REST::Admin::AccountSerializer` (verified field list from
+/// `app/serializers/rest/admin/account_serializer.rb`).
+///
+/// Gaps (all recorded as planned gaps, never fabricated rows):
+/// - `ip`/`ips`: birchtree stores no login IPs → `null`/`[]`.
+/// - `locale`/`invite_request`/`created_by_application_id`/
+///   `invited_by_account_id`: no invite/locale storage → `null`.
+/// - `approved`: no pending-approval state (Phase 2 gap) → always `true`.
+/// - `role`: birchtree roles have no numeric ids or permission bitmask; the
+///   id is the role name and permissions stay empty.
+pub fn admin_account_json(
+    server: &crate::api::mastodon::ServerInfo,
+    account: &Account,
+    user: Option<&LocalUser>,
+) -> Value {
+    let (role_id, role_name) = match user.map(|u| u.role).unwrap_or(UserRole::None) {
+        UserRole::Admin => ("admin", "Admin"),
+        UserRole::Moderator => ("moderator", "Moderator"),
+        UserRole::None => ("user", "User"),
+    };
+    json!({
+        "id": account.id.to_string(),
+        "username": account.username,
+        "domain": account.domain,
+        "created_at": iso(account.created_at_ms),
+        "email": opt_or_null(user.and_then(|u| u.email.clone())),
+        "ip": Value::Null,
+        "confirmed": user.map(|u| json!(u.email_verified)).unwrap_or(Value::Null),
+        "suspended": account.suspended,
+        "silenced": account.silenced,
+        "sensitized": account.sensitized,
+        "disabled": user.map(|u| json!(u.disabled)).unwrap_or(Value::Null),
+        "approved": true,
+        "locale": Value::Null,
+        "invite_request": Value::Null,
+        "created_by_application_id": Value::Null,
+        "invited_by_account_id": Value::Null,
+        "ips": [],
+        "account": dto::account_json(server, account),
+        "role": {
+            "id": role_id,
+            "name": role_name,
+            "permissions": "",
+            "color": "",
+            "highlighted": false,
+        },
+    })
+}
+
+fn parse_id(raw: &str) -> ApiResult<Id> {
+    raw.parse::<Id>().map_err(|_| ApiError::not_found())
+}
+
+fn parse_page(uri: &Uri) -> ApiResult<pagination::Page> {
+    let pairs = match uri.query() {
+        Some(query) => forms::parse(query.as_bytes()),
+        None => Vec::new(),
+    };
+    pagination::parse(
+        forms::get(&pairs, "limit"),
+        forms::get(&pairs, "max_id"),
+        forms::get(&pairs, "since_id"),
+        forms::get(&pairs, "min_id"),
+        100,
+        200,
+    )
+}
+
+/// Presence check (non-empty value), matching Rails' `present?`: upstream
+/// treats `?local=false` as present.
+fn present(pairs: &[(String, String)], key: &str) -> bool {
+    forms::get(pairs, key).is_some_and(|v| !v.is_empty())
+}
+
+/// Shared index body: filter, cursor, page, `Link`, serialize.
+fn index_response(
+    state: &ApiState,
+    uri: &Uri,
+    page: pagination::Page,
+    filter: AdminAccountFilter,
+) -> Response {
+    let store: &dyn Store = &*state.context.store;
+    // Upstream's `to_a_paginated_by_id`: a present `min_id` pages ascending.
+    let ascending = page.min_id.is_some();
+    let rows = match admin_uc::list_accounts(
+        store,
+        filter,
+        page.max_id,
+        page.since_id,
+        page.min_id,
+        ascending,
+        page.limit,
+    ) {
+        Ok(rows) => rows,
+        Err(err) => return ApiError::from(err).into_response(),
+    };
+    let body: Vec<Value> = rows
+        .iter()
+        .map(|(account, user)| admin_account_json(&state.server, account, user.as_ref()))
+        .collect();
+    let next = (rows.len() == page.limit)
+        .then(|| rows.last().map(|(a, _)| a.id))
+        .flatten();
+    let prev = rows.first().map(|(a, _)| a.id);
+    let mut response = axum::Json(body).into_response();
+    // Upstream omits pagination headers on an empty page.
+    if !rows.is_empty() {
+        if let Some(link) = pagination::link_header(uri, next, prev) {
+            if let Ok(value) = HeaderValue::from_str(&link) {
+                response.headers_mut().insert(header::LINK, value);
+            }
+        }
+    }
+    response
+}
+
+/// `GET /api/v1/admin/accounts` — upstream v1 filter flags.
+pub async fn index_v1(State(state): State<ApiState>, auth: Auth, uri: Uri) -> Response {
+    if let Err(err) = gate(&auth.0, &*state.context.store, READ_SCOPES) {
+        return err.into_response();
+    }
+    let page = match parse_page(&uri) {
+        Ok(page) => page,
+        Err(err) => return err.into_response(),
+    };
+    let pairs = match uri.query() {
+        Some(query) => forms::parse(query.as_bytes()),
+        None => Vec::new(),
+    };
+    // Upstream translation: default `origin=local, status=active`; `remote`
+    // flips the origin; each present status flag wins in order.
+    let mut status = Some(admin_uc::parse_status(Some("active")));
+    for flag in ["active", "pending", "disabled", "silenced", "suspended"] {
+        if present(&pairs, flag) {
+            status = Some(admin_uc::parse_status(Some(flag)));
+        }
+    }
+    let status = match status {
+        Some(Some(s)) => Some(s),
+        _ => None,
+    };
+    // Upstream default `origin=local`; a present `remote` flag flips it.
+    let local_only = Some(!present(&pairs, "remote"));
+    index_response(
+        &state,
+        &uri,
+        page,
+        AdminAccountFilter {
+            local_only,
+            by_domain: forms::get(&pairs, "by_domain").map(str::to_string),
+            status,
+            username_sub: forms::get(&pairs, "username").map(str::to_string),
+            display_name_sub: forms::get(&pairs, "display_name").map(str::to_string),
+            email_sub: forms::get(&pairs, "email").map(str::to_string),
+            ip_sub: forms::get(&pairs, "ip").map(str::to_string),
+            staff_only: present(&pairs, "staff"),
+            role_names: Vec::new(),
+        },
+    )
+}
+
+/// `GET /api/v2/admin/accounts` — upstream v2 filter names.
+pub async fn index_v2(State(state): State<ApiState>, auth: Auth, uri: Uri) -> Response {
+    if let Err(err) = gate(&auth.0, &*state.context.store, READ_SCOPES) {
+        return err.into_response();
+    }
+    let page = match parse_page(&uri) {
+        Ok(page) => page,
+        Err(err) => return err.into_response(),
+    };
+    let pairs = match uri.query() {
+        Some(query) => forms::parse(query.as_bytes()),
+        None => Vec::new(),
+    };
+    let local_only = match forms::get(&pairs, "origin") {
+        Some("local") => Some(true),
+        Some("remote") => Some(false),
+        _ => None,
+    };
+    // `invited_by`: no invite model exists, so a non-empty value matches
+    // nothing (documented gap).
+    let invited_by = forms::get(&pairs, "invited_by");
+    let mut filter = AdminAccountFilter {
+        local_only,
+        by_domain: forms::get(&pairs, "by_domain").map(str::to_string),
+        status: admin_uc::parse_status(forms::get(&pairs, "status")),
+        username_sub: forms::get(&pairs, "username").map(str::to_string),
+        display_name_sub: forms::get(&pairs, "display_name").map(str::to_string),
+        email_sub: forms::get(&pairs, "email").map(str::to_string),
+        ip_sub: forms::get(&pairs, "ip").map(str::to_string),
+        staff_only: forms::get(&pairs, "permissions") == Some("staff"),
+        role_names: forms::all(&pairs, "role_ids")
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    };
+    if invited_by.is_some_and(|v| !v.is_empty()) {
+        // No invite model: force an empty page honestly instead of ignoring
+        // the filter (which would leak unrelated rows).
+        filter.username_sub = Some("\u{10FFFF}".to_string());
+    }
+    index_response(&state, &uri, page, filter)
+}
+
+async fn load_target(
+    store: &dyn Store,
+    raw: &str,
+) -> Result<(Account, Option<LocalUser>), ApiError> {
+    let id = parse_id(raw)?;
+    let account = store
+        .account_by_id(id)
+        .map_err(ApiError::from)?
+        .ok_or_else(ApiError::not_found)?;
+    let user = store.user_by_account_id(id).map_err(ApiError::from)?;
+    Ok((account, user))
+}
+
+fn account_response(
+    state: &ApiState,
+    account: &Account,
+    user: Option<&LocalUser>,
+) -> Response {
+    axum::Json(admin_account_json(&state.server, account, user)).into_response()
+}
+
+/// `GET /api/v1/admin/accounts/:id`.
+pub async fn show(
+    State(state): State<ApiState>,
+    auth: Auth,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(err) = gate(&auth.0, &*state.context.store, READ_SCOPES) {
+        return err.into_response();
+    }
+    let store: &dyn Store = &*state.context.store;
+    match load_target(store, &id).await {
+        Ok((account, user)) => account_response(&state, &account, user.as_ref()),
+        Err(err) => err.into_response(),
+    }
+}
+
+/// `DELETE /api/v1/admin/accounts/:id` — immediate suspend + disable (no
+/// async deletion worker yet; statuses stay — a planned gap). Answers
+/// `200 {}` like upstream's `render_empty`.
+pub async fn destroy(
+    State(state): State<ApiState>,
+    auth: Auth,
+    Path(id): Path<String>,
+) -> Response {
+    let (actor, _) = match gate(&auth.0, &*state.context.store, WRITE_SCOPES) {
+        Ok(pair) => pair,
+        Err(err) => return err.into_response(),
+    };
+    let store: &dyn Store = &*state.context.store;
+    let target = match parse_id(&id) {
+        Ok(id) => id,
+        Err(err) => return err.into_response(),
+    };
+    match store.admin_delete_account(actor, target, "destroy", state.context.now_ms()) {
+        Ok(true) => axum::Json(json!({})).into_response(),
+        Ok(false) => ApiError::not_found().into_response(),
+        Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
+async fn patch_flag(
+    state: ApiState,
+    auth: Auth,
+    raw: &str,
+    audit_action: &'static str,
+    patch: AdminAccountPatch,
+    local_only: bool,
+) -> Response {
+    let (actor, _) = match gate(&auth.0, &*state.context.store, WRITE_SCOPES) {
+        Ok(pair) => pair,
+        Err(err) => return err.into_response(),
+    };
+    let store: &dyn Store = &*state.context.store;
+    let (account, user) = match load_target(store, raw).await {
+        Ok(pair) => pair,
+        Err(err) => return err.into_response(),
+    };
+    if local_only {
+        if let Err(err) = admin_uc::require_local_target(&account, user.as_ref()) {
+            return ApiError::from(err).into_response();
+        }
+    }
+    let mut patch = patch;
+    patch.audit_action = audit_action.to_string();
+    match admin_uc::moderate_account(store, actor, account.id, patch, state.context.now_ms()) {
+        Ok((account, user)) => account_response(&state, &account, user.as_ref()),
+        Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
+/// `POST /api/v1/admin/accounts/:id/enable` — local accounts only.
+pub async fn enable(
+    State(state): State<ApiState>,
+    auth: Auth,
+    Path(id): Path<String>,
+) -> Response {
+    patch_flag(
+        state,
+        auth,
+        &id,
+        "enable",
+        AdminAccountPatch {
+            disabled: Some(false),
+            ..Default::default()
+        },
+        true,
+    )
+    .await
+}
+
+/// `POST /api/v1/admin/accounts/:id/unsensitive`.
+pub async fn unsensitive(
+    State(state): State<ApiState>,
+    auth: Auth,
+    Path(id): Path<String>,
+) -> Response {
+    patch_flag(
+        state,
+        auth,
+        &id,
+        "unsensitive",
+        AdminAccountPatch {
+            sensitized: Some(false),
+            ..Default::default()
+        },
+        false,
+    )
+    .await
+}
+
+/// `POST /api/v1/admin/accounts/:id/unsilence`.
+pub async fn unsilence(
+    State(state): State<ApiState>,
+    auth: Auth,
+    Path(id): Path<String>,
+) -> Response {
+    patch_flag(
+        state,
+        auth,
+        &id,
+        "unsilence",
+        AdminAccountPatch {
+            silenced: Some(false),
+            ..Default::default()
+        },
+        false,
+    )
+    .await
+}
+
+/// `POST /api/v1/admin/accounts/:id/unsuspend` — applied immediately (no
+/// async unsuspension worker yet) with the same audit row.
+pub async fn unsuspend(
+    State(state): State<ApiState>,
+    auth: Auth,
+    Path(id): Path<String>,
+) -> Response {
+    patch_flag(
+        state,
+        auth,
+        &id,
+        "unsuspend",
+        AdminAccountPatch {
+            suspended: Some(false),
+            ..Default::default()
+        },
+        false,
+    )
+    .await
+}
+
+/// `POST /api/v1/admin/accounts/:id/approve` — local accounts only.
+/// No pending-approval state exists (Phase 2 gap: approval registration
+/// modes), so approve is the enable-equivalent (`disabled=false`) plus an
+/// `approve` audit row (planned gap P7.3-B1).
+pub async fn approve(
+    State(state): State<ApiState>,
+    auth: Auth,
+    Path(id): Path<String>,
+) -> Response {
+    patch_flag(
+        state,
+        auth,
+        &id,
+        "approve",
+        AdminAccountPatch {
+            disabled: Some(false),
+            ..Default::default()
+        },
+        true,
+    )
+    .await
+}
+
+/// `POST /api/v1/admin/accounts/:id/reject` — local accounts only. The
+/// account is suspended + disabled immediately (same as DELETE); there is no
+/// pending-approval queue to remove it from (planned gap P7.3-B1). Answers
+/// `200 {}` like upstream's `render_empty`.
+pub async fn reject(
+    State(state): State<ApiState>,
+    auth: Auth,
+    Path(id): Path<String>,
+) -> Response {
+    let (actor, _) = match gate(&auth.0, &*state.context.store, WRITE_SCOPES) {
+        Ok(pair) => pair,
+        Err(err) => return err.into_response(),
+    };
+    let store: &dyn Store = &*state.context.store;
+    let (account, user) = match load_target(store, &id).await {
+        Ok(pair) => pair,
+        Err(err) => return err.into_response(),
+    };
+    if let Err(err) = admin_uc::require_local_target(&account, user.as_ref()) {
+        return ApiError::from(err).into_response();
+    }
+    match store.admin_delete_account(actor, account.id, "reject", state.context.now_ms()) {
+        Ok(true) => axum::Json(json!({})).into_response(),
+        Ok(false) => ApiError::not_found().into_response(),
+        Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
+/// `POST /api/v1/admin/accounts/:account_id/action` — `Admin::AccountAction`
+/// types `none`/`disable`/`sensitive`/`silence`/`suspend` (verified against
+/// `app/models/admin/account_action.rb`). Answers `200 {}` like upstream's
+/// `render_empty`. Warning text/e-mail notifications have no model and are
+/// dropped (the action type is still audited).
+pub async fn action(
+    State(state): State<ApiState>,
+    auth: Auth,
+    Path(account_id): Path<String>,
+    LenientForm(pairs): LenientForm,
+) -> Response {
+    let (actor, _) = match gate(&auth.0, &*state.context.store, WRITE_SCOPES) {
+        Ok(pair) => pair,
+        Err(err) => return err.into_response(),
+    };
+    let store: &dyn Store = &*state.context.store;
+    let (account, user) = match load_target(store, &account_id).await {
+        Ok(pair) => pair,
+        Err(err) => return err.into_response(),
+    };
+    let Some(action_type) = forms::get(&pairs, "type") else {
+        return ApiError::unprocessable("Validation failed: Type can't be blank").into_response();
+    };
+    let action_type = action_type.to_string();
+    let local = account.local && user.is_some();
+    if let Err(err) = admin_uc::check_action_type(&action_type, local) {
+        return ApiError::from(err).into_response();
+    }
+    let report_id = match forms::get(&pairs, "report_id") {
+        None => None,
+        Some(raw) => match parse_id(raw) {
+            Ok(id) => Some(id),
+            Err(err) => return err.into_response(),
+        },
+    };
+    match admin_uc::account_action(
+        store,
+        actor,
+        account.id,
+        &action_type,
+        report_id,
+        state.context.now_ms(),
+    ) {
+        Ok(()) => axum::Json(json!({})).into_response(),
+        Err(err) => ApiError::from(err).into_response(),
+    }
+}

@@ -17,6 +17,7 @@ use crate::api::mastodon::pagination;
 use crate::api::mastodon::status_view::load_status_views;
 use crate::api::mastodon::ApiState;
 use crate::application::filters::filter_results_unscoped;
+use crate::application::policy::HomeMentionPolicy;
 use crate::application::ports::{Store, TimelinePage, TimelineQuery};
 use crate::application::timelines;
 use crate::domain::{Error as DomainError, Id, Status};
@@ -115,10 +116,11 @@ fn timeline_response(
     uri: &Uri,
     cache: &'static str,
     page: TimelinePage,
+    home_fold: bool,
 ) -> Response {
     let first = page.statuses.first().map(|status| status.id);
     let last = page.statuses.last().map(|status| status.id);
-    match render(state, viewer, page.statuses) {
+    match render(state, viewer, page.statuses, home_fold) {
         Ok(body) => {
             let mut response = axum::Json(body).into_response();
             let headers = response.headers_mut();
@@ -139,6 +141,7 @@ fn render(
     state: &ApiState,
     viewer: Option<Id>,
     statuses: Vec<Status>,
+    home_fold: bool,
 ) -> Result<Vec<Value>, ApiError> {
     let store: &dyn Store = &*state.context.store;
     let now = state.context.now_ms();
@@ -146,9 +149,30 @@ fn render(
     if let Some(viewer) = viewer {
         let page: Vec<Status> = views.iter().map(|view| view.status.clone()).collect();
         let matches = filter_results_unscoped(store, viewer, &page, now)?;
+        // D22 `Collapse` mode (home only): a status that mentions a
+        // blocked/muted account renders folded behind a
+        // content-warning-style `filtered` entry instead of being removed.
+        let collapse =
+            home_fold && timelines::home_mention_policy_of(store, viewer) == HomeMentionPolicy::Collapse;
         for view in &mut views {
             if let Some(entries) = matches.get(&view.status.id) {
                 view.filtered = entries.clone();
+            }
+            if collapse
+                && timelines::home_mention_fold(store, viewer, &view.status, now)
+                    .unwrap_or(false)
+            {
+                view.filtered.push(serde_json::json!({
+                    "filter": {
+                        "id": "home-mention-fold",
+                        "title": "Hidden mentions",
+                        "context": ["home"],
+                        "filter_action": "warn",
+                        "expires_at": null
+                    },
+                    "keyword_matches": [],
+                    "status_matches": []
+                }));
             }
         }
     }
@@ -191,7 +215,7 @@ pub async fn home(State(state): State<ApiState>, auth: Auth, uri: Uri) -> Respon
     };
     let store: &dyn Store = &*state.context.store;
     match timelines::home(store, viewer, query, state.context.now_ms()) {
-        Ok(page) => timeline_response(&state, Some(viewer), &uri, PRIVATE_CACHE, page),
+        Ok(page) => timeline_response(&state, Some(viewer), &uri, PRIVATE_CACHE, page, true),
         Err(err) => ApiError::from(err).into_response(),
     }
 }
@@ -208,7 +232,7 @@ pub async fn public(State(state): State<ApiState>, auth: OptionalAuth, uri: Uri)
     };
     let store: &dyn Store = &*state.context.store;
     match timelines::public(store, viewer, query, state.context.now_ms()) {
-        Ok(page) => timeline_response(&state, viewer, &uri, public_cache(viewer), page),
+        Ok(page) => timeline_response(&state, viewer, &uri, public_cache(viewer), page, false),
         Err(err) => ApiError::from(err).into_response(),
     }
 }
@@ -230,7 +254,7 @@ pub async fn tag(
     };
     let store: &dyn Store = &*state.context.store;
     match timelines::tag(store, viewer, &raw, query, state.context.now_ms()) {
-        Ok(page) => timeline_response(&state, viewer, &uri, public_cache(viewer), page),
+        Ok(page) => timeline_response(&state, viewer, &uri, public_cache(viewer), page, false),
         Err(err) => ApiError::from(err).into_response(),
     }
 }
@@ -258,7 +282,7 @@ pub async fn list(
     };
     let store: &dyn Store = &*state.context.store;
     match timelines::list(store, viewer, id, query, state.context.now_ms()) {
-        Ok(page) => timeline_response(&state, Some(viewer), &uri, PRIVATE_CACHE, page),
+        Ok(page) => timeline_response(&state, Some(viewer), &uri, PRIVATE_CACHE, page, false),
         Err(DomainError::NotFound(_)) => ApiError::not_found().into_response(),
         Err(err) => ApiError::from(err).into_response(),
     }

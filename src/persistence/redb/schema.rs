@@ -177,6 +177,44 @@ pub const MENTIONS_BY_ACCOUNT: TableDefinition<&[u8], ()> =
 pub const HASHTAG_INDEX: TableDefinition<&[u8], u64> = TableDefinition::new("hashtag_index");
 
 // ---------------------------------------------------------------------------
+// Phase 7 (schema v9): conversations, push subscriptions, web/tag rows.
+// ---------------------------------------------------------------------------
+
+/// Per-viewer conversation state: `(viewer_be || root_be)` -> JSON
+/// `ConversationState`.
+pub const CONVERSATION_STATE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("conversation_state");
+
+/// Conversation mutes: `(account_be || root_be)` -> JSON mute timestamp ms.
+pub const CONVERSATION_MUTES: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("conversation_mutes");
+
+/// Web Push subscriptions by numeric subscription id -> JSON.
+pub const PUSH_SUBSCRIPTIONS: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("push_subscriptions");
+
+/// Web Push subscription by access-token id -> subscription id.
+pub const PUSH_SUBSCRIPTION_BY_TOKEN: TableDefinition<u64, u64> =
+    TableDefinition::new("push_subscription_by_token");
+
+/// Web Push subscriptions by user: `(user_be || sub_id_be)` -> subscription id.
+pub const PUSH_SUBSCRIPTIONS_BY_USER: TableDefinition<&[u8], u64> =
+    TableDefinition::new("push_subscriptions_by_user");
+
+/// First-party web UI settings: `user_id_be` -> raw JSON settings object.
+pub const WEB_SETTINGS: TableDefinition<u64, &[u8]> = TableDefinition::new("web_settings");
+
+/// Session-bound web push subscriptions: `(user_id_be || sub_id_be)` -> JSON.
+pub const WEB_PUSH_SUBSCRIPTIONS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("web_push_subscriptions");
+
+/// Tag follows: `(account_id_be || tag_utf8)` -> JSON `TagFollow`.
+pub const TAG_FOLLOWS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("tag_follows");
+
+/// Featured tags: `(account_id_be || tag_utf8)` -> JSON `FeaturedTag`.
+pub const FEATURED_TAGS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("featured_tags");
+
+// ---------------------------------------------------------------------------
 // Phase 4 (schema v4): timelines, lists, markers, filters, scheduled
 // statuses, custom emoji.
 // ---------------------------------------------------------------------------
@@ -278,14 +316,146 @@ pub const UNRESOLVED_PARENT: TableDefinition<u64, &str> = TableDefinition::new("
 /// Reports (Flag, local and remote), by report ID (JSON).
 pub const REPORTS: TableDefinition<u64, &[u8]> = TableDefinition::new("reports");
 
+/// Admin audit trail (Phase 7.3): one JSON `AdminAuditRecord` per admin write,
+/// by numeric audit ID. Written in the same `redb` transaction as the admin
+/// mutation it records.
+pub const ADMIN_AUDIT: TableDefinition<u64, &[u8]> = TableDefinition::new("admin_audit");
+
 /// The remote URL of a media attachment fetched from another server, by media ID.
 pub const REMOTE_MEDIA_SOURCE: TableDefinition<u64, &str> = TableDefinition::new("remote_media_source");
+
+// ---------------------------------------------------------------------------
+// Phase 7.3 (schema v8): admin infrastructure rows (subagent C). Global
+// ordered tables use `desc_id(row_id)` keys so a forward scan yields newest
+// first; per-value unique indexes hold the real row id.
+// ---------------------------------------------------------------------------
+
+/// Admin domain allows by `desc_id(row_id)` -> JSON `AdminDomainAllow`.
+pub const ADMIN_DOMAIN_ALLOWS: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("admin_domain_allows");
+
+/// Admin domain allow id by normalized domain.
+pub const ADMIN_DOMAIN_ALLOW_BY_DOMAIN: TableDefinition<&str, u64> =
+    TableDefinition::new("admin_domain_allow_by_domain");
+
+/// Admin domain blocks by `desc_id(row_id)` -> JSON `AdminDomainBlock`.
+pub const ADMIN_DOMAIN_BLOCKS: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("admin_domain_blocks");
+
+/// Admin domain block id by normalized domain.
+pub const ADMIN_DOMAIN_BLOCK_BY_DOMAIN: TableDefinition<&str, u64> =
+    TableDefinition::new("admin_domain_block_by_domain");
+
+/// Admin email-domain blocks by `desc_id(row_id)` -> JSON.
+pub const ADMIN_EMAIL_DOMAIN_BLOCKS: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("admin_email_domain_blocks");
+
+/// Admin email-domain block id by normalized domain.
+pub const ADMIN_EMAIL_DOMAIN_BLOCK_BY_DOMAIN: TableDefinition<&str, u64> =
+    TableDefinition::new("admin_email_domain_block_by_domain");
+
+/// Admin IP blocks by `desc_id(row_id)` -> JSON `AdminIpBlock`.
+pub const ADMIN_IP_BLOCKS: TableDefinition<u64, &[u8]> = TableDefinition::new("admin_ip_blocks");
+
+/// Admin IP block ids by CIDR text (duplicates rejected).
+pub const ADMIN_IP_BLOCK_BY_IP: TableDefinition<&str, u64> =
+    TableDefinition::new("admin_ip_block_by_ip");
+
+/// Admin canonical email blocks by `desc_id(row_id)` -> JSON.
+pub const ADMIN_CANONICAL_EMAIL_BLOCKS: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("admin_canonical_email_blocks");
+
+/// Admin canonical email block ids by email hash (one hash may repeat).
+pub const ADMIN_CANONICAL_EMAIL_BLOCK_BY_HASH: TableDefinition<&str, u64> =
+    TableDefinition::new("admin_canonical_email_block_by_hash");
+
+/// Admin tag flags by `desc_id(row_id)` -> JSON `AdminTag`.
+pub const ADMIN_TAGS: TableDefinition<u64, &[u8]> = TableDefinition::new("admin_tags");
+
+/// Admin tag row id by tag name.
+pub const ADMIN_TAG_BY_NAME: TableDefinition<&str, u64> = TableDefinition::new("admin_tag_by_name");
+
+// ---------------------------------------------------------------------------
+// Phase 7.3 (schema v8): trend approval flags/candidates, annual reports and
+// the admin audit trail. Candidate rows are derived from real usage (hashtag
+// index, recent public statuses, URLs in status text); the flag rows are the
+// only operator state.
+// ---------------------------------------------------------------------------
+
+/// Trend tag approval flags by normalized tag name -> JSON `TrendTagFlag`.
+pub const TREND_TAG_FLAGS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("trend_tag_flags");
+
+/// Trend status approval flags by status ID -> JSON `TrendStatusFlag`.
+/// Absence of a row means pending review.
+pub const TREND_STATUS_FLAGS: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("trend_status_flags");
+
+/// Trend link candidates by numeric row ID -> JSON `TrendLink`.
+pub const TREND_LINKS: TableDefinition<u64, &[u8]> = TableDefinition::new("trend_links");
+
+/// Trend link ID by exact URL -> row ID (upsert index).
+pub const TREND_LINKS_BY_URL: TableDefinition<&str, u64> =
+    TableDefinition::new("trend_links_by_url");
+
+/// Trend publishers (preview-card providers) by numeric row ID -> JSON
+/// `TrendPublisher`.
+pub const TREND_PUBLISHERS: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("trend_publishers");
+
+/// Trend publisher ID by lowercased host -> row ID (upsert index).
+pub const TREND_PUBLISHERS_BY_DOMAIN: TableDefinition<&str, u64> =
+    TableDefinition::new("trend_publishers_by_domain");
+
+/// Generated annual reports by numeric row ID -> JSON `AnnualReport`.
+pub const ANNUAL_REPORTS: TableDefinition<u64, &[u8]> = TableDefinition::new("annual_reports");
+
+/// Annual report ID by `(account_id_be || year_be)` -> row ID.
+pub const ANNUAL_REPORTS_BY_ACCOUNT: TableDefinition<&[u8], u64> =
+    TableDefinition::new("annual_reports_by_account");
+
+/// Audit rows by target: `target_type || 0xFF || target_id || 0xFF ||
+/// desc(row_id)_be` -> row ID, so one target's history is a prefix scan.
+/// (The `ADMIN_AUDIT` table itself is defined with the Phase 7.3 admin
+/// infrastructure rows above and shared with `AdminInfraStore::admin_audit`.)
+pub const ADMIN_AUDIT_BY_TARGET: TableDefinition<&[u8], u64> =
+    TableDefinition::new("admin_audit_by_target");
+
+/// Fixed 12-byte composite key `(account_id_be || year_be)`.
+pub fn account_year_key(account_id: u64, year: i32) -> [u8; 12] {
+    let mut key = [0u8; 12];
+    key[..8].copy_from_slice(&account_id.to_be_bytes());
+    // Flip the sign bit so negative years sort before positive ones.
+    key[8..].copy_from_slice(&((year ^ i32::MIN) as u32).to_be_bytes());
+    key
+}
+
+/// Key for [`ADMIN_AUDIT_BY_TARGET`].
+pub fn audit_target_key(target_type: &str, target_id: &str, row_id: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(target_type.len() + target_id.len() + 10);
+    key.extend_from_slice(target_type.as_bytes());
+    key.push(0xFF);
+    key.extend_from_slice(target_id.as_bytes());
+    key.push(0xFF);
+    key.extend_from_slice(&desc_id(row_id).to_be_bytes());
+    key
+}
+
+/// Prefix of [`ADMIN_AUDIT_BY_TARGET`] keys for one target.
+pub fn audit_target_prefix(target_type: &str, target_id: &str) -> Vec<u8> {
+    let mut prefix = Vec::with_capacity(target_type.len() + target_id.len() + 2);
+    prefix.extend_from_slice(target_type.as_bytes());
+    prefix.push(0xFF);
+    prefix.extend_from_slice(target_id.as_bytes());
+    prefix.push(0xFF);
+    prefix
+}
 
 /// Key under `META` holding the applied schema version (big-endian `u64`).
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// Current schema version. Bump with a new migration step.
-pub const SCHEMA_VERSION: u64 = 7;
+pub const SCHEMA_VERSION: u64 = 9;
 
 /// All table names, for diagnostics and migration verification.
 pub const TABLE_NAMES: &[&str] = &[
@@ -303,9 +473,31 @@ pub const TABLE_NAMES: &[&str] = &[
     "status_by_uri",
     "remote_refresh",
     "reports",
+    "admin_audit",
     "remote_media_source",
     "quote_by_approval",
     "unresolved_parent",
+    "admin_domain_allows",
+    "admin_domain_allow_by_domain",
+    "admin_domain_blocks",
+    "admin_domain_block_by_domain",
+    "admin_email_domain_blocks",
+    "admin_email_domain_block_by_domain",
+    "admin_ip_blocks",
+    "admin_ip_block_by_ip",
+    "admin_canonical_email_blocks",
+    "admin_canonical_email_block_by_hash",
+    "admin_tags",
+    "admin_tag_by_name",
+    "trend_tag_flags",
+    "trend_status_flags",
+    "trend_links",
+    "trend_links_by_url",
+    "trend_publishers",
+    "trend_publishers_by_domain",
+    "annual_reports",
+    "annual_reports_by_account",
+    "admin_audit_by_target",
     "status_author_index",
     "status_parent_index",
     "status_reblog_index",
@@ -342,6 +534,15 @@ pub const TABLE_NAMES: &[&str] = &[
     "media_by_owner",
     "mentions_by_account",
     "hashtag_index",
+    "conversation_state",
+    "conversation_mutes",
+    "push_subscriptions",
+    "push_subscription_by_token",
+    "push_subscriptions_by_user",
+    "web_settings",
+    "web_push_subscriptions",
+    "tag_follows",
+    "featured_tags",
 ];
 
 /// Build the fixed 16-byte scheduling key used by [`JOBS_INDEX`].

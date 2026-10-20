@@ -23,6 +23,13 @@ pub struct Follow {
     pub show_reblogs: bool,
     /// Whether the follower wants follow notifications.
     pub notify: bool,
+    /// D23: per-follow language filter (Mastodon `follow.languages`). `None`
+    /// or empty means "no preference": every language is kept on home.
+    /// Entries are normalized BCP-47-ish tags (see
+    /// `application::policy::normalize_follow_languages`). `#[serde(default)]`
+    /// so rows written before D23 read as `None`.
+    #[serde(default)]
+    pub languages: Option<Vec<String>>,
     pub state: FollowState,
     pub created_at_ms: u64,
     /// Remote follow activity URI (Phase 6); `None` for local follows.

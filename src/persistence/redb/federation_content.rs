@@ -345,6 +345,13 @@ impl FederationContentStore for RedbStore {
             forwarded: input.forwarded,
             activity_uri: input.activity_uri,
             created_at_ms: now_ms,
+            action_taken: false,
+            action_taken_at_ms: None,
+            action_taken_by_account_id: None,
+            assigned_account_id: None,
+            category: "other".to_string(),
+            rule_ids: Vec::new(),
+            updated_at_ms: now_ms,
         };
         {
             let mut table = write.open_table(REPORTS)?;

@@ -23,7 +23,7 @@ trap cleanup EXIT
 cargo build --bin birchtree >/dev/null
 
 start_server() {
-  "$BIN" --data-dir="$DATA_DIR" --listen="127.0.0.1:${PORT}" --public-url="$BASE" &
+  "$BIN" --data-dir="$DATA_DIR" --listen="127.0.0.1:${PORT}" --public-url="$BASE" --no-transcode &
   PID=$!
   for _ in $(seq 1 100); do
     if curl -fsS "$BASE/health" >/dev/null 2>&1; then

@@ -516,6 +516,10 @@ pub async fn create(
                 state.context.streaming.publish(StreamEvent::StatusCreated {
                     status_id: created.status.id,
                 });
+                crate::api::mastodon::endpoints::conversations::publish_conversation_events(
+                    &state,
+                    &created.status,
+                );
             }
             status_response(&state, Some(viewer), created.status, StatusSourceMode::Content)
         }
