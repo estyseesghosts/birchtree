@@ -177,6 +177,18 @@ pub struct Tag {
     pub href: Option<Url>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Emoji image (`icon.url`; upstream `CustomEmojiParser` reads
+    /// `icon.url` for the image and `id` for the emoji URI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<EmojiIcon>,
+}
+
+/// An `Emoji` tag's image. Only `url` is read; the tag `id` (emoji URI)
+/// is not needed because rows are keyed `shortcode@domain`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmojiIcon {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<Url>,
 }
 
 /// An attachment: a `Document` with its `mediaType` and `url`.

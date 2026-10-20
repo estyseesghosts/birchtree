@@ -8,6 +8,7 @@ pub mod media;
 pub mod net;
 pub mod policy;
 pub mod preview;
+pub mod remote_emoji;
 pub mod threads;
 pub mod tombstone;
 pub mod resolver;

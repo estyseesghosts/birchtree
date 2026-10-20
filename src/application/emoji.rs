@@ -1,8 +1,10 @@
 //! Custom emoji use cases (CLI-managed) and the public index.
 //!
 //! Mirrors Mastodon's `Api::V1::CustomEmojisController` (public, listed
-//! scope = local + enabled + picker-visible) and the CLI-managed admin path
-//! (no admin API in the public-client milestone).
+//! scope = local + enabled + picker-visible) and the HTML-admin authoring
+//! path. There is no upstream REST admin API (see
+//! `endpoints::admin_emoji`); the admin use cases below back the new
+//! admin-gated surface (`set_emoji_flags`, `set_emoji_category`).
 
 use crate::application::ports::{BlobStore, Store};
 use crate::domain::{CustomEmoji, Error, Result};
@@ -75,4 +77,57 @@ pub fn emoji_partition(shortcode: &str) -> String {
     let a = bytes.first().map(|b| *b).unwrap_or(b'_');
     let b = bytes.get(1).map(|b| *b).unwrap_or(b'_');
     format!("{a:02x}/{b:02x}/{shortcode}")
+}
+
+/// Patch for [`set_emoji_flags`]: `None` leaves the field unchanged, while
+/// `category`'s inner `None` clears the category.
+#[derive(Debug, Default)]
+pub struct EmojiFlags {
+    pub category: Option<Option<String>>,
+    pub visible_in_picker: Option<bool>,
+    pub disabled: Option<bool>,
+}
+
+/// Admin: update an emoji's category, picker visibility, and disabled flag
+/// (upstream HTML-admin batch enable/disable/list/unlist).
+///
+/// Unknown shortcodes are `NotFound` (the endpoint maps this to 404);
+/// empty-string categories normalize to uncategorized, matching
+/// [`add_emoji`].
+pub fn set_emoji_flags(
+    store: &dyn Store,
+    shortcode: &str,
+    patch: EmojiFlags,
+) -> Result<CustomEmoji> {
+    let Some(mut emoji) = store.emoji_by_shortcode(shortcode)? else {
+        return Err(Error::NotFound(format!(
+            "No emoji with shortcode {shortcode}"
+        )));
+    };
+    if let Some(category) = patch.category {
+        emoji.category = category.filter(|c| !c.is_empty());
+    }
+    if let Some(visible) = patch.visible_in_picker {
+        emoji.visible_in_picker = visible;
+    }
+    if let Some(disabled) = patch.disabled {
+        emoji.disabled = disabled;
+    }
+    store.upsert_emoji(emoji)
+}
+
+/// Admin: update an emoji's category (`None` clears it).
+pub fn set_emoji_category(
+    store: &dyn Store,
+    shortcode: &str,
+    category: Option<&str>,
+) -> Result<CustomEmoji> {
+    set_emoji_flags(
+        store,
+        shortcode,
+        EmojiFlags {
+            category: Some(category.map(str::to_string)),
+            ..EmojiFlags::default()
+        },
+    )
 }

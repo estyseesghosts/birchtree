@@ -74,7 +74,7 @@ An unmodified Mastodon client connects to a birchtree instance and has an identi
 - **Search (interim):** `GET /api/v2/search` over the local corpus until the
   Phase 7.2 search library lands (v1 does not exist in v4.7.3). A query that is a status URL returns that status (as Mastodon's URL search) when it is stored here and the viewer may see it; with `resolve=true` an unknown remote status is fetched over federation first. Authenticated callers only. **Custom emoji:** public
   `GET /api/v1/custom_emojis` + image serving + status-payload `emojis` arrays
-  (CLI-managed).
+  (authored via CLI + admin API; remote emoji ingested from `Emoji` tags).
 - **Timelines:** `GET /api/v1/timelines/home` (user token; `read`/`read:statuses`;
   app-only → 422; no token → 401), `/public` (optional auth; `local`, `remote`,
   `only_media`), `/tag/:tag` (optional auth; unknown or empty tag → `200 []`),

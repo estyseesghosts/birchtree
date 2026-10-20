@@ -196,6 +196,7 @@ pub fn handle_with_transcode(
         | JobKind::ResolveParent
         | JobKind::CrawlReplies
         | JobKind::FetchRemoteMedia
+        | JobKind::FetchRemoteEmoji
         | JobKind::PreviewCardFetch => Ok(()),
         JobKind::GenerateAnnualReport => {            let account_id = job
                 .payload

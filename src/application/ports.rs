@@ -1797,6 +1797,10 @@ pub trait EmojiStore: Send + Sync {
     /// Listed emoji (index endpoint; local + enabled + picker-visible),
     /// shortcode order, bounded.
     fn listed_emojis(&self, cap: usize) -> Result<Vec<CustomEmoji>>;
+    /// Every emoji row (operator listing; includes disabled and
+    /// picker-hidden rows that `listed_emojis` filters out), shortcode
+    /// order, bounded.
+    fn all_emojis(&self, cap: usize) -> Result<Vec<CustomEmoji>>;
     /// Emoji whose shortcode is in `shortcodes` (status/account payloads).
     fn emojis_by_shortcodes(&self, shortcodes: &[String]) -> Result<Vec<CustomEmoji>>;
 }

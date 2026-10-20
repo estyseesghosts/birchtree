@@ -83,12 +83,12 @@ impl Object for NoteRef {
                     )));
                 }
                 let author = crate::activitypub::objects::author_of(data, &note.attributed_to).await?;
-                let sensitized = data
+                let account = data
                     .app
                     .store
                     .account_by_id(author)?
-                    .is_some_and(|account| account.sensitized);
-                let input = note_input_for(&note, author, sensitized);
+                    .ok_or_else(|| FedError::Refused("note author has no account row".into()))?;
+                let input = note_input_for(&note, author, &account.domain, account.sensitized);
                 let ingested = ingest_note(&*data.app.store, input, None, now)?;
                 Ok(NoteRef { status: ingested.status })
             }

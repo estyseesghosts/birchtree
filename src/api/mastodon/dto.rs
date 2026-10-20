@@ -1252,6 +1252,28 @@ pub fn custom_emoji_json(server: &ServerInfo, emoji: &crate::domain::CustomEmoji
     Value::Object(object)
 }
 
+/// `REST::CustomEmojiSerializer` for a remote emoji row: the stored
+/// shortcode is namespaced (`party@toot.example`, because `CUSTOM_EMOJI` is
+/// keyed by shortcode alone) but the wire `shortcode` is bare, and the
+/// image URLs come from the stored blob keys (which embed the namespaced
+/// key) rather than being rebuilt from the shortcode. Picker visibility is
+/// always false: remote rows never join the public index.
+pub fn custom_emoji_entity_json(server: &ServerInfo, emoji: &crate::domain::CustomEmoji) -> Value {
+    let shortcode = emoji.shortcode.split('@').next().unwrap_or(&emoji.shortcode);
+    let mut object = Map::new();
+    object.insert("shortcode".into(), json!(shortcode));
+    object.insert(
+        "url".into(),
+        json!(server.asset_url(&format!("system/{}", emoji.image_key))),
+    );
+    object.insert(
+        "static_url".into(),
+        json!(server.asset_url(&format!("system/{}", emoji.static_image_key))),
+    );
+    object.insert("visible_in_picker".into(), json!(false));
+    Value::Object(object)
+}
+
 /// `REST::TagSerializer` for search results (`history` is contract-shaped;
 /// this server keeps no per-tag usage history yet, and tag follow/feature is
 /// Phase 7).

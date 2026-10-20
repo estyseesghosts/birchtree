@@ -60,6 +60,23 @@ impl EmojiStore for RedbStore {
         Ok(out)
     }
 
+    fn all_emojis(&self, cap: usize) -> Result<Vec<CustomEmoji>> {
+        let read = self.begin_read()?;
+        let table = read.open_table(CUSTOM_EMOJI)?;
+        let cap = cap.min(LISTED_CAP);
+        let mut out = Vec::new();
+        for entry in table.range(""..)? {
+            let (_key, value) = entry?;
+            let emoji: CustomEmoji = decode(value.value())?;
+            out.push(emoji);
+            if out.len() >= cap {
+                break;
+            }
+        }
+        self.note_scanned(out.len());
+        Ok(out)
+    }
+
     fn emojis_by_shortcodes(&self, shortcodes: &[String]) -> Result<Vec<CustomEmoji>> {
         if shortcodes.is_empty() {
             return Ok(Vec::new());

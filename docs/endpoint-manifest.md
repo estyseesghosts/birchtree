@@ -270,7 +270,7 @@ Bullets in the old inventory that are now rows. Upstream sources: `app/controlle
 | POST | `/api/v1/tags/:id/unfollow` | user | write \| write:follows | implemented (Phase 7) | In | |
 | POST | `/api/v1/tags/:id/feature` | user | write \| write:accounts | implemented (Phase 7) | In | |
 | POST | `/api/v1/tags/:id/unfeature` | user | write \| write:accounts | implemented (Phase 7) | In | |
-| GET | `/api/v1/custom_emojis` | none | — | implemented (Phase 4) | In | public index over local + enabled + picker-visible emoji (CLI-managed; no admin API). Status-payload `emojis` arrays served; account-payload emoji remain `[]` (remote emoji ingest is federation tail) |
+| GET | `/api/v1/custom_emojis` | none | — | implemented (Phase 4) | In | public index over local + enabled + picker-visible emoji (authored via CLI `add-emoji`/`remove-emoji`/`list-emojis` and the admin API below). Status-payload `emojis` arrays serve local + remote emoji; account-payload emoji remain `[]` |
 
 ### Trends, public (Phase 7.3)
 
@@ -330,6 +330,17 @@ All admin rows: auth `user + role`. The role is `admin` (every admin route) or `
 | POST | `/api/v1/admin/reports/:id/unassign` | user + role | admin:write \| admin:write:reports | implemented (Phase 7.3) | In | |
 | POST | `/api/v1/admin/reports/:id/reopen` | user + role | admin:write \| admin:write:reports | implemented (Phase 7.3) | In | |
 | POST | `/api/v1/admin/reports/:id/resolve` | user + role | admin:write \| admin:write:reports | implemented (Phase 7.3) | In | |
+
+#### Custom emojis
+
+New API surface (no upstream REST equivalent in v4.7.3 — upstream authoring is the HTML `Admin::CustomEmojisController`): admins-only role gate (`AdminArea::AdminOnly`; moderators refused like the announcements module), bare `admin:read`/`admin:write` scopes (upstream defines no custom-emoji sub-scopes).
+
+| Method | Path | Auth | Scope | Status | Profile | Notes |
+|---|---|---|---|---|---|---|
+| GET | `/api/v1/admin/custom_emojis` | user + role | admin:read | implemented (emoji round) | In | every local row, shortcode order, incl. disabled + picker-hidden; rows render with the shared serializer plus a `disabled` flag |
+| POST | `/api/v1/admin/custom_emojis` | user + role | admin:write | implemented (emoji round) | In | multipart `shortcode` + `image` (+ optional `category`, `visible_in_picker`); 200 + row; re-post replaces bytes and metadata; 422 on blank/bad shortcode, >256 KB, or non-PNG/GIF/WebP bytes |
+| PUT | `/api/v1/admin/custom_emojis/:shortcode` | user + role | admin:write | implemented (emoji round) | In | JSON `category` (string-or-null) / `visible_in_picker` / `disabled`; 200 + row; 404 when missing; 422 on empty or wrong-typed body |
+| DELETE | `/api/v1/admin/custom_emojis/:shortcode` | user + role | admin:write | implemented (emoji round) | In | removes the row and its image bytes; 404 when missing; 200 `{}` |
 
 #### Domain allows, domain blocks, email-domain blocks, IP blocks
 

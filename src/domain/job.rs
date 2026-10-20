@@ -57,6 +57,11 @@ pub enum JobKind {
     CrawlReplies,
     /// Fetch a remote attachment's bytes and stage them for processing (Phase 6).
     FetchRemoteMedia,
+    /// Fetch one remote custom-emoji image and store the row (Phase 6 tail).
+    /// The payload carries `{shortcode, domain, url}`. The handler is
+    /// idempotent (re-ingest replaces the row and its bytes); a refusal
+    /// quarantines the job without failing the status that named it.
+    FetchRemoteEmoji,
     /// Generate an annual report for one account and year (Phase 7.3). The
     /// handler computes real stats from local records and inserts the row
     /// idempotently; a retry after commit is a no-op.
@@ -108,6 +113,7 @@ impl JobKind {
             JobKind::ResolveParent => "resolve_parent",
             JobKind::CrawlReplies => "crawl_replies",
             JobKind::FetchRemoteMedia => "fetch_remote_media",
+            JobKind::FetchRemoteEmoji => "fetch_remote_emoji",
             JobKind::GenerateAnnualReport => "generate_annual_report",
             JobKind::SearchIndexStatus => "search_index_status",
             JobKind::SearchBackfill => "search_backfill",

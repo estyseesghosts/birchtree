@@ -65,7 +65,13 @@ Conventions: `D##` = row in `docs/compatibility-profile.md`;
 ## Federation tail (own phase — D32 refuse-position stands)
 
 - Account Move (migrated follows need an individual register row).
-- Remote emoji ingest (`emojis` arrays omit remote emoji).
+- [x] Remote emoji ingest — fixed (emoji round, 2026-10-20): `Emoji` tags on
+  Notes parse to namespaced rows (`shortcode@domain`, enabled but
+  picker-invisible so the public index is unchanged), bytes arrive post-commit
+  via the durable `FetchRemoteEmoji` job under the same SSRF/size/type caps
+  as remote media, and status-payload `emojis` arrays resolve them
+  (`note_input_for` + `ingest_note` + `federation::remote_emoji`,
+  `tests/emoji_remote_ingest.rs`). Account-payload emoji remain `[]`.
 - Relays / inbox forwarding (delivery reachability claims).
 - Follower sync and remote counters.
 - Note / featured collections.

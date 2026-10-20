@@ -108,6 +108,7 @@ fn note(_author_uri: &str, id: &str, text: &str, _to: &str) -> RemoteNote {
         mention_uris: Vec::new(),
         tags: Vec::new(),
         attachments: Vec::new(),
+        emojis: Vec::new(),
         quote_uri: None,
         poll: None,
     }
@@ -773,6 +774,7 @@ fn outgoing_vote_names_the_choice_and_the_poll() {
             mention_uris: Vec::new(),
             tags: Vec::new(),
             attachments: Vec::new(),
+            emojis: Vec::new(),
             quote_uri: None,
             poll: None,
         },
@@ -840,6 +842,7 @@ fn a_question_with_a_future_closed_time_is_not_expired() {
         mention_uris: Vec::new(),
         tags: Vec::new(),
         attachments: Vec::new(),
+        emojis: Vec::new(),
         quote_uri: None,
         poll: None,
     }, poll2);
@@ -876,6 +879,7 @@ fn a_reblog_wrapper_is_addressed_on_the_booster_domain() {
         mention_uris: Vec::new(),
         tags: Vec::new(),
         attachments: Vec::new(),
+        emojis: Vec::new(),
         quote_uri: None,
         poll: None,
     };

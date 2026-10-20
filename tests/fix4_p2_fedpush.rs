@@ -254,11 +254,11 @@ fn note_visibility_matches_only_the_authors_own_followers_collection() {
 #[test]
 fn sensitized_account_forces_sensitive_on_notes_and_questions() {
     let note = test_note(vec![url(PUBLIC)]);
-    assert!(!note_input_for(&note, Id::new(7), false).sensitive);
-    assert!(note_input_for(&note, Id::new(7), true).sensitive);
+    assert!(!note_input_for(&note, Id::new(7), "remote.example", false).sensitive);
+    assert!(note_input_for(&note, Id::new(7), "remote.example", true).sensitive);
 
     let sensitive_note = Note { sensitive: Some(true), ..test_note(vec![url(PUBLIC)]) };
-    assert!(note_input_for(&sensitive_note, Id::new(7), false).sensitive);
+    assert!(note_input_for(&sensitive_note, Id::new(7), "remote.example", false).sensitive);
 
     let question = Question {
         kind: Default::default(),

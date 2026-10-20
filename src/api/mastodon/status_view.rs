@@ -288,6 +288,37 @@ impl<'a> StatusViewContext<'a> {
                 self.emoji_entities.insert(emoji.shortcode.clone(), emoji);
             }
         }
+        // Remote emoji rows are namespaced (`shortcode@domain`, because
+        // `CUSTOM_EMOJI` is keyed by shortcode alone); batch those keys for
+        // remote-authored statuses so their `emojis` arrays resolve. Local
+        // statuses keep the bare lookup above.
+        let mut remote_keys: Vec<String> = Vec::new();
+        for status in self.statuses.values() {
+            let Some(domain) = self
+                .accounts
+                .get(&status.account_id)
+                .filter(|account| !account.local)
+                .map(|account| account.domain.clone())
+            else {
+                continue;
+            };
+            let mut codes = crate::application::statuses::extract_emoji_shortcodes(
+                &status.source_text,
+            );
+            if let Some(spoiler) = &status.spoiler_text {
+                codes.extend(crate::application::statuses::extract_emoji_shortcodes(spoiler));
+            }
+            for code in codes {
+                remote_keys.push(format!("{code}@{domain}"));
+            }
+        }
+        remote_keys.sort();
+        remote_keys.dedup();
+        if !remote_keys.is_empty() {
+            for emoji in self.store.emojis_by_shortcodes(&remote_keys)? {
+                self.emoji_entities.insert(emoji.shortcode.clone(), emoji);
+            }
+        }
 
         Ok(())
     }
@@ -351,10 +382,33 @@ impl<'a> StatusViewContext<'a> {
         }
         shortcodes.sort();
         shortcodes.dedup();
+        // Remote statuses resolve namespaced rows (`shortcode@domain`)
+        // first, then fall back to bare local rows; local statuses use the
+        // bare lookup only. Namespaced rows render with the entity
+        // serializer (wire shortcode is bare; URLs come from the blob keys).
+        let remote_domain: Option<String> = if account.local {
+            None
+        } else {
+            Some(account.domain.clone())
+        };
         let emojis: Vec<serde_json::Value> = shortcodes
             .iter()
-            .filter_map(|shortcode| self.emoji_entities.get(shortcode))
-            .map(|emoji| dto::custom_emoji_json(self.server, emoji, false))
+            .filter_map(|shortcode| {
+                if let Some(domain) = &remote_domain {
+                    let key = format!("{shortcode}@{domain}");
+                    if let Some(emoji) = self.emoji_entities.get(&key) {
+                        return Some(emoji);
+                    }
+                }
+                self.emoji_entities.get(shortcode)
+            })
+            .map(|emoji| {
+                if emoji.shortcode.contains('@') {
+                    dto::custom_emoji_entity_json(self.server, emoji)
+                } else {
+                    dto::custom_emoji_json(self.server, emoji, false)
+                }
+            })
             .collect();
 
         Ok(dto::StatusView {

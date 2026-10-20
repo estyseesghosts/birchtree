@@ -30,6 +30,10 @@ struct Args {
     text: Option<String>,
     hint: Option<String>,
     id: Option<String>,
+    shortcode: Option<String>,
+    file: Option<String>,
+    category: Option<String>,
+    hidden: bool,
 }
 
 fn parse_args(cfg: &mut Config) -> Args {
@@ -78,6 +82,14 @@ fn parse_args(cfg: &mut Config) -> Args {
             args.hint = Some(v.to_string());
         } else if let Some(v) = arg.strip_prefix("--id=") {
             args.id = Some(v.to_string());
+        } else if let Some(v) = arg.strip_prefix("--shortcode=") {
+            args.shortcode = Some(v.to_string());
+        } else if let Some(v) = arg.strip_prefix("--file=") {
+            args.file = Some(v.to_string());
+        } else if let Some(v) = arg.strip_prefix("--category=") {
+            args.category = Some(v.to_string());
+        } else if arg == "--hidden" {
+            args.hidden = true;
         } else if let Some(v) = arg.strip_prefix("--site-title=") {
             cfg.site_title = v.to_string();
         } else if let Some(v) = arg.strip_prefix("--site-description=") {
@@ -300,6 +312,132 @@ fn run_grant_role(cfg: &Config, args: &Args) -> ! {
 /// Bare host of the public base URL (the local account domain).
 fn create_account_domain(base_url: &str) -> String {
     birchtree::application::accounts::host_from_url(base_url)
+}
+
+/// `add-emoji --shortcode=<name> --file=<path> [--category=<cat>] [--hidden]`:
+/// register (or replace) a local custom emoji from an image file (PNG/GIF/WebP,
+/// at most 256 KB). `--hidden` keeps it out of the picker (still served by
+/// URL). Missing flags exit 2; an unreadable file, bad shortcode, or
+/// oversize/invalid image exits 1.
+fn run_add_emoji(cfg: &Config, args: &Args) -> ! {
+    let shortcode = args.shortcode.clone().unwrap_or_else(|| {
+        eprintln!("add-emoji requires --shortcode=<name>");
+        std::process::exit(2);
+    });
+    let path = args.file.clone().unwrap_or_else(|| {
+        eprintln!("add-emoji requires --file=<path>");
+        std::process::exit(2);
+    });
+    let image = std::fs::read(&path).unwrap_or_else(|err| {
+        eprintln!("add-emoji: read {path}: {err}");
+        std::process::exit(1);
+    });
+    let (store, _clock, _ids) = build_store(cfg);
+    let blobs = birchtree::media::blob_store::FsBlobStore::open(cfg.data_dir.join("media"))
+        .unwrap_or_else(|err| {
+            eprintln!("open media store: {err}");
+            std::process::exit(1);
+        });
+    match birchtree::application::emoji::add_emoji(
+        &*store,
+        &blobs,
+        &shortcode,
+        &image,
+        args.category.as_deref(),
+        !args.hidden,
+    ) {
+        Ok(emoji) => {
+            println!("added emoji :{}:", emoji.shortcode);
+            std::process::exit(0);
+        }
+        Err(err) => {
+            eprintln!("add-emoji failed: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `remove-emoji --shortcode=<name>` (alias `rm-emoji`): delete a local custom
+/// emoji and its image bytes. A missing shortcode is a not-found error
+/// (exit 1), not a usage error: the invocation is well-formed but the row
+/// does not exist (same convention as `delete-rule`).
+fn run_remove_emoji(cfg: &Config, args: &Args) -> ! {
+    let shortcode = args.shortcode.clone().unwrap_or_else(|| {
+        eprintln!("remove-emoji requires --shortcode=<name>");
+        std::process::exit(2);
+    });
+    let (store, _clock, _ids) = build_store(cfg);
+    let blobs = birchtree::media::blob_store::FsBlobStore::open(cfg.data_dir.join("media"))
+        .unwrap_or_else(|err| {
+            eprintln!("open media store: {err}");
+            std::process::exit(1);
+        });
+    match birchtree::application::emoji::rm_emoji(&*store, &blobs, &shortcode) {
+        Ok(true) => {
+            println!("removed emoji :{shortcode}:");
+            std::process::exit(0);
+        }
+        Ok(false) => {
+            eprintln!("remove-emoji: no emoji :{shortcode}:");
+            std::process::exit(1);
+        }
+        Err(err) => {
+            eprintln!("remove-emoji failed: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `list-emojis`: print one line per emoji, shortcode-first:
+/// `<shortcode> category=<cat|-> picker|hidden [disabled]`.
+/// Currently lists picker-visible, enabled emoji only (`listed_emojis` is the
+/// only enumeration on the `Store` port); hidden/disabled rows need the
+/// proposed `all_emojis` port method before they can appear here.
+fn run_list_emojis(cfg: &Config, _args: &Args) -> ! {
+    use birchtree::application::ports::EmojiStore;
+    let (store, _clock, _ids) = build_store(cfg);
+    match store.all_emojis(1_000) {
+        Ok(emojis) => {
+            for emoji in emojis {
+                println!(
+                    "{} category={} {}{}",
+                    emoji.shortcode,
+                    emoji.category.as_deref().unwrap_or("-"),
+                    if emoji.visible_in_picker {
+                        "picker"
+                    } else {
+                        "hidden"
+                    },
+                    if emoji.disabled { " disabled" } else { "" },
+                );
+            }
+            std::process::exit(0);
+        }
+        Err(err) => {
+            eprintln!("list-emojis failed: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Operator CLI usage (also printed for `help` and unknown subcommands).
+fn print_usage() {
+    println!(
+        "\
+usage: birchtree [global flags] <subcommand> [args]
+subcommands:
+  create-account --username=<name> --password=<pw> [--email=..] [--display-name=..] [--role=admin|moderator]
+  grant-role --username=<name> --role=<admin|moderator|none>  (alias: set-role)
+  add-emoji --shortcode=<name> --file=<path> [--category=<cat>] [--hidden]
+  remove-emoji --shortcode=<name>  (alias: rm-emoji)
+  list-emojis
+  create-rule --text=<text> [--hint=<hint>]
+  delete-rule --id=<id>
+  list-rules
+  crash-harness --mode=open-and-spin|commit-and-spin [--username=<name>]
+  sweep-transcode-orphans [--media-id=<id> ...]
+  help"
+    );
 }
 
 /// Test-only harness used by `tests/crash_recovery.rs` to exercise `kill -9`
@@ -629,6 +767,13 @@ async fn main() {
     match args.positional.first().map(String::as_str) {
         Some("create-account") => run_create_account(&cfg, &args),
         Some("grant-role") | Some("set-role") => run_grant_role(&cfg, &args),
+        Some("add-emoji") => run_add_emoji(&cfg, &args),
+        Some("remove-emoji") | Some("rm-emoji") => run_remove_emoji(&cfg, &args),
+        Some("list-emojis") => run_list_emojis(&cfg, &args),
+        Some("help") => {
+            print_usage();
+            std::process::exit(0);
+        }
         Some("create-rule") => run_create_rule(&cfg, &args),
         Some("delete-rule") => run_delete_rule(&cfg, &args),
         Some("list-rules") => run_list_rules(&cfg, &args),
@@ -636,6 +781,7 @@ async fn main() {
         Some("sweep-transcode-orphans") => run_sweep_transcode_orphans(&cfg, &args),
         Some(other) => {
             eprintln!("unknown subcommand: {other}");
+            print_usage();
             std::process::exit(2);
         }
         None => serve(cfg).await,

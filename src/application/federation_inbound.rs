@@ -9,7 +9,7 @@
 
 use crate::application::federation_ports::{NewQuote, NewReport};
 use crate::application::policy::{quote_permission, QuotePermission};
-use crate::application::ports::{NewMedia, NewPollSpec, NewStatus, RemoteStatusIdentity, Store, VoteRejection};use crate::domain::{Error, Id, JobKind, QuoteState, Result, Status, Visibility};
+use crate::application::ports::{BlobStore, NewMedia, NewPollSpec, NewStatus, RemoteStatusIdentity, Store, VoteRejection};use crate::domain::{CustomEmoji, Error, Id, JobKind, QuoteState, Result, Status, Visibility};
 
 /// What an inbound activity did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +48,10 @@ pub struct RemoteNote {
     pub mention_uris: Vec<String>,
     pub tags: Vec<String>,
     pub attachments: Vec<RemoteAttachment>,
+    /// Remote custom emoji from the Note's `Emoji` tags (Phase 6 tail).
+    /// Bytes are fetched post-commit by the `FetchRemoteEmoji` job; the
+    /// ingest only enqueues the jobs.
+    pub emojis: Vec<RemoteEmoji>,
     /// The quoted status URI (`quote`), if any.
     pub quote_uri: Option<String>,
     /// A poll to attach, when the received object is a `Question`.
@@ -180,6 +184,23 @@ pub fn ingest_note(store: &dyn Store, note: RemoteNote, poll: Option<RemotePoll>
         store.enqueue(
             JobKind::FetchRemoteMedia,
             serde_json::json!({ "media_id": media_id.value() }),
+            now_ms,
+        )?;
+    }
+    // Remote emoji bytes arrive post-commit: one idempotent job per tag
+    // (bounded at parse; refusals never fail the Note).
+    for emoji in note
+        .emojis
+        .iter()
+        .take(crate::application::federation_inbound::MAX_REMOTE_EMOJI_PER_NOTE)
+    {
+        store.enqueue(
+            JobKind::FetchRemoteEmoji,
+            serde_json::json!({
+                "shortcode": emoji.shortcode,
+                "domain": emoji.domain,
+                "url": emoji.url,
+            }),
             now_ms,
         )?;
     }
@@ -631,4 +652,148 @@ pub fn quote_revoked(store: &dyn Store, actor_id: Id, authorization_uri: &str) -
     }
     store.set_quote_state(quote.id, QuoteState::Revoked, None, None)?;
     Ok(Applied::Applied)
+}
+
+// ---------------------------------------------------------------------------
+// Remote custom emoji (W3).
+// ---------------------------------------------------------------------------
+
+/// One remote custom emoji named by a federated Note's `Emoji` tag.
+///
+/// Mirrors upstream `ActivityPub::Parser::CustomEmojiParser` (Mastodon
+/// v4.7.3, `app/lib/activitypub/parser/custom_emoji_parser.rb`): `name` is
+/// `:shortcode:` (colons stripped), `icon.url` is the image URL, `id` is the
+/// emoji URI.
+#[derive(Debug, Clone)]
+pub struct RemoteEmoji {
+    /// Shortcode without colons (`party_parrot`).
+    pub shortcode: String,
+    /// The `icon.url` the origin advertised.
+    pub url: String,
+    /// A static (non-animated) variant URL, when the tag carried one.
+    /// Stored for the adapter's reference only; birchtree stages the
+    /// animated bytes under both blob keys like `add_emoji` does.
+    pub static_url: Option<String>,
+    /// The author's domain: remote emoji are namespaced per origin.
+    pub domain: String,
+}
+
+impl RemoteEmoji {
+    /// Build from one `Emoji` tag (`name` like `:party_parrot:`).
+    /// Returns `None` when the tag carries no usable shortcode, image URL
+    /// or domain.
+    pub fn from_tag(name: &str, url: &str, static_url: Option<&str>, domain: &str) -> Option<Self> {
+        // Upstream deletes every colon (`@json['name']&.delete(':')`).
+        let shortcode: String = name.chars().filter(|c| *c != ':').collect();
+        if !CustomEmoji::shortcode_valid(&shortcode) {
+            return None;
+        }
+        if url.is_empty() {
+            return None;
+        }
+        let domain = domain.trim().to_lowercase();
+        if domain.is_empty() {
+            return None;
+        }
+        Some(Self {
+            shortcode,
+            url: url.to_string(),
+            static_url: static_url.map(str::to_string),
+            domain,
+        })
+    }
+}
+
+/// Storage key for a remote emoji. `CUSTOM_EMOJI` is keyed by shortcode
+/// alone, so the origin domain joins the stored shortcode:
+/// `party_parrot@toot.example` never collides with another origin's row or
+/// with a local `party_parrot`. A future schema keying rows by
+/// `(shortcode, domain)` can drop the suffix.
+pub fn remote_emoji_key(shortcode: &str, domain: &str) -> String {
+    format!("{}@{}", shortcode, domain.to_lowercase())
+}
+
+/// How one Note's remote emoji settled.
+#[derive(Debug, Clone, Default)]
+pub struct RemoteEmojiIngest {
+    /// Rows stored (new or replaced).
+    pub stored: usize,
+    /// Refused entries (`shortcode@domain`, or a synthetic entry for the
+    /// per-note cap) with the reason, in tag order.
+    pub skipped: Vec<(String, String)>,
+}
+
+/// Bound on emoji tags processed per call: each row costs at most one
+/// 256 KiB image, and a hostile Note may carry thousands of tags.
+pub const MAX_REMOTE_EMOJI_PER_NOTE: usize = 50;
+
+/// Store a Note's remote emoji from already-fetched image bytes.
+///
+/// `fetch` maps an emoji's image URL to its bytes (production: the safe
+/// emoji fetch in `federation::remote_emoji`; tests: fixtures). Fetch
+/// failures, oversize images (over `CustomEmoji::IMAGE_LIMIT`, 256 KiB),
+/// non-emoji bytes and bad shortcodes are skipped — ingest never fails the
+/// Note. Re-ingest replaces the row and its bytes (idempotent).
+pub fn ingest_remote_emojis(
+    store: &dyn Store,
+    blobs: &dyn BlobStore,
+    emojis: &[RemoteEmoji],
+    fetch: &dyn Fn(&str) -> Option<Vec<u8>>,
+) -> Result<RemoteEmojiIngest> {
+    let mut out = RemoteEmojiIngest::default();
+    for emoji in emojis.iter().take(MAX_REMOTE_EMOJI_PER_NOTE) {
+        let domain = emoji.domain.trim().to_lowercase();
+        if !CustomEmoji::shortcode_valid(&emoji.shortcode) {
+            out.skipped.push((
+                format!("{}@{domain}", emoji.shortcode),
+                "invalid shortcode".to_string(),
+            ));
+            continue;
+        }
+        if domain.is_empty() {
+            out.skipped
+                .push((emoji.shortcode.clone(), "missing domain".to_string()));
+            continue;
+        }
+        let key = remote_emoji_key(&emoji.shortcode, &domain);
+        let Some(image) = fetch(&emoji.url) else {
+            out.skipped.push((key, "fetch failed".to_string()));
+            continue;
+        };
+        if image.len() as u64 > CustomEmoji::IMAGE_LIMIT {
+            out.skipped
+                .push((key, "image larger than 256 KiB".to_string()));
+            continue;
+        }
+        if !crate::media::ingest::is_emoji_image(&image) {
+            out.skipped.push((key, "not an emoji image".to_string()));
+            continue;
+        }
+        let partition = crate::application::emoji::emoji_partition(&key);
+        let image_key = format!("custom_emojis/images/{partition}/original/{key}.png");
+        let static_key = format!("custom_emojis/images/{partition}/static/{key}.png");
+        blobs.put(&image_key, &image)?;
+        blobs.put(&static_key, &image)?;
+        // Upstream `CustomEmoji` leaves `disabled` false for remote emoji
+        // (`disabled` defaults to FALSE; only the `listed` scope is
+        // local-only). Mirror that: the row stays enabled so status text
+        // can render it, but picker-invisible so it never joins the public
+        // index (`CustomEmoji::listed` needs `visible_in_picker`).
+        store.upsert_emoji(CustomEmoji {
+            shortcode: key,
+            image_key,
+            static_image_key: static_key,
+            visible_in_picker: false,
+            disabled: false,
+            category: None,
+        })?;
+        out.stored += 1;
+    }
+    if emojis.len() > MAX_REMOTE_EMOJI_PER_NOTE {
+        out.skipped.push((
+            format!("{} further tag(s)", emojis.len() - MAX_REMOTE_EMOJI_PER_NOTE),
+            "per-note emoji cap".to_string(),
+        ));
+    }
+    Ok(out)
 }

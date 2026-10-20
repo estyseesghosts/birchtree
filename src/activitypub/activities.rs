@@ -395,7 +395,7 @@ fn record(store: &dyn crate::application::ports::Store, id: &Url, applied: &Appl
 /// `author_sensitized` is the author's account flag: upstream forces
 /// `sensitive` when the account is sensitized
 /// (`Activity::Create#sensitive: @account.sensitized? || @status_parser.sensitive`).
-pub fn note_input_for(note: &Note, author_id: Id, author_sensitized: bool) -> RemoteNote {
+pub fn note_input_for(note: &Note, author_id: Id, author_domain: &str, author_sensitized: bool) -> RemoteNote {
     let published_ms = note
         .published
         .as_deref()
@@ -426,6 +426,23 @@ pub fn note_input_for(note: &Note, author_id: Id, author_sensitized: bool) -> Re
                 })
             })
             .collect(),
+        emojis: note
+            .tag
+            .iter()
+            .filter(|t| t.kind == "Emoji")
+            .filter_map(|t| {
+                inbound::RemoteEmoji::from_tag(
+                    t.name.as_deref().unwrap_or(""),
+                    t.icon
+                        .as_ref()
+                        .and_then(|icon| icon.url.as_ref())
+                        .map(|u| u.as_str())
+                        .unwrap_or(""),
+                    None,
+                    author_domain,
+                )
+            })
+            .collect(),
         quote_uri: note.quote.as_ref().map(|u| u.to_string()),
         poll: None,
     }
@@ -436,8 +453,8 @@ pub fn note_input_for(note: &Note, author_id: Id, author_sensitized: bool) -> Re
 /// Kept for callers without the author's account row (existing tests):
 /// production ingest uses [`note_input_for`], which also forces `sensitive`
 /// for sensitized authors.
-pub fn note_input(note: &Note, author_id: Id) -> RemoteNote {
-    note_input_for(note, author_id, false)
+pub fn note_input(note: &Note, author_id: Id, author_domain: &str) -> RemoteNote {
+    note_input_for(note, author_id, author_domain, false)
 }
 
 /// A received vote: the chosen option's title and the poll's URI.
@@ -512,6 +529,7 @@ pub fn question_input_for(question: &Question, author_id: Id, author_sensitized:
         mention_uris: Vec::new(),
         tags: Vec::new(),
         attachments: Vec::new(),
+        emojis: Vec::new(),
         quote_uri: None,
         poll: None,
     };
@@ -846,7 +864,7 @@ impl ActivityHandler for Create {
                         inbound::VoteDisposition::NotAVote => {}
                     }
                 }
-                let ingested = match tombstone::ingest_checked(store, note_input_for(&note, author.account.id, author.account.sensitized), None, now)? {
+                let ingested = match tombstone::ingest_checked(store, note_input_for(&note, author.account.id, &author.account.domain, author.account.sensitized), None, now)? {
                     CheckedIngest::Live(ingested) => ingested,
                     // The Delete won the race: the note stays gone.
                     CheckedIngest::Tombstoned => {
@@ -901,7 +919,7 @@ impl ActivityHandler for Update {
                 let note: Note = serde_json::from_value(self.object.clone())
                     .map_err(|e| FedError::Refused(format!("update of a note that does not parse: {e}")))?;
                 verify_note_author(&note, self.actor.inner())?;
-                let applied = inbound::update_note(store, author.account.id, &note_input_for(&note, author.account.id, author.account.sensitized), now)?;
+                let applied = inbound::update_note(store, author.account.id, &note_input_for(&note, author.account.id, &author.account.domain, author.account.sensitized), now)?;
                 log_outcome("Update", &self.id, self.actor.inner(), &applied);
                 record(store, &self.id, &applied, now)?;
             }
@@ -1165,7 +1183,7 @@ impl ActivityHandler for QuoteRequest {
         let quoting = match &self.instrument {
             crate::activitypub::wire::Instrument::Note(note) => {
                 verify_note_author(note, &self.actor)?;
-                match tombstone::ingest_checked(store, note_input_for(note, author.account.id, author.account.sensitized), None, now)? {
+                match tombstone::ingest_checked(store, note_input_for(note, author.account.id, &author.account.domain, author.account.sensitized), None, now)? {
                     CheckedIngest::Live(ingested) => ingested.status.id,
                     CheckedIngest::Tombstoned => {
                         let tombstoned = Applied::Ignored("quoting status was deleted before it arrived".into());

@@ -319,6 +319,11 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/v1/admin/reports/:id/unassign", post(endpoints::admin_reports::unassign))
         .route("/api/v1/admin/reports/:id/reopen", post(endpoints::admin_reports::reopen))
         .route("/api/v1/admin/reports/:id/resolve", post(endpoints::admin_reports::resolve))
+        // Admin custom-emoji authoring (new API surface; no upstream REST
+        // equivalent in v4.7.3 — mirrors the announcements admin module:
+        // admins-only role gate, bare `admin:read`/`admin:write` scopes).
+        .route("/api/v1/admin/custom_emojis", get(endpoints::admin_emoji::index).post(endpoints::admin_emoji::create))
+        .route("/api/v1/admin/custom_emojis/:shortcode", put(endpoints::admin_emoji::update).delete(endpoints::admin_emoji::destroy))
         .merge(endpoints::admin_infra::routes())
         // Trends (Phase 7.3): public approved-only reads.
         .route("/api/v1/trends", get(endpoints::trends::trends_alias))
