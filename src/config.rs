@@ -175,6 +175,12 @@ pub struct Config {
     /// `nag` (allow but signal), `block` (422 when image/video lacks a
     /// description). Local writes only. File + CLI/env override.
     pub alt_text_policy: String,
+    /// Aperture mode (Stage 2): photo-first policy. `false` (default,
+    /// Mastodon parity); `true` requires attachments on top-level
+    /// non-DM writes, scopes timelines/search to media, and drops
+    /// text-only top-levels on federation ingest. Forces NOTHING about
+    /// the three core-extension policies above. File + CLI/env override.
+    pub aperture_mode: bool,
 }
 
 impl Default for Config {
@@ -227,6 +233,7 @@ impl Default for Config {
             license_policy: "off".to_string(),
             place_policy: "off".to_string(),
             alt_text_policy: "off".to_string(),
+            aperture_mode: false,
         }
     }
 }

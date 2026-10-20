@@ -185,6 +185,8 @@ fn parse_args(cfg: &mut Config) -> Args {
             cfg.place_policy = v.to_string();
         } else if let Some(v) = arg.strip_prefix("--alt-text-policy=") {
             cfg.alt_text_policy = v.to_string();
+        } else if arg == "--aperture-mode" {
+            cfg.aperture_mode = true;
         } else if let Some(v) = arg.strip_prefix("--mode=") {
             args.harness_mode = Some(v.to_string());
         } else if arg.starts_with("--") {

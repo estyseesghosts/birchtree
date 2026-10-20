@@ -101,6 +101,10 @@ pub struct ServerInfo {
     /// on success responses with undescribed image/video; `block` 422s
     /// those writes instead.
     pub alt_text_policy: String,
+    /// Stage 2 aperture mode (mirrors `Config::aperture_mode`, default
+    /// `false`). Photo-first policy; forces nothing about the three
+    /// core-extension policies.
+    pub aperture_mode: bool,
 }
 
 /// Core extension CORE-T nag signal: when `policy == "nag"` and at least
@@ -249,6 +253,7 @@ impl ServerInfo {
             license_policy: cfg.license_policy.clone(),
             place_policy: cfg.place_policy.clone(),
             alt_text_policy: cfg.alt_text_policy.clone(),
+            aperture_mode: cfg.aperture_mode,
         }
     }
 }

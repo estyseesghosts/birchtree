@@ -107,3 +107,23 @@ override per the existing config pattern:
   tested, same on v1/v2 media + statuses). `block` = 422 when an
   image/video attachment is left without a description (media v1/v2
   POST, status create/edit). Text-only posts unaffected.
+
+## Aperture mode (Stage 2; default off, Mastodon parity when off)
+
+`aperture_mode: bool` (default `false`; file key + `--aperture-mode`).
+When true: top-level (no `in_reply_to_id`) non-`direct` writes require
+≥1 image/video attachment (422 local, silent drop on ingest; replies
+with a resolvable parent may be text; DMs exempt; PUT may not strip the
+last attachment off a top-level); home/public/tag/list/link timelines
+show only statuses with media (no cursor/`Link` change); `context`
+returns full chains; `/api/v2/search` statuses filter to `has_media`;
+grandfathered pre-flag text stays stored but leaves timelines/search
+(direct GET still serves it); federation `Create(Note)`/`Update`
+without a valid attachment and without resolvable `inReplyTo` drops
+(log + counter, no store); votes/likes/follows/DMs untouched;
+poll-only top-levels drop (documented deviation).
+Aperture forces NOTHING about `license_policy` / `place_policy` /
+`alt_text_policy`: each behaves exactly as configured whether aperture
+is on or off (e.g. aperture on + license enforced = top-level needs
+media AND an effective license; aperture on + license off = photo rule
+only). No cross-validation, no implied enables.
