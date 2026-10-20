@@ -21,8 +21,8 @@ use crate::application::ports::{
 use crate::domain::bookmark::Bookmark;
 use crate::domain::favourite::Favourite;
 use crate::domain::{
-    AccountStats, Error, Id, IdempotencyRecord, Job, JobKind, NotificationType, Poll, PollOption,
-    QuotePolicy, QuoteRecord, QuoteState, Result, Status, StatusVersion, Visibility,
+    Account, AccountStats, Error, Id, IdempotencyRecord, Job, JobKind, NotificationType, Poll,
+    PollOption, QuotePolicy, QuoteRecord, QuoteState, Result, Status, StatusVersion, Visibility,
 };
 
 use super::media::{check_attachable_txn, read_media_txn, write_media_txn};
@@ -76,6 +76,10 @@ pub(super) fn write_status_txn(write: &WriteTransaction, status: &Status) -> Sto
     {
         let mut table = write.open_table(STATUSES)?;
         table.insert(status.id.value(), encode(status)?.as_slice())?;
+    }
+    {
+        let mut by_uri = write.open_table(schema::STATUS_BY_URI)?;
+        by_uri.insert(status.uri.as_str(), status.id.value())?;
     }
     {
         let mut table = write.open_table(STATUS_AUTHOR_INDEX)?;
@@ -277,21 +281,14 @@ fn idempotency_key(account_id: Id, raw_key: &str) -> StoreResult<Vec<u8>> {
     Ok(key)
 }
 
-/// A reblog's `uri`/`url`: replace the target's trailing `/{target_id}`
-/// segment with the reblog id.
-fn reblog_links(uri: &str, url: &str, target_id: Id, reblog_id: Id) -> (String, String) {
-    let suffix = format!("/{target_id}");
-    let swap = |link: &str| {
-        let base = match link.strip_suffix(&suffix) {
-            Some(base) => base,
-            None => match link.rsplit_once('/') {
-                Some((base, _)) => base,
-                None => "",
-            },
-        };
-        format!("{base}/{reblog_id}")
-    };
-    (swap(uri), swap(url))
+/// A reblog wrapper's `uri`/`url`. The wrapper is the booster’s own status,
+/// so its links live on the booster's actor URI — never on the boosted
+/// status's domain. (An activity id on another host than its actor is
+/// refused by every domain-checking receiver, including ourselves.)
+fn reblog_links(booster_actor_uri: &str, reblog_id: Id) -> (String, String) {
+    let base = booster_actor_uri.trim_end_matches('/');
+    let uri = format!("{base}/statuses/{reblog_id}");
+    (uri.clone(), uri)
 }
 
 impl StatusStore for RedbStore {
@@ -329,8 +326,13 @@ impl StatusStore for RedbStore {
 
         // -- Mint the identity; uri/url are `{base}/{id}`.
         let status_id = self.next_id();
-        let uri = format!("{}/{}", input.uri_base, status_id);
-        let url = format!("{}/{}", input.url_base, status_id);
+        let (uri, url) = match &input.remote {
+            Some(identity) => (identity.uri.clone(), identity.url.clone()),
+            None => (
+                format!("{}/{}", input.uri_base, status_id),
+                format!("{}/{}", input.url_base, status_id),
+            ),
+        };
 
         // -- Poll, embedded with its expiry job. The polls module owns the
         //    row/index/job shapes for status creation.
@@ -485,6 +487,7 @@ impl StatusStore for RedbStore {
             quotes_count: 0,
         };
         write_status_txn(&write, &status)?;
+        super::federation_content::federation_event_txn(&write, self.next_id(), input.account_id, serde_json::json!({"event": "create", "status_id": status_id.value()}), now_ms)?;
 
         // -- Idempotency record, committed with the mutation it protects.
         if let Some(raw) = input.idempotency_key.as_deref() {
@@ -824,6 +827,7 @@ impl StatusStore for RedbStore {
         insert_version(&write, &snapshot)?;
 
         write_status_txn(&write, &status)?;
+        super::federation_content::federation_event_txn(&write, self.next_id(), account_id, serde_json::json!({"event": "update", "status_id": id.value()}), now_ms)?;
         write.commit()?;
         Ok(Some(status))
     }
@@ -914,6 +918,15 @@ impl StatusStore for RedbStore {
         stats.last_status_at_ms = newest_live_status_at(&write, account_id)?;
         write_stats_txn(&write, account_id, &stats)?;
 
+        super::federation_content::federation_event_txn(&write, self.next_id(), account_id, serde_json::json!({"event": "delete", "status_id": id.value()}), now_ms)?;
+        // Mastodon parity (item 52): deleting a reblog wrapper must also send
+        // `Undo(Announce)` so the origin decrements its reblog count. The
+        // `delete` above is kept for followers' timelines.
+        if let Some(target_id) = snapshot.reblog_of_id {
+            write.open_table(REBLOGS_BY_ACCOUNT)?
+                .remove(schema::pair_key(account_id.value(), target_id.value()).as_slice())?;
+            super::federation_content::federation_event_txn(&write, self.next_id(), account_id, serde_json::json!({"event": "undo_announce", "status_id": target_id.value(), "announce_uri": snapshot.uri.clone()}), now_ms)?;
+        }
         write.commit()?;
         Ok(DeletedStatus {
             status: snapshot,
@@ -1188,6 +1201,7 @@ impl StatusStore for RedbStore {
             )?;
         }
 
+        super::federation_content::federation_event_txn(&write, self.next_id(), account_id, serde_json::json!({"event": "like", "status_id": status_id.value()}), now_ms)?;
         write.commit()?;
         Ok(status)
     }
@@ -1219,6 +1233,7 @@ impl StatusStore for RedbStore {
             }
             status.favourites_count = status.favourites_count.saturating_sub(1);
             write_status_txn(&write, &status)?;
+            super::federation_content::federation_event_txn(&write, self.next_id(), account_id, serde_json::json!({"event": "unlike", "status_id": status_id.value()}), _now_ms)?;
             // Notification deletion belongs to the notification read surface
             // (Phase 4); the interaction never rewrites notification rows here.
         }
@@ -1331,7 +1346,19 @@ impl StatusStore for RedbStore {
         }
 
         let reblog_id = self.next_id();
-        let (uri, url) = reblog_links(&target.uri, &target.url, target.id, reblog_id);
+        // The wrapper's links live on the booster's actor URI (see
+        // `reblog_links`); the target's links stay untouched.
+        let booster_actor_uri = {
+            let accounts = write.open_table(ACCOUNTS)?;
+            match accounts.get(account_id.value())? {
+                Some(guard) => {
+                    let account: Account = decode(guard.value())?;
+                    account.actor_uri
+                }
+                None => return Err(Error::NotFound("reblogging account".into())),
+            }
+        };
+        let (uri, url) = reblog_links(&booster_actor_uri, reblog_id);
         let reblog = Status {
             id: reblog_id,
             account_id,
@@ -1397,6 +1424,7 @@ impl StatusStore for RedbStore {
             )?;
         }
 
+        super::federation_content::federation_event_txn(&write, self.next_id(), account_id, serde_json::json!({"event": "announce", "status_id": target.id.value()}), now_ms)?;
         write.commit()?;
         Ok(reblog)
     }
@@ -1445,6 +1473,7 @@ impl StatusStore for RedbStore {
         stats.statuses_count = stats.statuses_count.saturating_sub(1);
         write_stats_txn(&write, reblog.account_id, &stats)?;
 
+        super::federation_content::federation_event_txn(&write, self.next_id(), account_id, serde_json::json!({"event": "undo_announce", "status_id": status_id.value(), "announce_uri": reblog.uri.clone()}), now_ms)?;
         write.commit()?;
         Ok(target)
     }

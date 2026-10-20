@@ -1,0 +1,45 @@
+== Setup
+PASS  birchtree up: http://bt-a.lab:8080
+PASS  birchtree up: http://127.0.0.1:8081
+PASS  birchtree up: http://127.0.0.1:8082
+FAIL  mastodon up
+PASS  bt-a token
+PASS  bt-b token
+PASS  bt-c token
+WARNING: No mastodon token for alice, will use API endpoints that don't need it
+== Follow family: birchtree -> mastodon
+PASS  bt-a resolves alice
+FAIL  mastodon sees bt-a follow
+== Follow family: mastodon -> birchtree
+FAIL  bt-a home has alice follow
+== Notes: birchtree -> mastodon
+FAIL  mastodon received birchtree note
+== Notes: mastodon -> birchtree
+FAIL  bt-a home has mastodon note
+== Edit: birchtree -> mastodon
+FAIL  mastodon sees birchtree edit
+== Edit: mastodon -> birchtree
+FAIL  bt-a sees mastodon edit
+== Delete: birchtree -> mastodon
+FAIL  mastodon sees birchtree delete
+== Delete: mastodon -> birchtree
+PASS  bt-a home no longer has mastodon note
+== Replies + thread completion
+FAIL  birchtree reply linked to root
+== Likes both ways
+FAIL  mastodon count reflects bt-a like
+== Renotes/Boosts both ways
+FAIL  bt-a reblogs count reflects mastodon boost
+== Blocks both ways
+PASS  mastodon sees bt-a block (or local-only)
+== Quotes
+PASS  bt-a quotes endpoint reachable
+== Flags/Reports both ways
+FAIL  mastodon received report from bt-a
+== Remote media: birchtree -> mastodon
+FAIL  mastodon received media from bt-a
+== Birchtree <-> Birchtree (bt-a <-> bt-b)
+FAIL  bt-b home has bt-a note
+
+RESULT: 10 passed, 14 failed
+EXIT=0

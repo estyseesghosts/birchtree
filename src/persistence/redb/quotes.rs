@@ -44,16 +44,33 @@ pub(super) fn attach_quote_txn(
 ) -> StoreResult<QuoteRecord> {
     let mut quoted = super::statuses::read_status_txn(write, spec.quoted_status_id)?
         .ok_or_else(|| StoreError::Migration("quoted status missing".into()))?;
-    quoted.quotes_count = quoted.quotes_count.saturating_add(1);
-    super::statuses::write_status_txn(write, &quoted)?;
-
-    // Local quotes are accepted at creation when the quoted status's policy
-    // allows (the use case decides); federation states are Phase 6.
+    // A local quoted author accepts at creation when the policy allows (the use
+    // case decided). A remote author must approve first: the quote is pending,
+    // it does not count, and a QuoteRequest goes out (Phase 6).
+    let quoted_is_remote = {
+        let accounts = write.open_table(schema::ACCOUNTS)?;
+        match accounts.get(spec.quoted_account_id.value())? {
+            Some(guard) => {
+                let account: crate::domain::Account = decode(guard.value())?;
+                !account.local
+            }
+            None => false,
+        }
+    };
+    let state = if quoted_is_remote {
+        QuoteState::Pending
+    } else {
+        QuoteState::Accepted
+    };
+    if state == QuoteState::Accepted {
+        quoted.quotes_count = quoted.quotes_count.saturating_add(1);
+        super::statuses::write_status_txn(write, &quoted)?;
+    }
     let record = QuoteRecord {
         id: quote_id,
         quoting_status_id,
         quoted_status_id: spec.quoted_status_id,
-        state: QuoteState::Accepted,
+        state,
         quoting_account_id,
         quoted_account_id: spec.quoted_account_id,
         quote_activity_uri: None,
@@ -74,6 +91,15 @@ pub(super) fn attach_quote_txn(
     {
         let mut by_quoting = write.open_table(QUOTES_BY_QUOTING)?;
         by_quoting.insert(quoting_status_id.value(), quote_id.value())?;
+    }
+    if state == QuoteState::Pending {
+        super::federation_content::federation_event_txn(
+            write,
+            quote_id,
+            quoting_account_id,
+            serde_json::json!({"event": "quote_request", "quote_id": quote_id.value()}),
+            now_ms,
+        )?;
     }
     Ok(record)
 }
@@ -219,6 +245,7 @@ impl QuoteStore for RedbStore {
             let mut quotes = write.open_table(QUOTES)?;
             quotes.insert(quote_id.value(), encode(&quote)?.as_slice())?;
         }
+        super::federation_content::federation_event_txn(&write, self.next_id(), quote.quoted_account_id, serde_json::json!({"event": "quote_revoke", "quote_id": quote_id.value()}), now_ms)?;
         write.commit()?;
         Ok(quote)
     }

@@ -1,0 +1,56 @@
+variables:
+  - &rust_image "rust:1.88-bullseye"
+
+steps:
+  cargo_fmt:
+    image: rustdocker/rust:nightly
+    commands:
+      - /root/.cargo/bin/cargo fmt -- --check
+    when:
+      - event: pull_request
+
+  cargo_clippy:
+    image: *rust_image
+    environment:
+      CARGO_HOME: .cargo
+    commands:
+      - rustup component add clippy
+      - cargo clippy --all-targets --all-features
+    when:
+      - event: pull_request
+
+  cargo_test:
+    image: *rust_image
+    environment:
+      CARGO_HOME: .cargo
+    commands:
+      - cargo test --all-features --no-fail-fast
+    when:
+      - event: pull_request
+
+  cargo_doc:
+    image: *rust_image
+    environment:
+      CARGO_HOME: .cargo
+    commands:
+      - cargo doc --all-features
+    when:
+      - event: pull_request
+
+  cargo_run_actix_example:
+    image: *rust_image
+    environment:
+      CARGO_HOME: .cargo
+    commands:
+      - cargo run --example local_federation actix-web
+    when:
+      - event: pull_request
+
+  cargo_run_axum_example:
+    image: *rust_image
+    environment:
+      CARGO_HOME: .cargo
+    commands:
+      - cargo run --example local_federation axum
+    when:
+      - event: pull_request

@@ -90,7 +90,7 @@ async fn search_requires_q_and_pages_with_mastodon_messages() {
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
     let results = json(&bytes);
     assert_eq!(
-        results.as_object().unwrap().keys().collect::<Vec<_>>(),
+        results.as_object().unwrap().keys().collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>(),
         vec!["accounts", "collections", "hashtags", "statuses"]
     );
     assert!(results["collections"].as_array().unwrap().is_empty());
@@ -208,6 +208,33 @@ async fn search_finds_accounts_hashtags_and_statuses() {
     assert!(results["accounts"].as_array().unwrap().is_empty());
     assert!(results["statuses"].as_array().unwrap().is_empty());
     assert!(results["hashtags"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn search_by_status_url_returns_the_stored_status() {
+    let srv = TestServer::new(true);
+    let alice = user_token(&srv, "alice", "read:search read:statuses write:statuses").await;
+    let (status, _h, bytes) = send(
+        &srv.router,
+        form_request("POST", "/api/v1/statuses", "status=found+by+url", Some(&alice)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    let created = json(&bytes);
+    let (id, uri) = (created["id"].as_str().unwrap(), created["uri"].as_str().unwrap());
+
+    // No `type`: as Mastodon, a status URL query finds the status without `resolve`.
+    let path = format!("/api/v2/search?q={}", enc(uri));
+    let (status, _h, bytes) = send(&srv.router, get_request(&path, Some(&alice), None)).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    let statuses = json(&bytes)["statuses"].clone();
+    assert_eq!(statuses.as_array().unwrap().len(), 1);
+    assert_eq!(statuses[0]["id"], id);
+
+    // Anonymous callers get nothing, as for any status search.
+    let (status, _h, bytes) = send(&srv.router, get_request(&path, None, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json(&bytes)["statuses"].as_array().unwrap().is_empty());
 }
 
 // ---------------------------------------------------------------------------

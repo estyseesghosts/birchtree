@@ -88,7 +88,7 @@ async fn list_crud_round_trip_with_exact_keys() {
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
     let created = json(&bytes);
     assert_eq!(
-        created.as_object().unwrap().keys().collect::<Vec<_>>(),
+        created.as_object().unwrap().keys().collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>(),
         vec!["exclusive", "id", "replies_policy", "title"]
     );
     assert_eq!(created["title"], "Friends");

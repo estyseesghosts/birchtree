@@ -153,7 +153,7 @@ async fn index_shows_interactions_with_exact_shape_and_filters() {
     assert_eq!(ids.len(), 3);
     for item in items {
         assert_eq!(
-            item.as_object().unwrap().keys().collect::<Vec<_>>(),
+            item.as_object().unwrap().keys().collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>(),
             vec!["account", "created_at", "group_key", "id", "status", "type"]
         );
         assert!(item["group_key"]

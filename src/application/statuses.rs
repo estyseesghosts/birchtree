@@ -27,9 +27,12 @@ use crate::domain::{
 // Mastodon-compatible limits and verbatim error strings (v4.7.3, pinned).
 // ---------------------------------------------------------------------------
 
-/// Status text limit (`StatusLengthValidator::MAX_CHARS`); URLs count as a
-/// fixed 23 characters (see [`count_length`]).
-const MAX_STATUS_LENGTH: usize = 500;
+/// Default status text limit (`StatusLengthValidator::MAX_CHARS`); URLs count
+/// as a fixed 23 characters (see [`count_length`]). Configurable per server
+/// up to [`ABS_MAX_STATUS_LENGTH`] via `--max-status-chars=`.
+pub const DEFAULT_MAX_STATUS_LENGTH: usize = 500;
+/// Hard ceiling on the configurable status text limit (Misskey parity).
+pub const ABS_MAX_STATUS_LENGTH: usize = 3000;
 /// Every URL counts as this many characters (`URL_PLACEHOLDER`).
 const URL_LENGTH: usize = 23;
 /// Mastodon's `Status::MEDIA_ATTACHMENTS_LIMIT` for a single status.
@@ -45,7 +48,14 @@ const MAX_POLL_EXPIRY_S: u64 = 2_592_000;
 const CHILDREN_PER_LEVEL: usize = 200;
 
 const ERR_BLANK_TEXT: &str = "Validation failed: Text can't be blank";
-const ERR_TEXT_TOO_LONG: &str = "Validation failed: character limit of 500 exceeded";
+/// Prefix of the over-long-text error; the configured limit is interpolated
+/// (Mastodon embeds the number: "character limit of 500 exceeded").
+const ERR_TEXT_TOO_LONG_PREFIX: &str = "Validation failed: character limit of ";
+/// Over-long-text error with the configured limit interpolated, matching
+/// Mastodon's message shape (`character limit of 500 exceeded` at default).
+pub fn text_too_long_error(max_chars: usize) -> String {
+    format!("{ERR_TEXT_TOO_LONG_PREFIX}{max_chars} exceeded")
+}
 const ERR_VISIBILITY: &str =
     "Validation failed: Visibility must be public, unlisted, private or direct";
 const ERR_LANGUAGE: &str = "Validation failed: Language is invalid";
@@ -160,6 +170,7 @@ pub fn create_status(
     base_url: &str,
     now_ms: u64,
     cmd: CreateStatusCommand,
+    max_chars: usize,
 ) -> Result<CreateStatusResult> {
     let CreateStatusCommand {
         account_id,
@@ -234,8 +245,8 @@ pub fn create_status(
         .or(user.default_language.clone())
         .filter(|l| language_regex().is_match(l));
 
-    if count_length(&text) > MAX_STATUS_LENGTH {
-        return Err(Error::InvalidInput(ERR_TEXT_TOO_LONG.into()));
+    if count_length(&text) > max_chars {
+        return Err(Error::InvalidInput(text_too_long_error(max_chars)));
     }
     if text.trim().is_empty()
         && media_ids.is_empty()
@@ -333,6 +344,7 @@ pub fn create_status(
     let content_html = render_html(&text);
     let created = store.create_status(
         NewStatus {
+            remote: None,
             account_id,
             uri_base: format!("{base}/users/{}/statuses", account.username),
             url_base: format!("{base}/@{}", account.username),

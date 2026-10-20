@@ -407,6 +407,7 @@ fn crypto_helpers_reject_tampered_hash() {
 /// A minimal public status input for direct `StatusStore::create_status` use.
 fn new_status(account_id: Id, text: &str) -> NewStatus {
     NewStatus {
+        remote: None,
         account_id,
         uri_base: "https://example.social/users/test/statuses".to_string(),
         url_base: "https://example.social/@test".to_string(),

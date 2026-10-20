@@ -72,7 +72,7 @@ An unmodified Mastodon client connects to a birchtree instance and has an identi
   (past → posts immediately; unparseable → 422 `Record invalid`; <5 min →
   pinned 422) + index/show/update/delete + durable publish job.
 - **Search (interim):** `GET /api/v2/search` over the local corpus until the
-  Phase 7.2 search library lands (v1 does not exist in v4.7.3). **Custom emoji:** public
+  Phase 7.2 search library lands (v1 does not exist in v4.7.3). A query that is a status URL returns that status (as Mastodon's URL search) when it is stored here and the viewer may see it; with `resolve=true` an unknown remote status is fetched over federation first. Authenticated callers only. **Custom emoji:** public
   `GET /api/v1/custom_emojis` + image serving + status-payload `emojis` arrays
   (CLI-managed).
 - **Timelines:** `GET /api/v1/timelines/home` (user token; `read`/`read:statuses`;
@@ -152,6 +152,14 @@ Each row is a difference from Mastodon v4.7.3 that a client can observe, or a ga
 | D24 | No `kill` on account suspension or disablement (Phase 5 gap) | Suspended and disabled accounts' tokens are killed | A suspended account's open streams stay open until Phase 7.3 adds suspension | gap (Phase 7.3) |
 | D25 | Hashtag names are normalized by birchtree's REST normalizer (lowercase, Unicode alphanumerics and `_`), not upstream's `normalizeHashtag` (NFKC, folding of accented letters, stripping of other characters). Here `#café` and `#cafe` are two tags; upstream folds them into one (found 2026-10-17) | `normalizeHashtag` (`streaming/utils.js`) and `Tag.normalize` in Rails | A tag timeline or hashtag stream shows different statuses for names with accents or compatibility characters. Affects the REST tag timeline too | gap (escalated; not changed in Phase 5) |
 | D26 | Notifications from an account the recipient blocks, is blocked by, mutes or has domain-blocked are created and shown (Phase 3/4 gap, found 2026-10-17) | `NotifyService` drops them (`DropCondition`: blocked, muted, domain-blocked) and does not create the notification | The notification index and the notification streams carry notifications upstream would never create. Escalated with D22 and D23 (the shared policy) | gap (escalated; not changed in Phase 5) |
+| D27 | Inbound activities are limited to 1 MB (vendored crate, constant changed) | Inbox accepts 1 MB (`FEDERATION.md`, serialized JSON-LD limit) | None | closed (2026-10-18: vendor patch, see `vendor/README.md`; remote document fetches stay at 200 KB) |
+| D28 | Outbound: 4xx deliveries are retried (FailClientErrors middleware) | Mastodon retries a non-2xx delivery with backoff (`ActivityPub::DeliveryWorker`) | None | closed (2026-10-18: `federation::net::FailClientErrors`) |
+| D29 | `Question` (polls) federates both directions since 2026-10-19: inbound `Create` of a `Question` is stored with its poll, `Update` of one syncs tallies/expiry, vote-shaped `Create` `Note`s (`name` + `inReplyTo`, empty content) tally; local polls send `Create` of the `Question`, local votes on remote polls send `Create` of the vote `Note` to the poll's author, and new tallies/expiry send `Update` of the `Question` to followers (hidden totals are never distributed) | Polls federate (`FEDERATION.md`, `Question`, 500-option limit) | A remote poll is shown with its options and tallies; a local poll reaches followers and records remote votes | implemented (2026-10-19; evidence `tests/phase6_content.rs` poll section) |
+| D30 | `outbox`, `followers` and `following` collections now served (Phase 6); counts and pages match for the local account | Served, with counts and pages | None for the local account; remote collections are read from the remote | closed (2026-10-18, Phase 6) for local accounts |
+| D31 | NodeInfo 2.0 omits `usage` (Phase 6); `openRegistrations` and `software` are served | `usage.users` and `usage.localPosts` are served | Remote statistics for this server show nothing; no interop effect | recommended (needs local-only counts) |
+| D32 | An unsupported or malformed activity is refused `422` (Phase 6) | Mastodon's inbox answers `202` for any signed activity, and drops types it does not handle | Client-invisible. A remote sees a non-retried `4xx` for an activity birchtree does not support | decided (Phase 6) |
+| D33 | Activities with no effect (for example an Undo of a follow that is not there) are not recorded as seen, so a redelivery is evaluated again (Phase 6) | Mastodon records every processed activity ID | Client-invisible. Needed because Mastodon reuses an Undo's ID for a later undo of the same follow row | decided (Phase 6; found by the interop run, 2026-10-17) |
+| D34 | Phase 6 activity set now includes Create/Note, Create/Question, Update (Note and Question), vote `Create`/`Note`, Delete, Like/Undo, Announce/Undo, Block/Undo, quote Request/Accept/Reject/Revoke, Flag send/receive and thread completion, both directions | All of them | None, pending lab verification | partly closed (2026-10-19, in-process tests; lab interop pending) |
 
 **Decisions (2026-10-17)**
 
@@ -183,7 +191,9 @@ Each row is a difference from Mastodon v4.7.3 that a client can observe, or a ga
 - keystodon's first-party mode (Phase 7): bundle mount path and artifact source; whether first-party `/api/v1/*` calls use OAuth tokens (proposed default) or the session.
 - Admin permission split between `admin` and `moderator` (proposed: moderator covers reports and account actions; admin covers every admin route), and the audit trail (proposed: on) (Phase 7.3).
 - Search is on by default (D6, decided); the administrator switch is built in Phase 7.2 and 7.3.
-- Maximum status/media limits.
+- Maximum status/media limits. Decided for statuses (2026-10-19): default 500
+  (Mastodon parity), configurable to 3000 (Misskey parity) via
+  `--max-status-chars=`; advertised in the v1/v2 instance configuration.
 - Whether public web/ActivityPub object routes are part of the first federation milestone (Phase 6).
 - Latency/resource acceptance thresholds (Phase 8).
 

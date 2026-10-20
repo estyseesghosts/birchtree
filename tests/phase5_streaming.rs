@@ -514,12 +514,15 @@ async fn streaming_path_redirects_to_a_configured_host() {
         blobs,
         std::sync::Arc::new(streams.clone()),
     ));
+    let federation = common::federation_config(context.clone(), common::TEST_PUBLIC_URL);
     let router = birchtree::api::mastodon::build_router(birchtree::api::mastodon::ApiState {
         context,
         trusted_proxies: std::sync::Arc::new(Vec::new()),
         max_body_size: 1024 * 1024,
         server,
         streams,
+        federation,
+        rate_limit_multiplier: 1,
     });
     let response = send(
         &router,

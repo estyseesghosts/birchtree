@@ -302,11 +302,31 @@ pub async fn context(
                     Err(err) => return err.into_response(),
                 }
             }
-            axum::Json(serde_json::json!({
+            // Remote threads complete on an authenticated read (Phase 6, contract B/C).
+            // The refresh ID is announced so the client polls again.
+            let refresh = if auth.0.is_some() {
+                match store.status_by_id(id) {
+                    Ok(Some(root)) => crate::federation::threads::read_time_completion(store, &root, state.context.now_ms())
+                        .unwrap_or_else(|err| {
+                            tracing::warn!(error = %err, "thread completion not scheduled");
+                            None
+                        }),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let mut response = axum::Json(serde_json::json!({
                 "ancestors": ancestors,
                 "descendants": descendants,
             }))
-            .into_response()
+            .into_response();
+            if let Some(refresh_id) = refresh {
+                if let Ok(value) = axum::http::HeaderValue::from_str(&format!("id=\"{refresh_id}\", retry=3")) {
+                    response.headers_mut().insert("mastodon-async-refresh", value);
+                }
+            }
+            response
         }
         Err(err) => status_error(err).into_response(),
     }
@@ -468,6 +488,7 @@ pub async fn create(
             now_ms,
             cmd,
             scheduled_at_ms,
+            state.server.max_status_chars,
         ) {
             Ok(row) => {
                 let media = store
@@ -488,7 +509,7 @@ pub async fn create(
         };
     }
 
-    match statuses::create_status(store, &state.server.public_url, state.context.now_ms(), cmd) {
+    match statuses::create_status(store, &state.server.public_url, state.context.now_ms(), cmd, state.server.max_status_chars) {
         Ok(created) => {
             // An idempotent replay committed nothing new, so nothing streams.
             if !created.replayed {

@@ -1,4 +1,7 @@
 pub mod ports;
+pub mod federation_ports;
+pub mod federation;
+pub mod federation_inbound;
 pub mod context;
 pub mod crypto;
 pub mod policy;

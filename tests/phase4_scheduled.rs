@@ -118,7 +118,7 @@ async fn scheduling_returns_the_scheduled_shape_and_publishes_later() {
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
     let scheduled = json(&bytes);
     assert_eq!(
-        scheduled.as_object().unwrap().keys().collect::<Vec<_>>(),
+        scheduled.as_object().unwrap().keys().collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>(),
         vec!["id", "media_attachments", "params", "scheduled_at"]
     );
     assert_eq!(scheduled["params"]["text"], "later post");

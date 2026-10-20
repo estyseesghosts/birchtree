@@ -152,6 +152,20 @@ impl<'a> ViewerScope<'a> {
         })
     }
 
+    /// Whether `status` is a reply whose remote parent has not been resolved
+    /// yet (contract A): it is withheld from home and list feeds until its
+    /// parent is linked.
+    fn unresolved_reply(&self, status: &Status) -> bool {
+        match self.store.unresolved_parent(status.id) {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(err) => {
+                self.fail(err);
+                false
+            }
+        }
+    }
+
     /// The viewer holds an active follow of `account`.
     fn follows(&self, account: Id) -> bool {
         self.facts(account).is_some_and(|f| f.pair.following)
@@ -268,6 +282,9 @@ impl TimelineFilter for HomeFilter<'_> {
         if is_orphan_reply(status) {
             return false;
         }
+        if author != self.viewer && self.scope.unresolved_reply(status) {
+            return false;
+        }
         if let Some(parent) = foreign_reply_parent(status) {
             if parent != self.viewer && !self.scope.follows(parent) {
                 return false;
@@ -333,6 +350,9 @@ impl TimelineFilter for ListFilter<'_> {
             return false;
         }
         if is_orphan_reply(status) {
+            return false;
+        }
+        if author != self.viewer && self.scope.unresolved_reply(status) {
             return false;
         }
         if let Some(parent) = foreign_reply_parent(status) {

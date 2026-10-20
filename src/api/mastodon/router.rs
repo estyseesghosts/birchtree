@@ -19,6 +19,7 @@ use crate::api::oauth::{authorization, token};
 /// Build the application router.
 pub fn build_router(state: ApiState) -> Router {
     let max_body = state.max_body_size;
+    let rate_multiplier = state.rate_limit_multiplier;
     Router::new()
         // Runtime probes.
         .route("/health", get(health))
@@ -412,7 +413,7 @@ pub fn build_router(state: ApiState) -> Router {
         // params before the action); this sits inside the rate limiter, which
         // runs first, as Rack::Attack does upstream.
         .layer(middleware::from_fn(json_body::guard))
-        .layer(middleware::from_fn(rate_limits::middleware))
+        .layer(middleware::from_fn_with_state(rate_multiplier, rate_limits::middleware))
         .layer(middleware::from_fn(vary_authorization))
         .layer(DefaultBodyLimit::max(max_body))
         .layer(TraceLayer::new_for_http())

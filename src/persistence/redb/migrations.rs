@@ -272,6 +272,57 @@ pub fn apply(db: &Database) -> Result<u64, StoreError> {
             }
         }
 
+        // Step v6: federation keys, actor-URI index, inbound activity dedup and
+        // outbound follow-by-URI index (Phase 6). The actor-URI index is backfilled
+        // from the accounts table: local accounts were not indexed before v6.
+        if current < 6 {
+            let _ = write.open_table(schema::ACTOR_KEYS)?;
+            let _ = write.open_table(schema::ACTIVITY_DEDUP)?;
+            let _ = write.open_table(schema::FOLLOW_BY_URI)?;
+            use redb::ReadableTable;
+            use crate::domain::Account;
+            let rows: Vec<(u64, String)> = {
+                let accounts = write.open_table(ACCOUNTS)?;
+                let mut rows = Vec::new();
+                for entry in accounts.iter()? {
+                    let (key, value) = entry?;
+                    let account: Account = super::decode(value.value())?;
+                    rows.push((key.value(), account.actor_uri));
+                }
+                rows
+            };
+            let mut by_actor = write.open_table(schema::ACCOUNT_BY_ACTOR_URI)?;
+            for (id, actor_uri) in rows {
+                by_actor.insert(actor_uri.as_str(), id)?;
+            }
+        }
+
+        // Step v7: status identity by URI (backfilled from every existing status),
+        // the remote-thread refresh table, and reports.
+        if current < 7 {
+            let _ = write.open_table(schema::REMOTE_REFRESH)?;
+            let _ = write.open_table(schema::REPORTS)?;
+            let _ = write.open_table(schema::REMOTE_MEDIA_SOURCE)?;
+            let _ = write.open_table(schema::QUOTE_BY_APPROVAL)?;
+            let _ = write.open_table(schema::UNRESOLVED_PARENT)?;
+            use redb::ReadableTable;
+            use crate::domain::Status;
+            let rows: Vec<(String, u64)> = {
+                let statuses = write.open_table(STATUSES)?;
+                let mut rows = Vec::new();
+                for entry in statuses.iter()? {
+                    let (key, value) = entry?;
+                    let status: Status = super::decode(value.value())?;
+                    rows.push((status.uri, key.value()));
+                }
+                rows
+            };
+            let mut by_uri = write.open_table(schema::STATUS_BY_URI)?;
+            for (uri, id) in rows {
+                by_uri.insert(uri.as_str(), id)?;
+            }
+        }
+
         {
             let mut meta = write.open_table(META)?;
             meta.insert(

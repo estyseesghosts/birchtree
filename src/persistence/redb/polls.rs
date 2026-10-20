@@ -289,6 +289,29 @@ impl PollStore for RedbStore {
             super::jobs::insert_job(&write, &job).map_err(vote_err)?;
         }
 
+        // Federation, committed with the tally: a local vote on a remote poll
+        // is delivered to its origin (`poll_vote`); a vote on a local poll
+        // redistributes the new totals to followers (`question_update`).
+        // Each event is a no-op for a remote actor, so it lands exactly
+        // where it is due: a remote voter's ballot never leaves, and a poll
+        // we do not own never gets an update from us.
+        super::federation_content::federation_event_txn(
+            &write,
+            self.next_id(),
+            account_id,
+            serde_json::json!({"event": "poll_vote", "status_id": poll.status_id.value()}),
+            now_ms,
+        )
+        .map_err(vote_err)?;
+        super::federation_content::federation_event_txn(
+            &write,
+            self.next_id(),
+            poll.account_id,
+            serde_json::json!({"event": "question_update", "status_id": poll.status_id.value()}),
+            now_ms,
+        )
+        .map_err(vote_err)?;
+
         write.commit().map_err(vote_err)?;
         Ok(poll)
     }
@@ -302,6 +325,43 @@ impl PollStore for RedbStore {
             None => return Ok(None),
         };
         poll.expired = true;
+        {
+            let mut polls = write.open_table(POLLS)?;
+            polls.insert(poll_id.value(), encode(&poll)?.as_slice())?;
+        }
+        write.commit()?;
+        Ok(Some(poll))
+    }
+
+    fn sync_remote_poll(
+        &self,
+        poll_id: Id,
+        counts: &[(String, u64)],
+        voters_count: u64,
+        expires_at_ms: Option<u64>,
+        expired: bool,
+        now_ms: u64,
+    ) -> Result<Option<Poll>> {
+        let write = self.begin_write()?;
+        let mut poll = match read_poll_txn(&write, poll_id)? {
+            Some(poll) => poll,
+            None => return Ok(None),
+        };
+        for (title, votes) in counts {
+            if let Some(option) = poll.options.iter_mut().find(|o| o.title == *title) {
+                option.votes_count = *votes;
+            }
+        }
+        // The origin is authoritative for the totals; local ballots stay as
+        // they are (a remote sync never invents or removes a local ballot).
+        poll.voters_count = voters_count;
+        poll.votes_count = poll.options.iter().map(|o| o.votes_count).sum();
+        if let Some(expiry) = expires_at_ms {
+            poll.expires_at_ms = Some(expiry);
+        }
+        if expired || poll.is_expired_at(now_ms) {
+            poll.expired = true;
+        }
         {
             let mut polls = write.open_table(POLLS)?;
             polls.insert(poll_id.value(), encode(&poll)?.as_slice())?;

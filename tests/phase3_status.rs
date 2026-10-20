@@ -118,12 +118,16 @@ fn error_of(bytes: &[u8]) -> String {
 
 /// Sorted object key set, for exact-shape assertions.
 fn key_set(value: &Value) -> Vec<String> {
-    value
+    // Sorted: serde_json's map order depends on the `preserve_order` feature,
+    // which the federation crate enables. The key set is what the test pins.
+    let mut keys: Vec<String> = value
         .as_object()
         .unwrap_or_else(|| panic!("not a JSON object: {value}"))
         .keys()
         .cloned()
-        .collect()
+        .collect();
+    keys.sort();
+    keys
 }
 
 /// The local account id for a username.

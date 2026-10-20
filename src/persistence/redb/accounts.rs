@@ -89,6 +89,11 @@ impl AccountStore for RedbStore {
             handles.insert(key.as_str(), account_id.value())?;
         }
         {
+            // Local accounts are found by actor URI too (Phase 6 federation).
+            let mut by_actor = write.open_table(super::schema::ACCOUNT_BY_ACTOR_URI)?;
+            by_actor.insert(account.actor_uri.as_str(), account_id.value())?;
+        }
+        {
             let mut users = write.open_table(LOCAL_USERS)?;
             users.insert(account_id.value(), encode(&user)?.as_slice())?;
         }

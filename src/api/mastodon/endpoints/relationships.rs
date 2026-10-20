@@ -83,6 +83,10 @@ pub async fn follow(
         Ok(account) => account,
         Err(err) => return err.into_response(),
     };
+    if !target.local {
+        // A remote target is followed by federation: a signed Follow, pending until the Accept.
+        return federated_follow(&state, viewer, &target).await;
+    }
     let pairs = body;
     let cmd = relationships::FollowCommand {
         follower_id: viewer,
@@ -93,6 +97,28 @@ pub async fn follow(
     match relationships::follow(store, state.context.now_ms(), cmd) {
         Ok(_) => relationship_response(&state, viewer, target.id),
         Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
+/// Follow a remote account: the block check of the local path, then the federated request.
+async fn federated_follow(state: &ApiState, viewer: crate::domain::Id, target: &Account) -> Response {
+    let store: &dyn Store = &*state.context.store;
+    let follower = match store.account_by_id(viewer) {
+        Ok(Some(account)) => account,
+        Ok(None) => return ApiError::not_found().into_response(),
+        Err(err) => return ApiError::from(err).into_response(),
+    };
+    match store.pair_state(viewer, target.id, state.context.now_ms()) {
+        Ok(pair) if pair.blocking || pair.blocked_by => {
+            return ApiError::from(crate::domain::Error::Forbidden("This action is not allowed".into()))
+                .into_response();
+        }
+        Ok(_) => {}
+        Err(err) => return ApiError::from(err).into_response(),
+    }
+    match crate::activitypub::outbound::send_follow(&state.federation, &follower, target).await {
+        Ok(_) => relationship_response(state, viewer, target.id),
+        Err(err) => ApiError::from(crate::domain::Error::from(err)).into_response(),
     }
 }
 
@@ -114,6 +140,23 @@ pub async fn unfollow(
         Ok(account) => account,
         Err(err) => return err.into_response(),
     };
+    if !target.local {
+        // A remote target gets a signed Undo; the follow row goes in the same transaction.
+        let follower = match store.account_by_id(viewer) {
+            Ok(Some(account)) => account,
+            Ok(None) => return ApiError::not_found().into_response(),
+            Err(err) => return ApiError::from(err).into_response(),
+        };
+        return match crate::activitypub::outbound::send_unfollow(&state.federation, &follower, &target).await {
+            Ok(removed) => {
+                if removed.is_some() {
+                    publish_policy(&state, vec![viewer], None);
+                }
+                relationship_response(&state, viewer, target.id)
+            }
+            Err(err) => ApiError::from(crate::domain::Error::from(err)).into_response(),
+        };
+    }
     match relationships::unfollow(store, viewer, target.id, state.context.now_ms()) {
         Ok(removed) => {
             if removed.is_some() {

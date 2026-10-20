@@ -116,12 +116,15 @@ impl TestServer {
             blobs.clone(),
             Arc::new(streams.clone()),
         ));
+        let federation = federation_config(context.clone(), TEST_PUBLIC_URL);
         let router = build_router(ApiState {
             context,
             trusted_proxies: Arc::new(Vec::new()),
             max_body_size: 16 * 1024 * 1024,
             server,
             streams: streams.clone(),
+            federation,
+            rate_limit_multiplier: 1,
         });
         Self {
             dir,
@@ -188,4 +191,53 @@ pub fn session_cookie(headers: &HeaderMap) -> Option<String> {
     let raw = headers.get("set-cookie")?.to_str().ok()?;
     let first = raw.split(';').next()?;
     Some(first.to_string())
+}
+
+/// The crate's configuration for a test server. The crate spawns its queue
+/// tasks when it is built, so it is built on a runtime of its own, on its own
+/// thread: test servers are constructed from synchronous code, sometimes inside
+/// a test runtime, where a nested `block_on` would panic.
+#[allow(dead_code)]
+pub fn federation_config(
+    context: Arc<birchtree::application::context::Context>,
+    public_url: &str,
+) -> activitypub_federation::config::FederationConfig<birchtree::activitypub::FedContext> {
+    federation_config_with(
+        context,
+        public_url,
+        &birchtree::federation::net::SafeHttpConfig::default(),
+        false,
+    )
+}
+
+/// As [`federation_config`], with an explicit transport policy and the crate's debug switch.
+/// Debug mode skips the crate's DNS-based production checks, so tests that name
+/// a loopback target or an unresolvable host do not depend on the network.
+#[allow(dead_code)]
+pub fn federation_config_with(
+    context: Arc<birchtree::application::context::Context>,
+    public_url: &str,
+    http: &birchtree::federation::net::SafeHttpConfig,
+    debug: bool,
+) -> activitypub_federation::config::FederationConfig<birchtree::activitypub::FedContext> {
+    let public_url = public_url.to_string();
+    let http = http.clone();
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("federation runtime")
+            .block_on(birchtree::activitypub::build_config(
+                context,
+                &public_url,
+                false,
+                &http,
+                debug,
+                None,
+                false,
+            ))
+            .expect("federation config")
+    })
+    .join()
+    .expect("federation config thread")
 }

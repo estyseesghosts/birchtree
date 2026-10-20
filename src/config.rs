@@ -15,6 +15,10 @@ pub struct Config {
     pub max_file_size: u64,
     /// Maximum request body size in bytes for the HTTP layer.
     pub max_body_size: usize,
+    /// Maximum status text length in characters (Mastodon-compatible count:
+    /// URLs count as 23). Default 500 (Mastodon parity); configurable up to
+    /// 3000 (Misskey parity) via `--max-status-chars=`.
+    pub max_status_chars: usize,
     /// Worker poll interval when the queue is empty.
     pub worker_poll_interval: Duration,
     /// Whether new account registration is open. Phase 1 keeps this closed;
@@ -34,6 +38,23 @@ pub struct Config {
     /// streaming paths on this host answer `301` to that host (upstream's
     /// `StreamingController`).
     pub streaming_api_base_url: Option<String>,
+    /// Allow `http://` federation targets. Off by default: production is HTTPS only.
+    /// Set only for a lab network (`--federation-allow-http`).
+    pub federation_allow_http: bool,
+    /// Private ranges that federation may reach, CIDR list. Empty by default.
+    /// Set only for a lab network (`--federation-allow-private=CIDR,...`), as
+    /// Mastodon's `ALLOWED_PRIVATE_ADDRESSES` does.
+    pub federation_allowlist: Vec<crate::federation::policy::Cidr>,
+    /// PEM file of extra trust roots for federation TLS. Set only for a lab
+    /// certificate authority (`--federation-extra-ca=PATH`); empty by default.
+    pub federation_extra_ca: Option<std::path::PathBuf>,
+    /// Authorized fetch (Mastodon's `AUTHORIZED_FETCH`): the note, quote-authorization
+    /// and collection reads need a valid HTTP signature. Off by default.
+    pub federation_authorized_fetch: bool,
+    /// Multiplier on the API rate limit (1 = production limit). Raised only for
+    /// load tests on a debug node (`--debug-weak-rate-limits` or
+    /// `--rate-limit-multiplier=N`).
+    pub rate_limit_multiplier: u32,
 }
 
 impl Default for Config {
@@ -45,6 +66,7 @@ impl Default for Config {
             trusted_proxies: Vec::new(),
             max_file_size: 16 * 1024 * 1024,
             max_body_size: 16 * 1024 * 1024,
+            max_status_chars: 500,
             worker_poll_interval: Duration::from_millis(250),
             registration_open: false,
             site_title: "Birchtree".to_string(),
@@ -52,6 +74,11 @@ impl Default for Config {
             site_contact_email: "admin@localhost".to_string(),
             site_contact_username: None,
             streaming_api_base_url: None,
+            federation_allow_http: false,
+            federation_allowlist: Vec::new(),
+            federation_extra_ca: None,
+            federation_authorized_fetch: false,
+            rate_limit_multiplier: 1,
         }
     }
 }
@@ -76,6 +103,12 @@ impl Config {
         }
         if self.max_file_size > self.max_body_size as u64 {
             return Err("max_file_size must not exceed max_body_size".to_string());
+        }
+        if self.max_status_chars == 0 {
+            return Err("max_status_chars must be > 0".to_string());
+        }
+        if self.max_status_chars > 3000 {
+            return Err("max_status_chars must not exceed 3000".to_string());
         }
         if self.worker_poll_interval.is_zero() {
             return Err("worker_poll_interval must be > 0".to_string());
@@ -129,6 +162,34 @@ mod tests {
             ..Config::default()
         };
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn default_status_limit_is_mastodon_parity() {
+        assert_eq!(Config::default().max_status_chars, 500);
+    }
+
+    #[test]
+    fn rejects_zero_status_limit() {
+        let cfg = Config {
+            max_status_chars: 0,
+            ..Config::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_status_limit_above_misskey_parity() {
+        let cfg = Config {
+            max_status_chars: 3001,
+            ..Config::default()
+        };
+        assert!(cfg.validate().is_err());
+        let cfg = Config {
+            max_status_chars: 3000,
+            ..Config::default()
+        };
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

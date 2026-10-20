@@ -40,6 +40,17 @@ pub enum JobKind {
     PublishScheduledStatus,
     /// Placeholder for outbound federation delivery (Phase 6).
     DeliverActivity,
+    /// A local change that federates (status, like, boost, block, quote, flag).
+    /// Enqueued in the same transaction as the change; the worker builds the
+    /// activity and enqueues one `DeliverActivity` per destination inbox.
+    FederationEvent,
+    /// Fetch the parent of a remote reply whose parent is unknown (Phase 6,
+    /// thread completion). One hop per job; the handler is idempotent.
+    ResolveParent,
+    /// Crawl a remote status's `replies` collection (Phase 6, thread completion).
+    CrawlReplies,
+    /// Fetch a remote attachment's bytes and stage them for processing (Phase 6).
+    FetchRemoteMedia,
 }
 
 impl JobKind {
@@ -53,6 +64,10 @@ impl JobKind {
             JobKind::ProcessMedia => "process_media",
             JobKind::PublishScheduledStatus => "publish_scheduled_status",
             JobKind::DeliverActivity => "deliver_activity",
+            JobKind::FederationEvent => "federation_event",
+            JobKind::ResolveParent => "resolve_parent",
+            JobKind::CrawlReplies => "crawl_replies",
+            JobKind::FetchRemoteMedia => "fetch_remote_media",
         }
     }
 }

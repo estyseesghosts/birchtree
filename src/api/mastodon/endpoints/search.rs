@@ -117,6 +117,44 @@ pub async fn index(State(state): State<ApiState>, auth: OptionalAuth, uri: Uri) 
     };
 
     let store: &dyn Store = &*state.context.store;
+    // `resolve=true` on a remote handle: fetch it over federation and add it to
+    // the accounts. A handle that cannot be resolved adds nothing (upstream's
+    // `ResolveAccountService` also returns no account, without an error).
+    let resolve = bool_cast(forms::get(&pairs, "resolve").unwrap_or("false"));
+    let handle_search = kind.as_deref().is_none_or(|k| k == "accounts");
+    let resolved = if resolve && viewer.is_some() && handle_search && query.contains('@') {
+        match crate::activitypub::resolve::resolve_handle(&state.federation, &query).await {
+            Ok(account) => account,
+            Err(err) => {
+                tracing::info!(error = %err, "remote account did not resolve");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // A status URL (as Mastodon's `perform_url_search`): a status already stored is returned, and with
+    // `resolve=true` a remote one is fetched. The show gate decides whether the viewer may see it.
+    let status_search = kind.as_deref().is_none_or(|k| k == "statuses");
+    let url_status = if viewer.is_some() && status_search && (query.starts_with("http://") || query.starts_with("https://")) {
+        let known = store.status_by_uri(&query).ok().flatten();
+        let status = match known {
+            Some(status) => Some(status),
+            None if resolve => match crate::activitypub::resolve::resolve_status(&state.federation, &query).await {
+                Ok(status) => Some(status),
+                Err(err) => {
+                    tracing::info!(error = %err, "remote status did not resolve");
+                    None
+                }
+            },
+            None => None,
+        };
+        status.and_then(|status| {
+            crate::application::statuses::show_status(store, viewer, status.id, state.context.now_ms()).ok()
+        })
+    } else {
+        None
+    };
     match search::search(
         store,
         viewer,
@@ -130,19 +168,30 @@ pub async fn index(State(state): State<ApiState>, auth: OptionalAuth, uri: Uri) 
         min_id,
     ) {
         Ok(results) => {
-            let accounts: Vec<serde_json::Value> = results
-                .accounts
+            let mut found = results.accounts;
+            if let Some(account) = resolved {
+                if !found.iter().any(|a| a.id == account.id) {
+                    found.insert(0, account);
+                }
+            }
+            let accounts: Vec<serde_json::Value> = found
                 .iter()
                 .map(|account| dto::account_json(&state.server, account))
                 .collect();
-            let statuses = match results.statuses.is_empty() {
+            let mut found_statuses = results.statuses;
+            if let Some(status) = url_status {
+                if !found_statuses.iter().any(|s| s.id == status.id) {
+                    found_statuses.insert(0, status);
+                }
+            }
+            let statuses = match found_statuses.is_empty() {
                 true => Vec::new(),
                 false => {
                     match crate::api::mastodon::status_view::load_status_views(
                         &state.server,
                         store,
                         viewer,
-                        results.statuses,
+                        found_statuses,
                         state.context.now_ms(),
                     ) {
                         Ok(views) => views

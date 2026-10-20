@@ -59,6 +59,7 @@ fn post(store: &RedbStore, account: Id, text: &str, now_ms: u64) -> Id {
             application_website: None,
             idempotency_key: None,
         },
+        birchtree::application::statuses::DEFAULT_MAX_STATUS_LENGTH,
     )
     .expect("create status")
     .status

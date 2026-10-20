@@ -27,6 +27,10 @@ pub mod scheduled;
 pub mod emoji;
 pub mod search;
 
+// Phase 6: federation keys, remote accounts, inbound dedup and follow commands.
+pub mod federation;
+pub mod federation_content;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

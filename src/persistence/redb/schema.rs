@@ -240,11 +240,52 @@ pub const SCHEDULED_BY_ACCOUNT: TableDefinition<&[u8], ()> =
 /// alphabetically).
 pub const CUSTOM_EMOJI: TableDefinition<&str, &[u8]> = TableDefinition::new("custom_emoji");
 
+// ---------------------------------------------------------------------------
+// Phase 6 (schema v6): federation. Keys by account, the actor-URI index, the
+// inbound activity dedup record and the outbound follow-by-URI index.
+// ---------------------------------------------------------------------------
+
+/// Signing keys by account ID (JSON `StoredKeys`; local accounts carry the private key).
+pub const ACTOR_KEYS: TableDefinition<u64, &[u8]> = TableDefinition::new("actor_keys");
+
+/// Accounts by canonical actor URI -> account ID (local and remote).
+pub const ACCOUNT_BY_ACTOR_URI: TableDefinition<&str, u64> =
+    TableDefinition::new("account_by_actor_uri");
+
+/// Applied inbound activities by canonical activity URI -> recorded-at ms.
+pub const ACTIVITY_DEDUP: TableDefinition<&str, u64> = TableDefinition::new("activity_dedup");
+
+/// Outbound follow rows by follow activity URI -> 16-byte `(follower_id_be || followed_id_be)`.
+pub const FOLLOW_BY_URI: TableDefinition<&str, &[u8]> = TableDefinition::new("follow_by_uri");
+
+// ---------------------------------------------------------------------------
+// Phase 6 (schema v7): status identity by URI, remote-thread refresh cooldown,
+// and reports (Flag).
+// ---------------------------------------------------------------------------
+
+/// Status ID by canonical status URI (local and remote statuses).
+pub const STATUS_BY_URI: TableDefinition<&str, u64> = TableDefinition::new("status_by_uri");
+
+/// Last remote-thread refresh of a status, by status ID (JSON `RefreshRecord`).
+pub const REMOTE_REFRESH: TableDefinition<u64, &[u8]> = TableDefinition::new("remote_refresh");
+
+/// Quote by its authorization URI (`approval_uri`) -> quote ID.
+pub const QUOTE_BY_APPROVAL: TableDefinition<&str, u64> = TableDefinition::new("quote_by_approval");
+
+/// The parent URI of a reply whose parent is not known here yet, by reply status ID.
+pub const UNRESOLVED_PARENT: TableDefinition<u64, &str> = TableDefinition::new("unresolved_parent");
+
+/// Reports (Flag, local and remote), by report ID (JSON).
+pub const REPORTS: TableDefinition<u64, &[u8]> = TableDefinition::new("reports");
+
+/// The remote URL of a media attachment fetched from another server, by media ID.
+pub const REMOTE_MEDIA_SOURCE: TableDefinition<u64, &str> = TableDefinition::new("remote_media_source");
+
 /// Key under `META` holding the applied schema version (big-endian `u64`).
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// Current schema version. Bump with a new migration step.
-pub const SCHEMA_VERSION: u64 = 5;
+pub const SCHEMA_VERSION: u64 = 7;
 
 /// All table names, for diagnostics and migration verification.
 pub const TABLE_NAMES: &[&str] = &[
@@ -259,6 +300,12 @@ pub const TABLE_NAMES: &[&str] = &[
     "jobs",
     "jobs_index",
     "statuses",
+    "status_by_uri",
+    "remote_refresh",
+    "reports",
+    "remote_media_source",
+    "quote_by_approval",
+    "unresolved_parent",
     "status_author_index",
     "status_parent_index",
     "status_reblog_index",

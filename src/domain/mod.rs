@@ -20,6 +20,8 @@ pub mod filter;
 pub mod marker;
 pub mod scheduled_status;
 pub mod custom_emoji;
+pub mod federation;
+pub mod report;
 
 // Re-export commonly used domain types at the crate level.
 pub use error::{Error, Result};
@@ -44,3 +46,5 @@ pub use marker::Marker;
 pub use scheduled_status::ScheduledStatus;
 pub use custom_emoji::CustomEmoji;
 pub use idempotency::IdempotencyRecord;
+pub use federation::ActorKeys;
+pub use report::Report;

@@ -1,0 +1,46 @@
+== reset: birchtree data, Mastodon relationship with bob
+created account id=117459896471322624 username=bob
+PASS  birchtree up (health)
+PASS  bob OAuth token
+== 1. WebFinger + actor document, read by Mastodon
+      mastodon resolved: bob@birchtree.lab https://birchtree.lab/users/bob
+PASS  Mastodon resolves bob@birchtree.lab via WebFinger + actor
+== 2. Inbound Follow: Mastodon alice -> birchtree bob (Accept back)
+      mastodon alice_follows_bob: true
+PASS  Mastodon shows alice following bob (Accept applied on the Mastodon side)
+      birchtree: 2026-10-18T03:56:54.994563Z  INFO birchtree::federation: activity handled direction="inbound" kind="Follow" activity=https://mastodon.lab/d6d5bbc2-00c4-41b8-8757-05cefb82d159 actor=https://mastodon.lab/ap/users/117459698571330258 outcome="applied"
+      birchtree: 2026-10-18T03:56:55.043833Z DEBUG birchtree::federation: sending direction="outbound" task=https://mastodon.lab/d6d5bbc2-00c4-41b8-8757-05cefb82d159#accept to https://mastodon.lab/ap/users/117459698571330258/inbox
+      birchtree: 2026-10-18T03:56:55.140852Z  INFO birchtree::federation: delivered (2xx, or 4xx rejected by the remote: the crate does not retry 4xx) direction="outbound" inbox="https://mastodon.lab/ap/users/117459698571330258/inbox" activity=https://mastodon.lab/d6d5bbc2-00c
+PASS  birchtree applied the inbound Follow and sent an Accept
+== 3. Outbound Follow: birchtree bob -> Mastodon alice (Accept back)
+      resolved alice on birchtree: id=117459898529742848
+PASS  birchtree resolves alice@mastodon.lab (WebFinger + actor, search resolve=true)
+      POST /follow response: {"id":"117459898529742848","following":false,"showing_reblogs":true,"notifying":false,"languages":null,"followed_by":false,"blocking":false,"blocked_by":false,"
+      birchtree relationship following=True
+      birchtree: 2026-10-18T03:57:22.657264Z DEBUG birchtree::federation: sending direction="outbound" task=https://birchtree.lab/users/bob/follows/117459900327657472 to https://mastodon.lab/inbox
+      birchtree: 2026-10-18T03:57:22.694453Z  INFO birchtree::federation: delivered (2xx, or 4xx rejected by the remote: the crate does not retry 4xx) direction="outbound" inbox="https://mastodon.lab/inbox" activity=https://birchtree.lab/users/bob/follows/117459900327657472
+      birchtree: 2026-10-18T03:57:22.759140Z  INFO birchtree::federation: activity handled direction="inbound" kind="Accept" activity=https://mastodon.lab/ap/users/117459698571330258#accepts/follows/23 actor=https://mastodon.lab/ap/users/117459698571330258 outcome="applied"
+PASS  birchtree sent a Follow to alice (outbound, delivered)
+PASS  birchtree shows bob following alice after the Accept
+PASS  birchtree applied the Accept from alice
+== 4. Outbound Undo: birchtree bob unfollows alice
+      mastodon alice.followers include bob: false
+PASS  Mastodon removed bob from alice's followers after the Undo
+== 5. Inbound Undo: Mastodon alice unfollows birchtree bob
+      birchtree relationship followed_by=False (after Mastodon's Undo)
+PASS  birchtree removed alice from bob's followers after the inbound Undo
+      birchtree: 2026-10-18T03:57:00.838025Z  INFO birchtree::federation: activity handled direction="inbound" kind="Undo" activity=https://mastodon.lab/ap/users/117459698571330258#follows/17/undo actor=https://mastodon.lab/ap/users/117459698571330258 outcome="applied"
+      birchtree: 2026-10-18T03:58:28.872998Z  INFO birchtree::federation: activity handled direction="inbound" kind="Undo" activity=https://mastodon.lab/ap/users/117459698571330258#follows/18/undo actor=https://mastodon.lab/ap/users/117459698571330258 outcome="ignored: no foll
+== 6. Pending follow, then Accept: birchtree bob -> locked Mastodon alice
+      while pending: requested=True following=False
+PASS  birchtree holds a pending request (requested, not following)
+      after authorize: following=True requested=False
+PASS  birchtree applies Mastodon's Accept of the pending request
+      birchtree: 2026-10-18T03:59:13.318770Z  INFO birchtree::federation: activity handled direction="inbound" kind="Accept" activity=https://mastodon.lab/ap/users/117459698571330258#accepts/follows/24 actor=https://mastodon.lab/ap/users/117459698571330258 outcome="applied"
+== 7. Reject: unfollow, pending again, Mastodon rejects
+      after reject: following=False requested=False
+PASS  birchtree removes the rejected pending request
+      birchtree: 2026-10-18T03:59:59.701171Z  INFO birchtree::federation: activity handled direction="inbound" kind="Reject" activity=https://mastodon.lab/ap/users/117459698571330258#rejects/follows/25 actor=https://mastodon.lab/ap/users/117459698571330258 outcome="applied"
+
+RESULT: 14 passed, 0 failed
+exit=0

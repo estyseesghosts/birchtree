@@ -144,7 +144,7 @@ async fn run(
                     break;
                 }
                 alive = false;
-                if sink.send(Message::Ping(axum::body::Bytes::new())).await.is_err() {
+                if sink.send(Message::Ping(Vec::new())).await.is_err() {
                     break;
                 }
             }

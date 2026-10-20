@@ -1,0 +1,6 @@
+birchtree is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
+
+The activitypub_federation crate (vendored under vendor/) is AGPL-3.0.
+The owner accepted AGPL-3.0 for this project on 2026-10-17.
+
+Full license text: https://www.gnu.org/licenses/agpl-3.0.html

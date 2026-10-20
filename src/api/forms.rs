@@ -125,6 +125,7 @@ pub struct LenientForm(pub Vec<(String, String)>);
 /// above it are refused by [`json_body::guard`] before this runs.
 const MAX_FORM_BODY: usize = 1024 * 1024;
 
+#[axum::async_trait]
 impl<S> axum::extract::FromRequest<S> for LenientForm
 where
     S: Send + Sync,
@@ -147,6 +148,7 @@ where
 /// that is neither form nor JSON gets axum's `RawForm` rejection (`415`).
 pub struct FormBody(pub Vec<(String, String)>);
 
+#[axum::async_trait]
 impl<S> axum::extract::FromRequest<S> for FormBody
 where
     S: Send + Sync,

@@ -63,13 +63,17 @@ pub fn destroy(store: &dyn Store, account_id: Id, id: Id) -> Result<()> {
 /// Schedule a validated status command for later publication.
 ///
 /// The media check runs first (identical messages to immediate posts), then
-/// the Mastodon validations: the 5-minute floor and the 300/25 limits.
+/// the text-length check (same message as an immediate post, so an over-long
+/// scheduled post is rejected at schedule time instead of silently dropped
+/// at publish), then the Mastodon validations: the 5-minute floor and the
+/// 300/25 limits.
 pub fn schedule_status(
     store: &dyn Store,
     base_url: &str,
     now_ms: u64,
     cmd: CreateStatusCommand,
     scheduled_at_ms: u64,
+    max_chars: usize,
 ) -> Result<ScheduledStatus> {
     let account_id = cmd.account_id;
     validate_time(scheduled_at_ms, now_ms)?;
@@ -110,7 +114,15 @@ pub fn schedule_status(
         }
     }
 
-    let params = command_params(&cmd);
+    // Text length is enforced now (same message as immediate posts); the
+    // publish worker replays with the stored limit.
+    if let Some(text) = &cmd.text {
+        if statuses::count_length(text) > max_chars {
+            return Err(Error::InvalidInput(statuses::text_too_long_error(max_chars)));
+        }
+    }
+
+    let params = command_params(&cmd, max_chars);
     store.create_scheduled(
         NewScheduledStatus {
             account_id,
@@ -162,7 +174,15 @@ pub fn publish_scheduled_job(
             return Ok(None);
         }
     };
-    match statuses::create_status(store, base_url, now_ms, cmd) {
+    // The limit in force at schedule time travels with the row (old rows
+    // predate the param and fall back to the Mastodon default).
+    let max_chars = row
+        .params
+        .get("max_status_chars")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(statuses::DEFAULT_MAX_STATUS_LENGTH);
+    match statuses::create_status(store, base_url, now_ms, cmd, max_chars) {
         Ok(created) => Ok(Some(created.status.id)),
         Err(err) => {
             // `PublishScheduledStatusWorker` swallows validation failures.
@@ -178,8 +198,9 @@ pub fn publish_scheduled_job(
 
 /// Serialize a creation command into replayable params (Mastodon
 /// `scheduled_options`).
-fn command_params(cmd: &CreateStatusCommand) -> serde_json::Value {
+fn command_params(cmd: &CreateStatusCommand, max_chars: usize) -> serde_json::Value {
     let mut params = serde_json::Map::new();
+    params.insert("max_status_chars".into(), serde_json::json!(max_chars));
     if let Some(text) = &cmd.text {
         params.insert("text".into(), serde_json::json!(text));
     }

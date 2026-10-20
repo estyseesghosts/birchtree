@@ -299,7 +299,7 @@ pub fn instance_v1_json(
         "invites_enabled": false,
         "contact_account": contact,
         "rules": [],
-        "configuration": v1_configuration(),
+        "configuration": v1_configuration(server),
     })
 }
 
@@ -343,11 +343,11 @@ fn version_string() -> String {
     "4.7.3 (compatible; birchtree 0.1.0)".to_string()
 }
 
-fn v1_configuration() -> Value {
+fn v1_configuration(server: &ServerInfo) -> Value {
     json!({
         "accounts": { "max_featured_tags": 10 },
         "statuses": {
-            "max_characters": 500,
+            "max_characters": server.max_status_chars,
             "max_media_attachments": 4,
             "characters_reserved_per_url": 23,
         },
@@ -390,7 +390,7 @@ fn v2_configuration(server: &ServerInfo) -> Value {
             "profile_field_value_limit": 255,
         },
         "statuses": {
-            "max_characters": 500,
+            "max_characters": server.max_status_chars,
             "max_media_attachments": 4,
             "characters_reserved_per_url": 23,
         },

@@ -251,8 +251,18 @@ pub struct NewQuoteSpec {
 }
 
 /// Input for creating a status in one atomic transaction.
+/// The URI and URL of a remote status, as its server published them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteStatusIdentity {
+    pub uri: String,
+    pub url: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct NewStatus {
+    /// Set for a status received from a remote server: its own URI and URL are
+    /// stored as given, and no local URI is minted. `None` for a local status.
+    pub remote: Option<RemoteStatusIdentity>,
     pub account_id: Id,
     /// Canonical ActivityPub object URI base; the store appends `/{id}`
     /// (computed by the use case from the public URL + username).
@@ -658,6 +668,20 @@ pub trait PollStore: Send + Sync {
 
     /// Sticky-mark a poll expired (PollExpired job handler; idempotent).
     fn mark_poll_expired(&self, poll_id: Id, now_ms: u64) -> Result<Option<Poll>>;
+
+    /// Overwrite a poll's tallies from its origin in ONE transaction: option
+    /// counts matched by title (unknown names ignored), the voters count, the
+    /// expiry when given, and the sticky expired flag. `None` when the poll
+    /// row is gone. Local ballots are never rewritten by this path.
+    fn sync_remote_poll(
+        &self,
+        poll_id: Id,
+        counts: &[(String, u64)],
+        voters_count: u64,
+        expires_at_ms: Option<u64>,
+        expired: bool,
+        now_ms: u64,
+    ) -> Result<Option<Poll>>;
 }
 
 /// Quotes (local quote state machine; federated quote requests are Phase 6).
@@ -1162,6 +1186,8 @@ pub trait Store:
     + EmojiStore
     + TimelineStore
     + SearchStore
+    + crate::application::federation_ports::FederationStore
+    + crate::application::federation_ports::FederationContentStore
 {
 }
 impl<T> Store for T where
@@ -1183,6 +1209,8 @@ impl<T> Store for T where
         + EmojiStore
         + TimelineStore
         + SearchStore
+        + crate::application::federation_ports::FederationStore
+    + crate::application::federation_ports::FederationContentStore
 {
 }
 

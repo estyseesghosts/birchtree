@@ -50,6 +50,11 @@ fn parse_args(cfg: &mut Config) -> Args {
                 eprintln!("invalid --max-body-size: {v}");
                 std::process::exit(2);
             });
+        } else if let Some(v) = arg.strip_prefix("--max-status-chars=") {
+            cfg.max_status_chars = v.parse().ok().filter(|m| *m >= 1).unwrap_or_else(|| {
+                eprintln!("invalid --max-status-chars (want an integer 1..=3000): {v}");
+                std::process::exit(2);
+            });
         } else if let Some(v) = arg.strip_prefix("--username=") {
             args.username = Some(v.to_string());
         } else if let Some(v) = arg.strip_prefix("--password=") {
@@ -68,6 +73,24 @@ fn parse_args(cfg: &mut Config) -> Args {
             cfg.streaming_api_base_url = Some(v.trim_end_matches('/').to_string());
         } else if let Some(v) = arg.strip_prefix("--site-contact-username=") {
             cfg.site_contact_username = Some(v.trim_start_matches('@').to_string());
+        } else if arg == "--federation-allow-http" {
+            cfg.federation_allow_http = true;
+        } else if arg == "--federation-authorized-fetch" {
+            cfg.federation_authorized_fetch = true;
+        } else if let Some(v) = arg.strip_prefix("--federation-extra-ca=") {
+            cfg.federation_extra_ca = Some(std::path::PathBuf::from(v));
+        } else if let Some(v) = arg.strip_prefix("--federation-allow-private=") {
+            cfg.federation_allowlist = birchtree::federation::policy::parse_allowlist(v).unwrap_or_else(|err| {
+                eprintln!("invalid --federation-allow-private: {err}");
+                std::process::exit(2);
+            });
+        } else if arg == "--debug-weak-rate-limits" {
+            cfg.rate_limit_multiplier = 10;
+        } else if let Some(v) = arg.strip_prefix("--rate-limit-multiplier=") {
+            cfg.rate_limit_multiplier = v.parse().ok().filter(|m| *m >= 1).unwrap_or_else(|| {
+                eprintln!("invalid --rate-limit-multiplier (want an integer >= 1): {v}");
+                std::process::exit(2);
+            });
         } else if arg == "--registration-open" {
             cfg.registration_open = true;
         } else if arg == "--registration-closed" {
@@ -224,13 +247,66 @@ async fn serve(cfg: Config) {
         blobs.clone(),
         streaming.clone(),
     ));
+    // Federation (Phase 6). The allowlist and http switches are lab-only and off by default.
+    let lab = !cfg.federation_allowlist.is_empty();
+    if cfg.federation_allow_http || lab {
+        tracing::warn!(
+            allow_http = cfg.federation_allow_http,
+            allowlist_entries = cfg.federation_allowlist.len(),
+            "lab federation policy is in force: not for production"
+        );
+    }
+    let extra_roots = match &cfg.federation_extra_ca {
+        Some(path) => {
+            let pem = std::fs::read(path).unwrap_or_else(|err| {
+                eprintln!("read --federation-extra-ca {}: {err}", path.display());
+                std::process::exit(2);
+            });
+            reqwest::Certificate::from_pem_bundle(&pem).unwrap_or_else(|err| {
+                eprintln!("parse --federation-extra-ca {}: {err}", path.display());
+                std::process::exit(2);
+            })
+        }
+        None => Vec::new(),
+    };
+    let http_policy = birchtree::federation::net::SafeHttpConfig {
+        allow_http: cfg.federation_allow_http,
+        allowlist: cfg.federation_allowlist.clone(),
+        extra_roots,
+        ..Default::default()
+    };
+    let instance = birchtree::activitypub::instance::ensure(&*store, &cfg.normalized_public_url())
+        .await
+        .unwrap_or_else(|err| {
+            eprintln!("instance actor: {err}");
+            std::process::exit(1);
+        });
+    let federation = birchtree::activitypub::build_config(
+        context.clone(),
+        &cfg.normalized_public_url(),
+        cfg.registration_open,
+        &http_policy,
+        lab,
+        Some(&instance),
+        cfg.federation_authorized_fetch,
+    )
+    .await
+    .unwrap_or_else(|err| {
+        eprintln!("start federation: {err}");
+        std::process::exit(1);
+    });
     let state = ApiState {
         context,
         trusted_proxies: Arc::new(cfg.trusted_proxies.clone()),
         max_body_size: cfg.max_body_size,
         server,
         streams,
+        federation: federation.clone(),
+        rate_limit_multiplier: cfg.rate_limit_multiplier,
     };
+    if cfg.rate_limit_multiplier > 1 {
+        tracing::warn!(multiplier = cfg.rate_limit_multiplier, "debug rate-limit weakening is in force: not for production");
+    }
     let app = build_router(state);
     let mailer: Arc<dyn MailSender> = Arc::new(LoggingMailSender);
 
@@ -255,6 +331,7 @@ async fn serve(cfg: Config) {
         mailer,
         blobs,
         streaming,
+        federation,
         cfg.worker_poll_interval,
         jobs::worker::DEFAULT_BATCH,
         shutdown_rx,

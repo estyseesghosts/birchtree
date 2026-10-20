@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::Request;
+use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -92,10 +92,11 @@ fn client_key(req: &Request) -> String {
 }
 
 /// Middleware: count the request, attach `X-RateLimit-*`, and return 429 when
-/// the budget is exhausted.
-pub async fn middleware(req: Request, next: Next) -> Response {
+/// the budget is exhausted. `multiplier` scales the limit (1 in production).
+pub async fn middleware(State(multiplier): State<u32>, req: Request, next: Next) -> Response {
     let key = client_key(&req);
-    let rl = global().check(&key, DEFAULT_LIMIT, DEFAULT_PERIOD_SECS, now_s());
+    let limit = DEFAULT_LIMIT.saturating_mul(multiplier.max(1));
+    let rl = global().check(&key, limit, DEFAULT_PERIOD_SECS, now_s());
     if rl.remaining == 0 {
         let mut response = (
             StatusCode::TOO_MANY_REQUESTS,

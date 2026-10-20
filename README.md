@@ -208,6 +208,7 @@ All options are command-line flags (there's no config file). Defaults are shown.
 | `--listen=` | `0.0.0.0:3000` | Bind address. |
 | `--trusted-proxy=` | (none) | IP allowed to set `X-Forwarded-For`. Repeatable. |
 | `--max-body-size=` | `16777216` | Max request body bytes (also caps media uploads). |
+| `--max-status-chars=` | `500` | Max status text length in characters (URLs count as 23). Mastodon parity at the default; up to `3000` (Misskey parity). |
 | `--site-title=` | `Birchtree` | Instance title. |
 | `--site-description=` | `A Mastodon-compatible server` | Instance description. |
 | `--site-contact-email=` | `admin@localhost` | Contact email. |

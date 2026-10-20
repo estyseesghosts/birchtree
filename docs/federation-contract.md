@@ -135,3 +135,42 @@ These differ from the first plan text and are recorded as corrections. Birchtree
 ## Non-goals
 
 No outbound HTTP inside a local status/follow transaction. No multi-node mode until storage adapter + media arrangement + routing + shared conformance suite are implemented and tested. Read-time ancestor completion is in profile for logged-in viewers only (see C, deviation D5).
+
+## Media federation interop notes (bench run5, 2026-10-19/20)
+
+No product change. All run5 media FAILs involving the lab Mastodon node
+were investigated with wire + code evidence and found not ours:
+
+- Outbound (`*/bt -> mastodon mismatch:404`): our `Document` emit
+  (`src/activitypub/outgoing.rs:130-158`, `type/mediaType/url/name` +
+  conditional `blurhash/width/height`, string-form `url`) matches what
+  Mastodon 4.7.3 parses (`media_attachment_parser.rb`, `json_ld_helper.rb`
+  `url_to_href`); media URLs are unauthenticated
+  (`src/api/mastodon/endpoints/media.rs:133-155`,
+  `src/api/mastodon/router.rs:270`) over plain `http://` in bench, so no
+  TLS/lab-CA involvement. The failing URL is Mastodon's own
+  `system/cache/...` path, i.e. Mastodon created the attachment row and its
+  fetch/store (or Sidekiq redownload lag) never made bytes servable.
+  Independent pinetree sender fails identically. Verdict: MASTODON-SIDE
+  (+ possible BENCH-ARTIFACT transient).
+- Inbound (`mastodon -> * mismatch:200`): our remote fetch stores original
+  bytes verbatim with sniffed MIME (`src/federation/media.rs:65-91`) and
+  re-serves them unmodified with re-sniffed content-type
+  (`src/api/mastodon/endpoints/media.rs:133-151`); control pairs
+  (`pt/bt -> bt`) are byte-exact PASS. Mastodon re-encodes every locally
+  uploaded image (`lazy_thumbnail.rb needs_convert?` /
+  `media_attachment.rb GLOBAL_CONVERT_OPTIONS`), so a byte-hash oracle
+  (`sha(uploaded) == sha(served)`) can never pass for mastodon-src pairs.
+  Verdict: MASTODON-SIDE + HARNESS-TOO-STRICT (needs perceptual or
+  served-snapshot comparison).
+- `no-attachment` (dst=mastodon): 0/34 media deliveries into lab-mastodon
+  across five independent senders (bt, pt, misskey, catodon, akkoma) with
+  zero non-mastodon failures; interop vs real Mastodon 4.7.3 passes
+  (`interop.out` "mastodon received media from bt-a PASS"). Fetch failures
+  on Mastodon keep the attachment row (→ 404 shape), so zero-record rows
+  are a mastodon-ingest-side drop, mechanism unproven (lab Sidekiq/rails
+  logs not retained). Verdict: MASTODON-SIDE / BENCH-ARTIFACT.
+- Bench media payloads are PNG-only, so video/GIF `Document` emit (same
+  code shape, only `mediaType`/count differ) is unexercised over
+  federation. Cosmetic only: we emit `"name": ""` where Mastodon omits
+  null `name` (harmless: `.presence` → nil).

@@ -78,6 +78,7 @@ async fn resolve(state: &ApiState, plaintext: &str) -> ApiResult<Authenticated> 
     Ok(Authenticated { token, app })
 }
 
+#[axum::async_trait]
 impl FromRequestParts<ApiState> for Auth {
     type Rejection = ApiError;
 
@@ -90,6 +91,7 @@ impl FromRequestParts<ApiState> for Auth {
     }
 }
 
+#[axum::async_trait]
 impl FromRequestParts<ApiState> for OptionalAuth {
     type Rejection = ApiError;
 

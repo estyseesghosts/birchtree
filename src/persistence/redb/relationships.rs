@@ -56,7 +56,7 @@ where
 }
 
 /// Read one follow row inside an existing (write) transaction.
-fn read_follow_txn(write: &WriteTransaction, key: &[u8]) -> StoreResult<Option<Follow>> {
+pub(super) fn read_follow_txn(write: &WriteTransaction, key: &[u8]) -> StoreResult<Option<Follow>> {
     let follows = write.open_table(FOLLOWS)?;
     json_at(&follows, key)
 }
@@ -64,7 +64,7 @@ fn read_follow_txn(write: &WriteTransaction, key: &[u8]) -> StoreResult<Option<F
 /// Read one account's counters inside an existing transaction. A missing row
 /// is [`AccountStats::default`]: counters accumulate from zero, never from a
 /// created row.
-fn read_stats_txn(write: &WriteTransaction, account_id: Id) -> StoreResult<AccountStats> {
+pub(super) fn read_stats_txn(write: &WriteTransaction, account_id: Id) -> StoreResult<AccountStats> {
     let stats = write.open_table(ACCOUNT_STATS)?;
     match stats.get(account_id.value())? {
         Some(guard) => Ok(decode(guard.value())?),
@@ -74,7 +74,7 @@ fn read_stats_txn(write: &WriteTransaction, account_id: Id) -> StoreResult<Accou
 
 /// Persist one account's counters inside the same transaction that moved
 /// them.
-fn write_stats_txn(
+pub(super) fn write_stats_txn(
     write: &WriteTransaction,
     account_id: Id,
     stats: &AccountStats,
@@ -82,6 +82,52 @@ fn write_stats_txn(
     let mut table = write.open_table(ACCOUNT_STATS)?;
     table.insert(account_id.value(), encode(stats)?.as_slice())?;
     Ok(())
+}
+
+/// Remove a follow row inside an existing transaction, with its reverse index,
+/// both sides' counters, and any endorsement or list membership it carries.
+/// Returns the removed row (`None` when there was none). Shared by `unfollow`
+/// and the federated Undo, so the two cannot drift apart.
+pub(super) fn unfollow_txn(
+    write: &WriteTransaction,
+    follower_id: Id,
+    followed_id: Id,
+) -> Result<Option<Follow>> {
+    let key = schema::pair_key(follower_id.value(), followed_id.value());
+    let Some(existing) = read_follow_txn(write, key.as_slice())? else {
+        return Ok(None);
+    };
+
+    let mut follower_stats = read_stats_txn(write, follower_id)?;
+    let mut followed_stats = read_stats_txn(write, followed_id)?;
+    match existing.state {
+        FollowState::Active => {
+            followed_stats.followers_count = followed_stats.followers_count.saturating_sub(1);
+            follower_stats.following_count = follower_stats.following_count.saturating_sub(1);
+        }
+        FollowState::Pending => {
+            followed_stats.follow_requests_count =
+                followed_stats.follow_requests_count.saturating_sub(1);
+        }
+    }
+
+    {
+        let mut follows = write.open_table(FOLLOWS)?;
+        follows.remove(key.as_slice())?;
+    }
+    {
+        let mut by_followed = write.open_table(FOLLOWS_BY_FOLLOWED)?;
+        by_followed
+            .remove(schema::pair_key(followed_id.value(), follower_id.value()).as_slice())?;
+    }
+    // Mastodon destroys matching AccountPins with the follow.
+    remove_endorsement_txn(write, follower_id, followed_id)?;
+    // `list_accounts.follow_id` cascades on follow deletion upstream: the
+    // followed account leaves every list the follower owns.
+    super::lists::retain_membership_txn(write, follower_id, followed_id)?;
+    write_stats_txn(write, follower_id, &follower_stats)?;
+    write_stats_txn(write, followed_id, &followed_stats)?;
+    Ok(Some(existing))
 }
 
 /// Remove an endorsement and its reverse index inside an existing
@@ -215,42 +261,9 @@ impl RelationshipStore for RedbStore {
     fn unfollow(&self, follower_id: Id, followed_id: Id, now_ms: u64) -> Result<Option<Follow>> {
         let _ = now_ms; // Removal records no transition timestamp and no job.
         let write = self.begin_write()?;
-        let key = schema::pair_key(follower_id.value(), followed_id.value());
-        let Some(existing) = read_follow_txn(&write, key.as_slice())? else {
-            return Ok(None);
-        };
-
-        let mut follower_stats = read_stats_txn(&write, follower_id)?;
-        let mut followed_stats = read_stats_txn(&write, followed_id)?;
-        match existing.state {
-            FollowState::Active => {
-                followed_stats.followers_count = followed_stats.followers_count.saturating_sub(1);
-                follower_stats.following_count = follower_stats.following_count.saturating_sub(1);
-            }
-            FollowState::Pending => {
-                followed_stats.follow_requests_count =
-                    followed_stats.follow_requests_count.saturating_sub(1);
-            }
-        }
-
-        {
-            let mut follows = write.open_table(FOLLOWS)?;
-            follows.remove(key.as_slice())?;
-        }
-        {
-            let mut by_followed = write.open_table(FOLLOWS_BY_FOLLOWED)?;
-            by_followed
-                .remove(schema::pair_key(followed_id.value(), follower_id.value()).as_slice())?;
-        }
-        // Mastodon destroys matching AccountPins with the follow.
-        remove_endorsement_txn(&write, follower_id, followed_id)?;
-        // `list_accounts.follow_id` cascades on follow deletion upstream: the
-        // followed account leaves every list the follower owns.
-        super::lists::retain_membership_txn(&write, follower_id, followed_id)?;
-        write_stats_txn(&write, follower_id, &follower_stats)?;
-        write_stats_txn(&write, followed_id, &followed_stats)?;
+        let removed = unfollow_txn(&write, follower_id, followed_id)?;
         write.commit()?;
-        Ok(Some(existing))
+        Ok(removed)
     }
 
     fn remove_follower(&self, account_id: Id, follower_id: Id, now_ms: u64) -> Result<Option<Follow>> {
@@ -509,6 +522,7 @@ impl RelationshipStore for RedbStore {
             by_blocked
                 .insert(schema::pair_key(target_id.value(), account_id.value()).as_slice(), ())?;
         }
+        super::federation_content::federation_event_txn(&write, self.next_id(), account_id, serde_json::json!({"event": "block", "target_id": target_id.value()}), now_ms)?;
         write.commit()?;
         Ok(Some(block))
     }
@@ -533,6 +547,7 @@ impl RelationshipStore for RedbStore {
             by_blocked
                 .remove(schema::pair_key(target_id.value(), account_id.value()).as_slice())?;
         }
+        super::federation_content::federation_event_txn(&write, self.next_id(), account_id, serde_json::json!({"event": "unblock", "target_id": target_id.value()}), now_ms)?;
         write.commit()?;
         Ok(Some(existing))
     }

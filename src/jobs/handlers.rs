@@ -65,7 +65,15 @@ pub fn handle(
                 .map(Id::new)
                 .ok_or_else(|| Error::Internal("poll_expired: missing poll_id".into()))?;
             // Sticky flag: repeating the call is a no-op.
-            store.mark_poll_expired(poll_id, job.due_at_ms)?;
+            if let Some(poll) = store.mark_poll_expired(poll_id, job.due_at_ms)? {
+                // The origin tells its followers the poll closed (a no-op
+                // when the poll's author is remote).
+                store.enqueue_event(
+                    poll.account_id,
+                    serde_json::json!({"event": "question_update", "status_id": poll.status_id.value()}),
+                    job.due_at_ms,
+                )?;
+            }
             Ok(())
         }
         JobKind::ProcessMedia => {
@@ -99,8 +107,16 @@ pub fn handle(
             }
             Ok(())
         }
+        // The job worker dispatches these kinds to the federation handlers and never
+        // calls this function for them. The arm exists for a synchronous drain that
+        // does not federate (in-process tests): there is no network to reach here,
+        // so the drain completes the job without sending it.
+        JobKind::FederationEvent
+        | JobKind::ResolveParent
+        | JobKind::CrawlReplies
+        | JobKind::FetchRemoteMedia => Ok(()),
         JobKind::DeliverActivity => Err(Error::Internal(
-            "deliver_activity handler arrives in Phase 6".into(),
+            "deliver_activity runs in the job worker (federation::delivery), not here".into(),
         )),
     }
 }

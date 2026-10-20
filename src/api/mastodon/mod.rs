@@ -30,6 +30,9 @@ pub struct ServerInfo {
     pub site_contact_username: Option<String>,
     /// Whether public registration is open (mirrors `Config::registration_open`).
     pub registrations_open: bool,
+    /// Maximum status text length in characters (mirrors
+    /// `Config::max_status_chars`; advertised by the instance endpoints).
+    pub max_status_chars: usize,
     /// Streaming API base URL advertised to clients.
     pub streaming_url: String,
     /// Streaming host configured separately from this server. Streaming paths
@@ -138,6 +141,7 @@ impl ServerInfo {
             site_contact_email: cfg.site_contact_email.clone(),
             site_contact_username: cfg.site_contact_username.clone(),
             registrations_open: cfg.registration_open,
+            max_status_chars: cfg.max_status_chars,
             streaming_url,
             streaming_host,
         }
@@ -154,4 +158,9 @@ pub struct ApiState {
     pub server: Arc<ServerInfo>,
     /// The streaming hub (Phase 5). The same hub is `context.streaming`.
     pub streams: crate::streaming::Hub,
+    /// The ActivityPub crate's configuration (Phase 6): the safe HTTP client,
+    /// the URL policy and the app data the crate hands to its callbacks.
+    pub federation: activitypub_federation::config::FederationConfig<crate::activitypub::FedContext>,
+    /// Multiplier on the API rate limit (1 in production). See `Config::rate_limit_multiplier`.
+    pub rate_limit_multiplier: u32,
 }

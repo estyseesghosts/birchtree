@@ -1,0 +1,12 @@
+/target
+/.idea
+perf.data*
+flamegraph.svg
+
+# direnv
+/.direnv
+/.envrc
+
+# nix flake
+/flake.nix
+/flake.lock

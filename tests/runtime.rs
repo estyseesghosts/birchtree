@@ -36,12 +36,15 @@ fn app(max_body_size: usize) -> (tempfile::TempDir, axum::Router) {
         blobs,
         Arc::new(streams.clone()),
     ));
+    let federation = common::federation_config(context.clone(), "https://example.social");
     let router = build_router(ApiState {
         context,
         trusted_proxies: Arc::new(Vec::new()),
         max_body_size,
         server,
         streams,
+        federation,
+        rate_limit_multiplier: 1,
     });
     (dir, router)
 }
