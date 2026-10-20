@@ -138,6 +138,18 @@ pub async fn update(
     let Ok(id) = raw.parse::<Id>() else {
         return ApiError::not_found().into_response();
     };
+    // An update with no `scheduled_at` param at all is a no-op returning the
+    // row unchanged (upstream `update!(scheduled_status_params)` with an
+    // empty permit list persists nothing and renders 200). A present-but-
+    // blank value still 422s (`can't be blank`); an unparseable one is
+    // upstream's `Record invalid`.
+    if forms::get(&body, "scheduled_at").is_none() {
+        let store: &dyn Store = &*state.context.store;
+        return match scheduled_statuses::show(store, viewer, id) {
+            Ok(row) => render(&state, &row),
+            Err(err) => ApiError::from(err).into_response(),
+        };
+    }
     let Some(raw_at) = forms::get(&body, "scheduled_at").map(str::trim) else {
         return ApiError::unprocessable("Validation failed: Scheduled at can't be blank")
             .into_response();

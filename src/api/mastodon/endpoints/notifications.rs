@@ -40,18 +40,20 @@ fn bool_cast(value: &str) -> bool {
 }
 
 /// Parse a wire notification type (`types[]`/`exclude_types[]`).
+///
+/// Covers the 7 types this server produces. The 10 remaining upstream types
+/// (`status`, `update`, `severed_relationships`, `moderation_warning`,
+/// `annual_report`, `admin.sign_up`, `admin.report`, `quoted_update`,
+/// `added_to_collection`, `collection_update` — full list in the parent
+/// snippet: `Notification::TYPES` at the pin needs new `NotificationType`
+/// variants first, plus `as_str`/`filterable` entries and the status-bearing
+/// Parse any upstream `types[]`/`exclude_types[]` entry
+/// (`notification.rb:28-81` at the pin + `PROPERTIES` keys).
+/// Unknown values are silently ignored (Mastodon). New types parse so
+/// clients can name them; producers for unbuilt features get register rows,
+/// not stubs.
 fn parse_type(raw: &str) -> Option<NotificationType> {
-    match raw {
-        "mention" => Some(NotificationType::Mention),
-        "follow" => Some(NotificationType::Follow),
-        "reblog" => Some(NotificationType::Reblog),
-        "favourite" => Some(NotificationType::Favourite),
-        "poll" => Some(NotificationType::PollVote),
-        "follow_request" => Some(NotificationType::FollowRequest),
-        "quote" => Some(NotificationType::Quote),
-        // Unknown values are silently ignored (Mastodon).
-        _ => None,
-    }
+    NotificationType::parse(raw)
 }
 
 /// `GET /api/v1/notifications`.
@@ -108,6 +110,19 @@ pub async fn index(State(state): State<ApiState>, auth: Auth, uri: Uri) -> Respo
             Some(requested)
         }
     };
+    // Upstream `browserable_params`: `account_id` narrows to one actor;
+    // `include_filtered` also serves filtered rows (the store page excludes
+    // them — honored once the store gains the flag; accepted without effect
+    // until then, see the use-case docs); `supported_types[]` only gates the
+    // `fallback` rendering for non-baseline types, which this server never
+    // emits, so it is accepted and carried on pagination links.
+    let from_account = match forms::get(&pairs, "account_id").map(|raw| raw.parse::<Id>()) {
+        Some(Ok(id)) => Some(id),
+        Some(Err(_)) => None,
+        None => None,
+    };
+    let include_filtered = bool_cast(forms::get(&pairs, "include_filtered").unwrap_or("false"));
+    let _ = forms::all(&pairs, "supported_types");
 
     let store: &dyn Store = &*state.context.store;
     let query = NotificationQuery {
@@ -115,6 +130,8 @@ pub async fn index(State(state): State<ApiState>, auth: Auth, uri: Uri) -> Respo
         since_id: page.since_id,
         min_id: page.min_id,
         limit: page.limit,
+        from_account,
+        include_filtered,
     };
     let fetched = match notifications::index(store, recipient, query) {
         Ok(notifications) => notifications,

@@ -121,6 +121,14 @@ pub struct UserSettingsUpdate {
     /// empty, = replace; an empty list clears the preference like upstream's
     /// `compact_blank.presence` normalization).
     pub chosen_languages: Option<Vec<String>>,
+    /// Reading preferences (`None` = unchanged). Birchtree extension:
+    /// upstream sets these only through the web settings UI; here
+    /// `update_credentials[source][display_media|expand_spoilers|
+    /// autoplay_gifs]` stores them. `display_media` is one of
+    /// `default`/`show_all`/`hide_all` (upstream `user_settings.rb:38`).
+    pub web_display_media: Option<String>,
+    pub web_expand_spoilers: Option<bool>,
+    pub web_auto_play_gifs: Option<bool>,
 }
 
 /// Mutable subset of an account profile (`PATCH update_credentials`).
@@ -134,6 +142,12 @@ pub struct AccountProfileUpdate {
     pub discoverable: Option<bool>,
     pub indexable: Option<bool>,
     pub hide_collections: Option<bool>,
+    /// Replace the whole profile-field list (`fields_attributes` semantics).
+    pub fields: Option<Vec<crate::domain::AccountField>>,
+    /// Replace the attribution-domain list.
+    pub attribution_domains: Option<Vec<String>>,
+    /// Automated account flag (`update_credentials[bot]`).
+    pub bot: Option<bool>,
 }
 
 /// Accounts, local users, and the unique handle index.
@@ -673,11 +687,14 @@ pub trait RelationshipStore: Send + Sync {
     /// Remove an inbound follow (the caller's own follower).
     fn remove_follower(&self, account_id: Id, follower_id: Id, now_ms: u64) -> Result<Option<Follow>>;
 
-    /// Pending inbound follow requests, newest first (cursor = follower id).
+    /// Pending inbound follow requests, newest first (cursor = follower id;
+    /// upstream paginates `FollowRequest` row ids, which are client-opaque
+    /// through `Link` — registered as a divergence, not re-keyed).
     fn follow_requests(
         &self,
         target_id: Id,
         max_id: Option<Id>,
+        since_id: Option<Id>,
         limit: usize,
     ) -> Result<Vec<Follow>>;
 
@@ -1311,7 +1328,7 @@ pub trait QuoteStore: Send + Sync {
     fn quotes_by_quoting_ids(&self, ids: &[Id]) -> Result<HashMap<Id, QuoteRecord>>;
 
     /// Accepted quotes of `quoted_status_id` with their quoting statuses,
-    /// newest first (cursor = quoting status id).
+    /// newest first (cursor = quote id, upstream `paginate_by_max_id`).
     fn quotes_of_status(
         &self,
         quoted_status_id: Id,

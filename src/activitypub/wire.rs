@@ -69,11 +69,20 @@ pub struct Note {
 }
 
 impl Note {
-    /// The status language: the single `contentMap` key, if there is one.
+    /// The status language: the single `contentMap` key, if there is one, in
+    /// BCP47 canonical case. Upstream maps the downcased key through its
+    /// locale table (`NORMALIZED_LOCALE_NAMES`, falling back to the raw key);
+    /// without that catalog this canonicalizes the standard shapes directly
+    /// (`EN` → `en`, `pt-br` → `pt-BR`), which agrees with the table on every
+    /// standard tag and keeps unknown tags legible.
     pub fn language(&self) -> Option<String> {
-        self.content_map
-            .as_ref()
-            .and_then(|m| if m.len() == 1 { m.keys().next().cloned() } else { None })
+        self.content_map.as_ref().and_then(|m| {
+            if m.len() == 1 {
+                m.keys().next().map(|key| canonical_language_tag(key))
+            } else {
+                None
+            }
+        })
     }
 
     /// The `actor` URIs of the Note's mentions, from its `Mention` tags.
@@ -102,19 +111,61 @@ impl Note {
 
     /// The Note's visibility from its audience (`PostStatusService` / `ActivityPub::Parser::StatusParser#visibility`):
     /// public in `to`, unlisted in `cc`, followers-only when `to` names the author's
-    /// followers collection, otherwise direct.
+    /// followers collection exactly, otherwise direct. The expected collection
+    /// is the author's own `{attributedTo}/followers` (see [`followers_uri_of`]).
     pub fn visibility(&self) -> Visibility {
         let public = |list: &[Url]| list.iter().any(|u| u.as_str() == PUBLIC);
         if public(&self.to) {
             Visibility::Public
         } else if public(&self.cc) {
             Visibility::Unlisted
-        } else if self.to.iter().any(|u| u.as_str().ends_with("/followers")) {
+        } else if {
+            let expected = followers_uri_of(&self.attributed_to);
+            self.to.iter().any(|u| u.as_str() == expected)
+        } {
             Visibility::Private
         } else {
             Visibility::Direct
         }
     }
+}
+
+/// The followers collection URI for `actor` under the Mastodon-family
+/// convention (`{actor_uri}/followers`): what this server advertises in its
+/// actor documents ([`crate::activitypub::outgoing::followers_uri`]) and
+/// what remote Mastodon-family servers advertise in theirs. Audience checks
+/// compare against this exact string (upstream compares against the author's
+/// `followers_collection`, `StatusParser#visibility`), never a bare
+/// `ends_with("/followers")`, so `https://evil.example/users/alice/followers`
+/// does not pass for `alice`.
+pub fn followers_uri_of(actor: &Url) -> String {
+    format!("{}/followers", actor.as_str().trim_end_matches('/'))
+}
+
+/// BCP47 canonical case for a language tag: the language subtag lowercase,
+/// a two-letter region uppercase, a four-letter script titlecase, everything
+/// else lowercase (`EN` → `en`, `pt-br` → `pt-BR`, `zh-hans-cn` → `zh-Hans-CN`).
+pub fn canonical_language_tag(tag: &str) -> String {
+    let mut parts = tag.split(['-', '_']);
+    let mut out = String::new();
+    if let Some(language) = parts.next() {
+        out.push_str(&language.to_lowercase());
+    }
+    for part in parts {
+        out.push('-');
+        if part.len() == 2 && part.bytes().all(|b| b.is_ascii_alphabetic()) {
+            out.push_str(&part.to_uppercase());
+        } else if part.len() == 4 && part.bytes().all(|b| b.is_ascii_alphabetic()) {
+            let mut chars = part.chars();
+            if let Some(first) = chars.next() {
+                out.push_str(&first.to_uppercase().to_string());
+                out.push_str(&chars.as_str().to_lowercase());
+            }
+        } else {
+            out.push_str(&part.to_lowercase());
+        }
+    }
+    out
 }
 
 /// A tag: a `Mention` (with `href`), a `Hashtag` (with `name`) or an `Emoji`.

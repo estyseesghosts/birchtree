@@ -55,12 +55,16 @@ pub fn get_poll(
     Ok(poll)
 }
 
-/// `POST /api/v1/polls/:id/votes` — cast (or replace, on multiple-choice
+/// `POST /api/v1/polls/:id/votes` — cast (or extend, on multiple-choice
 /// polls) the viewer's ballot.
 ///
-/// Gates, in order: poll exists -> its status is showable -> no block in
-/// either direction -> at least one choice -> the store's in-transaction
-/// validation (expiry/choice/self/duplicate), mapped through unchanged.
+/// Gates, in order: poll exists -> its status is showable -> an empty
+/// `choices` list is a silent no-op returning the poll unchanged (upstream
+/// `VoteService#call` line 22 returns before the vote gate or the
+/// interaction tracker, while the controller still 404s a missing/invisible
+/// poll via `set_poll`) -> no block in either direction -> the store's
+/// in-transaction validation (expiry/choice/self/dup), mapped through
+/// unchanged.
 pub fn vote(
     store: &dyn Store,
     viewer_id: Id,
@@ -83,15 +87,16 @@ pub fn vote(
     if !policy::can_fetch(Some(viewer_id), &status, status_pair) {
         return Err(PollVoteError::NotFound);
     }
+    // Empty choices: no vote, no journal, no block check — the poll as-is.
+    if choices.is_empty() {
+        return Ok(poll);
+    }
     // Blocks either direction between the poll author and the voter -> 403.
     let author_pair = store
         .pair_state(poll.account_id, viewer_id, now_ms)
         .map_err(store_error)?;
     if author_pair.blocking || author_pair.blocked_by {
         return Err(PollVoteError::NotPermitted);
-    }
-    if choices.is_empty() {
-        return Err(PollVoteError::Rejected(VoteRejection::InvalidChoice));
     }
     let poll = store
         .vote_poll(poll_id, viewer_id, choices, now_ms)

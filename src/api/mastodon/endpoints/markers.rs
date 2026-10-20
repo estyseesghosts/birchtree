@@ -90,7 +90,14 @@ pub async fn create(
             ))
             .into_response();
         };
-        updates.push((timeline.to_string(), last_read_id, None));
+        // Optimistic locking (`Marker#lock_version`): a stale version 409s
+        // via the use case. Absent = no check (upstream `lock_version` is nil
+        // then); garbage casts to 0 like Rails' `to_i`, which only matches a
+        // fresh row.
+        let lock_version = forms::get(&pairs, &format!("{timeline}[lock_version]")).map(|raw| {
+            raw.parse::<u64>().unwrap_or(0)
+        });
+        updates.push((timeline.to_string(), last_read_id, lock_version));
     }
     if updates.is_empty() {
         // Mastodon `params.slice(*TIMELINES)` with nothing usable renders an

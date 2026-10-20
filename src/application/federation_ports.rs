@@ -148,6 +148,14 @@ pub struct NewReport {
     pub comment: String,
     pub forwarded: bool,
     pub activity_uri: Option<String>,
+    /// Validated category (`spam`, `violation`, `legal`, `other`, ...).
+    pub category: String,
+    /// Validated rule ids (empty unless the endpoint checked them).
+    pub rule_ids: Vec<String>,
+    /// Lowercased forward domains (empty when not forwarded).
+    pub forward_to_domains: Vec<String>,
+    /// Numeric-validated collection ids.
+    pub collection_ids: Vec<Id>,
 }
 
 /// The content side of federation: statuses by URI, quotes, reply links,
@@ -163,6 +171,13 @@ pub trait FederationContentStore: Send + Sync {
 
     /// Whether an activity URI is recorded as applied.
     fn activity_recorded(&self, activity_uri: &str) -> Result<bool>;
+
+    /// Drop dedup rows recorded at or before `cutoff_ms`, up to `cap` rows;
+    /// returns the dropped count (fix round P2 #20b; TTL policy lives in
+    /// `crate::federation::dedup`). Called amortized from `record_activity`,
+    /// so no scheduler is needed: the table only grows on ingest, and ingest
+    /// prunes it.
+    fn prune_activities_before(&self, cutoff_ms: u64, cap: usize) -> Result<usize>;
 
     /// File a tombstone for an object URI a remote `Delete` removed before any
     /// `Create` for it arrived. Returns `true` when the tombstone is new.

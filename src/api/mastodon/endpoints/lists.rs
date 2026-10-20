@@ -22,6 +22,9 @@ const WRITE_SCOPES: &[&str] = &["write", "write:lists"];
 /// Mastodon `DEFAULT_ACCOUNTS_LIMIT` for the members endpoint.
 const MEMBERS_DEFAULT_LIMIT: usize = 40;
 const MEMBERS_MAX_LIMIT: usize = 80;
+/// Bound for the `limit=0` unlimited path (upstream has no cap; a list holds
+/// at most one row per account, so this is generous without unbounded reads).
+const ALL_MEMBERS_CAP: usize = 10_000;
 
 fn bool_cast(value: &str) -> bool {
     matches!(
@@ -176,7 +179,10 @@ pub async fn accounts_index(
         Some(query) => forms::parse(query.as_bytes()),
         None => Vec::new(),
     };
-    // Mastodon: `limit=0` returns every member.
+    // Mastodon: `limit=0` returns every member (`unlimited?`, no `Link`).
+    // A present `max_id`/`since_id` with `limit=0` still returns everything
+    // (upstream ignores cursors on the unlimited path).
+    let unlimited = forms::get(&pairs, "limit").is_some_and(|raw| raw == "0");
     let limit: usize = match forms::get(&pairs, "limit") {
         None => MEMBERS_DEFAULT_LIMIT,
         Some(raw) => {
@@ -198,9 +204,17 @@ pub async fn accounts_index(
         None => None,
     };
     let store: &dyn Store = &*state.context.store;
-    let members = match lists::members(store, viewer, id, max_id, limit) {
-        Ok(members) => members,
-        Err(err) => return list_error(err).into_response(),
+    // `limit=0` bypasses cursor paging entirely (upstream `unlimited?`).
+    let members = if unlimited {
+        match store.all_list_members(id, ALL_MEMBERS_CAP) {
+            Ok(members) => members,
+            Err(err) => return list_error(err).into_response(),
+        }
+    } else {
+        match lists::members(store, viewer, id, max_id, limit) {
+            Ok(members) => members,
+            Err(err) => return list_error(err).into_response(),
+        }
     };
     let accounts = store.accounts_by_ids(&members).unwrap_or_default();
     let stats = store.account_stats_by_ids(&members).unwrap_or_default();
@@ -215,15 +229,18 @@ pub async fn accounts_index(
         }
     }
     let mut response = axum::Json(body).into_response();
-    if let Some(link) = pagination::link_header(
-        &uri,
-        members.last().copied(),
-        members.first().copied(),
-    ) {
-        if let Ok(value) = axum::http::header::HeaderValue::from_str(&link) {
-            response
-                .headers_mut()
-                .insert(axum::http::header::LINK, value);
+    // No `Link` on the unlimited path (upstream `unlimited?` skips paging).
+    if !unlimited {
+        if let Some(link) = pagination::link_header(
+            &uri,
+            members.last().copied(),
+            members.first().copied(),
+        ) {
+            if let Ok(value) = axum::http::header::HeaderValue::from_str(&link) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::LINK, value);
+            }
         }
     }
     response

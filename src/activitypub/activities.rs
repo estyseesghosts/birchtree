@@ -336,14 +336,19 @@ pub type QuoteRequestActivity = QuoteRequest;
 // Helpers.
 // ---------------------------------------------------------------------------
 
-/// The visibility of an activity or Note from its audience.
-pub fn audience_visibility(to: &[Url], cc: &[Url]) -> Visibility {
+/// The visibility of an activity or Note from its audience. `followers_uri`
+/// is the author's own followers collection URI (see
+/// [`crate::activitypub::wire::followers_uri_of`]): only an exact match
+/// yields followers-only (upstream `StatusParser#visibility` compares
+/// against the author's `followers_collection`). A bare
+/// `ends_with("/followers")` would let any host's `…/followers` URI pass.
+pub fn audience_visibility(to: &[Url], cc: &[Url], followers_uri: &str) -> Visibility {
     let public = |list: &[Url]| list.iter().any(|u| u.as_str() == PUBLIC);
     if public(to) {
         Visibility::Public
     } else if public(cc) {
         Visibility::Unlisted
-    } else if to.iter().any(|u| u.as_str().ends_with("/followers")) {
+    } else if to.iter().any(|u| u.as_str() == followers_uri) {
         Visibility::Private
     } else {
         Visibility::Direct
@@ -386,7 +391,11 @@ fn record(store: &dyn crate::application::ports::Store, id: &Url, applied: &Appl
 }
 
 /// Turn a verified Note into the application's input, for the given author.
-pub fn note_input(note: &Note, author_id: Id) -> RemoteNote {
+///
+/// `author_sensitized` is the author's account flag: upstream forces
+/// `sensitive` when the account is sensitized
+/// (`Activity::Create#sensitive: @account.sensitized? || @status_parser.sensitive`).
+pub fn note_input_for(note: &Note, author_id: Id, author_sensitized: bool) -> RemoteNote {
     let published_ms = note
         .published
         .as_deref()
@@ -401,7 +410,7 @@ pub fn note_input(note: &Note, author_id: Id) -> RemoteNote {
         visibility: note.visibility(),
         content_html: note.content.clone(),
         spoiler_text: note.summary.clone().filter(|s| !s.is_empty()),
-        sensitive: note.sensitive.unwrap_or(false),
+        sensitive: author_sensitized || note.sensitive.unwrap_or(false),
         language: note.language(),
         in_reply_to_uri: note.in_reply_to.as_ref().map(|u| u.to_string()),
         mention_uris: note.mention_uris(),
@@ -420,6 +429,15 @@ pub fn note_input(note: &Note, author_id: Id) -> RemoteNote {
         quote_uri: note.quote.as_ref().map(|u| u.to_string()),
         poll: None,
     }
+}
+
+/// Turn a verified Note into the application's input, for the given author.
+///
+/// Kept for callers without the author's account row (existing tests):
+/// production ingest uses [`note_input_for`], which also forces `sensitive`
+/// for sensitized authors.
+pub fn note_input(note: &Note, author_id: Id) -> RemoteNote {
+    note_input_for(note, author_id, false)
 }
 
 /// A received vote: the chosen option's title and the poll's URI.
@@ -446,7 +464,11 @@ pub fn vote_of(note: &Note) -> Option<RemoteVote> {
 /// Turn a verified Question into the application's input, for the given
 /// author: the status fields plus the poll. The tallies ride along so the
 /// ingest can seed them atomically with the status.
-pub fn question_input(question: &Question, author_id: Id, now_ms: u64) -> (RemoteNote, inbound::RemotePoll) {
+///
+/// `author_sensitized` forces `sensitive`, like [`note_input_for`] (upstream
+/// `Activity::Create` forces it for every status shape of a sensitized
+/// account).
+pub fn question_input_for(question: &Question, author_id: Id, author_sensitized: bool, now_ms: u64) -> (RemoteNote, inbound::RemotePoll) {
     let published_ms = question
         .published
         .as_deref()
@@ -474,10 +496,17 @@ pub fn question_input(question: &Question, author_id: Id, now_ms: u64) -> (Remot
         url: question.url.as_ref().unwrap_or(&question.id).to_string(),
         author_id,
         published_ms,
-        visibility: audience_visibility(&question.to, &question.cc),
+        visibility: audience_visibility(
+            &question.to,
+            &question.cc,
+            &crate::activitypub::wire::followers_uri_of(&question.attributed_to),
+        ),
         content_html: question.content.clone(),
         spoiler_text: None,
-        sensitive: false,
+        // Upstream also honors the Question's own `sensitive` flag here;
+        // the wire shape carries no such field (adding one breaks the
+        // shared struct literals), so only the account flag forces it.
+        sensitive: author_sensitized,
         language: None,
         in_reply_to_uri: question.in_reply_to.as_ref().map(|u| u.to_string()),
         mention_uris: Vec::new(),
@@ -495,6 +524,13 @@ pub fn question_input(question: &Question, author_id: Id, now_ms: u64) -> (Remot
         expired: question.closed_flag(now_ms),
     };
     (note, poll)
+}
+
+/// Turn a verified Question into the application's input, for the given
+/// author. Kept for callers without the author's account row (existing
+/// tests): production ingest uses [`question_input_for`].
+pub fn question_input(question: &Question, author_id: Id, now_ms: u64) -> (RemoteNote, inbound::RemotePoll) {
+    question_input_for(question, author_id, false, now_ms)
 }
 
 /// An object's author must be the actor that sent it, and its ID must be on the actor's host.
@@ -781,7 +817,7 @@ impl ActivityHandler for Create {
         match self.object {
             CreateObject::Question(question) => {
                 verify_object_author(&question.id, &question.attributed_to, self.actor.inner())?;
-                let (note, poll) = question_input(&question, author.account.id, now);
+                let (note, poll) = question_input_for(&question, author.account.id, author.account.sensitized, now);
                 let applied = match tombstone::ingest_checked(store, note, Some(poll), now)? {
                     CheckedIngest::Live(ingested) => {
                         if let Some(parent_uri) = &ingested.parent_unknown {
@@ -810,7 +846,7 @@ impl ActivityHandler for Create {
                         inbound::VoteDisposition::NotAVote => {}
                     }
                 }
-                let ingested = match tombstone::ingest_checked(store, note_input(&note, author.account.id), None, now)? {
+                let ingested = match tombstone::ingest_checked(store, note_input_for(&note, author.account.id, author.account.sensitized), None, now)? {
                     CheckedIngest::Live(ingested) => ingested,
                     // The Delete won the race: the note stays gone.
                     CheckedIngest::Tombstoned => {
@@ -865,7 +901,7 @@ impl ActivityHandler for Update {
                 let note: Note = serde_json::from_value(self.object.clone())
                     .map_err(|e| FedError::Refused(format!("update of a note that does not parse: {e}")))?;
                 verify_note_author(&note, self.actor.inner())?;
-                let applied = inbound::update_note(store, author.account.id, &note_input(&note, author.account.id), now)?;
+                let applied = inbound::update_note(store, author.account.id, &note_input_for(&note, author.account.id, author.account.sensitized), now)?;
                 log_outcome("Update", &self.id, self.actor.inner(), &applied);
                 record(store, &self.id, &applied, now)?;
             }
@@ -882,7 +918,7 @@ impl ActivityHandler for Update {
                     .map_err(|e| FedError::Refused(format!("update of a question that does not parse: {e}")))?;
                 verify_object_author(&question.id, &question.attributed_to, self.actor.inner())?;
                 let author = self.actor.dereference(data).await?;
-                let (note, poll) = question_input(&question, author.account.id, now);
+                let (note, poll) = question_input_for(&question, author.account.id, author.account.sensitized, now);
                 // Out-of-order delivery: an Update for a status never seen is
                 // ingested as its Create (Mastodon does the same), unless its
                 // Delete arrived first (then it stays gone).
@@ -1026,7 +1062,11 @@ impl ActivityHandler for Announce {
             store,
             actor.account.id,
             object_uri.as_str(),
-            audience_visibility(&self.to, &self.cc),
+            audience_visibility(
+                &self.to,
+                &self.cc,
+                &crate::activitypub::wire::followers_uri_of(self.actor.inner()),
+            ),
             now,
         )?;
         log_outcome("Announce", &self.id, self.actor.inner(), &applied);
@@ -1125,7 +1165,7 @@ impl ActivityHandler for QuoteRequest {
         let quoting = match &self.instrument {
             crate::activitypub::wire::Instrument::Note(note) => {
                 verify_note_author(note, &self.actor)?;
-                match tombstone::ingest_checked(store, note_input(note, author.account.id), None, now)? {
+                match tombstone::ingest_checked(store, note_input_for(note, author.account.id, author.account.sensitized), None, now)? {
                     CheckedIngest::Live(ingested) => ingested.status.id,
                     CheckedIngest::Tombstoned => {
                         let tombstoned = Applied::Ignored("quoting status was deleted before it arrived".into());
@@ -1136,7 +1176,7 @@ impl ActivityHandler for QuoteRequest {
             }
             crate::activitypub::wire::Instrument::Question(question) => {
                 verify_object_author(&question.id, &question.attributed_to, &self.actor)?;
-                let (note, poll) = question_input(question, author.account.id, now);
+                let (note, poll) = question_input_for(question, author.account.id, author.account.sensitized, now);
                 match tombstone::ingest_checked(store, note, Some(poll), now)? {
                     CheckedIngest::Live(ingested) => ingested.status.id,
                     CheckedIngest::Tombstoned => {

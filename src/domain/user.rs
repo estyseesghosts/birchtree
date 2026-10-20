@@ -89,6 +89,16 @@ pub struct LocalUser {
     /// `ListFeed` have none.
     #[serde(default)]
     pub chosen_languages: Option<Vec<String>>,
+    /// Reading preferences (upstream web-settings-only; here settable through
+    /// `update_credentials[source][display_media|expand_spoilers|
+    /// autoplay_gifs]` as a birchtree extension, like `chosen_languages`).
+    /// `None` = upstream default (`default`/`false`/`false`).
+    #[serde(default)]
+    pub web_display_media: Option<String>,
+    #[serde(default)]
+    pub web_expand_spoilers: Option<bool>,
+    #[serde(default)]
+    pub web_auto_play_gifs: Option<bool>,
     /// Staff role for the admin API (Phase 7.3). `None` (the `#[serde(default)]`
     /// for every pre-7.3 record) means "no staff role".
     #[serde(default)]

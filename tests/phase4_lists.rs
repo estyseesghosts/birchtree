@@ -436,3 +436,103 @@ async fn list_scopes_and_auth_are_enforced() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn list_members_limit_zero_returns_all_without_link() {
+    // Upstream `lists/accounts_controller.rb` `unlimited?` (fix round P2
+    // #14a): `limit=0` returns every member with no `Link` cursors.
+    let srv = TestServer::new(true);
+    let alice = user_token(&srv, "alice").await;
+    let bob = user_token(&srv, "bob").await;
+    let carol = user_token(&srv, "carol").await;
+    let store = &*srv.store;
+    let alice_id = store
+        .account_by_handle("alice", "example.social")
+        .unwrap()
+        .expect("alice")
+        .id;
+    for name in ["bob", "carol"] {
+        let target = store
+            .account_by_handle(name, "example.social")
+            .unwrap()
+            .expect("member")
+            .id;
+        store
+            .follow(
+                alice_id,
+                target,
+                birchtree::application::ports::FollowOptions {
+                    show_reblogs: true,
+                    notify: false,
+                    languages: None,
+                },
+                false,
+                1_700_000_000_000,
+            )
+            .unwrap();
+    }
+    let (status, _h, bytes) = send(
+        &srv.router,
+        form_request("POST", "/api/v1/lists", "title=All", Some(&alice)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let list_id = json(&bytes)["id"].as_str().unwrap().to_string();
+    let _ = (bob, carol);
+    // Add both members by id lookup through the store handles.
+    let mut ids = Vec::new();
+    for name in ["bob", "carol"] {
+        ids.push(
+            store
+                .account_by_handle(name, "example.social")
+                .unwrap()
+                .expect("member")
+                .id
+                .to_string(),
+        );
+    }
+    let body = ids
+        .iter()
+        .map(|id| format!("account_ids[]={id}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let (status, _h, _) = send(
+        &srv.router,
+        form_request(
+            "POST",
+            &format!("/api/v1/lists/{list_id}/accounts"),
+            &body,
+            Some(&alice),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // `limit=0` → every member, no `Link`.
+    let (status, headers, bytes) = send(
+        &srv.router,
+        get_request(
+            &format!("/api/v1/lists/{list_id}/accounts?limit=0"),
+            Some(&alice),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(json(&bytes).as_array().unwrap().len(), 2);
+    assert!(!headers.contains_key("link"), "no Link on unlimited page");
+
+    // A bounded page still carries `Link` cursors.
+    let (status, headers, bytes) = send(
+        &srv.router,
+        get_request(
+            &format!("/api/v1/lists/{list_id}/accounts?limit=1"),
+            Some(&alice),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&bytes).as_array().unwrap().len(), 1);
+    assert!(headers.contains_key("link"), "bounded page keeps Link");
+}

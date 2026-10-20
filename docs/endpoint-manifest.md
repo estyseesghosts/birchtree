@@ -12,9 +12,9 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| GET | `/.well-known/webfinger` | none | — | implemented (Phase 6) | In | WebFinger `acct:` resolution |
+| GET | `/.well-known/webfinger` | none | — | implemented (Phase 6, fix round) | In | WebFinger `acct:` resolution; suspended accounts → 410 (upstream `gone`) |
 | GET | `/.well-known/nodeinfo` | none | — | implemented (Phase 6) | In | NodeInfo discovery |
-| GET | `/nodeinfo/2.0` | none | — | implemented (Phase 6) | In | NodeInfo 2.0 document (real local-only `usage`, D31) |
+| GET | `/nodeinfo/2.0` | none | — | implemented (Phase 6, fix round) | In | NodeInfo 2.0 document (real local-only `usage`, D31; `metadata` carries `nodeName`/`nodeDescription`; `software.name` is the `birchtree` rebrand, D48) |
 | GET/POST | `/oauth/authorize` | session | — | implemented (Phase 2) | In | Doorkeeper authorize; login + consent rendered server-side |
 | POST | `/oauth/token` | basic/client | — | implemented (Phase 2) | In | `authorization_code` (PKCE S256) + `client_credentials` |
 | POST | `/oauth/revoke` | basic/client | — | implemented (Phase 2) | In | Always `200 {}`; wrong client `403 unauthorized_client` |
@@ -39,11 +39,11 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 | GET | `/api/v1/instance/terms_of_service/:date` | none | — | planned | In | as above |
 | GET | `/api/v1/accounts` | optional | read \| read:accounts | implemented (Phase 7) | In | multi-fetch `id[]` (up to 40; above that `422 Mastodon::ValidationError`); unapproved and pending-deletion accounts omitted (upstream `set_accounts`) |
 | POST | `/api/v1/accounts` | app | write \| write:accounts | implemented (Phase 2) | In | registration; returns a user token |
-| GET | `/api/v1/accounts/verify_credentials` | user | profile \| read \| read:accounts | implemented (Phase 2) | In | `CredentialAccountSerializer` (real counters) |
-| PATCH | `/api/v1/accounts/update_credentials` | user | write \| write:accounts | implemented (Phase 2) | In | incl. `source[quote_policy]`. Accepts `source[chosen_languages][]` (D21; birchtree extension — upstream has no API setter): replaces the stored preference, empty clears it, absent leaves it unchanged |
-| GET | `/api/v1/accounts/lookup` | user | read | implemented (Phase 7) | In | acct → account resolution |
-| GET | `/api/v1/accounts/search` | user | read | implemented (Phase 7) | In | |
-| GET | `/api/v1/accounts/relationships` | user | read \| read:follows | implemented (Phase 2, real data Phase 3) | In | real per-viewer relationship aggregates |
+| GET | `/api/v1/accounts/verify_credentials` | user | profile \| read \| read:accounts | implemented (Phase 2, source/role fix round) | In | `CredentialAccountSerializer` (real counters); `source` renders stored profile fields/discoverable/hide_collections/indexable/attribution (`null`/defaults when never set); `role` is real for staff (`Admin`/`Moderator` + permission bitmask), legacy `User` shape otherwise |
+| PATCH | `/api/v1/accounts/update_credentials` | user | write \| write:accounts | implemented (Phase 2, fields fix round) | In | incl. `source[quote_policy]`. Accepts `source[chosen_languages][]` (D21; birchtree extension — upstream has no API setter): replaces the stored preference, empty clears it, absent leaves it unchanged. `bot`/`fields_attributes[]`/`attribution_domains[]` parsed with upstream rules (max 4, blank-label 422, truncation) and persisted (absent leaves stored values); `source[display_media|expand_spoilers|autoplay_gifs]` stored as a birchtree extension (upstream: web-settings-only). `avatar`/`header` need the media pipeline (named follow-up) |
+| GET | `/api/v1/accounts/lookup` | user | read | implemented (Phase 7, fix round) | In | leading-`@`-tolerant, domain-lowercased resolution incl. known remote accounts; suspended still returned; unknown remote → 404 (live webfinger = federation follow-up) |
+| GET | `/api/v1/accounts/search` | user | read | implemented (Phase 7, fix round) | In | `require_user!` (was anonymous); default limit 40/max 80, `offset`; blank `q` → `[]`; exact handle match first (local + known remote + `resolve=`); `following=true` gates; suspended excluded |
+| GET | `/api/v1/accounts/relationships` | user | read \| read:follows | implemented (Phase 2, real data Phase 3, fix round) | In | real per-viewer relationship aggregates; `without_suspended` unless truthy `with_suspended` |
 | GET | `/api/v1/accounts/:id` | none | — | implemented (Phase 2, real counters Phase 3) | In | public profile |
 | GET | `/api/v1/accounts/:id/statuses` | optional | read | implemented (Phase 3) | In | `pinned`/`exclude_replies`/`exclude_reblogs` filters, `Link` cursors |
 | GET | `/invite/:invite_code` | none | — | implemented (round 3, durable round 4) | In | mirrors `Api::V1::InvitesController#show`: 200 `{invite_code, instance_api_url}`, 404 unknown, 401 `{error: "Invalid invitation code"}` for expired/exhausted (checked before the registrations gate); durable `INVITES` table (see D12) |
@@ -122,15 +122,15 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
 | GET | `/api/v1/polls/:id` | optional | read \| read:statuses | implemented (Phase 3) | In | 404 when missing/invisible |
-| POST | `/api/v1/polls/:id/votes` | user | write \| write:statuses | implemented (Phase 3) | In | `choices[]` required (else 400); single-choice re-vote 422 |
+| POST | `/api/v1/polls/:id/votes` | user | write \| write:statuses | implemented (Phase 3, vote-semantics fix round) | In | missing `choices` → 400; present-but-empty → 200 no-op (upstream early return); multiple-choice re-votes merge additively (never replace/delete); divergences recorded: JSON `{"choices":[]}` flattens to missing (400), `choices[]=abc` → 422 (upstream 500s) |
 
 ### Timelines, media, notifications, discovery (later phases)
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
 | GET | `/api/v1/timelines/home` | user | read \| read:statuses | implemented (Phase 4) | In | own statuses + the most recent 1000 active follows, minus members of the viewer's exclusive lists (D10b, Phase 4.1); `limit` 20/max 40 (`limit=0`/non-numeric → empty, no `Link`); `local` accepted and ignored (as upstream v4.7.3); app-only token → 422; `Cache-Control: private, no-store` |
-| GET | `/api/v1/timelines/public` | optional | read \| read:statuses | implemented (Phase 4) | In | public visibility only; self-replies kept, replies to others and reblogs dropped; `local`/`remote`/`only_media`; anonymous → `max-age=15, public, stale-while-revalidate=30, stale-if-error=86400`, authenticated → `private, no-store` |
-| GET | `/api/v1/timelines/tag/{tag}` | optional | read \| read:statuses | implemented (Phase 4) | In | tag normalized (case-insensitive, leading `#` stripped); unknown or empty tag → `200 []` with no `Link`; public visibility only; replies kept; reblog wrappers not indexed (matches upstream, see deviations); `local`/`remote`/`only_media`; cache header as `public` above |
+| GET | `/api/v1/timelines/public` | optional | read \| read:statuses | implemented (Phase 4, feed-gate fix round) | In | public visibility only; self-replies kept, replies to others and reblogs dropped; `local`/`remote`/`only_media`; anonymous → `max-age=15, public, stale-while-revalidate=30, stale-if-error=86400`, authenticated → `private, no-store`. `*_live_feed_access` gates (default `public`): non-`public` requires login (anonymous → 401); `disabled` serves `[]` to non-staff |
+| GET | `/api/v1/timelines/tag/{tag}` | optional | read \| read:statuses | implemented (Phase 4, any/all/none + feed-gate fix round) | In | tag normalized (case-insensitive, leading `#` stripped); unknown or empty tag → `200 []` with no `Link`; public visibility only; replies kept; reblog wrappers not indexed (matches upstream, see deviations); `local`/`remote`/`only_media`; `any[]`/`all[]`/`none[]` multi-tag queries (upstream `TagFeed` modes, 4-tag cap each); `*_topic_feed_access` gates as `public` above; cache header as `public` above |
 | GET | `/api/v1/timelines/list/{id}` | user | read \| read:lists | implemented (Phase 4) | In | members' statuses under the home gates; the list's `replies_policy` (`list`/`followed`/`none`) governs replies; not owned or unparsable id → 404 `{"error":"Record not found"}`; app-only token → 422; `Cache-Control: private, no-store` |
 | GET | `/api/v1/timelines/link` | optional | read | implemented (Phase 7) | In | link timeline over `PreviewCard` URLs (`?url=`) |
 | GET | `/api/v1/media/:id` | user | write \| write:media | implemented (Phase 4) | In | 206 while unprocessed; 422 on processing failure (Mastodon's controller authorizes write on every action, `show` included) |
@@ -138,7 +138,7 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 | PUT | `/api/v1/media/:id` | user | write \| write:media | implemented (Phase 4) | In | description/focus/thumbnail; 206 while unprocessed |
 | DELETE | `/api/v1/media/:id` | user | write \| write:media | implemented (Phase 4) | In | 422 while attached to a status |
 | POST | `/api/v2/media` | user | write \| write:media | implemented (Phase 4, stills extended round 3) | In | media v2 (multipart; video/audio delayed → 202, images inline → 200); HEIC/HEIF/TIFF accepted as stills → WebP (D4) |
-| GET | `/api/v1/notifications` | user | read:notifications | implemented (Phase 4) | In | `limit` 20/max 40 with `limit_param` semantics (`limit=0` → empty page); `types[]`/`exclude_types[]` silently drop unknown values; `group_key` uses the `ungrouped-<id>` fallback (no server-side merging in the v1 profile) |
+| GET | `/api/v1/notifications` | user | read:notifications | implemented (Phase 4, params fix round) | In | `limit` 20/max 40 with `limit_param` semantics (`limit=0` → empty page); `types[]`/`exclude_types[]` accept all 17 upstream types (unbuilt-feature types parse but never match — register rows, not stubs); unknown values silently dropped; `account_id` filters by actor (fill-loop, cursor-stable); `include_filtered` accepted (no servable filtered rows yet); `supported_types[]` accepted (fallback rendering unbuilt); suspended/gone actors excluded (`without_suspended`); `group_key` uses the `ungrouped-<id>` fallback (no server-side merging in the v1 profile) |
 | GET | `/api/v1/notifications/:id` | user | read:notifications | implemented (Phase 4) | In | 404 `{"error":"Record not found"}` for foreign/missing |
 | POST | `/api/v1/notifications/clear` | user | write \| write:notifications | implemented (Phase 4) | In | `200 {}` |
 | GET | `/api/v1/notifications/unread_count` | user | read:notifications | implemented (Phase 4) | In | `{"count": N}` = rows newer than the notifications marker (limit default 100, max 1000) |
@@ -153,7 +153,7 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 | GET | `/api/v1/notifications/policy` | user | read:notifications | implemented (round 3) | In | upstream V1 policy singleton defaults (`private_mentions` + `limited_accounts` = filter, rest accept) |
 | PUT | `/api/v1/notifications/policy` | user | write:notifications | implemented (round 3) | In | set `filter_*` flags; absent flags keep their value; `for_limited_accounts` not settable here, like upstream V1 |
 | GET/POST | `/api/v1/markers` | user | read:statuses / write:statuses | implemented (Phase 4) | In | `timeline[]` on GET; `home[last_read_id]`/`notifications[last_read_id]` on POST (query or body); response `{timeline:{last_read_id,version,updated_at}}`; fresh marker reports `version: 1` |
-| GET | `/api/v1/preferences` | user | read \| read:accounts | implemented (Phase 2) | In | incl. quote-policy defaults |
+| GET | `/api/v1/preferences` | user | read \| read:accounts | implemented (Phase 2, reading-keys fix round) | In | incl. quote-policy defaults; `posting:default:language` cascades `default_language` → registration `locale`; `reading:*` render stored preferences (birchtree extension setters) defaulting to upstream defaults (`default`/`false`/`false`) |
 | GET | `/api/v1/filters` | user | read \| read:filters | implemented (Phase 4) | In | v1 projection over keyword rows (deprecated upstream since 2022-11-14, but pinned v4.7.3 still serves it); each row's `id` is the keyword id |
 | POST | `/api/v1/filters` | user | write \| write:filters | implemented (Phase 4) | In | creates filter + one keyword in ONE transaction |
 | GET | `/api/v1/filters/:id` | user | read \| read:filters | implemented (Phase 4) | In | |
@@ -229,7 +229,7 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| POST | `/api/v1/push/subscription` | user | push | implemented (Phase 7, encrypted payloads round 3+4) | In | subscription bound to the access token; VAPID keys from configuration; standard subs get RFC 8291 `aes128gcm` (two-stage KDF, RFC-vector-locked), legacy keyed subs get draft-04 `aesgcm` (upstream selection rule), keyless legacy keep the tickle (D42: `access_token`/`icon` empty, never fabricated) |
+| POST | `/api/v1/push/subscription` | user | push | implemented (Phase 7, encrypted payloads round 3+4, fix round) | In | subscription bound to the access token; VAPID keys from configuration; standard subs get RFC 8291 `aes128gcm` (two-stage KDF, RFC-vector-locked), legacy keyed subs get draft-04 `aesgcm` (upstream selection rule), keyless legacy keep the tickle (D42: `access_token`/`icon` empty, never fabricated). Delivery retries then quarantines (4xx-except-408/429 destroy, D28 4xx-retry stands); VAPID `exp` 24h; `Unsubscribe-URL` sent when the subscription carries one (minted at creation; pre-token rows send none) |
 | GET | `/api/v1/push/subscription` | user | push | implemented (Phase 7) | In | |
 | PUT | `/api/v1/push/subscription` | user | push | implemented (Phase 7) | In | update; `check_push_subscription` guard |
 | PATCH | `/api/v1/push/subscription` | user | push | implemented (Phase 7) | In | alias of PUT |
@@ -286,7 +286,7 @@ Upstream serves only admin-approved items (`Trends.*.query.allowed`) and returns
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| POST | `/api/v1/reports` | user | write \| write:reports | implemented (Phase 6) | In | creates a report (`require_user!`); `rule_ids` renders `[]` on create; remote forwarding as Flag is Phase 6 |
+| POST | `/api/v1/reports` | user | write \| write:reports | implemented (Phase 6, params fix round) | In | creates a report (`require_user!`); `category` enum-gated (`rule_ids` force `violation`), `rule_ids` validated (unknown → 422), `forward_to_domains` lowercased (forwarded iff target's domain listed), `forward` honored for non-local targets, `collection_ids` numeric-validated — all persisted; remote forwarding as Flag is Phase 6 |
 
 ### Annual reports (Phase 7.3)
 

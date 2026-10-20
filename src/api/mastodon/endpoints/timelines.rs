@@ -220,6 +220,50 @@ pub async fn home(State(state): State<ApiState>, auth: Auth, uri: Uri) -> Respon
     }
 }
 
+/// Feed-access gate (fix round P2 #21d; upstream
+/// `PublicController#require_auth?` / `TopicController#require_auth?` plus
+/// `PublicFeed#incompatible_feed_settings?`'s empty-page behavior).
+///
+/// `modes` are the relevant `*_feed_access` settings (selected like
+/// upstream: `local` flag wins, else `remote`, else both). All `public` →
+/// serve. Otherwise anonymous is refused (`401`, upstream `require_user!`);
+/// an authenticated viewer without a functional credential, or a non-staff
+/// viewer under `disabled`, gets an empty page (`200 []`, upstream
+/// incompatible-settings behavior). `Ok(None)` = serve.
+pub(crate) fn feed_gate(
+    state: &ApiState,
+    viewer: Option<Id>,
+    modes: &[&str],
+    uri: &Uri,
+) -> Result<Option<Response>, ApiError> {
+    if modes.iter().all(|mode| *mode == "public") {
+        return Ok(None);
+    }
+    let Some(viewer) = viewer else {
+        return Err(ApiError::invalid_token());
+    };
+    let store: &dyn Store = &*state.context.store;
+    let user = store.user_by_account_id(viewer).map_err(ApiError::from)?;
+    let functional = user.as_ref().is_some_and(|u| u.approved && !u.disabled);
+    let staff = user
+        .as_ref()
+        .is_some_and(|u| u.role != crate::domain::UserRole::None);
+    if !functional || (modes.iter().any(|mode| *mode == "disabled") && !staff) {
+        return Ok(Some(timeline_response(
+            state,
+            Some(viewer),
+            uri,
+            PRIVATE_CACHE,
+            TimelinePage {
+                statuses: Vec::new(),
+                scanned: 0,
+            },
+            false,
+        )));
+    }
+    Ok(None)
+}
+
 /// `GET /api/v1/timelines/public`.
 pub async fn public(State(state): State<ApiState>, auth: OptionalAuth, uri: Uri) -> Response {
     if let Err(err) = optional_scopes(&auth, READ_STATUSES) {
@@ -228,6 +272,21 @@ pub async fn public(State(state): State<ApiState>, auth: OptionalAuth, uri: Uri)
     let viewer = viewer_of(&auth);
     let query = match timeline_query(&uri) {
         Ok(query) => query,
+        Err(err) => return err.into_response(),
+    };
+    let modes: Vec<&str> = if query.local_only {
+        vec![state.server.local_live_feed_access.as_str()]
+    } else if query.remote_only {
+        vec![state.server.remote_live_feed_access.as_str()]
+    } else {
+        vec![
+            state.server.local_live_feed_access.as_str(),
+            state.server.remote_live_feed_access.as_str(),
+        ]
+    };
+    match feed_gate(&state, viewer, &modes, &uri) {
+        Ok(Some(refusal)) => return refusal,
+        Ok(None) => {}
         Err(err) => return err.into_response(),
     };
     let store: &dyn Store = &*state.context.store;
@@ -252,8 +311,31 @@ pub async fn tag(
         Ok(query) => query,
         Err(err) => return err.into_response(),
     };
+    // Upstream `TagFeed` modes: `any[]` widens, `all[]` narrows, `none[]`
+    // excludes (each capped in `timelines::tag_filtered`).
+    let pairs = forms::parse(uri.query().unwrap_or("").as_bytes());
+    let any: Vec<String> = forms::all(&pairs, "any").into_iter().map(str::to_string).collect();
+    let all: Vec<String> = forms::all(&pairs, "all").into_iter().map(str::to_string).collect();
+    let none: Vec<String> = forms::all(&pairs, "none").into_iter().map(str::to_string).collect();
     let store: &dyn Store = &*state.context.store;
-    match timelines::tag(store, viewer, &raw, query, state.context.now_ms()) {
+    // Topic feed gate (#21d): same shape as the live gate above, over the
+    // topic settings (upstream `TopicController#require_auth?`).
+    let modes: Vec<&str> = if query.local_only {
+        vec![state.server.local_topic_feed_access.as_str()]
+    } else if query.remote_only {
+        vec![state.server.remote_topic_feed_access.as_str()]
+    } else {
+        vec![
+            state.server.local_topic_feed_access.as_str(),
+            state.server.remote_topic_feed_access.as_str(),
+        ]
+    };
+    match feed_gate(&state, viewer, &modes, &uri) {
+        Ok(Some(refusal)) => return refusal,
+        Ok(None) => {}
+        Err(err) => return err.into_response(),
+    };
+    match timelines::tag_filtered(store, viewer, &raw, &any, &all, &none, query, state.context.now_ms()) {
         Ok(page) => timeline_response(&state, viewer, &uri, public_cache(viewer), page, false),
         Err(err) => ApiError::from(err).into_response(),
     }

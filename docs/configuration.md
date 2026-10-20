@@ -54,7 +54,13 @@ mails only reach the log. Mail bodies/subjects mirror upstream
 These have no CLI flag and can only be set via the file: `max_file_size`,
 `worker_poll_interval_ms`, `trends_enabled`, `invites_enabled`,
 `peers_api_enabled` (default true), `activity_api_enabled` (default true),
-`domain_blocks_public` (default false, upstream default hidden).
+`domain_blocks_public` (default false, upstream default hidden),
+`local_live_feed_access` / `remote_live_feed_access` (default `public`;
+`authenticated` or `disabled`, upstream `FEED_ACCESS_MODES`),
+`local_topic_feed_access` (default `public`; `public`/`authenticated`) and
+`remote_topic_feed_access` (default `public`; `public`/`authenticated`/
+`disabled`). Non-`public` feed gates require login on the public, tag and
+link timelines (anonymous → 401); `disabled` serves `[]` to non-staff.
 
 ## Reloading
 

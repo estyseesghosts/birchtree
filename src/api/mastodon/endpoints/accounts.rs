@@ -217,6 +217,47 @@ pub async fn update_credentials(
             json!({}),
         );
     }
+    // Upstream `credentials_controller.rb#account_params`: `bot`,
+    // `fields_attributes[][name|value]` and `attribution_domains[]` are
+    // accepted alongside the profile fields above (`avatar`/`header` need
+    // the media pipeline — named follow-up). They persist on the account row
+    // in the same `update_account_profile` transaction as the rest.
+    let bot = field("bot").map(bool_cast);
+    // `fields_attributes` absent → leave stored fields unchanged (upstream
+    // nested-attributes semantics); present → replace the whole list.
+    let profile_fields: Option<Vec<crate::domain::AccountField>> =
+        if pairs.iter().any(|(key, _)| key.starts_with("fields_attributes")) {
+            match parse_profile_fields(&pairs) {
+                Ok(fields) => Some(
+                    fields
+                        .into_iter()
+                        .map(|(name, value)| crate::domain::AccountField {
+                            name,
+                            value,
+                            verified_at: None,
+                        })
+                        .collect(),
+                ),
+                Err(err) => return err,
+            }
+        } else {
+            None
+        };
+    // Same presence rule for `attribution_domains[]`.
+    let attribution_domains: Option<Vec<String>> = pairs
+        .iter()
+        .any(|(key, _)| key == "attribution_domains" || key == "attribution_domains[]")
+        .then(|| {
+            forms::all(&pairs, "attribution_domains")
+                .into_iter()
+                .map(|raw| raw.trim().to_string())
+                .filter(|domain| !domain.is_empty())
+                // No model length check upstream; the ingest path truncates
+                // to the hard limit (`account.rb:87`,
+                // `process_account_service.rb:261`).
+                .take(256)
+                .collect()
+        });
 
     let store: &dyn Store = &*state.context.store;
     let profile = AccountProfileUpdate {
@@ -226,6 +267,9 @@ pub async fn update_credentials(
         discoverable: field("discoverable").map(bool_cast),
         indexable: field("indexable").map(bool_cast),
         hide_collections: field("hide_collections").map(bool_cast),
+        fields: profile_fields,
+        attribution_domains,
+        bot,
     };
     if let Err(err) = store.update_account_profile(account_id, profile) {
         return ApiError::from(err).into_response();
@@ -256,9 +300,26 @@ pub async fn update_credentials(
         || source("source[sensitive]").is_some()
         || source("source[language]").is_some()
         || source("source[quote_policy]").is_some()
+        || source("source[display_media]").is_some()
+        || source("source[expand_spoilers]").is_some()
+        || source("source[autoplay_gifs]").is_some()
         || field("home_mention_policy").is_some()
         || chosen_languages.is_some()
     {
+        // `display_media` enum (`user_settings.rb:38`); unknown values are
+        // refused with the 422 shape upstream's inclusion validation gives.
+        let display_media = match source("source[display_media]") {
+            None => None,
+            Some(raw) => match raw.trim() {
+                "default" | "show_all" | "hide_all" => Some(raw.trim().to_string()),
+                _ => {
+                    return validation_error(
+                        "Validation failed: Display media is not included in the list",
+                        json!({}),
+                    )
+                }
+            },
+        };
         let update = UserSettingsUpdate {
             default_privacy: source("source[privacy]").map(str::to_string),
             default_sensitive: source("source[sensitive]").map(bool_cast),
@@ -270,6 +331,9 @@ pub async fn update_credentials(
                     .to_string()
             }),
             chosen_languages,
+            web_display_media: display_media,
+            web_expand_spoilers: source("source[expand_spoilers]").map(bool_cast),
+            web_auto_play_gifs: source("source[autoplay_gifs]").map(bool_cast),
         };
         if let Err(err) = store.update_user_settings(account_id, update) {
             return ApiError::from(err).into_response();
@@ -296,14 +360,19 @@ pub async fn relationships(
     let pairs = forms::parse(query.unwrap_or_default().as_bytes());
     let store: &dyn Store = &*state.context.store;
 
-    // Resolve targets in request order; unknown ids are silently skipped
-    // (Mastodon skips deleted/suspended accounts).
+    // Upstream (`relationships_controller.rb`): `without_suspended` unless
+    // the `with_suspended` param is truthy; unknown ids are silently skipped.
+    let with_suspended = forms::get(&pairs, "with_suspended").is_some_and(bool_cast);
     let mut target_ids: Vec<crate::domain::Id> = Vec::new();
     for raw in forms::all(&pairs, "id") {
         let Ok(id) = raw.parse::<crate::domain::Id>() else {
             continue;
         };
-        if store.account_by_id(id).ok().flatten().is_some() {
+        let include = match store.account_by_id(id).ok().flatten() {
+            Some(account) => with_suspended || !account.suspended,
+            None => false,
+        };
+        if include {
             target_ids.push(id);
         }
     }
@@ -342,6 +411,87 @@ fn validation_error(message: &str, details: Value) -> Response {
         axum::Json(json!({ "error": message, "details": details })),
     )
         .into_response()
+}
+
+/// Parse `fields_attributes` profile fields from flattened params.
+///
+/// Accepts both the form encoding (`fields_attributes[][name|value]`) and the
+/// JSON-flattened indexed encoding (`fields_attributes[N][name|value]`,
+/// like the filters' `keywords_attributes[N][...]`). Upstream rules
+/// (`account.rb:133` max 4 fields; `Account::Field#sanitize` strip + 255
+/// chars; `EmptyProfileFieldNamesValidator`) are enforced here with 422s;
+/// persistence is the named follow-up (no `Account` storage yet), so valid
+/// fields are returned only for validation.
+fn parse_profile_fields(pairs: &[(String, String)]) -> Result<Vec<(String, String)>, Response> {
+    use std::collections::BTreeMap;
+    let mut indexed: BTreeMap<String, (Option<String>, Option<String>)> = BTreeMap::new();
+    let mut ordered: Vec<(Option<String>, Option<String>)> = Vec::new();
+    for (key, value) in pairs {
+        if let Some(rest) = key.strip_prefix("fields_attributes[]") {
+            // Form encoding: `fields_attributes[][name]` — pairs arrive in
+            // order; a `[name]` starts a new field, `[value]` completes it.
+            if rest == "[name]" {
+                ordered.push((Some(value.clone()), None));
+            } else if rest == "[value]" {
+                match ordered.last_mut() {
+                    Some(last) if last.1.is_none() => last.1 = Some(value.clone()),
+                    _ => ordered.push((None, Some(value.clone()))),
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = key.strip_prefix("fields_attributes[") {
+            // Indexed encoding: `fields_attributes[N][name|value]`.
+            let Some((index, field)) = rest.split_once("][") else {
+                continue;
+            };
+            let field = field.trim_end_matches(']');
+            if field != "name" && field != "value" {
+                continue;
+            }
+            let entry = indexed.entry(index.to_string()).or_insert((None, None));
+            if field == "name" {
+                entry.0 = Some(value.clone());
+            } else {
+                entry.1 = Some(value.clone());
+            }
+        }
+    }
+    for (_, entry) in indexed {
+        ordered.push(entry);
+    }
+    // Rails drops fully-blank rows (`reject_if: :all_blank` on the nested
+    // attributes). Over-long names/values are truncated, not rejected
+    // (`Account::Field#sanitize`: strip + first 255 local chars).
+    let truncate = |raw: String| {
+        let stripped = raw.trim();
+        stripped.chars().take(255).collect::<String>()
+    };
+    let fields: Vec<(String, String)> = ordered
+        .into_iter()
+        .map(|(name, value)| {
+            (
+                truncate(name.unwrap_or_default()),
+                truncate(value.unwrap_or_default()),
+            )
+        })
+        .filter(|(name, value)| !(name.is_empty() && value.is_empty()))
+        .collect();
+    // `account.rb:133`: at most 4 fields (Rails length-validator message).
+    if fields.len() > 4 {
+        return Err(validation_error(
+            "Validation failed: Fields is too long (maximum is 4 characters)",
+            json!({}),
+        ));
+    }
+    // `EmptyProfileFieldNamesValidator`: a value without a label 422s.
+    if fields.iter().any(|(name, value)| name.is_empty() && !value.is_empty()) {
+        return Err(validation_error(
+            "Validation failed: Fields contains values with missing labels",
+            json!({}),
+        ));
+    }
+    Ok(fields)
 }
 
 /// `GET /api/v1/accounts?id[]=…` — multi-fetch up to 40 accounts.
@@ -403,6 +553,13 @@ pub async fn index(
 }
 
 /// `GET /api/v1/accounts/lookup` — resolve an account by acct.
+///
+/// Upstream (`lookup_controller.rb` + `ResolveAccountService` with
+/// `skip_webfinger: true`): a leading `@` is stripped, the handle resolves
+/// local accounts and already-known remotes, and suspended accounts are
+/// returned (no suspension gate on this route). Remote handles unknown to
+/// this server 404 here — live webfinger resolution is the federation
+/// follow-up (named; the v2 search `resolve=` path already attempts it).
 pub async fn lookup(
     State(state): State<ApiState>,
     auth: crate::api::mastodon::auth::OptionalAuth,
@@ -420,9 +577,11 @@ pub async fn lookup(
             .into_response();
     };
 
-    let (username, domain) = match acct.split_once('@') {
-        Some((u, d)) => (u.to_string(), d.to_string()),
-        None => (acct.to_string(), state.server.domain.clone()),
+    // `ResolveAccountService` strips one leading `@`.
+    let stripped = acct.strip_prefix('@').unwrap_or(acct);
+    let (username, domain) = match stripped.split_once('@') {
+        Some((u, d)) => (u.to_string(), d.to_ascii_lowercase()),
+        None => (stripped.to_string(), state.server.domain.clone()),
     };
 
     let store: &dyn Store = &*state.context.store;
@@ -442,44 +601,159 @@ pub async fn lookup(
 }
 
 /// `GET /api/v1/accounts/search` — search accounts by query.
+///
+/// Upstream (`accounts/search_controller.rb` + `AccountSearchService`):
+/// requires a user token; `q` blank (after `@`-strip) or `limit < 1`
+/// returns `[]`; an exact handle match (`user@domain`, `@`-prefixed or
+/// not) sorts first when `offset` is zero; `following=true` restricts both
+/// the exact match and the substring results to followed accounts;
+/// `resolve=true` resolves a remote handle over federation.
+/// Default limit 40, max 80 (`limit_param(DEFAULT_ACCOUNTS_LIMIT)`).
 pub async fn search(
     State(state): State<ApiState>,
-    auth: crate::api::mastodon::auth::OptionalAuth,
+    auth: Auth,
     RawQuery(query): RawQuery,
 ) -> Response {
-    if let Some(authenticated) = &auth.0
-        && let Err(err) = authenticated.require_scopes(&["read", "read:accounts"])
-    {
+    if let Err(err) = auth.0.require_scopes(&["read", "read:accounts"]) {
         return err.into_response();
     }
+    let viewer = match auth.0.require_user() {
+        Ok(id) => id,
+        Err(err) => return err.into_response(),
+    };
 
     let pairs = forms::parse(query.unwrap_or_default().as_bytes());
-    let q = forms::get(&pairs, "q").unwrap_or("").to_string();
-    let limit = forms::get(&pairs, "limit")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(20)
-        .min(40);
+    let raw_q = forms::get(&pairs, "q").unwrap_or("");
+    let q = raw_q.strip_prefix('@').unwrap_or(raw_q).trim().to_string();
+    let limit: usize = match forms::get(&pairs, "limit") {
+        None => 40,
+        Some(raw) => {
+            let value: i64 = raw.parse().unwrap_or(0);
+            if value < 1 {
+                return axum::Json(Vec::<Value>::new()).into_response();
+            }
+            (value as usize).min(80)
+        }
+    };
+    let offset: usize = match forms::get(&pairs, "offset") {
+        None => 0,
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(value) if value >= 0 => value as usize,
+            _ => {
+                return ApiError::bad_request(
+                    "Pagination values for `offset` and `limit` must be positive",
+                )
+                .into_response();
+            }
+        },
+    };
+    let following = forms::get(&pairs, "following").is_some_and(bool_cast);
+    let resolve = forms::get(&pairs, "resolve").is_some_and(bool_cast);
 
     let store: &dyn Store = &*state.context.store;
-    let needle = q.to_ascii_lowercase();
-    match store.search_accounts(&needle, 500) {
-        Ok(candidates) => {
-            let mut out: Vec<Value> = Vec::new();
-            for account in candidates.into_iter().take(limit) {
-                if account.suspended {
-                    continue;
-                }
-                let stats = store.account_stats(account.id).ok();
-                out.push(dto::account_json_with_stats(
-                    &state.server,
-                    &account,
-                    stats.as_ref(),
-                ));
-            }
-            axum::Json(out).into_response()
-        }
-        Err(err) => ApiError::from(err).into_response(),
+    if q.is_empty() {
+        return axum::Json(Vec::<Value>::new()).into_response();
     }
+
+    // Exact handle match first (upstream `exact_match`, `offset.zero?` only).
+    let mut exact: Option<crate::domain::Account> = None;
+    if offset == 0 && q.contains('@') {
+        let (username, domain) = match q.split_once('@') {
+            Some((u, d)) => (u.to_ascii_lowercase(), d.to_ascii_lowercase()),
+            None => (q.to_ascii_lowercase(), state.server.domain.clone()),
+        };
+        if domain == state.server.domain {
+            exact = store
+                .account_by_handle(&username, &domain)
+                .ok()
+                .flatten();
+        } else {
+            exact = store
+                .account_by_handle(&username, &domain)
+                .ok()
+                .flatten();
+            // `resolve=true` on a remote handle: fetch it over federation
+            // (mirrors the v2 search resolve path; unknown handles add
+            // nothing, like upstream's `ResolveAccountService` miss).
+            if exact.is_none() && resolve {
+                match crate::activitypub::resolve::resolve_handle(&state.federation, &q).await {
+                    Ok(account) => exact = account,
+                    Err(err) => tracing::info!(error = %err, "remote account did not resolve"),
+                }
+            }
+        }
+        // `following=true` gates the exact match too.
+        if following
+            && let Some(ref account) = exact
+        {
+            let followed = match store.follow_of(viewer, account.id) {
+                Ok(Some(follow)) => follow.state == crate::domain::FollowState::Active,
+                _ => false,
+            };
+            if !followed {
+                exact = None;
+            }
+        }
+        if exact.as_ref().is_some_and(|account| account.suspended) {
+            exact = None;
+        }
+    }
+
+    let needle = q.to_ascii_lowercase();
+    let mut out: Vec<Value> = Vec::new();
+    if let Some(ref account) = exact {
+        let stats = store.account_stats(account.id).ok();
+        out.push(dto::account_json_with_stats(
+            &state.server,
+            account,
+            stats.as_ref(),
+        ));
+    }
+    // Substring results fill the remainder (`limit - 1` when exact matched).
+    let room = limit.saturating_sub(out.len());
+    if room > 0 {
+        match store.search_accounts(&needle, 500) {
+            Ok(candidates) => {
+                let exact_id = exact.as_ref().map(|account| account.id);
+                let mut skipped = 0usize;
+                let mut taken = 0usize;
+                for account in candidates {
+                    if Some(account.id) == exact_id || account.suspended {
+                        continue;
+                    }
+                    if following {
+                        let followed = match store.follow_of(viewer, account.id) {
+                            Ok(Some(follow)) => {
+                                follow.state == crate::domain::FollowState::Active
+                            }
+                            _ => false,
+                        };
+                        if !followed {
+                            continue;
+                        }
+                    }
+                    // `offset` pages the substring results (the exact match
+                    // only exists at offset zero).
+                    if skipped < offset {
+                        skipped += 1;
+                        continue;
+                    }
+                    if taken >= room {
+                        break;
+                    }
+                    let stats = store.account_stats(account.id).ok();
+                    out.push(dto::account_json_with_stats(
+                        &state.server,
+                        &account,
+                        stats.as_ref(),
+                    ));
+                    taken += 1;
+                }
+            }
+            Err(err) => return ApiError::from(err).into_response(),
+        }
+    }
+    axum::Json(out).into_response()
 }
 
 // ---------------------------------------------------------------------------

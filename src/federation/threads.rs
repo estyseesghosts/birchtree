@@ -51,7 +51,9 @@ pub fn schedule_parent(store: &dyn Store, child_id: Id, parent_uri: &str, now_ms
 fn settle(err: FedError) -> DeliveryError {
     match err {
         // Refused, gone, or not a valid document: retrying gives the same answer.
-        FedError::Refused(msg) | FedError::Unsupported(msg) => DeliveryError::Quarantine(msg),
+        FedError::Refused(msg) | FedError::Gone(msg) | FedError::Unsupported(msg) => {
+            DeliveryError::Quarantine(msg)
+        }
         FedError::Domain(e) => DeliveryError::Quarantine(e.to_string()),
         FedError::Protocol(e) => match e {
             ProtocolError::NotFound

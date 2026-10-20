@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use url::Url;
 
 use crate::activitypub::actor::ActorRecord;
-use crate::activitypub::activities::{note_input, question_input};
+use crate::activitypub::activities::{note_input_for, question_input_for};
 use crate::activitypub::error::FedError;
 use crate::activitypub::outgoing;
 use crate::activitypub::wire::NoteOrQuestion;
@@ -83,7 +83,12 @@ impl Object for NoteRef {
                     )));
                 }
                 let author = crate::activitypub::objects::author_of(data, &note.attributed_to).await?;
-                let input = note_input(&note, author);
+                let sensitized = data
+                    .app
+                    .store
+                    .account_by_id(author)?
+                    .is_some_and(|account| account.sensitized);
+                let input = note_input_for(&note, author, sensitized);
                 let ingested = ingest_note(&*data.app.store, input, None, now)?;
                 Ok(NoteRef { status: ingested.status })
             }
@@ -94,7 +99,12 @@ impl Object for NoteRef {
                     )));
                 }
                 let author = crate::activitypub::objects::author_of(data, &question.attributed_to).await?;
-                let (input, poll) = question_input(&question, author, now);
+                let sensitized = data
+                    .app
+                    .store
+                    .account_by_id(author)?
+                    .is_some_and(|account| account.sensitized);
+                let (input, poll) = question_input_for(&question, author, sensitized, now);
                 let ingested = ingest_note(&*data.app.store, input, Some(poll), now)?;
                 Ok(NoteRef { status: ingested.status })
             }

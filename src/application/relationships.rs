@@ -324,9 +324,10 @@ pub fn list_follow_requests(
     store: &dyn Store,
     target_id: Id,
     max_id: Option<Id>,
+    since_id: Option<Id>,
     limit: usize,
 ) -> Result<Vec<Follow>> {
-    store.follow_requests(target_id, max_id, limit)
+    store.follow_requests(target_id, max_id, since_id, limit)
 }
 
 /// Accept a pending follow request (`POST /api/v1/follow_requests/:id/authorize`):
@@ -359,24 +360,69 @@ pub fn reject_request(
 
 /// Followers of `account_id`, newest first, cursor-bounded (`GET
 /// /api/v1/accounts/:id/followers`).
+///
+/// Mirrors upstream's `hide_results?`
+/// (`app/controllers/api/v1/accounts/follower_accounts_controller.rb` at pin
+/// `8ff11c2b`): a suspended target yields `[]`, as does any non-self viewer
+/// the target blocks. Upstream also hides when the target enables
+/// `hide_collections?`; that setting is accepted but not yet persisted (see
+/// `persistence/redb/accounts.rs`), so the hides branch is recorded as a gap
+/// in the fix-round report rather than enforced here.
 pub fn followers_of(
     store: &dyn Store,
+    viewer: Option<Id>,
     account_id: Id,
     max_id: Option<Id>,
     limit: usize,
+    now_ms: u64,
 ) -> Result<Vec<Id>> {
+    if hidden_edge_list(store, viewer, account_id, now_ms)? {
+        return Ok(Vec::new());
+    }
     store.followers(account_id, max_id, limit)
 }
 
 /// Accounts followed by `account_id`, newest first, cursor-bounded (`GET
-/// /api/v1/accounts/:id/following`).
+/// /api/v1/accounts/:id/following`). Same hide gate as [`followers_of`]
+/// (upstream `following_accounts_controller.rb` at the pin).
 pub fn following_of(
     store: &dyn Store,
+    viewer: Option<Id>,
     account_id: Id,
     max_id: Option<Id>,
     limit: usize,
+    now_ms: u64,
 ) -> Result<Vec<Id>> {
+    if hidden_edge_list(store, viewer, account_id, now_ms)? {
+        return Ok(Vec::new());
+    }
     store.following(account_id, max_id, limit)
+}
+
+/// Upstream `hide_results?` minus the unpersisted `hide_collections?`
+/// setting: unavailable (suspended) targets hide from everyone, and a target
+/// that blocks the viewer hides from that viewer (anonymous viewers are
+/// never blocked). The target always sees their own lists.
+fn hidden_edge_list(
+    store: &dyn Store,
+    viewer: Option<Id>,
+    account_id: Id,
+    now_ms: u64,
+) -> Result<bool> {
+    let Some(target) = store.account_by_id(account_id)? else {
+        return Ok(false);
+    };
+    if target.suspended {
+        return Ok(true);
+    }
+    let Some(viewer) = viewer else {
+        return Ok(false);
+    };
+    if viewer == account_id {
+        return Ok(false);
+    }
+    // `pair_state(target, viewer).blocking` = the target blocks the viewer.
+    Ok(store.pair_state(account_id, viewer, now_ms)?.blocking)
 }
 
 /// Relationship aggregates for the given target ids, in input order; unknown

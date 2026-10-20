@@ -39,10 +39,17 @@ pub struct Report {
     /// Report category (`spam`, `legal`, `other`, ...; upstream default `other`).
     #[serde(default = "default_category")]
     pub category: String,
-    /// Instance-rule ids attached at update time (no Rule model yet; rendered
-    /// as `rules: []` with a documented gap).
+    /// Instance-rule ids attached at update time (validated against the
+    /// rule store by the endpoint; upstream `Report#rules`).
     #[serde(default)]
     pub rule_ids: Vec<String>,
+    /// Remote domains this report was forwarded to (upstream `forwarded` +
+    /// `Report#forward_to_origin?` domain set).
+    #[serde(default)]
+    pub forward_to_domains: Vec<String>,
+    /// Collection ids attached at creation (upstream `report_params`).
+    #[serde(default)]
+    pub collection_ids: Vec<u64>,
     /// Last moderator-queue write (`updated_at`).
     #[serde(default)]
     pub updated_at_ms: u64,

@@ -474,6 +474,11 @@ fn fetch_visible(store: &dyn Store, viewer: Id, status_id: Id, now_ms: u64) -> R
 
 /// `POST /api/v1/statuses/:id/mute`: mute the status's conversation
 /// (idempotent). Returns the status for the DTO.
+///
+/// Upstream (`statuses/mutes_controller.rb#set_conversation`) raises
+/// `Mastodon::ValidationError` (422) when the status has no conversation:
+/// only direct-visibility statuses belong to one. Missing, deleted or
+/// otherwise invisible statuses stay 404 via the show gate above.
 pub fn mute_status_conversation(
     store: &dyn Store,
     viewer: Id,
@@ -481,6 +486,7 @@ pub fn mute_status_conversation(
     now_ms: u64,
 ) -> Result<Status> {
     let status = fetch_visible(store, viewer, status_id, now_ms)?;
+    require_conversation(&status)?;
     let root = thread_root(store, &status)?;
     store.mute_conversation(viewer, root, now_ms)?;
     Ok(status)
@@ -494,9 +500,22 @@ pub fn unmute_status_conversation(
     now_ms: u64,
 ) -> Result<Status> {
     let status = fetch_visible(store, viewer, status_id, now_ms)?;
+    require_conversation(&status)?;
     let root = thread_root(store, &status)?;
     store.unmute_conversation(viewer, root)?;
     Ok(status)
+}
+
+/// Only direct-visibility statuses have a conversation; anything else is
+/// upstream's 422 `ValidationError` (this server's `InvalidInput` maps to
+/// 422 the same way).
+fn require_conversation(status: &Status) -> Result<()> {
+    if status.visibility != Visibility::Direct {
+        return Err(Error::InvalidInput(
+            "Validation failed: Status does not have an associated conversation".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Whether the viewer mutes the conversation a status belongs to (feeds the

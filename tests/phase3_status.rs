@@ -655,7 +655,7 @@ async fn context_ancestors_descendants() {
         .iter()
         .map(|s| s["id"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(descendants, vec![reply, deep], "descendants: {ctx}");
+    assert_eq!(descendants, vec![deep, reply], "descendants: {ctx}");
 
     // Anonymous callers get the same small thread (within the anon caps).
     let ctx = get_ok(&srv, &format!("/api/v1/statuses/{root}/context"), None).await;

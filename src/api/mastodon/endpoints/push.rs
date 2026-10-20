@@ -126,6 +126,7 @@ pub async fn create(
         standard,
         policy,
         alerts,
+        Some(state.server.public_url.as_str()),
         state.context.now_ms(),
     ) {
         Ok(subscription) => {

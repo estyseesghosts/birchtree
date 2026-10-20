@@ -34,6 +34,10 @@ pub struct FedContext {
     pub public_url: Arc<str>,
     /// Whether public registration is open (advertised in NodeInfo).
     pub registrations_open: bool,
+    /// Instance title/description (advertised in NodeInfo `metadata`;
+    /// upstream `NodeInfo::Serializer#metadata`).
+    pub site_title: Arc<str>,
+    pub site_description: Arc<str>,
     /// The outbound transport policy (remote media fetches apply it too).
     pub http: std::sync::Arc<SafeHttpConfig>,
     /// A plain client for remote media: the crate's client is not reachable from here.
@@ -52,6 +56,8 @@ pub async fn build_config(
     context: Arc<Context>,
     public_url: &str,
     registrations_open: bool,
+    site_title: &str,
+    site_description: &str,
     http: &SafeHttpConfig,
     debug: bool,
     instance: Option<&instance::InstanceActor>,
@@ -71,6 +77,8 @@ pub async fn build_config(
             app: context,
             public_url: Arc::from(public_url.trim_end_matches('/')),
             registrations_open,
+            site_title: Arc::from(site_title),
+            site_description: Arc::from(site_description),
             http: Arc::new(http.clone()),
             media_client,
             authorized_fetch,

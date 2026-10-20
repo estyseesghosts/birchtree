@@ -61,16 +61,7 @@ pub fn fan_out_from_payload(store: &dyn Store, payload: &Value) -> Result<Option
     let kind = payload
         .get("type")
         .and_then(|v| v.as_str())
-        .and_then(|raw| match raw {
-            "mention" => Some(NotificationType::Mention),
-            "follow" => Some(NotificationType::Follow),
-            "reblog" => Some(NotificationType::Reblog),
-            "favourite" => Some(NotificationType::Favourite),
-            "poll" => Some(NotificationType::PollVote),
-            "follow_request" => Some(NotificationType::FollowRequest),
-            "quote" => Some(NotificationType::Quote),
-            _ => None,
-        });
+        .and_then(NotificationType::parse);
     let Some(kind) = kind else { return Ok(None) };
     let actor_id = get_u64("actor_id").map(Id::new);
     let status_id = get_u64("status_id").map(Id::new);
@@ -188,21 +179,90 @@ pub struct NotificationQuery {
     pub since_id: Option<Id>,
     pub min_id: Option<Id>,
     pub limit: usize,
+    /// Only notifications from this actor (`browserable_params[:account_id]`).
+    /// `None` = no actor filter.
+    pub from_account: Option<Id>,
+    /// Accepted for upstream param parity (`browserable_params` permits
+    /// `include_filtered`), but filtered rows cannot be served yet: the store
+    /// page excludes them and no store call lists them. DEFERRED (not a gap):
+    /// pushing `from_account`/`include_filtered` into the store page is a
+    /// bounded perf optimization only — the `index` fill loop below is
+    /// correct (cursor-stable, full pages) with the current store shape, and
+    /// a naive in-page filter would break the loop's end-of-scan detection.
+    /// Revisit only with measured scan pressure.
+    pub include_filtered: bool,
 }
 
 /// `GET /api/v1/notifications` — one page, newest first.
+///
+/// Upstream `without_suspended` scope: notifications whose actor is suspended
+/// are excluded (and `show` answers 404 for them). The store page has no
+/// suspension or actor filter, so this loops bounded page fetches (at most a
+/// few rounds: exclusions are rare) and advances `max_id` past excluded rows,
+/// keeping pages full and cursors stable.
 pub fn index(
     store: &dyn Store,
     recipient: Id,
     query: NotificationQuery,
 ) -> Result<Vec<Notification>> {
-    store.notifications_page(
-        recipient,
-        query.limit,
-        query.max_id,
-        query.since_id,
-        query.min_id,
-    )
+    let mut out: Vec<Notification> = Vec::new();
+    let mut max_id = query.max_id;
+    // Bounded fill loop: each round fetches one page past the excluded rows.
+    for _ in 0..8 {
+        let remaining = query.limit.saturating_sub(out.len());
+        if remaining == 0 {
+            break;
+        }
+        let page = store.notifications_page(
+            recipient,
+            remaining,
+            max_id,
+            query.since_id,
+            query.min_id,
+        )?;
+        if page.is_empty() {
+            break;
+        }
+        let mut excluded = 0usize;
+        for notification in page {
+            max_id = Some(notification.id);
+            if query
+                .from_account
+                .is_some_and(|actor| notification.actor_id != Some(actor))
+            {
+                excluded += 1;
+                continue;
+            }
+            if notification_excluded(store, &notification)? {
+                excluded += 1;
+                continue;
+            }
+            out.push(notification);
+            if out.len() >= query.limit {
+                break;
+            }
+        }
+        // A short or fully-excluded page ends the scan (a full page of
+        // exclusions retries past them; the round cap bounds the scan).
+        if excluded == 0 {
+            break;
+        }
+    }
+    out.truncate(query.limit);
+    Ok(out)
+}
+
+/// Whether a notification is hidden from the browserable surface: upstream's
+/// `without_suspended` join drops rows whose actor is suspended (or gone —
+/// the inner join drops actor-less rows too).
+fn notification_excluded(store: &dyn Store, notification: &Notification) -> Result<bool> {
+    let Some(actor_id) = notification.actor_id else {
+        return Ok(true);
+    };
+    match store.account_by_id(actor_id)? {
+        Some(actor) => Ok(actor.suspended),
+        None => Ok(true),
+    }
 }
 
 /// Keep only notifications whose type is in `types` (`types[]` semantics:
@@ -213,11 +273,18 @@ pub fn retain_types(notifications: &mut Vec<Notification>, types: &[Notification
 }
 
 /// `GET /api/v1/notifications/:id` — one notification of the recipient.
+///
+/// Upstream scopes the find with `without_suspended`: a notification whose
+/// actor is suspended (or gone) answers 404, like the index exclusion.
 pub fn show(store: &dyn Store, recipient: Id, id: Id) -> Result<Notification> {
-    store
+    let notification = store
         .notification_by_id(id)?
         .filter(|n| n.recipient_id == recipient)
-        .ok_or_else(|| Error::NotFound("Record not found".into()))
+        .ok_or_else(|| Error::NotFound("Record not found".into()))?;
+    if notification_excluded(store, &notification)? {
+        return Err(Error::NotFound("Record not found".into()));
+    }
+    Ok(notification)
 }
 
 /// `POST /api/v1/notifications/:id/dismiss` — delete one notification.
@@ -275,11 +342,20 @@ pub const NEW_FOLLOWER_THRESHOLD_MS: u64 = 3 * 24 * 60 * 60 * 1000;
 pub const NEW_ACCOUNT_THRESHOLD_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 /// Whether a notification of this type can be filtered (upstream
-/// `Notification::PROPERTIES[*][:filterable]`; only the types this server
-/// produces are listed: mention, reblog, follow, follow_request, favourite
-/// and quote are filterable, poll is not).
+/// `Notification::PROPERTIES[*][:filterable]`: mention, reblog, follow,
+/// follow_request, favourite, quote and added_to_collection are filterable;
+/// every other type is not).
 pub fn filterable_type(kind: NotificationType) -> bool {
-    !matches!(kind, NotificationType::PollVote)
+    matches!(
+        kind,
+        NotificationType::Mention
+            | NotificationType::Reblog
+            | NotificationType::Follow
+            | NotificationType::FollowRequest
+            | NotificationType::Favourite
+            | NotificationType::Quote
+            | NotificationType::AddedToCollection
+    )
 }
 
 /// Evaluate the recipient's notification policy for one notification

@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 use crate::domain::Id;
 
 /// Notification kinds exposed by the API (`type` is the snake_case wire form).
+/// The 17 upstream types (`notification.rb:28-81` at the pin) are all
+/// parseable; only the 7 we produce are emittable (the rest need unbuilt
+/// producers — Phase 6/7.x — and are registered as gaps, not stubs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationType {
@@ -19,6 +22,16 @@ pub enum NotificationType {
     PollVote,
     FollowRequest,
     Quote,
+    Status,
+    Update,
+    SeveredRelationships,
+    ModerationWarning,
+    AnnualReport,
+    AdminSignUp,
+    AdminReport,
+    QuotedUpdate,
+    AddedToCollection,
+    CollectionUpdate,
 }
 
 impl NotificationType {
@@ -32,6 +45,16 @@ impl NotificationType {
             NotificationType::PollVote => "poll",
             NotificationType::FollowRequest => "follow_request",
             NotificationType::Quote => "quote",
+            NotificationType::Status => "status",
+            NotificationType::Update => "update",
+            NotificationType::SeveredRelationships => "severed_relationships",
+            NotificationType::ModerationWarning => "moderation_warning",
+            NotificationType::AnnualReport => "annual_report",
+            NotificationType::AdminSignUp => "admin.sign_up",
+            NotificationType::AdminReport => "admin.report",
+            NotificationType::QuotedUpdate => "quoted_update",
+            NotificationType::AddedToCollection => "added_to_collection",
+            NotificationType::CollectionUpdate => "collection_update",
         }
     }
 
@@ -45,7 +68,41 @@ impl NotificationType {
             NotificationType::PollVote => 5,
             NotificationType::FollowRequest => 6,
             NotificationType::Quote => 7,
+            NotificationType::Status => 8,
+            NotificationType::Update => 9,
+            NotificationType::SeveredRelationships => 10,
+            NotificationType::ModerationWarning => 11,
+            NotificationType::AnnualReport => 12,
+            NotificationType::AdminSignUp => 13,
+            NotificationType::AdminReport => 14,
+            NotificationType::QuotedUpdate => 15,
+            NotificationType::AddedToCollection => 16,
+            NotificationType::CollectionUpdate => 17,
         }
+    }
+
+    /// Parse any upstream wire type (returns `None` for unknown strings).
+    pub fn parse(raw: &str) -> Option<NotificationType> {
+        Some(match raw {
+            "mention" => NotificationType::Mention,
+            "follow" => NotificationType::Follow,
+            "reblog" => NotificationType::Reblog,
+            "favourite" => NotificationType::Favourite,
+            "poll" => NotificationType::PollVote,
+            "follow_request" => NotificationType::FollowRequest,
+            "quote" => NotificationType::Quote,
+            "status" => NotificationType::Status,
+            "update" => NotificationType::Update,
+            "severed_relationships" => NotificationType::SeveredRelationships,
+            "moderation_warning" => NotificationType::ModerationWarning,
+            "annual_report" => NotificationType::AnnualReport,
+            "admin.sign_up" => NotificationType::AdminSignUp,
+            "admin.report" => NotificationType::AdminReport,
+            "quoted_update" => NotificationType::QuotedUpdate,
+            "added_to_collection" => NotificationType::AddedToCollection,
+            "collection_update" => NotificationType::CollectionUpdate,
+            _ => return None,
+        })
     }
 }
 

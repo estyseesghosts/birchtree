@@ -77,6 +77,12 @@ impl AccountStore for RedbStore {
             silenced: false,
             sensitized: false,
             moved_to: None,
+            bot: false,
+            discoverable: None,
+            indexable: false,
+            hide_collections: None,
+            fields: Vec::new(),
+            attribution_domains: Vec::new(),
             created_at_ms: input.now_ms,
         };
         let user = LocalUser {
@@ -102,6 +108,10 @@ impl AccountStore for RedbStore {
             // text and consumed invite code (INVITE_USES, same transaction).
             locale: input.locale,
             invite_request: input.invite_request,
+            // Reading preferences start unset (upstream defaults apply).
+            web_display_media: None,
+            web_expand_spoilers: None,
+            web_auto_play_gifs: None,
         };
 
         {
@@ -275,8 +285,24 @@ impl AccountStore for RedbStore {
         if let Some(v) = update.locked {
             account.locked = v;
         }
-        // `discoverable`/`indexable`/`hide_collections` are accepted but not yet
-        // persisted (no column in Phase 2); recorded as a gap.
+        if let Some(v) = update.discoverable {
+            account.discoverable = Some(v);
+        }
+        if let Some(v) = update.indexable {
+            account.indexable = v;
+        }
+        if let Some(v) = update.hide_collections {
+            account.hide_collections = Some(v);
+        }
+        if let Some(v) = update.fields {
+            account.fields = v;
+        }
+        if let Some(v) = update.attribution_domains {
+            account.attribution_domains = v;
+        }
+        if let Some(v) = update.bot {
+            account.bot = v;
+        }
         {
             let mut accounts = write.open_table(ACCOUNTS)?;
             accounts.insert(account_id.value(), encode(&account)?.as_slice())?;
@@ -323,6 +349,17 @@ impl AccountStore for RedbStore {
             } else {
                 Some(normalized)
             };
+        }
+        if let Some(v) = update.web_display_media {
+            // Upstream `user_settings.rb:38` enum; unknown values are
+            // refused at the endpoint, so anything reaching here stores.
+            user.web_display_media = Some(v);
+        }
+        if let Some(v) = update.web_expand_spoilers {
+            user.web_expand_spoilers = Some(v);
+        }
+        if let Some(v) = update.web_auto_play_gifs {
+            user.web_auto_play_gifs = Some(v);
         }
         {
             let mut users = write.open_table(LOCAL_USERS)?;

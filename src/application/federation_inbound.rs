@@ -504,6 +504,10 @@ pub fn flag(
                 comment: comment.chars().take(5000).collect(),
                 forwarded: false,
                 activity_uri: Some(activity_uri.to_string()),
+                category: "other".to_string(),
+                rule_ids: Vec::new(),
+                forward_to_domains: Vec::new(),
+                collection_ids: Vec::new(),
             },
             now_ms,
         )?;

@@ -48,9 +48,25 @@ pub fn quotes_of(
             ),
             None => (PairState::default(), policy::FetchFacts::default()),
         };
-        if policy::can_fetch_full(viewer_id, &quoting_status, pair, facts) {
-            visible.push((quote, quoting_status));
+        if !policy::can_fetch_full(viewer_id, &quoting_status, pair, facts) {
+            continue;
         }
+        // Upstream `StatusFilter#filtered?` (`app/lib/status_filter.rb` at pin
+        // `8ff11c2b`) additionally hides a silenced author's quotes unless
+        // the viewer follows that author. (Blocks, mutes and domain blocks
+        // are already refused by `can_fetch_full` above, which is stricter
+        // than upstream `show?`.) `pair.followed_by` is viewer-follows-author
+        // (`pair_state(author, viewer)`), matching upstream's
+        // `account_following_status_account?`.
+        if !pair.followed_by {
+            let silenced = store
+                .account_by_id(quoting_status.account_id)?
+                .is_some_and(|author| author.silenced);
+            if silenced {
+                continue;
+            }
+        }
+        visible.push((quote, quoting_status));
     }
     Ok(visible)
 }

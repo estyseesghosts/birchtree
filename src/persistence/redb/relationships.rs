@@ -313,6 +313,7 @@ impl RelationshipStore for RedbStore {
         &self,
         target_id: Id,
         max_id: Option<Id>,
+        since_id: Option<Id>,
         limit: usize,
     ) -> Result<Vec<Follow>> {
         if limit == 0 {
@@ -346,6 +347,11 @@ impl RelationshipStore for RedbStore {
                 break;
             }
             if max_id.is_some_and(|max| follower_id >= max) {
+                continue;
+            }
+            // Ascending-scan parity with the `max_id` exclusive bound:
+            // keep only follower ids newer than `since_id`.
+            if since_id.is_some_and(|since| follower_id <= since) {
                 continue;
             }
             let Some(follow) = json_at::<_, Follow>(
@@ -389,14 +395,17 @@ impl RelationshipStore for RedbStore {
             let mut follows = write.open_table(FOLLOWS)?;
             follows.insert(key.as_slice(), encode(&follow)?.as_slice())?;
         }
-        // The requester learns the target accepted: recipient = follower.
+        // The authorizer learns someone new follows them (upstream
+        // `follow_requests_controller.rb#authorize` enqueues the `Follow`
+        // notification to `current_account`, i.e. the authorizer — the
+        // requester already knows they asked).
         let job = Job::new(
             self.next_id(),
             JobKind::FanOutNotification,
             fan_out_payload(
-                follower_id,
+                target_id,
                 NotificationType::Follow,
-                Some(target_id),
+                Some(follower_id),
                 None,
                 now_ms,
             ),

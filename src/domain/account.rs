@@ -49,6 +49,19 @@ pub fn handle_key(normalized_username: &str, domain: &str) -> String {
 ///
 /// Distinct from `crate::domain::user::LocalUser` (credentials/login) and from
 /// OAuth clients. An account is not conflated with its credential.
+/// One profile field (upstream `Account::Field`: name/value pair;
+/// `verified_at` is set by the proof flow, which is out of profile).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AccountField {
+    pub name: String,
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_at: Option<u64>,
+}
+
+/// A local or remote ActivityPub actor with the profile attributes the API
+/// renders (`#[serde(default)]` fields are filled by registration/profile
+/// stores; older rows decode with the defaults).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Account {
     pub id: Id,
@@ -73,6 +86,27 @@ pub struct Account {
     #[serde(default)]
     pub sensitized: bool,
     pub moved_to: Option<Id>,
+    /// Automated account flag (upstream `Account#bot`, PATCH
+    /// `update_credentials[bot]`).
+    #[serde(default)]
+    pub bot: bool,
+    /// Profile-directory / search visibility (upstream nullable; `None` =
+    /// never set, rendered `null`).
+    #[serde(default)]
+    pub discoverable: Option<bool>,
+    /// Search-index opt-in (upstream default `false`).
+    #[serde(default)]
+    pub indexable: bool,
+    /// Featured-collections visibility (upstream nullable; `None` = never
+    /// set, rendered `null`).
+    #[serde(default)]
+    pub hide_collections: Option<bool>,
+    /// Profile fields (upstream `fields`, max 4 via `update_credentials`).
+    #[serde(default)]
+    pub fields: Vec<AccountField>,
+    /// Domains attributed to this account (upstream `attribution_domains`).
+    #[serde(default)]
+    pub attribution_domains: Vec<String>,
     pub created_at_ms: u64,
 }
 
@@ -135,6 +169,12 @@ mod tests {
             silenced: false,
             sensitized: false,
             moved_to: None,
+            bot: false,
+            discoverable: None,
+            indexable: false,
+            hide_collections: None,
+            fields: Vec::new(),
+            attribution_domains: Vec::new(),
             created_at_ms: 0,
         };
         assert_eq!(a.acct(), "alice");

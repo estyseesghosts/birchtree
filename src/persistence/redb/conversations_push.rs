@@ -230,6 +230,7 @@ impl PushSubscriptionStore for RedbStore {
         standard: bool,
         policy: String,
         alerts: std::collections::HashMap<String, bool>,
+        public_base_url: Option<&str>,
         now_ms: u64,
     ) -> Result<WebPushSubscription> {
         let write = self.begin_write()?;
@@ -247,6 +248,20 @@ impl PushSubscriptionStore for RedbStore {
                 None => None,
             }
         };
+        // Bearer unsubscribe token (fix round P2 #16c): preserved on
+        // replace, minted on create. The absolute URL is built next to it:
+        // the delivery job cannot reconstruct the public base URL itself.
+        let token = match old.as_ref().map(|row| row.unsubscribe_token.as_str()) {
+            Some(existing) if !existing.is_empty() => existing.to_string(),
+            _ => crate::application::crypto::random_token_hex(24),
+        };
+        let unsubscribe_url = public_base_url.map(|base| {
+            format!(
+                "{}/api/web/push_subscriptions/{}",
+                base.trim_end_matches('/'),
+                token
+            )
+        });
         let row = WebPushSubscription {
             id: old.as_ref().map(|row| row.id).unwrap_or_else(|| self.next_id()),
             token_id,
@@ -257,6 +272,8 @@ impl PushSubscriptionStore for RedbStore {
             standard,
             policy,
             alerts,
+            unsubscribe_token: token,
+            unsubscribe_url,
             created_at_ms: old.as_ref().map(|row| row.created_at_ms).unwrap_or(now_ms),
             updated_at_ms: now_ms,
         };
@@ -279,6 +296,51 @@ impl PushSubscriptionStore for RedbStore {
         }
         write.commit()?;
         Ok(row)
+    }
+
+    fn destroy_api_push_subscription_by_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<WebPushSubscription>> {
+        // Token lookup scans subscription rows (bounded): rows only exist
+        // for users who created them, and the scan cap bounds abuse. Mirrors
+        // `destroy_web_push_subscription_by_token` for the first-party rows.
+        const SCAN_CAP: usize = 10_000;
+        let write = self.begin_write()?;
+        let removed = {
+            let mut subs = write.open_table(PUSH_SUBSCRIPTIONS)?;
+            let mut found: Option<(u64, WebPushSubscription)> = None;
+            let mut scanned = 0usize;
+            for entry in subs.iter()? {
+                if scanned >= SCAN_CAP {
+                    break;
+                }
+                scanned += 1;
+                let (key, value) = entry?;
+                let row: WebPushSubscription = decode(value.value())?;
+                if row.unsubscribe_token == token {
+                    found = Some((key.value(), row));
+                    break;
+                }
+            }
+            match found {
+                Some((id, row)) => {
+                    subs.remove(id)?;
+                    Some(row)
+                }
+                None => None,
+            }
+        };
+        if let Some(row) = &removed {
+            let mut by_token = write.open_table(PUSH_SUBSCRIPTION_BY_TOKEN)?;
+            by_token.remove(row.token_id.value())?;
+            let mut by_user = write.open_table(PUSH_SUBSCRIPTIONS_BY_USER)?;
+            let _ = by_user.remove(
+                schema::pair_key(row.user_id.value(), row.id.value()).as_slice(),
+            );
+        }
+        write.commit()?;
+        Ok(removed)
     }
 
     fn update_push_subscription_data(

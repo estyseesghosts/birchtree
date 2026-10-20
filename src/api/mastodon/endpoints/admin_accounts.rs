@@ -45,7 +45,7 @@ fn gate(
 }
 
 /// Mastodon's ISO-8601 with milliseconds (`created_at` on the wire).
-fn iso(ms: u64) -> String {
+pub(crate) fn iso(ms: u64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64)
         .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
         .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string())

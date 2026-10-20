@@ -70,7 +70,25 @@ where a divergence remains.
   identity stores (locale/invite-request/INVITE_USES schema v15/login IPs,
   serializer + `invited_by`/`ip` filters). Incidental parent fix: HTTP
   registration now consumes invites (`register_account_with_invite` was
-  dead code — D12 claim made real). P2 fix workers launch on the
+  dead code — D12 claim made real).
+- **P2b/P2c workers DONE 2026-10-20**; parent merged their follow-ups:
+  stored profile fields (bot/discoverable/indexable/hide_collections/fields/
+  attribution), reading-preference extension setters, notification 17-type
+  parse + filterable table, reports persistence, audience exact-match,
+  dedup TTL policy + amortized prune (no scheduler), nodeinfo metadata,
+  feed-access gates (4 config flags), token-per-API-sub + `Unsubscribe-URL`
+  + token-first API destroy, `hide_collections` noted (no store yet).
+  Deferred with record: store push-down for notification paging (fill loop
+  is correct), avatar/header pipeline, `site_terms`/extended/privacy text
+  settings, scheduled publish job, rule translations, locale catalog.
+- **P2a worker DONE 2026-10-20** (context promotion, quotes silence gate,
+  favourited/reblogged exclusions, follower hide-gate, endorsements
+  unlimited, v1 deprecation headers; revoke/no-op overlays verified
+  wire-equal). Parent merges: phase3 context order fix, filter PUT/PATCH
+  routes, lists `limit=0`, authorize→authorizer notification (corrected from
+  propose-add to replace: the follower-directed job was wrong-direction),
+  follow-request `since_id` (namespace registered D50, not re-keyed),
+  quotes cursor rekey + schema v16 migration. P2 fix workers launch on the
   CONFIRMED queue above when the worktree is quiet.
 
 ## P0 — privacy bugs (verified, fix unconditionally)

@@ -126,6 +126,12 @@ fn upsert_remote_txn(
                 silenced: false,
                 sensitized: false,
                 moved_to: None,
+                bot: false,
+                discoverable: None,
+                indexable: false,
+                hide_collections: None,
+                fields: Vec::new(),
+                attribution_domains: Vec::new(),
                 created_at_ms: now_ms,
             }
         }

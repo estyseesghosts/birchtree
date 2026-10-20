@@ -28,6 +28,23 @@ const READ_SCOPES: &[&str] = &["read", "read:filters"];
 /// Write scopes for filter writes.
 const WRITE_SCOPES: &[&str] = &["write", "write:filters"];
 
+/// `Deprecation` header value for the v1 filter API. Upstream
+/// `Api::V1::FiltersController` calls `deprecate_api '2022-11-14'`
+/// (`DeprecationConcern`, `app/controllers/concerns/deprecation_concern.rb`
+/// at pin `8ff11c2b`), rendering `@<unix timestamp>` for midnight UTC on
+/// that date.
+const V1_DEPRECATION: &str = "@1668384000";
+
+/// Stamp a v1 response as deprecated (upstream `DeprecationConcern`).
+fn deprecated(response: axum::response::Response) -> axum::response::Response {
+    let mut response = response;
+    response.headers_mut().insert(
+        "deprecation",
+        axum::http::HeaderValue::from_static(V1_DEPRECATION),
+    );
+    response
+}
+
 fn bool_cast(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -157,7 +174,7 @@ pub async fn v1_index(State(state): State<ApiState>, auth: Auth) -> Response {
                 .iter()
                 .map(|row| dto::filter_v1_json(&row.keyword, &row.filter, &row.status_ids))
                 .collect();
-            axum::Json(body).into_response()
+            deprecated(axum::Json(body).into_response())
         }
         Err(err) => filter_error(err).into_response(),
     }
@@ -200,8 +217,10 @@ pub async fn v1_create(
         whole_word,
         state.context.now_ms(),
     ) {
-        Ok(row) => axum::Json(dto::filter_v1_json(&row.keyword, &row.filter, &row.status_ids))
-            .into_response(),
+        Ok(row) => deprecated(
+            axum::Json(dto::filter_v1_json(&row.keyword, &row.filter, &row.status_ids))
+                .into_response(),
+        ),
         Err(err) => filter_error(err).into_response(),
     }
 }
@@ -224,8 +243,10 @@ pub async fn v1_show(
     };
     let store: &dyn Store = &*state.context.store;
     match filters::v1_show(store, viewer, id) {
-        Ok(row) => axum::Json(dto::filter_v1_json(&row.keyword, &row.filter, &row.status_ids))
-            .into_response(),
+        Ok(row) => deprecated(
+            axum::Json(dto::filter_v1_json(&row.keyword, &row.filter, &row.status_ids))
+                .into_response(),
+        ),
         Err(err) => filter_error(err).into_response(),
     }
 }
@@ -260,8 +281,10 @@ pub async fn v1_update(
     };
     let store: &dyn Store = &*state.context.store;
     match filters::v1_update(store, viewer, id, update, state.context.now_ms()) {
-        Ok(row) => axum::Json(dto::filter_v1_json(&row.keyword, &row.filter, &row.status_ids))
-            .into_response(),
+        Ok(row) => deprecated(
+            axum::Json(dto::filter_v1_json(&row.keyword, &row.filter, &row.status_ids))
+                .into_response(),
+        ),
         Err(err) => filter_error(err).into_response(),
     }
 }
@@ -285,7 +308,7 @@ pub async fn v1_destroy(
     };
     let store: &dyn Store = &*state.context.store;
     match filters::v1_destroy(store, viewer, id) {
-        Ok(()) => axum::Json(json!({})).into_response(),
+        Ok(()) => deprecated(axum::Json(json!({})).into_response()),
         Err(err) => filter_error(err).into_response(),
     }
 }

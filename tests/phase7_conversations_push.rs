@@ -679,6 +679,8 @@ async fn push_delivery_sends_vapid_tickle_and_classifies() {
         standard: false,
         policy: "all".into(),
         alerts: HashMap::from([("mention".to_string(), true)]),
+        unsubscribe_token: String::new(),
+        unsubscribe_url: None,
         created_at_ms: 0,
         updated_at_ms: 0,
     };

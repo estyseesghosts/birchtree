@@ -909,19 +909,54 @@ async fn interacted_by(
         Ok(pairs) => pairs,
         Err(err) => return ApiError::from(err).into_response(),
     };
+    // Upstream `load_accounts`
+    // (`favourited_by_accounts_controller.rb` /
+    // `reblogged_by_accounts_controller.rb` at pin `8ff11c2b`):
+    // `without_suspended` always applies, and an authenticated viewer never
+    // sees accounts they block/mute or are blocked by
+    // (`not_excluded_by_account`, i.e. upstream's blocks + blocked-bys +
+    // mutes — domain blocks are account-scoped here, not domain-scoped).
+    // Anonymous viewers get every resolvable non-suspended account.
+    let excluded: std::collections::HashSet<Id> = match viewer {
+        Some(viewer) => {
+            let ids: Vec<Id> = pairs.iter().map(|(account_id, _)| *account_id).collect();
+            match store.batch_pair_states(viewer, &ids, state.context.now_ms()) {
+                // `(incoming, outgoing)`: `incoming.blocking` = the account
+                // blocks the viewer; `outgoing.blocking`/`muting` = the
+                // viewer blocks/mutes the account.
+                Ok(states) => states
+                    .into_iter()
+                    .filter_map(|(id, (incoming, outgoing))| {
+                        (outgoing.blocking || outgoing.muting || incoming.blocking)
+                            .then_some(id)
+                    })
+                    .collect(),
+                Err(err) => return ApiError::from(err).into_response(),
+            }
+        }
+        None => std::collections::HashSet::new(),
+    };
     let mut accounts = Vec::with_capacity(pairs.len());
-    for (account_id, _cursor) in &pairs {
+    let mut kept: Vec<(Id, Id)> = Vec::with_capacity(pairs.len());
+    for (account_id, cursor) in &pairs {
+        if excluded.contains(account_id) {
+            continue;
+        }
         match store.account_by_id(*account_id) {
-            Ok(Some(account)) => accounts.push(account),
-            Ok(None) => continue,
+            Ok(Some(account)) if !account.suspended => {
+                kept.push((*account_id, *cursor));
+                accounts.push(account);
+            }
+            Ok(_) => continue,
             Err(err) => return ApiError::from(err).into_response(),
         }
     }
-    // Cursors are interaction ids (favourite id / reblog status id).
+    // Cursors are interaction ids (favourite id / reblog status id), derived
+    // from the filtered page like upstream's `pagination_max_id`.
     let next = (pairs.len() == page.limit)
-        .then(|| pairs.last().map(|(_, cursor)| *cursor))
+        .then(|| kept.last().map(|(_, cursor)| *cursor))
         .flatten();
-    let prev = pairs.first().map(|(_, cursor)| *cursor);
+    let prev = kept.first().map(|(_, cursor)| *cursor);
     let mut response = axum::Json(
         accounts
             .iter()
@@ -1037,9 +1072,9 @@ pub async fn quotes_index(
     ) {
         Ok(entries) => {
             let next = (entries.len() == page.limit)
-                .then(|| entries.last().map(|(_, status)| status.id))
+                .then(|| entries.last().map(|(quote, _)| quote.id))
                 .flatten();
-            let prev = entries.first().map(|(_, status)| status.id);
+            let prev = entries.first().map(|(quote, _)| quote.id);
             let statuses: Vec<Status> = entries.into_iter().map(|(_, status)| status).collect();
             let mut response = status_list_response(&state, viewer, statuses);
             if let Some(link) = pagination::link_header(&uri, next, prev) {

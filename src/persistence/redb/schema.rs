@@ -166,7 +166,8 @@ pub const POLL_VOTES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("poll
 /// Quotes by numeric quote ID.
 pub const QUOTES: TableDefinition<u64, &[u8]> = TableDefinition::new("quotes");
 
-/// Quotes of a status: `(quoted_status_id_be || quoting_status_id_be)` -> quote ID.
+/// Quotes of a status: `(quoted_status_id_be || quote_id_be)` -> quoting status
+/// ID (rekeyed in schema v16; upstream paginates `Quote` rows by quote id).
 pub const QUOTES_BY_QUOTED: TableDefinition<&[u8], u64> = TableDefinition::new("quotes_by_quoted");
 
 /// The quote authored by a status: `quoting_status_id_be` -> quote ID.
@@ -556,7 +557,7 @@ pub fn audit_target_prefix(target_type: &str, target_id: &str) -> Vec<u8> {
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// Current schema version. Bump with a new migration step.
-pub const SCHEMA_VERSION: u64 = 15;
+pub const SCHEMA_VERSION: u64 = 16;
 
 /// All table names, for diagnostics and migration verification.
 pub const TABLE_NAMES: &[&str] = &[

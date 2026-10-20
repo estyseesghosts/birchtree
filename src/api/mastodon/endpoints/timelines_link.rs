@@ -78,6 +78,22 @@ pub async fn link(State(state): State<ApiState>, auth: OptionalAuth, uri: Uri) -
     let viewer = viewer_of(&auth);
     let store: &dyn Store = &*state.context.store;
     let now = state.context.now_ms();
+    // Topic feed gate (#21d; upstream `TopicController#require_auth?`).
+    let modes: Vec<&str> = if query.local_only {
+        vec![state.server.local_topic_feed_access.as_str()]
+    } else if query.remote_only {
+        vec![state.server.remote_topic_feed_access.as_str()]
+    } else {
+        vec![
+            state.server.local_topic_feed_access.as_str(),
+            state.server.remote_topic_feed_access.as_str(),
+        ]
+    };
+    match super::timelines::feed_gate(&state, viewer, &modes, &uri) {
+        Ok(Some(refusal)) => return refusal,
+        Ok(None) => {}
+        Err(err) => return err.into_response(),
+    };
     match web_cases::link_timeline(store, viewer, &url, query, now) {
         Ok(page) => {
             let first = page.statuses.first().map(|status| status.id);

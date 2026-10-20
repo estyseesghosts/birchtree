@@ -590,6 +590,15 @@ fn collect_descendants(
             }
         }
     }
+    descendants.sort_by_key(|status| {
+        // Upstream `Status::ThreadingConcern#find_statuses_from_tree_path`
+        // (`app/models/concerns/status/threading_concern.rb`, `promote: true`
+        // at pin `8ff11c2b`): self-replies (the author answering themselves)
+        // sort ahead of other replies. `sort_by_key` is stable, like
+        // upstream's `promote_by!`, so relative order within each group is
+        // preserved. `false < true`, so self-replies (key `false`) come first.
+        status.in_reply_to_account_id != Some(status.account_id)
+    });
     Ok(descendants)
 }
 

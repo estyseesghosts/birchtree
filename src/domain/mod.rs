@@ -33,7 +33,7 @@ pub use error::{Error, Result};
 pub use id::{Clock, Id, IdGenerator, SystemClock, TimestampIdGenerator};
 pub use visibility::{QuotePolicy, Visibility};
 pub use status::{Status, StatusApplication, StatusVersion};
-pub use account::Account;
+pub use account::{Account, AccountField};
 pub use admin_infra::{
     AdminAccountOverview, AdminAuditRecord, AdminCanonicalEmailBlock, AdminDomainAllow,
     AdminDomainBlock, AdminDomainSeverity, AdminEmailDomainBlock, AdminIpBlock, AdminIpSeverity,

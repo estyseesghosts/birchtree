@@ -94,6 +94,15 @@ pub struct WebPushSubscription {
     pub standard: bool,
     pub policy: String,
     pub alerts: HashMap<String, bool>,
+    /// Bearer unsubscribe token (fix round P2 #16c). Minted at creation,
+    /// preserved on replace; pre-token rows decode as `""` (treated absent).
+    #[serde(default)]
+    pub unsubscribe_token: String,
+    /// Absolute unsubscribe URL stored at creation (the creator knows the
+    /// public base URL; the delivery job does not). Sent as `Unsubscribe-URL`
+    /// when present.
+    #[serde(default)]
+    pub unsubscribe_url: Option<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }

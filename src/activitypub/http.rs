@@ -108,6 +108,11 @@ pub async fn webfinger(
     let actor = ActorRecord::local_by_username(&data, &username)
         .await?
         .ok_or_else(|| not_found("account"))?;
+    // Upstream answers 410 for a suspended account (`check_account_suspension`
+    // → `gone if @account.permanently_unavailable?`).
+    if actor.account.suspended {
+        return Err(FedError::Gone(format!("acct:{}@{}", actor.account.username, data.domain())));
+    }
     let subject = format!("acct:{}@{}", actor.account.username, data.domain());
     let body: Webfinger = build_webfinger_response(subject, actor.url().clone());
     Ok(([(header::CONTENT_TYPE, "application/jrd+json")], Json(body)))
@@ -157,7 +162,7 @@ pub async fn nodeinfo(data: Data<FedContext>) -> Json<serde_json::Value> {
             "localPosts": local_posts,
         },
         "openRegistrations": data.registrations_open,
-        "metadata": {}
+        "metadata": {"nodeName": &*data.site_title, "nodeDescription": &*data.site_description}
     }))
 }
 
@@ -310,32 +315,74 @@ pub async fn quote_authorization(
     })))
 }
 
-/// `GET /users/{username}/followers`: the followers collection. Its count is exact; the
-/// members are not listed (the collection is a count, as far as remote servers read it).
+/// `GET /users/{username}/followers`: the followers collection, paged like
+/// upstream (`FollowerAccountsController`, `FOLLOW_PER_PAGE = 12`):
+/// the base document carries `{id, type: OrderedCollection, totalItems,
+/// first: <uri>?page=1}` and each `?page=N` carries an
+/// `OrderedCollectionPage` (`partOf`, `totalItems`, actor-URI `orderedItems`,
+/// `next`/`prev`).
+///
+/// Divergence note: our account rows do not persist `hide_collections`, so
+/// the collection is always listed (upstream hides the member list but keeps
+/// the counts when the flag is set).
 pub async fn followers(
     Path(username): Path<String>,
+    Query(query): Query<CollectionQuery>,
     data: Data<FedContext>,
     headers: axum::http::HeaderMap,
     method: axum::http::Method,
     uri: axum::http::Uri,
 ) -> Result<FederationJson<serde_json::Value>, FedError> {
     require_signed(&data, &headers, &method, &uri).await?;
-    collection(&username, &data, true).await
+    federation_collection(&username, &query, &data, true).await
 }
 
-/// `GET /users/{username}/following`: the following collection (a count, as above).
+/// `GET /users/{username}/following`: the following collection, same paging
+/// shape as followers (upstream `FollowingAccountsController`).
 pub async fn following(
     Path(username): Path<String>,
+    Query(query): Query<CollectionQuery>,
     data: Data<FedContext>,
     headers: axum::http::HeaderMap,
     method: axum::http::Method,
     uri: axum::http::Uri,
 ) -> Result<FederationJson<serde_json::Value>, FedError> {
     require_signed(&data, &headers, &method, &uri).await?;
-    collection(&username, &data, false).await
+    federation_collection(&username, &query, &data, false).await
 }
 
-async fn collection(username: &str, data: &Data<FedContext>, followers: bool) -> Result<FederationJson<serde_json::Value>, FedError> {
+/// Query parameters of the collection routes: numbered `page` for the
+/// followers/following collections, `page=true` with `min_id`/`max_id`
+/// cursors for the outbox (upstream's two paging shapes).
+#[derive(Debug, Default, Deserialize)]
+pub struct CollectionQuery {
+    #[serde(default)]
+    pub page: Option<String>,
+    #[serde(default)]
+    pub min_id: Option<String>,
+    #[serde(default)]
+    pub max_id: Option<String>,
+}
+
+/// Members per followers/following page (upstream
+/// `AccountControllerConcern::FOLLOW_PER_PAGE`).
+pub const COLLECTION_PER_PAGE: usize = 12;
+/// Highest followers/following page served: bounds the cursor walk
+/// (`page * PER_PAGE` rows) so a far-future page cannot force an unbounded
+/// scan. Past it the answer is 404.
+pub const COLLECTION_MAX_PAGE: u64 = 1000;
+
+/// Parse a decimal id query parameter.
+fn parse_collection_id(raw: &str, what: &str) -> Result<crate::domain::Id, FedError> {
+    raw.parse().map_err(|_| not_found(what))
+}
+
+async fn federation_collection(
+    username: &str,
+    query: &CollectionQuery,
+    data: &Data<FedContext>,
+    followers: bool,
+) -> Result<FederationJson<serde_json::Value>, FedError> {
     let account = local_account(data, username).await?;
     let stats = data.app.store.account_stats(account.id)?;
     let (suffix, total) = if followers {
@@ -343,17 +390,63 @@ async fn collection(username: &str, data: &Data<FedContext>, followers: bool) ->
     } else {
         ("following", stats.following_count)
     };
-    Ok(FederationJson(json!({
+    let base = format!("{}/{suffix}", account.actor_uri);
+    let Some(page_raw) = query.page.as_deref() else {
+        return Ok(FederationJson(json!({
+            "@context": crate::activitypub::outgoing::context(),
+            "id": base,
+            "type": "OrderedCollection",
+            "totalItems": total,
+            "first": format!("{base}?page=1"),
+        })));
+    };
+    let page: u64 = page_raw.parse().map_err(|_| not_found("page"))?;
+    if page == 0 || page > COLLECTION_MAX_PAGE {
+        return Err(not_found("page"));
+    }
+    let store = &*data.app.store;
+    // Newest-first cursor walk: rows up to the end of the wanted page, then
+    // keep its last `PER_PAGE`. Bounded by `COLLECTION_MAX_PAGE`.
+    let rows = if followers {
+        store.followers(account.id, None, (page as usize).saturating_mul(COLLECTION_PER_PAGE))?
+    } else {
+        store.following(account.id, None, (page as usize).saturating_mul(COLLECTION_PER_PAGE))?
+    };
+    let start = (page as usize - 1) * COLLECTION_PER_PAGE;
+    let ids: Vec<crate::domain::Id> = rows.into_iter().skip(start).take(COLLECTION_PER_PAGE).collect();
+    let accounts = store.accounts_by_ids(&ids)?;
+    let mut items = Vec::with_capacity(ids.len());
+    for id in &ids {
+        if let Some(account) = accounts.get(id) {
+            items.push(account.actor_uri.clone());
+        }
+    }
+    let mut page_doc = json!({
         "@context": crate::activitypub::outgoing::context(),
-        "id": format!("{}/{suffix}", account.actor_uri),
-        "type": "OrderedCollection",
+        "id": format!("{base}?page={page}"),
+        "type": "OrderedCollectionPage",
+        "partOf": base,
         "totalItems": total,
-    })))
+        "orderedItems": items,
+    });
+    if (page as usize) * COLLECTION_PER_PAGE < total as usize {
+        page_doc["next"] = json!(format!("{base}?page={}", page + 1));
+    }
+    if page > 1 {
+        page_doc["prev"] = json!(format!("{base}?page={}", page - 1));
+    }
+    Ok(FederationJson(page_doc))
 }
 
-/// `GET /users/{username}/outbox`: the public statuses as Create activities, newest first.
+/// `GET /users/{username}/outbox`: the public statuses as Create activities,
+/// newest first, paged like upstream (`OutboxesController`, `LIMIT = 20`):
+/// the base document carries `{id, type: OrderedCollection, totalItems:
+/// statuses_count, first: <uri>?page=true, last: <uri>?page=true&min_id=0}`
+/// and each `?page=true` (with `min_id`/`max_id` cursors) carries an
+/// `OrderedCollectionPage` (`partOf`, `prev`/`next`, `orderedItems`).
 pub async fn outbox(
     Path(username): Path<String>,
+    Query(query): Query<CollectionQuery>,
     data: Data<FedContext>,
     headers: axum::http::HeaderMap,
     method: axum::http::Method,
@@ -362,24 +455,82 @@ pub async fn outbox(
     require_signed(&data, &headers, &method, &uri).await?;
     let account = local_account(&data, &username).await?;
     let store = &*data.app.store;
+    let base = format!("{}/outbox", account.actor_uri);
+    let is_page = query.page.as_deref() == Some("true");
+    if !is_page {
+        let total = store.account_stats(account.id)?.statuses_count;
+        return Ok(FederationJson(json!({
+            "@context": crate::activitypub::outgoing::context(),
+            "id": base,
+            "type": "OrderedCollection",
+            "totalItems": total,
+            "first": format!("{base}?page=true"),
+            "last": format!("{base}?page=true&min_id=0"),
+        })));
+    }
+    // Cursor page: walk the author's newest-first id list past the cursor,
+    // keeping public statuses until the limit fills (bounded: the scan stops
+    // after `OUTBOX_PAGE_LIMIT * OUTBOX_SCAN_FACTOR` rows so a media-heavy
+    // tail cannot stall the request).
+    let max_id = query.max_id.as_deref().map(|raw| parse_collection_id(raw, "max_id")).transpose()?;
+    let min_id = query.min_id.as_deref().map(|raw| parse_collection_id(raw, "min_id")).transpose()?;
+    const OUTBOX_PAGE_LIMIT: usize = 20;
+    const OUTBOX_SCAN_FACTOR: usize = 10;
     let mut items = Vec::new();
+    let mut item_ids: Vec<crate::domain::Id> = Vec::new();
+    let mut scanned = 0usize;
+    let mut last_seen: Option<crate::domain::Id> = None;
     for id in store.account_status_ids(account.id)? {
-        if items.len() >= 20 {
+        if let Some(max_id) = max_id
+            && id >= max_id
+        {
+            continue;
+        }
+        if let Some(min_id) = min_id
+            && id <= min_id
+        {
             break;
+        }
+        last_seen = Some(id);
+        scanned += 1;
+        if scanned > OUTBOX_PAGE_LIMIT * OUTBOX_SCAN_FACTOR {
+            break;
+        }
+        if items.len() >= OUTBOX_PAGE_LIMIT {
+            continue;
         }
         if let Some(status) = store.status_by_id(id)? {
             if status.visibility == crate::domain::Visibility::Public {
+                item_ids.push(status.id);
                 items.push(crate::activitypub::outgoing::create(store, &data.public_url, &status, data.app.now_ms())?);
             }
         }
     }
-    Ok(FederationJson(json!({
+    let full = items.len() >= OUTBOX_PAGE_LIMIT;
+    let mut params = String::from("page=true");
+    if let Some(min_id) = query.min_id.as_deref() {
+        params.push_str(&format!("&min_id={min_id}"));
+    }
+    if let Some(max_id) = query.max_id.as_deref() {
+        params.push_str(&format!("&max_id={max_id}"));
+    }
+    let mut page_doc = json!({
         "@context": crate::activitypub::outgoing::context(),
-        "id": format!("{}/outbox", account.actor_uri),
-        "type": "OrderedCollection",
-        "totalItems": items.len(),
+        "id": format!("{base}?{params}"),
+        "type": "OrderedCollectionPage",
+        "partOf": base,
         "orderedItems": items,
-    })))
+    });
+    // A full page means older rows may remain: `next` continues below the
+    // oldest row the scan touched. `prev` climbs above the page's newest id
+    // (absent on an empty page, like upstream's empty-`@statuses` page).
+    if full && let Some(last) = last_seen {
+        page_doc["next"] = json!(format!("{base}?page=true&max_id={}", last.value()));
+    }
+    if let Some(newest) = item_ids.first() {
+        page_doc["prev"] = json!(format!("{base}?page=true&min_id={}", newest.value()));
+    }
+    Ok(FederationJson(page_doc))
 }
 
 /// `GET /actor`: the instance actor's document (its key verifies signed fetches).

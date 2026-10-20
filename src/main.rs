@@ -464,6 +464,8 @@ async fn serve(cfg: Config) {
         context.clone(),
         &cfg.normalized_public_url(),
         cfg.registration_open,
+        &cfg.site_title,
+        &cfg.site_description,
         &http_policy,
         lab,
         Some(&instance),

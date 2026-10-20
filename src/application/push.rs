@@ -11,9 +11,10 @@
 //! ([`crate::domain::JobKind::WebPushDelivery`], parent patch): a
 //! VAPID-authenticated RFC 8030 POST with an empty body (a "tickle" — the
 //! client wakes and fetches; see the delivery deviation below), bounded
-//! retries, then quarantine. A `404`/`410` answer deletes the subscription
-//! (upstream removes gone endpoints the same way). Network I/O never runs
-//! inside a request transaction.
+//! retries, then quarantine. An answer in `4xx` other than `408`/`429`
+//! deletes the subscription (upstream's `Web::PushNotificationWorker#send`
+//! rule); `408`/`429` and anything outside `2xx`/`4xx` retries with backoff.
+//! Network I/O never runs inside a request transaction.
 //!
 //! Delivery (round 3, area C closes the encryption half; round 4 the legacy
 //! half): standard subscriptions get an RFC 8291 `aes128gcm`-encrypted JSON
@@ -49,9 +50,21 @@ pub trait PushSubscriptionStore: Send + Sync {
     /// subscriptions to the token, and tokens to the user).
     fn push_subscriptions_for_user(&self, user_id: Id) -> Result<Vec<WebPushSubscription>>;
 
+    /// Destroy the API subscription holding this bearer unsubscribe token
+    /// (`None` when unknown). Backs the token-first
+    /// `DELETE /api/web/push_subscriptions/:token` path for API rows, like
+    /// the first-party bearer path (fix round P2 #16c).
+    fn destroy_api_push_subscription_by_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<WebPushSubscription>>;
+
     /// Create or replace the subscription for `(token_id, user_id)` in ONE
     /// transaction (upstream destroys the token's subscriptions on create, so
-    /// exactly one row exists per token).
+    /// exactly one row exists per token). Mints the bearer unsubscribe token
+    /// when the row has none (fix round P2 #16c); `public_base_url` builds
+    /// the stored absolute unsubscribe URL next to it (the delivery job
+    /// cannot reconstruct the base URL itself).
     fn upsert_push_subscription(
         &self,
         token_id: Id,
@@ -62,6 +75,7 @@ pub trait PushSubscriptionStore: Send + Sync {
         standard: bool,
         policy: String,
         alerts: HashMap<String, bool>,
+        public_base_url: Option<&str>,
         now_ms: u64,
     ) -> Result<WebPushSubscription>;
 
@@ -117,7 +131,9 @@ impl VapidKeys {
 /// An unconfigured (empty) pair does not fail startup: subscription endpoints
 /// keep working, and delivery jobs quarantine with a configuration error
 /// until keys are set.
-pub const VAPID_JWT_LIFETIME_SECS: u64 = 12 * 3600;
+///
+/// Upstream `WebPushRequest::PAYLOAD_EXPIRATION` (24 h).
+pub const VAPID_JWT_LIFETIME_SECS: u64 = 24 * 3600;
 
 /// Push TTL in seconds (upstream `Web::PushNotificationWorker::TTL`, 48 h).
 pub const PUSH_TTL_SECS: u64 = 48 * 3600;
@@ -198,6 +214,14 @@ pub struct PushRequest {
     /// carries the salt in this header; the standard encoding embeds it in
     /// the body instead). `None` for tickles and standard deliveries.
     pub encryption: Option<String>,
+    /// `Unsubscribe-URL`, sent when set (upstream sends it on both legacy
+    /// and standard requests: `api_web_push_subscription_url` with a bearer
+    /// token for the subscription). The builders leave it `None`: no token
+    /// source exists for API subscriptions yet (the bearer tokens live in
+    /// the web-subscription store, which the delivery job cannot reach), so
+    /// the header is plumbed but unset — see the module docs. Callers with
+    /// a token URL set this field before sending.
+    pub unsubscribe_url: Option<String>,
 }
 
 pub fn build_push_request(
@@ -223,6 +247,7 @@ pub fn build_push_request(
         body: Vec::new(),
         content_encoding: None,
         encryption: None,
+        unsubscribe_url: None,
     })
 }
 
@@ -312,17 +337,21 @@ fn subscription_key_trimmed(raw: &str) -> &str {
 pub enum PushOutcome {
     /// The endpoint accepted (2xx).
     Delivered,
-    /// The endpoint is gone (`404`/`410`): delete the subscription.
+    /// The subscription is invalid or expired: delete it. Upstream
+    /// (`Web::PushNotificationWorker#send`) destroys on any 4xx except
+    /// rate-limiting (408) and timeouts (429).
     Gone,
     /// Retry with backoff (bounded by the job's retry budget, then quarantine).
     Retry(String),
 }
 
-/// Classify an HTTP status into a [`PushOutcome`].
+/// Classify an HTTP status into a [`PushOutcome`]: every 4xx except 408/429
+/// is gone (upstream's rule, quoted above); 2xx is delivered; anything else
+/// (including 408/429) retries.
 pub fn classify_push_response(status: u16) -> PushOutcome {
     if (200..300).contains(&status) {
         PushOutcome::Delivered
-    } else if status == 404 || status == 410 {
+    } else if (400..500).contains(&status) && status != 408 && status != 429 {
         PushOutcome::Gone
     } else {
         PushOutcome::Retry(format!("push endpoint answered {status}"))
@@ -333,11 +362,12 @@ pub fn classify_push_response(status: u16) -> PushOutcome {
 /// production; any `reqwest::Client` in tests). Tickles go out bodiless;
 /// encrypted requests carry `Content-Type: application/octet-stream` and
 /// their `Content-Encoding` (upstream's standard request adds the same
-/// pair, plus `Authorization`, `Ttl`/`TTL`, `Urgency` and `Unsubscribe-URL`;
-/// the unsubscribe URL is a web-route concern and stays out of this
-/// transport type). Legacy `aesgcm` requests additionally carry the
+/// pair, plus `Authorization`, `Ttl`/`TTL`, `Urgency` and `Unsubscribe-URL`).
+/// Legacy `aesgcm` requests additionally carry the
 /// `Encryption: salt=…` header (upstream's legacy request sends it
-/// alongside `Crypto-Key: dh=…;…`).
+/// alongside `Crypto-Key: dh=…;…`). `Unsubscribe-URL` is sent when
+/// [`PushRequest::unsubscribe_url`] is set (upstream always sends it; here
+/// the token source is still pending, so it is usually absent).
 pub async fn deliver_push(
     client: &reqwest::Client,
     request: &PushRequest,
@@ -355,6 +385,9 @@ pub async fn deliver_push(
     }
     if let Some(encryption) = &request.encryption {
         outgoing = outgoing.header("Encryption", encryption.clone());
+    }
+    if let Some(unsubscribe) = &request.unsubscribe_url {
+        outgoing = outgoing.header("Unsubscribe-URL", unsubscribe.clone());
     }
     let response = outgoing.body(request.body.clone()).send().await;
     match response {
@@ -514,7 +547,7 @@ pub async fn handle_push_job(
     // the tickle (this server's RFC 8030-compliant fallback for rows that
     // predate key validation — upstream destroys such rows instead, via its
     // `unless valid?` gate, but a bodiless tickle never misfires).
-    let request = if subscription.standard {
+    let mut request = if subscription.standard {
         let payload_json = push_notification_payload(store, &notification)?;
         match build_push_request_encrypted(&subscription, keys, subject, now_ms, &payload_json) {
             Ok(request) => request,
@@ -541,6 +574,10 @@ pub async fn handle_push_job(
     } else {
         build_push_request(&subscription, keys, subject, now_ms).map_err(Error::Internal)?
     };
+    // `Unsubscribe-URL` (upstream sends it on every standard + legacy
+    // request): the stored absolute URL, minted at subscription creation.
+    // Pre-token rows carry none and send no header (never fabricated).
+    request.unsubscribe_url = subscription.unsubscribe_url.clone();
     match deliver_push(client, &request).await {
         PushOutcome::Delivered => Ok(PushJobOutcome::Complete),
         PushOutcome::Gone => Ok(PushJobOutcome::DeleteSubscriptionAndComplete(
@@ -689,8 +726,15 @@ mod tests {
     #[test]
     fn response_classification() {
         assert_eq!(classify_push_response(201), PushOutcome::Delivered);
-        assert_eq!(classify_push_response(404), PushOutcome::Gone);
-        assert_eq!(classify_push_response(410), PushOutcome::Gone);
+        // Upstream destroys on every 4xx except 408 (timeout) and 429
+        // (rate-limited): both retry with backoff instead.
+        for gone in [400, 401, 403, 404, 410, 422, 499] {
+            assert_eq!(classify_push_response(gone), PushOutcome::Gone, "{gone}");
+        }
+        assert!(matches!(
+            classify_push_response(408),
+            PushOutcome::Retry(_)
+        ));
         assert!(matches!(
             classify_push_response(429),
             PushOutcome::Retry(_)

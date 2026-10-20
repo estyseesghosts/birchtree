@@ -519,7 +519,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/v1/filters", get(endpoints::filters::v1_index))
         .route("/api/v1/filters", post(endpoints::filters::v1_create))
         .route("/api/v1/filters/:id", get(endpoints::filters::v1_show))
-        .route("/api/v1/filters/:id", put(endpoints::filters::v1_update))
+        .route("/api/v1/filters/:id", put(endpoints::filters::v1_update).patch(endpoints::filters::v1_update))
         .route(
             "/api/v1/filters/:id",
             delete(endpoints::filters::v1_destroy),
@@ -544,7 +544,7 @@ pub fn build_router(state: ApiState) -> Router {
             delete(endpoints::filters::statuses_destroy),
         )
         .route("/api/v2/filters/:id", get(endpoints::filters::v2_show))
-        .route("/api/v2/filters/:id", patch(endpoints::filters::v2_update))
+        .route("/api/v2/filters/:id", put(endpoints::filters::v2_update).patch(endpoints::filters::v2_update))
         .route("/api/v2/filters/:id", delete(endpoints::filters::v2_destroy))
         .route(
             "/api/v2/filters/:filter_id/keywords",

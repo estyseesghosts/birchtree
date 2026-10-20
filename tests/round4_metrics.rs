@@ -268,8 +268,11 @@ fn vote_journals_cast_ballots_only() {
 
     // Duplicate ballot on a single-choice poll is rejected: journals nothing.
     assert!(polls::vote(&*store, bob.id, poll.id, &[0], t).is_err());
-    // Empty ballot is rejected before the store: journals nothing.
-    assert!(polls::vote(&*store, bob.id, poll.id, &[], t).is_err());
+    // Empty ballot is a silent no-op returning the poll unchanged (upstream
+    // `VoteService#call` returns before the vote gate or the tracker; the
+    // 400 for a *missing* `choices` key lives at the endpoint layer):
+    // journals nothing.
+    assert!(polls::vote(&*store, bob.id, poll.id, &[], t).is_ok());
     assert_eq!(
         count(&store, Some(InteractionEventKind::Vote), 0, t + END_SLACK_MS),
         1,

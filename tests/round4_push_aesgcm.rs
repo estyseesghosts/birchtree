@@ -341,6 +341,8 @@ fn keyed_sub(standard: bool) -> birchtree::domain::WebPushSubscription {
         standard,
         policy: "all".into(),
         alerts: HashMap::from([("mention".to_string(), true)]),
+        unsubscribe_token: String::new(),
+        unsubscribe_url: None,
         created_at_ms: 0,
         updated_at_ms: 0,
     }
@@ -491,6 +493,7 @@ async fn legacy_aesgcm_delivery_decrypts() {
             false,
             "all".to_string(),
             HashMap::from([("mention".to_string(), true)]),
+            None,
             T0,
         )
         .expect("subscribe");
@@ -609,6 +612,7 @@ async fn corrupt_legacy_keys_drop_subscription() {
             false,
             "all".to_string(),
             HashMap::from([("mention".to_string(), true)]),
+            None,
             T0,
         )
         .expect("subscribe");
@@ -660,6 +664,8 @@ async fn tickle_for_keyless_legacy_preserved() {
         standard: false,
         policy: "all".into(),
         alerts: HashMap::from([("mention".to_string(), true)]),
+        unsubscribe_token: String::new(),
+        unsubscribe_url: None,
         created_at_ms: 0,
         updated_at_ms: 0,
     };

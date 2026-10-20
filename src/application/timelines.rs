@@ -529,16 +529,93 @@ pub fn tag(
     query: TimelineQuery,
     now_ms: u64,
 ) -> Result<TimelinePage> {
+    tag_filtered(store, viewer, raw_tag, &[], &[], &[], query, now_ms)
+}
+
+/// Tags per `any`/`all`/`none` mode (upstream `TagFeed::LIMIT_PER_MODE`).
+pub const TAG_MODE_CAP: usize = 4;
+
+/// Hashtag timeline with upstream's `any`/`all`/`none` modes (`TagFeed`):
+/// `any` widens the base tag (a status carrying the base tag or any listed
+/// tag passes), `all` narrows to statuses carrying the base tag and every
+/// listed tag, `none` drops statuses carrying any listed tag. Each mode list
+/// is capped at [`TAG_MODE_CAP`] extra tags.
+///
+/// The store reads one tag at a time, so each tag in `{base} ∪ any` is read
+/// with the same cursors and the pages are merged newest-first, deduplicated
+/// and cut to `limit` after the `all`/`none` test (which reads the status's
+/// own normalized tags, the same values the store indexed). Merged cursor
+/// pages can be shorter than `limit` when the other tags hold the rest —
+/// the `Link` cursors still advance — which the single-query upstream never
+/// does; the membership semantics match exactly.
+pub fn tag_filtered(
+    store: &dyn Store,
+    viewer: Option<Id>,
+    raw_tag: &str,
+    any: &[String],
+    all: &[String],
+    none: &[String],
+    query: TimelineQuery,
+    now_ms: u64,
+) -> Result<TimelinePage> {
     let normalized = normalize_tag(raw_tag);
     if normalized.is_empty() {
         return Ok(TimelinePage::default());
     }
-    let filter = TagFilter {
-        scope: ViewerScope::new(store, viewer, now_ms),
+    let mut tags = vec![normalized];
+    for raw in any {
+        let tag = normalize_tag(raw);
+        if !tag.is_empty() && !tags.contains(&tag) && tags.len() < TAG_MODE_CAP + 1 {
+            tags.push(tag);
+        }
+    }
+    let all: Vec<String> = {
+        let mut kept = Vec::new();
+        for raw in all {
+            let tag = normalize_tag(raw);
+            if !tag.is_empty() && !kept.contains(&tag) && kept.len() < TAG_MODE_CAP {
+                kept.push(tag);
+            }
+        }
+        kept
     };
-    let page = store.hashtag_timeline(&normalized, query, &filter)?;
+    let none: Vec<String> = {
+        let mut kept = Vec::new();
+        for raw in none {
+            let tag = normalize_tag(raw);
+            if !tag.is_empty() && !kept.contains(&tag) && kept.len() < TAG_MODE_CAP {
+                kept.push(tag);
+            }
+        }
+        kept
+    };
+    // Fast path: the historical single-tag read.
+    if tags.len() == 1 && all.is_empty() && none.is_empty() {
+        let filter = TagFilter {
+            scope: ViewerScope::new(store, viewer, now_ms),
+        };
+        let page = store.hashtag_timeline(&tags[0], query, &filter)?;
+        filter.scope.finish()?;
+        return Ok(page);
+    }
+    let scope = ViewerScope::new(store, viewer, now_ms);
+    let filter = TagFilter { scope };
+    let mut merged: Vec<Status> = Vec::new();
+    let mut scanned = 0usize;
+    for tag in &tags {
+        let page = store.hashtag_timeline(tag, query.clone(), &filter)?;
+        scanned += page.scanned;
+        merged.extend(page.statuses);
+    }
     filter.scope.finish()?;
-    Ok(page)
+    merged.sort_by(|a, b| b.id.cmp(&a.id));
+    merged.dedup_by_key(|status| status.id);
+    merged.retain(|status| {
+        all.iter().all(|tag| status.tags.iter().any(|owned| owned == tag))
+            && !none.iter().any(|tag| status.tags.iter().any(|owned| owned == tag))
+    });
+    merged.truncate(query.limit);
+    Ok(TimelinePage { statuses: merged, scanned })
 }
 
 /// List timeline. Ownership is checked first: a list the viewer does not own

@@ -78,6 +78,14 @@ pub struct ServerInfo {
     pub domain_blocks_public: bool,
     /// Whether invite tokens are honored (mirrors `Config::invites_enabled`).
     pub invites_enabled: bool,
+    /// Feed access gates (mirrors the four `Config::*_feed_access` keys,
+    /// upstream defaults all `public`). Anything but `public` requires login
+    /// on the anonymous-capable timelines; `disabled` serves `[]` to
+    /// non-staff.
+    pub local_live_feed_access: String,
+    pub remote_live_feed_access: String,
+    pub local_topic_feed_access: String,
+    pub remote_topic_feed_access: String,
 }
 
 /// Host and optional explicit port of a separately configured streaming base.
@@ -198,6 +206,10 @@ impl ServerInfo {
             activity_api_enabled: cfg.activity_api_enabled,
             domain_blocks_public: cfg.domain_blocks_public,
             invites_enabled: cfg.invites_enabled,
+            local_live_feed_access: cfg.local_live_feed_access.clone(),
+            remote_live_feed_access: cfg.remote_live_feed_access.clone(),
+            local_topic_feed_access: cfg.local_topic_feed_access.clone(),
+            remote_topic_feed_access: cfg.remote_topic_feed_access.clone(),
         }
     }
 }

@@ -148,6 +148,20 @@ pub struct Config {
     /// is not modeled; `true` serves silence/suspend rows with public
     /// digests. File-only.
     pub domain_blocks_public: bool,
+    /// Live-feed access gates (upstream `Setting.{local,remote}_live_feed_access`,
+    /// default `public`). Each is `public`, `authenticated` or `disabled`
+    /// (upstream `FEED_ACCESS_MODES`); anything but `public` requires login
+    /// on `GET /api/v1/timelines/public`, and `disabled` additionally serves
+    /// `[]` to non-staff. File-only.
+    pub local_live_feed_access: String,
+    pub remote_live_feed_access: String,
+    /// Topic-feed access gates (upstream `Setting.{local,remote}_topic_feed_access`,
+    /// default `public`). `local_*` is `public` or `authenticated` (upstream
+    /// `ALTERNATE_FEED_ACCESS_MODES`); `remote_*` adds `disabled`. Gate
+    /// `GET /api/v1/timelines/tag/*` and `/api/v1/timelines/link` the same
+    /// way as the live gates. File-only.
+    pub local_topic_feed_access: String,
+    pub remote_topic_feed_access: String,
 }
 
 impl Default for Config {
@@ -193,6 +207,10 @@ impl Default for Config {
             peers_api_enabled: true,
             activity_api_enabled: true,
             domain_blocks_public: false,
+            local_live_feed_access: "public".to_string(),
+            remote_live_feed_access: "public".to_string(),
+            local_topic_feed_access: "public".to_string(),
+            remote_topic_feed_access: "public".to_string(),
         }
     }
 }
@@ -253,6 +271,26 @@ impl Config {
         }
         if self.opus_bitrate_kbps == 0 {
             return Err("opus_bitrate_kbps must be > 0".to_string());
+        }
+        // Feed access gates mirror upstream's `FEED_ACCESS_MODES`
+        // (`public`/`authenticated`/`disabled`) and
+        // `ALTERNATE_FEED_ACCESS_MODES` (`public`/`authenticated`, no
+        // `disabled` for the local topic feed).
+        for (key, value) in [
+            ("local_live_feed_access", &self.local_live_feed_access),
+            ("remote_live_feed_access", &self.remote_live_feed_access),
+            ("remote_topic_feed_access", &self.remote_topic_feed_access),
+        ] {
+            if !["public", "authenticated", "disabled"].contains(&value.as_str()) {
+                return Err(format!(
+                    "{key} must be one of public, authenticated, disabled"
+                ));
+            }
+        }
+        if !["public", "authenticated"].contains(&self.local_topic_feed_access.as_str()) {
+            return Err(
+                "local_topic_feed_access must be one of public, authenticated".to_string(),
+            );
         }
         if let Some(base) = &self.streaming_api_base_url {
             let valid = ["ws://", "wss://", "http://", "https://"]

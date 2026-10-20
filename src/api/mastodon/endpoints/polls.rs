@@ -93,15 +93,22 @@ pub async fn vote(
         return ApiError::not_found().into_response();
     };
     let pairs = body;
-    // `params.require(:choices)` -> 400 when missing or empty.
-    let choices: Vec<u64> = forms::all(&pairs, "choices")
-        .iter()
-        .filter_map(|raw| raw.parse::<u64>().ok())
-        .collect();
-    if choices.is_empty() {
+    // `params.require(:choices)` -> 400 when the key is missing entirely.
+    // A present-but-empty list (`choices[]=`) is upstream's silent no-op
+    // (`VoteService` returns before the vote gate): 200 with the unchanged
+    // poll. A present list with no parseable choice 422s like upstream's
+    // `VoteValidator#invalid_choice?` (`Integer(choice)` fails there; a
+    // bare empty string from form encoding is ignored as a form artifact).
+    if !forms::has(&pairs, "choices") {
         return ApiError::bad_request("param is missing or the value is empty: choices")
             .into_response();
     }
+    let raw = forms::all(&pairs, "choices");
+    if raw.iter().any(|item| !item.is_empty() && item.parse::<u64>().is_err()) {
+        return ApiError::unprocessable("Validation failed: The chosen vote option does not exist")
+            .into_response();
+    }
+    let choices: Vec<u64> = raw.iter().filter_map(|raw| raw.parse::<u64>().ok()).collect();
     let store: &dyn Store = &*state.context.store;
     match polls::vote(store, viewer, poll_id, &choices, state.context.now_ms()) {
         Ok(poll) => {

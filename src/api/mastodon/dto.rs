@@ -57,9 +57,12 @@ pub fn account_json_with_stats(
     object.insert("acct".into(), json!(account.acct()));
     object.insert("display_name".into(), json!(account.display_name));
     object.insert("locked".into(), json!(account.locked));
-    object.insert("bot".into(), json!(false));
-    object.insert("discoverable".into(), json!(true));
-    object.insert("indexable".into(), json!(false));
+    object.insert("bot".into(), json!(account.bot));
+    object.insert(
+        "discoverable".into(),
+        account.discoverable.map(Value::from).unwrap_or(Value::Null),
+    );
+    object.insert("indexable".into(), json!(account.indexable));
     object.insert("group".into(), json!(false));
     object.insert("created_at".into(), json!(date_only(account.created_at_ms)));
     object.insert("note".into(), json!(account.note));
@@ -81,12 +84,28 @@ pub fn account_json_with_stats(
             None => Value::Null,
         },
     );
-    object.insert("hide_collections".into(), Value::Null);
+    object.insert(
+        "hide_collections".into(),
+        account.hide_collections.map(Value::from).unwrap_or(Value::Null),
+    );
     object.insert("show_media".into(), json!(true));
     object.insert("show_media_replies".into(), json!(true));
     object.insert("show_featured".into(), json!(true));
     object.insert("emojis".into(), json!([]));
-    object.insert("fields".into(), json!([]));
+    object.insert(
+        "fields".into(),
+        json!(
+            account
+                .fields
+                .iter()
+                .map(|field| json!({
+                    "name": field.name,
+                    "value": field.value,
+                    "verified_at": field.verified_at.map(crate::api::mastodon::endpoints::admin_accounts::iso),
+                }))
+                .collect::<Vec<_>>()
+        ),
+    );
     object.insert(
         "feature_approval".into(),
         json!({ "automatic": [], "manual": [], "current_user": "missing" }),
@@ -131,32 +150,111 @@ pub fn credential_account_json_with_stats(
         "source".into(),
         source_json(account, user, stats.map_or(0, |s| s.follow_requests_count)),
     );
-    object.insert("role".into(), json!({
-        "id": "-1",
-        "name": "User",
-        "permissions": "0",
-        "color": "",
-        "highlighted": false,
-        "collection_limit": 0,
-    }));
+    object.insert("role".into(), role_json(user));
     Value::Object(object)
+}
+
+/// `REST::RoleSerializer` for the credential account (`role_serializer.rb`
+/// at the pin: `{id, name, permissions, color, highlighted,
+/// collection_limit}`, `permissions` = `computed_permissions.to_s`).
+///
+/// Non-staff viewers keep the historical `User` shape (no role rows exist for
+/// them). Staff render their real collapsed role (`user.rs` `UserRole`):
+/// names match the seeded `config/roles.yml` `Moderator`/`Admin` entries and
+/// `permissions` is the OR of the upstream flag bits that role carries there
+/// (`user_role.rb:20-44` — e.g. moderator = `view_dashboard | view_audit_log
+/// | view_feeds | manage_users | manage_reports | manage_taxonomies` =
+/// `1049888`). Ids are synthetic slugs (`moderator`/`admin`): birchtree
+/// collapses roles to an enum with no row ids (same convention as the admin
+/// account serializer), so upstream numeric row ids cannot round-trip.
+pub fn role_json(user: Option<&LocalUser>) -> Value {
+    // Upstream `UserRole::FLAGS` bit positions (`user_role.rb:20-44`).
+    const VIEW_DASHBOARD: u64 = 1 << 3;
+    const VIEW_AUDIT_LOG: u64 = 1 << 2;
+    const VIEW_FEEDS: u64 = 1 << 20;
+    const MANAGE_USERS: u64 = 1 << 10;
+    const MANAGE_REPORTS: u64 = 1 << 4;
+    const MANAGE_TAXONOMIES: u64 = 1 << 8;
+    const MANAGE_FEDERATION: u64 = 1 << 5;
+    const MANAGE_SETTINGS: u64 = 1 << 6;
+    const MANAGE_BLOCKS: u64 = 1 << 7;
+    const MANAGE_APPEALS: u64 = 1 << 9;
+    const MANAGE_INVITES: u64 = 1 << 11;
+    const MANAGE_RULES: u64 = 1 << 12;
+    const MANAGE_ANNOUNCEMENTS: u64 = 1 << 13;
+    const MANAGE_CUSTOM_EMOJIS: u64 = 1 << 14;
+    const MANAGE_WEBHOOKS: u64 = 1 << 15;
+    const MANAGE_USER_ACCESS: u64 = 1 << 18;
+    const DELETE_USER_DATA: u64 = 1 << 19;
+    const MANAGE_ROLES: u64 = 1 << 17;
+    const MODERATOR_PERMISSIONS: u64 = VIEW_DASHBOARD
+        | VIEW_AUDIT_LOG
+        | VIEW_FEEDS
+        | MANAGE_USERS
+        | MANAGE_REPORTS
+        | MANAGE_TAXONOMIES;
+    const ADMIN_PERMISSIONS: u64 = MODERATOR_PERMISSIONS
+        | MANAGE_FEDERATION
+        | MANAGE_SETTINGS
+        | MANAGE_BLOCKS
+        | MANAGE_APPEALS
+        | MANAGE_INVITES
+        | MANAGE_RULES
+        | MANAGE_ANNOUNCEMENTS
+        | MANAGE_CUSTOM_EMOJIS
+        | MANAGE_WEBHOOKS
+        | MANAGE_USER_ACCESS
+        | DELETE_USER_DATA
+        | MANAGE_ROLES;
+    let (id, name, permissions, highlighted) = match user.map(|u| u.role).unwrap_or_default() {
+        crate::domain::UserRole::Admin => ("admin", "Admin", ADMIN_PERMISSIONS, true),
+        crate::domain::UserRole::Moderator => {
+            ("moderator", "Moderator", MODERATOR_PERMISSIONS, true)
+        }
+        crate::domain::UserRole::None => return json!({
+            "id": "-1",
+            "name": "User",
+            "permissions": "0",
+            "color": "",
+            "highlighted": false,
+            "collection_limit": 0,
+        }),
+    };
+    json!({
+        "id": id,
+        "name": name,
+        "permissions": permissions.to_string(),
+        "color": "",
+        "highlighted": highlighted,
+        "collection_limit": 0,
+    })
 }
 
 fn source_json(account: &Account, user: Option<&LocalUser>, follow_requests_count: u64) -> Value {
     let privacy = user
         .and_then(|u| u.default_privacy.clone())
         .unwrap_or_else(|| if account.locked { "private" } else { "public" }.to_string());
+    // `language` is the real `setting_default_language` (upstream uses
+    // `preferred_posting_language` only in preferences, not here).
     json!({
         "privacy": privacy,
         "sensitive": user.and_then(|u| u.default_sensitive).unwrap_or(false),
         "language": user.and_then(|u| u.default_language.clone()),
         "note": account.note,
-        "fields": [],
+        "fields": account
+            .fields
+            .iter()
+            .map(|field| json!({
+                "name": field.name,
+                "value": field.value,
+                "verified_at": field.verified_at.map(crate::api::mastodon::endpoints::admin_accounts::iso),
+            }))
+            .collect::<Vec<_>>(),
         "follow_requests_count": follow_requests_count,
-        "hide_collections": Value::Null,
-        "discoverable": true,
-        "indexable": false,
-        "attribution_domains": [],
+        "hide_collections": account.hide_collections.map(Value::from).unwrap_or(Value::Null),
+        "discoverable": account.discoverable.map(Value::from).unwrap_or(Value::Null),
+        "indexable": account.indexable,
+        "attribution_domains": account.attribution_domains,
         "quote_policy": user
             .and_then(|u| u.default_quote_policy.clone())
             .unwrap_or_else(|| "public".to_string()),
@@ -214,20 +312,45 @@ pub fn app_json(app: &OAuthApplication, client_secret: Option<&str>) -> Value {
 }
 
 /// `PATCH/GET preferences` shape (Mastodon `REST::PreferencesSerializer`).
+///
+/// `posting:default:language` is `preferred_posting_language`
+/// (`has_settings.rb:22-24`: `valid_locale_cascade(default_language, locale,
+/// I18n.locale)`), i.e. the posting default with the registration locale as
+/// the cascade fallback — not the raw `default_language` setting. The
+/// `reading:*` keys have no stored settings yet (upstream `web.display_media`
+/// / `web.expand_content_warnings` / `web.auto_play`, all under the web
+/// settings namespace): they render upstream's column defaults
+/// (`display_media` default `'default'`, booleans `false`) until per-user
+/// reading settings land (named follow-up: `LocalUser` +
+/// `UserSettingsUpdate` + store fields).
 pub fn preferences_json(account: &Account, user: Option<&LocalUser>) -> Value {
     let visibility = user
         .and_then(|u| u.default_privacy.clone())
         .unwrap_or_else(|| if account.locked { "private" } else { "public" }.to_string());
+    // `preferred_posting_language` cascade minus the server locale (no server
+    // locale setting exists here): first non-blank of `default_language`,
+    // the registration `locale`.
+    let posting_language = user
+        .and_then(|u| {
+            u.default_language
+                .clone()
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| u.locale.clone().filter(|v| !v.trim().is_empty()))
+        })
+        .map(Value::String)
+        .unwrap_or(Value::Null);
     json!({
         "posting:default:visibility": visibility,
         "posting:default:sensitive": user.and_then(|u| u.default_sensitive).unwrap_or(false),
-        "posting:default:language": user.and_then(|u| u.default_language.clone()),
+        "posting:default:language": posting_language,
         "posting:default:quote_policy": user
             .and_then(|u| u.default_quote_policy.clone())
             .unwrap_or_else(|| "public".to_string()),
-        "reading:expand:media": "default",
-        "reading:expand:spoilers": false,
-        "reading:autoplay:gifs": false,
+        "reading:expand:media": user
+            .and_then(|u| u.web_display_media.clone())
+            .unwrap_or_else(|| "default".to_string()),
+        "reading:expand:spoilers": user.and_then(|u| u.web_expand_spoilers).unwrap_or(false),
+        "reading:autoplay:gifs": user.and_then(|u| u.web_auto_play_gifs).unwrap_or(false),
     })
 }
 
@@ -266,9 +389,9 @@ pub fn instance_v1_json(
             "acct": a.acct(),
             "display_name": a.display_name,
             "locked": a.locked,
-            "bot": false,
-            "discoverable": true,
-            "indexable": false,
+            "bot": a.bot,
+            "discoverable": a.discoverable.map(Value::from).unwrap_or(Value::Null),
+            "indexable": a.indexable,
             "group": false,
             "created_at": date_only(a.created_at_ms),
             "note": a.note,
@@ -283,7 +406,11 @@ pub fn instance_v1_json(
             "statuses_count": 0,
             "last_status_at": Value::Null,
             "emojis": [],
-            "fields": [],
+            "fields": a.fields.iter().map(|field| json!({
+                "name": field.name,
+                "value": field.value,
+                "verified_at": field.verified_at.map(crate::api::mastodon::endpoints::admin_accounts::iso),
+            })).collect::<Vec<_>>(),
         })
     });
     json!({
@@ -302,8 +429,8 @@ pub fn instance_v1_json(
         "thumbnail": server.asset_url("preview.png"),
         "languages": ["en"],
         "registrations": server.registrations_open,
-        "approval_required": false,
-        "invites_enabled": false,
+        "approval_required": server.registrations_require_approval,
+        "invites_enabled": server.invites_enabled,
         "contact_account": contact,
         "rules": [],
         "configuration": v1_configuration(server),
@@ -324,7 +451,7 @@ pub fn instance_v2_json(
         "domain": server.domain,
         "title": server.site_title,
         "version": version_string(),
-        "source_url": "https://github.com/example/birchtree",
+        "source_url": "https://github.com/mastodon/mastodon",
         "description": server.site_description,
         "usage": { "users": { "active_month": stats.active_month } },
         "thumbnail": { "url": server.asset_url("preview.png") },
@@ -333,8 +460,8 @@ pub fn instance_v2_json(
         "configuration": v2_configuration(server),
         "registrations": {
             "enabled": server.registrations_open,
-            "approval_required": false,
-            "reason_required": false,
+            "approval_required": server.registrations_require_approval,
+            "reason_required": server.registrations_require_approval,
             "message": Value::Null,
             "min_age": Value::Null,
             "url": Value::Null,
@@ -359,7 +486,7 @@ fn v1_configuration(server: &ServerInfo) -> Value {
             "characters_reserved_per_url": 23,
         },
         "media_attachments": {
-            "supported_mime_types": [],
+            "supported_mime_types": crate::media::ingest::ACCEPTED_MIME_TYPES,
             "image_size_limit": 16_777_216,
             "image_matrix_limit": 33_177_600,
             "video_size_limit": 103_809_024,
@@ -384,7 +511,7 @@ fn v2_configuration(server: &ServerInfo) -> Value {
             "privacy_policy": server.asset_url("privacy-policy"),
             "terms_of_service": Value::Null,
         },
-        "vapid": { "public_key": "" },
+        "vapid": { "public_key": server.vapid_public_key },
         "accounts": {
             "max_display_name_length": 40,
             "max_note_length": 500,
@@ -405,7 +532,7 @@ fn v2_configuration(server: &ServerInfo) -> Value {
             "description_limit": 10_000,
             "image_matrix_limit": 33_177_600,
             "image_size_limit": 16_777_216,
-            "supported_mime_types": [],
+            "supported_mime_types": crate::media::ingest::ACCEPTED_MIME_TYPES,
             "video_frame_rate_limit": 120,
             "video_matrix_limit": 8_294_400,
             "video_size_limit": 103_809_024,
@@ -418,9 +545,18 @@ fn v2_configuration(server: &ServerInfo) -> Value {
         },
         "translation": { "enabled": false },
         "timelines_access": {
-            "live_feeds": { "local": "public", "remote": "public" },
-            "hashtag_feeds": { "local": "public", "remote": "public" },
-            "trending_link_feeds": { "local": "public", "remote": "public" },
+            "live_feeds": {
+                "local": server.local_live_feed_access,
+                "remote": server.remote_live_feed_access,
+            },
+            "hashtag_feeds": {
+                "local": server.local_topic_feed_access,
+                "remote": server.remote_topic_feed_access,
+            },
+            "trending_link_feeds": {
+                "local": server.local_topic_feed_access,
+                "remote": server.remote_topic_feed_access,
+            },
         },
         "limited_federation": false,
     })

@@ -644,6 +644,7 @@ async fn push_encrypted_delivery_decrypts() {
             true,
             "all".to_string(),
             HashMap::from([("mention".to_string(), true)]),
+            None,
             T0,
         )
         .expect("subscribe");
@@ -709,6 +710,8 @@ async fn push_tickle_fallback_preserved() {
         standard: false,
         policy: "all".into(),
         alerts: HashMap::from([("mention".to_string(), true)]),
+        unsubscribe_token: String::new(),
+        unsubscribe_url: None,
         created_at_ms: 0,
         updated_at_ms: 0,
     };

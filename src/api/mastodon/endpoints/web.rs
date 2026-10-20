@@ -271,6 +271,13 @@ pub async fn push_destroy(
         Ok(None) => {}
         Err(err) => return ApiError::from(err).into_response(),
     }
+    // Bearer path for API (OAuth) subscriptions (fix round P2 #16c): same
+    // unconditional `200 {}` on a hit, still exempt from CSRF/session.
+    match store.destroy_api_push_subscription_by_token(&raw) {
+        Ok(Some(_)) => return axum::Json(serde_json::json!({})).into_response(),
+        Ok(None) => {}
+        Err(err) => return ApiError::from(err).into_response(),
+    }
     let Some(user_id) = user else {
         return axum::Json(serde_json::json!({})).into_response();
     };

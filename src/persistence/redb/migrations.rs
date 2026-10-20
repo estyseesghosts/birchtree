@@ -5,7 +5,7 @@
 //! any missing table, so re-running a step is harmless. The runner refuses to
 //! open a database written by a newer build.
 
-use redb::{Database, ReadableDatabase};
+use redb::{Database, ReadableDatabase, ReadableTable};
 
 use super::schema::{
     self, ACCESS_TOKENS, ACCOUNTS, ACCOUNT_NOTES, ACCOUNT_STATS, AUTHORIZATION_CODES, BLOCKS,
@@ -457,6 +457,60 @@ pub fn apply(db: &Database) -> Result<u64, StoreError> {
         // shape; no backfill (pre-v15 accounts have no recorded code).
         if current < 15 {
             let _ = write.open_table(schema::INVITE_USES)?;
+        }
+
+        // Step v16: rekey `QUOTES_BY_QUOTED` from
+        // `(quoted || quoting) -> quote_id` to `(quoted || quote_id) ->
+        // quoting_id` (fix round P2 #2: upstream paginates Quote rows by
+        // quote id). Old entries carry everything needed: the quote id is
+        // the old value, the quoting id is the old key suffix. New keys are
+        // written first, then stale old keys are removed — except where an
+        // old key is byte-identical to its new key (quote_id ==
+        // quoting_id), which already holds the correct value.
+        if current < 16 {
+            let rewrites: Vec<([u8; 16], [u8; 16])> = {
+                let quotes = write.open_table(schema::QUOTES)?;
+                let mut rewrites = Vec::new();
+                for entry in quotes.iter()? {
+                    let (_, value) = entry?;
+                    let record: crate::domain::QuoteRecord = serde_json::from_slice(
+                        value.value(),
+                    )
+                    .map_err(|err| {
+                        StoreError::Migration(format!("quote row decode: {err}"))
+                    })?;
+                    let mut old_key = [0u8; 16];
+                    old_key[..8]
+                        .copy_from_slice(&record.quoted_status_id.value().to_be_bytes());
+                    old_key[8..16]
+                        .copy_from_slice(&record.quoting_status_id.value().to_be_bytes());
+                    let mut new_key = [0u8; 16];
+                    new_key[..8]
+                        .copy_from_slice(&record.quoted_status_id.value().to_be_bytes());
+                    new_key[8..16].copy_from_slice(&record.id.value().to_be_bytes());
+                    rewrites.push((old_key, new_key));
+                }
+                rewrites
+            };
+            if !rewrites.is_empty() {
+                let quotes = write.open_table(schema::QUOTES)?;
+                let mut by_quoted = write.open_table(schema::QUOTES_BY_QUOTED)?;
+                for (old_key, new_key) in &rewrites {
+                    // New value = quoting id, recovered from the old key.
+                    let mut quoting = [0u8; 8];
+                    quoting.copy_from_slice(&old_key[8..16]);
+                    by_quoted.insert(
+                        new_key.as_slice(),
+                        u64::from_be_bytes(quoting),
+                    )?;
+                }
+                drop(quotes);
+                for (old_key, new_key) in &rewrites {
+                    if old_key != new_key {
+                        by_quoted.remove(old_key.as_slice())?;
+                    }
+                }
+            }
         }
 
         {

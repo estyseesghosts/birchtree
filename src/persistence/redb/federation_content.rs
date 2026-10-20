@@ -3,7 +3,7 @@
 //! jobs that outbound federation reads. Each mutation commits in one `redb`
 //! transaction with the job it causes (`birchtree.md` §5); no network I/O here.
 
-use redb::{ReadableTable, WriteTransaction};
+use redb::{ReadableTable, ReadableTableMetadata, WriteTransaction};
 
 use crate::application::federation_ports::{FederationContentStore, NewQuote, NewReport};
 use crate::domain::federation::RefreshRecord;
@@ -17,6 +17,13 @@ use super::schema::{
     UNRESOLVED_PARENT,
 };
 use super::{decode, encode, RedbStore, StoreResult};
+
+/// Amortized dedup bound (fix round P2 #20b): past this many rows a record
+/// also prunes expired entries (same txn, capped below), so the table hovers
+/// near the 7-day ingest volume with no scheduler.
+const ACTIVITY_DEDUP_PRUNE_TRIGGER: u64 = 10_000;
+/// Max expired rows dropped per triggering record.
+const ACTIVITY_DEDUP_PRUNE_CAP: usize = 512;
 
 /// Enqueue the federation event for a local actor's change, in the caller's
 /// transaction. Remote actors cause no outbound event, so the call is a no-op
@@ -93,6 +100,27 @@ impl FederationContentStore for RedbStore {
         {
             let mut dedup = write.open_table(ACTIVITY_DEDUP)?;
             dedup.insert(activity_uri, now_ms)?;
+            // Amortized bound (fix round P2 #20b): the table only grows
+            // here, so prune here — capped, same transaction. The trigger
+            // keeps the steady-state table near the 7-day ingest volume.
+            if dedup.len()? > ACTIVITY_DEDUP_PRUNE_TRIGGER {
+                let cutoff = now_ms.saturating_sub(crate::federation::dedup::DEDUP_TTL_MS);
+                let mut dropped = 0usize;
+                let stale: Vec<String> = dedup
+                    .iter()?
+                    .filter_map(|entry| {
+                        entry.ok().and_then(|(key, value)| {
+                            (value.value() <= cutoff).then(|| key.value().to_string())
+                        })
+                    })
+                    .take(ACTIVITY_DEDUP_PRUNE_CAP)
+                    .collect();
+                for uri in stale {
+                    dedup.remove(uri.as_str())?;
+                    dropped += 1;
+                }
+                let _ = dropped;
+            }
         }
         write.commit()?;
         Ok(())
@@ -102,6 +130,29 @@ impl FederationContentStore for RedbStore {
         let read = self.begin_read()?;
         let table = read.open_table(ACTIVITY_DEDUP)?;
         Ok(table.get(activity_uri)?.is_some())
+    }
+
+    fn prune_activities_before(&self, cutoff_ms: u64, cap: usize) -> Result<usize> {
+        let write = self.begin_write()?;
+        let mut dropped = 0usize;
+        {
+            let mut dedup = write.open_table(ACTIVITY_DEDUP)?;
+            let stale: Vec<String> = dedup
+                .iter()?
+                .filter_map(|entry| {
+                    entry.ok().and_then(|(key, value)| {
+                        (value.value() <= cutoff_ms).then(|| key.value().to_string())
+                    })
+                })
+                .take(cap)
+                .collect();
+            for uri in stale {
+                dedup.remove(uri.as_str())?;
+                dropped += 1;
+            }
+        }
+        write.commit()?;
+        Ok(dropped)
     }
 
     fn record_remote_tombstone(&self, uri: &str, now_ms: u64) -> Result<bool> {
@@ -370,8 +421,10 @@ impl FederationContentStore for RedbStore {
             action_taken_at_ms: None,
             action_taken_by_account_id: None,
             assigned_account_id: None,
-            category: "other".to_string(),
-            rule_ids: Vec::new(),
+            category: input.category,
+            rule_ids: input.rule_ids,
+            forward_to_domains: input.forward_to_domains,
+            collection_ids: input.collection_ids.iter().map(|id| id.value()).collect(),
             updated_at_ms: now_ms,
         };
         {

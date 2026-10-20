@@ -83,9 +83,12 @@ pub(super) fn attach_quote_txn(
     }
     {
         let mut by_quoted = write.open_table(QUOTES_BY_QUOTED)?;
+        // Keyed by (quoted id, quote id): upstream paginates `Quote` rows by
+        // quote id (`quotes_controller.rb:29-44`); the quoting status id is
+        // the value (fix round P2 #2; pre-v16 rows are rekeyed by migration).
         by_quoted.insert(
-            schema::pair_key(spec.quoted_status_id.value(), quoting_status_id.value()).as_slice(),
-            quote_id.value(),
+            schema::pair_key(spec.quoted_status_id.value(), quote_id.value()).as_slice(),
+            quoting_status_id.value(),
         )?;
     }
     {
@@ -161,27 +164,28 @@ impl QuoteStore for RedbStore {
         let lower = schema::pair_key(quoted_status_id.value(), 0);
         let upper = schema::pair_key(quoted_status_id.value(), u64::MAX);
 
-        // Collect (quoting status id, quote id) pairs for this quoted status,
-        // bounded by the scan cap.
+        // Collect (quote id, quoting status id) pairs for this quoted
+        // status, bounded by the scan cap.
         let mut pairs: Vec<(u64, u64)> = Vec::new();
         {
             let by_quoted = write.open_table(QUOTES_BY_QUOTED)?;
             for entry in by_quoted.range(lower.as_slice()..=upper.as_slice())? {
                 let (key, value) = entry?;
-                let quoting = u64::from_be_bytes(key.value()[8..].try_into().unwrap());
-                pairs.push((quoting, value.value()));
+                let bytes = key.value();
+                let quote = u64::from_be_bytes(bytes[8..].try_into().unwrap());
+                pairs.push((quote, value.value()));
                 if pairs.len() >= SCAN_CAP {
                     break;
                 }
             }
         }
-        // Keys ascend by quoting id; newest first is a descending scan.
+        // Keys ascend by quote id; newest first is a descending scan.
         pairs.reverse();
 
         let mut out: Vec<(QuoteRecord, Status)> = Vec::new();
-        for (quoting, quote_id) in pairs {
+        for (quote_id, quoting) in pairs {
             let quoting_status_id = Id::new(quoting);
-            if max_id.is_some_and(|max| quoting_status_id >= max) {
+            if max_id.is_some_and(|max| Id::new(quote_id) >= max) {
                 continue;
             }
             if out.len() >= limit {
@@ -214,10 +218,12 @@ impl QuoteStore for RedbStore {
     ) -> Result<QuoteRecord> {
         let _ = now_ms; // The state machine records no transition timestamp.
         let write = self.begin_write()?;
-        let lookup = schema::pair_key(quoted_status_id.value(), quoting_status_id.value());
+        // Resolve the quote id through the quoting-status index, then check
+        // it quotes this status (the by-quoted index is keyed by quote id
+        // since the P2 #2 rekey, so a direct pair lookup no longer exists).
         let quote_id = {
-            let by_quoted = write.open_table(QUOTES_BY_QUOTED)?;
-            match by_quoted.get(lookup.as_slice())? {
+            let by_quoting = write.open_table(QUOTES_BY_QUOTING)?;
+            match by_quoting.get(quoting_status_id.value())? {
                 Some(guard) => Id::new(guard.value()),
                 None => {
                     return Err(Error::NotFound(format!(
@@ -228,6 +234,11 @@ impl QuoteStore for RedbStore {
         };
         let mut quote = read_quote_txn(&write, quote_id)?
             .ok_or_else(|| Error::NotFound(format!("quote {quote_id}")))?;
+        if quote.quoted_status_id != quoted_status_id {
+            return Err(Error::NotFound(format!(
+                "quote on status {quoted_status_id} by {quoting_status_id}"
+            )));
+        }
 
         // Mastodon's `Quote#reject!`: an accepted quote is revoked and its
         // counter decremented; any other non-revoked state becomes rejected;

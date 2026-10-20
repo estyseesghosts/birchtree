@@ -19,6 +19,10 @@ pub enum FedError {
     Domain(#[from] DomainError),
     #[error("refused: {0}")]
     Refused(String),
+    /// The document is gone (a suspended account's WebFinger, a deleted
+    /// status's Tombstone): answer 410 so remotes stop retrying.
+    #[error("gone: {0}")]
+    Gone(String),
     /// A well-formed activity of a kind outside the compatibility profile (a `Question`, for one).
     #[error("unsupported: {0}")]
     Unsupported(String),
@@ -58,6 +62,7 @@ impl FedError {
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             },
             FedError::Refused(_) => StatusCode::FORBIDDEN,
+            FedError::Gone(_) => StatusCode::GONE,
             // Same status as an unparseable body: permanent, so the remote does not retry.
             FedError::Unsupported(_) => StatusCode::UNPROCESSABLE_ENTITY,
         }
@@ -77,6 +82,8 @@ impl From<FedError> for DomainError {
         match err {
             FedError::Domain(e) => e,
             FedError::Refused(msg) => DomainError::Forbidden(msg),
+            // No 410 in the domain error set; a gone remote reads as missing.
+            FedError::Gone(msg) => DomainError::NotFound(msg),
             FedError::Unsupported(msg) => DomainError::InvalidInput(msg),
             FedError::Protocol(ProtocolError::UrlVerificationError(msg)) => {
                 DomainError::Forbidden(msg.to_string())

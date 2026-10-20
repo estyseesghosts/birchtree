@@ -241,6 +241,8 @@ pub fn federation_config_with(
                 context,
                 &public_url,
                 false,
+                "Birchtree Test",
+                "Test instance",
                 &http,
                 debug,
                 None,

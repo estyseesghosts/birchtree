@@ -550,6 +550,7 @@ pub async fn follow_requests(
         store,
         viewer,
         page.max_id,
+        page.since_id,
         page.limit,
     ) {
         Ok(requests) => requests,
@@ -750,7 +751,7 @@ enum Edge {
 
 async fn account_edge_list(
     state: &ApiState,
-    _auth: &OptionalAuth,
+    auth: &OptionalAuth,
     target: String,
     uri: Uri,
     edge: Edge,
@@ -759,14 +760,20 @@ async fn account_edge_list(
         Ok(page) => page,
         Err(err) => return err.into_response(),
     };
+    let viewer = auth.0.as_ref().and_then(|a| a.token.user_id);
     let store: &dyn Store = &*state.context.store;
     let target = match require_account(store, &target) {
         Ok(account) => account,
         Err(err) => return err.into_response(),
     };
+    let now_ms = state.context.now_ms();
     let ids = match edge {
-        Edge::Followers => relationships::followers_of(store, target.id, page.max_id, page.limit),
-        Edge::Following => relationships::following_of(store, target.id, page.max_id, page.limit),
+        Edge::Followers => {
+            relationships::followers_of(store, viewer, target.id, page.max_id, page.limit, now_ms)
+        }
+        Edge::Following => {
+            relationships::following_of(store, viewer, target.id, page.max_id, page.limit, now_ms)
+        }
     };
     let ids = match ids {
         Ok(ids) => ids,
@@ -806,11 +813,22 @@ pub async fn account_endorsements(
     if store.account_by_id(target_id).ok().flatten().is_none() {
         return axum::Json(Vec::<Value>::new()).into_response();
     }
-    let ids = match relationships::list_endorsements(store, target_id, page.max_id, page.limit) {
+    // Upstream `unlimited?` (`limit=0`): the whole collection, no cursors.
+    let (max_id, limit, unlimited) = if wants_unlimited(&uri) {
+        (None, UNLIMITED_FETCH, true)
+    } else {
+        (page.max_id, page.limit, false)
+    };
+    let ids = match relationships::list_endorsements(store, target_id, max_id, limit) {
         Ok(ids) => ids,
         Err(err) => return ApiError::from(err).into_response(),
     };
     let accounts = load_accounts(store, &ids);
+    if unlimited {
+        // Upstream `next_path`/`prev_path` return nil when unlimited: no
+        // `Link` header at all.
+        return axum::Json(accounts_json(&state, store, &accounts)).into_response();
+    }
     accounts_page(&uri, &accounts, page.limit, store, &state)
 }
 
@@ -832,17 +850,50 @@ pub async fn endorsements_index(
         Err(err) => return err.into_response(),
     };
     let store: &dyn Store = &*state.context.store;
-    let ids = match relationships::list_endorsements(store, viewer, page.max_id, page.limit) {
+    // Upstream `unlimited?` (`limit=0`): the whole collection, no cursors.
+    let (max_id, limit, unlimited) = if wants_unlimited(&uri) {
+        (None, UNLIMITED_FETCH, true)
+    } else {
+        (page.max_id, page.limit, false)
+    };
+    let ids = match relationships::list_endorsements(store, viewer, max_id, limit) {
         Ok(ids) => ids,
         Err(err) => return ApiError::from(err).into_response(),
     };
     let accounts = load_accounts(store, &ids);
+    if unlimited {
+        return axum::Json(accounts_json(&state, store, &accounts)).into_response();
+    }
     accounts_page(&uri, &accounts, page.limit, store, &state)
 }
 
-/// Load accounts for ids, silently skipping ids that no longer resolve.
+/// Load accounts for ids, silently skipping ids that no longer resolve and
+/// suspended accounts (upstream `without_suspended` on both endorsements
+/// endpoints at pin `8ff11c2b`).
 fn load_accounts(store: &dyn Store, ids: &[Id]) -> Vec<Account> {
     ids.iter()
-        .filter_map(|id| store.account_by_id(*id).ok().flatten())
+        .filter_map(|id| {
+            store
+                .account_by_id(*id)
+                .ok()
+                .flatten()
+                .filter(|account| !account.suspended)
+        })
         .collect()
 }
+
+/// Whether the raw query asks for the whole collection (`limit=0`, upstream
+/// `unlimited?` in `endorsements_controller.rb` / `lists/accounts_controller.rb`
+/// at pin `8ff11c2b`). Our shared `pagination::parse` maps `0` to the default
+/// limit, so the raw value is inspected here.
+fn wants_unlimited(uri: &Uri) -> bool {
+    let pairs = match uri.query() {
+        Some(query) => forms::parse(query.as_bytes()),
+        None => Vec::new(),
+    };
+    forms::get(&pairs, "limit").is_some_and(|raw| raw.trim() == "0")
+}
+
+/// Fetch size for an unlimited endorsements read. The store still bounds the
+/// scan (`ENDORSEMENT_SCAN_CAP`), so this only needs to exceed any real page.
+const UNLIMITED_FETCH: usize = usize::MAX / 2;
