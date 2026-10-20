@@ -249,6 +249,8 @@ pub struct InstanceStats {
     pub user_count: u64,
     pub status_count: u64,
     pub domain_count: u64,
+    /// Unique sign-in-log accounts over the trailing 4 weeks (round 3, D31).
+    pub active_month: u64,
 }
 
 /// `REST::V1::InstanceSerializer`.
@@ -311,7 +313,7 @@ pub fn instance_v1_json(
 /// `REST::InstanceSerializer` (API v2 shape).
 pub fn instance_v2_json(
     server: &ServerInfo,
-    _stats: InstanceStats,
+    stats: InstanceStats,
     contact_account: Option<&Account>,
 ) -> Value {
     let contact = json!({
@@ -324,7 +326,7 @@ pub fn instance_v2_json(
         "version": version_string(),
         "source_url": "https://github.com/example/birchtree",
         "description": server.site_description,
-        "usage": { "users": { "active_month": 0 } },
+        "usage": { "users": { "active_month": stats.active_month } },
         "thumbnail": { "url": server.asset_url("preview.png") },
         "icon": [],
         "languages": ["en"],

@@ -135,17 +135,68 @@ pub async fn nodeinfo_links(data: Data<FedContext>) -> Json<serde_json::Value> {
     }))
 }
 
-/// `GET /nodeinfo/2.0`. The `usage` block is not published: birchtree has no
-/// count of local accounts or posts separate from remote ones yet.
+/// `GET /nodeinfo/2.0`. The `usage` block carries real local-only counts
+/// (round 3, D31): local accounts, unique password sign-ins over the trailing
+/// 4 and 24 weeks (upstream `active_user_count(4/24)` over
+/// `activity:logins`), and non-deleted statuses by local authors (upstream
+/// `local_status_count`). A failed scan degrades that counter to zero rather
+/// than failing the document; every counter is measured, never fabricated.
 pub async fn nodeinfo(data: Data<FedContext>) -> Json<serde_json::Value> {
+    let (users_total, active_month, active_halfyear, local_posts) = nodeinfo_usage(&data);
     Json(json!({
         "version": "2.0",
         "software": {"name": "birchtree", "version": env!("CARGO_PKG_VERSION")},
         "protocols": ["activitypub"],
         "services": {"inbound": [], "outbound": []},
+        "usage": {
+            "users": {
+                "total": users_total,
+                "activeMonth": active_month,
+                "activeHalfyear": active_halfyear,
+            },
+            "localPosts": local_posts,
+        },
         "openRegistrations": data.registrations_open,
         "metadata": {}
     }))
+}
+
+/// `(local users, active 4w, active 24w, local posts)` for NodeInfo.
+fn nodeinfo_usage(data: &Data<FedContext>) -> (u64, u64, u64, u64) {
+    use std::collections::HashSet;
+    const SCAN_CAP: usize = 200_000;
+    const WEEK_MS: u64 = 7 * 86_400_000;
+    let store = &data.app.store;
+    let now = data.app.now_ms();
+    let accounts = store.admin_accounts_overview(SCAN_CAP).unwrap_or_default();
+    let local_ids: HashSet<crate::domain::Id> = accounts
+        .iter()
+        .filter(|account| account.local)
+        .map(|account| account.id)
+        .collect();
+    let sign_ins = store.admin_sign_ins(SCAN_CAP).unwrap_or_default();
+    let unique_since = |since_ms: u64| {
+        sign_ins
+            .iter()
+            .filter(|(_, at)| *at >= since_ms && *at <= now)
+            .map(|(who, _)| *who)
+            .collect::<HashSet<_>>()
+            .len() as u64
+    };
+    let posts = store
+        .admin_status_metrics(SCAN_CAP)
+        .map(|rows| {
+            rows.iter()
+                .filter(|row| local_ids.contains(&row.account_id))
+                .count() as u64
+        })
+        .unwrap_or(0);
+    (
+        local_ids.len() as u64,
+        unique_since(now.saturating_sub(4 * WEEK_MS)),
+        unique_since(now.saturating_sub(24 * WEEK_MS)),
+        posts,
+    )
 }
 
 /// `POST /inbox`: the shared inbox. Any local recipient is served by the same handler.

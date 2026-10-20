@@ -352,9 +352,12 @@ fn decision_table_per_input_class() {
     assert_eq!(plan_for_mime("audio/ogg"), Passthrough);
     assert_eq!(plan_for_mime("audio/mpeg"), Passthrough);
     assert_eq!(plan_for_mime("audio/mp4"), Passthrough);
-    // HEIC/TIFF are not accepted uploads (the sniffer rejects them), so they
-    // never reach the planner; unknown types take the legacy path.
-    assert_eq!(plan_for_mime("image/heic"), Passthrough);
+    // HEIC/HEIF/TIFF are accepted D4 stills (round 3): they route to the
+    // WebP transcode, never the legacy path.
+    assert_eq!(plan_for_mime("image/heic"), ImageToWebp);
+    assert_eq!(plan_for_mime("image/heif"), ImageToWebp);
+    assert_eq!(plan_for_mime("image/tiff"), ImageToWebp);
+    assert_eq!(plan_for_mime("image/x-tiff"), ImageToWebp);
     assert!(needs_transcode("image/gif"));
     assert!(needs_transcode("video/mp4"));
     assert!(!needs_transcode("image/webp"));

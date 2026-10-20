@@ -28,6 +28,13 @@ pub enum StreamEvent {
     /// A notification row was created. Delivered as `notification` to the
     /// recipient's streams.
     Notification { notification_id: Id },
+    /// A notification request was accepted: the actor's filtered rows were
+    /// unhidden. Delivered as `notifications_merged` (payload `"1"`, as
+    /// upstream's `UnfilterNotificationsWorker`) to the recipient's `user`
+    /// (with notifications in scope) and `user:notification` streams.
+    /// Publish only when the accept actually merged something; a no-op
+    /// accept publishes nothing (this is what the D20 lock test pins).
+    NotificationsMerged { recipient_id: Id },
     /// Live policy removed visibility for these viewers (a block, mute,
     /// unfollow or domain block). Their connections drop every frame queued
     /// before this event is processed.

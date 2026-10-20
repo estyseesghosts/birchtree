@@ -46,7 +46,9 @@ pub use follow::{Follow, FollowState};
 pub use relationship::{
     AccountNote, AccountStats, Block, DomainBlock, Endorsement, Mute,
 };
-pub use notification::{Notification, NotificationType};
+pub use notification::{
+    Notification, NotificationPolicy, NotificationRequest, NotificationType, PolicyAction,
+};
 pub use poll::{Poll, PollOption, PollVote};
 pub use quote::{QuoteRecord, QuoteState};
 pub use media::{FocusPoint, MediaAttachment, MediaState};

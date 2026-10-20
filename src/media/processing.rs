@@ -16,6 +16,11 @@
 //! - video → WebM/VP9 + Opus, except VP9/WebM + Opus-or-silent within the
 //!   upload size limit, which passes through;
 //! - stills → WebP (WebP passes through); the `small` preview is WebP too.
+//!   HEIC/HEIF/TIFF stills (D4) always take the ffmpeg `ImageToWebp` path
+//!   when transcoding is enabled; the pure-Rust decoders below cannot read
+//!   them, so with transcoding disabled (or an undecodable input) they fail
+//!   as [`ProcessError::Unidentifiable`] — a refused `Failed` row, never a
+//!   silent success and never fabricated bytes.
 //!
 //! Every ffmpeg command carries `-map_metadata 0` and no strip filter:
 //! metadata (EXIF, orientation tag) rides along, never applied to pixels.
@@ -88,6 +93,11 @@ pub struct Processed {
 
 /// Process the original bytes of an attachment classified as `mime_type`
 /// (the *sniffed* content type, never the declared one).
+///
+/// HEIC/HEIF/TIFF have no pure-Rust decoder here on purpose: those rows take
+/// the ffmpeg `ImageToWebp` job when transcoding is enabled, and answering
+/// `Unidentifiable` on the legacy path keeps a toolchain-less server honest
+/// (the row commits `Failed`, surfaced as 422) instead of guessing.
 pub fn process(mime_type: &str, bytes: &[u8]) -> Result<Processed, ProcessError> {
     if mime_type.starts_with("image/") {
         return process_image(mime_type, bytes);

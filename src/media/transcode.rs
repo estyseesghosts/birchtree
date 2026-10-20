@@ -11,7 +11,12 @@
 //!   within the upload size limit keeps its codecs — byte-identical when
 //!   already WebM, stream-copied (`-c copy`, no re-encode) into WebM
 //!   otherwise, so served bytes are always WebM.
-//! - Still images (JPEG, PNG, BMP, ...) → WebP (D4). WebP passes through.
+//! - Still images (JPEG, PNG, BMP, HEIC/HEIF, TIFF, ...) → WebP (D4).
+//!   WebP passes through. Upstream converts only HEIC, HEIF and AVIF to
+//!   JPEG (`IMAGE_CONVERTIBLE_MIME_TYPES` → `IMAGE_CONVERTED_STYLES`,
+//!   `media_attachment.rb:65,88-95,328-332`) and currently accepts none of
+//!   them (`IMAGE_MIME_TYPES`, `:53,64-65`); birchtree accepts HEIC/HEIF/TIFF
+//!   and converts every still to WebP instead.
 //!   The generated `small` preview is WebP too.
 //! - Audio is not transcoded and keeps the legacy processing path.
 //! - Metadata is never stripped: every ffmpeg command carries
@@ -338,7 +343,11 @@ pub enum TranscodePlan {
 pub fn plan_for_mime(mime_type: &str) -> TranscodePlan {
     match mime_type {
         "image/gif" => TranscodePlan::GifToWebm,
-        "image/jpeg" | "image/png" | "image/bmp" => TranscodePlan::ImageToWebp,
+        // D4 stills → WebP. `image/x-tiff` is the legacy alias for TIFF
+        // (the sniffer reports canonical `image/tiff`); both spellings map
+        // here so a row carrying either one still converges to WebP.
+        "image/jpeg" | "image/png" | "image/bmp" | "image/heic" | "image/heif"
+        | "image/tiff" | "image/x-tiff" => TranscodePlan::ImageToWebp,
         "image/webp" => TranscodePlan::Passthrough,
         mime if mime.starts_with("video/") => TranscodePlan::VideoToWebm,
         _ => TranscodePlan::Passthrough,
@@ -1172,11 +1181,17 @@ fn run_transcode_plan(
         return run_remux_to_webm(store, blobs, media, bytes, now_ms, config);
     }
     let with_audio = plan == TranscodePlan::VideoToWebm && probe_has_audio(bytes, config);
-    let input_ext = match plan {
-        TranscodePlan::ImageToWebp => "img",
-        TranscodePlan::GifToWebm => "gif",
-        TranscodePlan::VideoToWebm | TranscodePlan::VideoRemux => "vid",
-        TranscodePlan::Passthrough => "bin",
+    // Demuxer hint only (ffmpeg sniffs content): real extensions keep ffmpeg
+    // from mis-probing BOM-less stills, and bound the temp-file namespace.
+    let input_ext = match media.mime_type.as_str() {
+        "image/heic" | "image/heif" => "heic",
+        "image/tiff" | "image/x-tiff" => "tif",
+        _ => match plan {
+            TranscodePlan::ImageToWebp => "img",
+            TranscodePlan::GifToWebm => "gif",
+            TranscodePlan::VideoToWebm | TranscodePlan::VideoRemux => "vid",
+            TranscodePlan::Passthrough => "bin",
+        },
     };
     match transcode_bytes(bytes, input_ext, plan, with_audio, config) {
         Ok((derived, _stats)) => commit_derived(store, blobs, media, bytes, &derived, plan, now_ms, config),
@@ -1483,6 +1498,12 @@ mod tests {
         assert_eq!(plan_for_mime("image/jpeg"), ImageToWebp);
         assert_eq!(plan_for_mime("image/png"), ImageToWebp);
         assert_eq!(plan_for_mime("image/bmp"), ImageToWebp);
+        // D4 extension: HEIC/HEIF/TIFF stills → WebP (upstream converts only
+        // HEIC/HEIF/AVIF to JPEG and currently accepts none of them).
+        assert_eq!(plan_for_mime("image/heic"), ImageToWebp);
+        assert_eq!(plan_for_mime("image/heif"), ImageToWebp);
+        assert_eq!(plan_for_mime("image/tiff"), ImageToWebp);
+        assert_eq!(plan_for_mime("image/x-tiff"), ImageToWebp);
         assert_eq!(plan_for_mime("image/gif"), GifToWebm);
         assert_eq!(plan_for_mime("image/webp"), Passthrough);
         assert_eq!(plan_for_mime("video/mp4"), VideoToWebm);
@@ -1493,6 +1514,9 @@ mod tests {
         assert_eq!(plan_for_mime("application/pdf"), Passthrough);
         assert!(needs_transcode("image/gif"));
         assert!(needs_transcode("image/jpeg"));
+        assert!(needs_transcode("image/heic"));
+        assert!(needs_transcode("image/heif"));
+        assert!(needs_transcode("image/tiff"));
         assert!(needs_transcode("video/mp4"));
         assert!(!needs_transcode("image/webp"));
         assert!(!needs_transcode("audio/ogg"));

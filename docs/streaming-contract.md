@@ -65,7 +65,7 @@ Payloads:
 | `user` | `update`, `status.update`, `delete`; `notification` (with notifications in scope); `status.update` for an edit that mentions the viewer (upstream's notifications channel, folded in) | Home gate: own statuses; statuses from followed authors; direct only to mentioned viewers; reply rules; reblogs only where the follow shows reblogs and the target passes; exclusive-list members left out (D10b); blocks, mutes and domain blocks (author); `delete` on the pre-deletion snapshot |
 | `user:notification` | `notification`; `status.update` for an edit that mentions the viewer | Recipient is the viewer. Birchtree does not drop notifications from blocked or muted accounts (upstream does; D26) |
 | `public` | `update`, `status.update`, `delete` | Public visibility, not a reblog, the public reply rule (self-replies and top-level only); author not blocked, muted or domain-blocked; for a logged-in viewer, no mentioned account blocked or muted (upstream's streaming check). The viewer's `chosen_languages` filter `update`/`status.update` when set (D21). `delete` is sent without a viewer check, as upstream does |
-| `public:local`, `public:remote` | as `public` | Origin: local is the author's account being local; remote is not. Remote is empty until Phase 6 (D19) |
+| `public:local`, `public:remote` | as `public` | Origin: local is the author's account being local; remote is not (D19, closed round 3) |
 | `public:media` and the local/remote media variants | as `public` | Only statuses with media attachments |
 | `hashtag`, `hashtag:local` | `update`, `status.update`, `delete` | Public, not a reblog, carries the normalized tag (`normalize_tag`, as the REST tag timeline; not upstream's `normalizeHashtag`, D25); replies kept (upstream's hashtag streams keep them); author and mention block or mute check; the viewer's `chosen_languages` filter `update`/`status.update` when set (D21); `local` also requires a local author |
 | `list` | `update`, `status.update`, `delete` | The list timeline's rules (`ListFilter`): members only, the list's replies policy, the home reblog rules; the owner's own statuses |
@@ -86,7 +86,7 @@ Publication runs after a use case commits, in the adapter, never inside a storag
 - **Unfollow, remove follower, domain block**: the affected viewer's epoch rises. No `delete` is sent, as upstream does not send one for an unfollow or a domain block.
 - **Token revoked** (`POST /oauth/revoke`): every connection of that token closes (the SSE body ends; the WebSocket receives a close frame). Suspension and disablement revoke the account's tokens and publish one `TokenRevoked` per token (D24); the sockets close and reuse answers `401`.
 - **Filter create, update or delete**: no event. Upstream's `filters_changed` has no payload, so its streaming server never transmits it. `filtered` is computed at delivery, so a filter change applies to every later frame.
-- **Not yet published** (no source in birchtree yet): `notifications_merged` (explicit planned gap: ships with the notification-request filter pipeline; until then never sent; D20). Suspension/disablement `kill` is shipped as token kill (D24).
+- **Merge**: accepting a notification request publishes `notifications_merged` (payload `"1"`, round 3, D20) on the recipient's `user:notification` streams; dismiss is silent.
 
 ## Ordering, liveness and the no-leak rule
 
@@ -127,8 +127,8 @@ The register (`docs/compatibility-profile.md`) carries each row. In summary:
 - D16: a streaming path on the configured streaming host's own origin is served, not `404`.
 - D17: `Vary: Authorization` on streaming responses (upstream's Node service sends none; no client reads it).
 - D18: the `direct` stream carried `conversation` events since Phase 7 (2026-10-20).
-- D19: the `public:remote` streams are silent until Phase 6.
-- D20: `notifications_merged` is a planned gap, never sent until the request pipeline ships.
+- D19: the `public:remote` streams emit remote statuses since federation (closed round 3).
+- D20: `notifications_merged` is emitted on real merges only (shipped round 3).
 - D21: `chosen_languages` filter on public REST + public/hashtag streams (set via the `update_credentials` extension).
 - D22: home keeps mention-blocked/muted statuses by default; per-user `Collapse` (fold) or `Filter` (upstream-like removal) via `home_mention_policy` (2026-10-20).
 - D23: the home gate applies a follow's language preference (`Follow.languages`) (2026-10-20).

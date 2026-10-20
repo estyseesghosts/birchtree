@@ -101,6 +101,17 @@ pub struct Config {
     /// Directory holding keystodon's built first-party bundle. `None`
     /// (default) means the bundle is not deployed: `/app/*` answers 404.
     pub web_client_dir: Option<PathBuf>,
+    /// Whether invite tokens are honored (round 3, area A). When false, a
+    /// supplied `invite_code` is refused with reason and invites never open
+    /// closed registrations. On by default (upstream always models invites).
+    pub invites_enabled: bool,
+    /// SMTP provider URL (`smtp://` or `smtps://`). `None` (default) means
+    /// outbound mail is explicitly disabled: confirmation/reset sends fail
+    /// with `503 Email delivery is not configured`, never a silent success.
+    pub smtp_url: Option<String>,
+    /// Envelope sender for outbound mail. Required when `smtp_url` is set;
+    /// setting it without `smtp_url` is a configuration error.
+    pub mail_from: Option<String>,
 }
 
 impl Default for Config {
@@ -140,6 +151,9 @@ impl Default for Config {
             vapid_public_key: String::new(),
             vapid_private_key: String::new(),
             web_client_dir: None,
+            invites_enabled: true,
+            smtp_url: None,
+            mail_from: None,
         }
     }
 }
@@ -211,7 +225,40 @@ impl Config {
                 );
             }
         }
+        // Mail: a half-configured provider is a hard startup error, never a
+        // silent pass (round 3, area A). Unconfigured mail is a valid state —
+        // sends then fail explicitly with 503 at the HTTP layer.
+        match (&self.smtp_url, &self.mail_from) {
+            (None, None) => {}
+            (None, Some(_)) => {
+                return Err(
+                    "--mail-from is set but --smtp-url is not; mail would never send".to_string(),
+                );
+            }
+            (Some(url), from) => {
+                let rest = url
+                    .strip_prefix("smtp://")
+                    .or_else(|| url.strip_prefix("smtps://"));
+                if rest.is_none_or(|r| r.is_empty()) {
+                    return Err("--smtp-url must start with smtp:// or smtps://".to_string());
+                }
+                match from {
+                    Some(addr) if addr.contains('@') => {}
+                    _ => {
+                        return Err(
+                            "--smtp-url is set but --mail-from is missing or invalid; refusal address required"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Whether outbound mail has a configured provider.
+    pub fn mail_enabled(&self) -> bool {
+        self.smtp_url.is_some()
     }
 
     /// Normalize the public URL (strip trailing slash) for actor/object URIs.

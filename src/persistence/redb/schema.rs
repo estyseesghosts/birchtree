@@ -157,6 +157,28 @@ pub const NOTIFICATIONS_BY_RECIPIENT: TableDefinition<&[u8], u64> =
 pub const NOTIFICATION_DEDUP: TableDefinition<&[u8], u64> =
     TableDefinition::new("notification_dedup");
 
+/// Notification policies by account ID (round 3, area C): account ID ->
+/// JSON `NotificationPolicy`. Absent rows read as the upstream column
+/// defaults (`find_or_initialize_by`).
+pub const NOTIFICATION_POLICIES: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("notification_policies");
+
+/// Notification requests by numeric request ID (round 3, area C).
+pub const NOTIFICATION_REQUESTS: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("notification_requests");
+
+/// Notification requests per recipient: 16-byte
+/// `(recipient_id_be || from_account_id_be)` -> request ID (one live row
+/// per actor, like upstream's `find_or_initialize_by`).
+pub const NOTIFICATION_REQUESTS_BY_PAIR: TableDefinition<&[u8], u64> =
+    TableDefinition::new("notification_requests_by_pair");
+
+/// Notification filter bypasses (round 3, area C; upstream
+/// `NotificationPermission`): 16-byte `(recipient_id_be ||
+/// from_account_id_be)` -> 0. Created on request accept.
+pub const NOTIFICATION_PERMISSIONS: TableDefinition<&[u8], u64> =
+    TableDefinition::new("notification_permissions");
+
 /// Idempotency records: `(account_id_be || sha256(key)[..16])` -> JSON record.
 pub const IDEMPOTENCY: TableDefinition<&[u8], &[u8]> = TableDefinition::new("idempotency");
 

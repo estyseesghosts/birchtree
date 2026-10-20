@@ -30,4 +30,5 @@ pub mod scheduled_statuses;
 pub mod streaming;
 pub mod conversations;
 pub mod push;
+pub mod push_crypto;
 pub mod web;

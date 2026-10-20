@@ -36,6 +36,10 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 | GET | `/api/v1/accounts/relationships` | user | read \| read:follows | implemented (Phase 2, real data Phase 3) | In | real per-viewer relationship aggregates |
 | GET | `/api/v1/accounts/:id` | none | — | implemented (Phase 2, real counters Phase 3) | In | public profile |
 | GET | `/api/v1/accounts/:id/statuses` | optional | read | implemented (Phase 3) | In | `pinned`/`exclude_replies`/`exclude_reblogs` filters, `Link` cursors |
+| GET | `/invite/:invite_code` | none | — | implemented (round 3) | In | mirrors `Api::V1::InvitesController#show`: 200 `{invite_code, instance_api_url}`, 404 unknown, 401 `{error: "Invalid invitation code"}` for expired/exhausted (checked before the registrations gate); store is in-memory (durable redb follow-up, see D12) |
+| POST | `/api/v1/emails/confirmations` | user | write \| write:accounts | implemented (round 3) | In | re-sends the confirmation mail (`200 {}`); 403 when already confirmed; explicit 503 without a mail provider, never fake success; `created_by_application` ownership + redemption remain (D12) |
+| GET | `/api/v1/emails/check_confirmation` | user | read \| read:accounts | implemented (round 3) | In | bool; gated on unconfirmed (D12 remainder as above) |
+| POST | `/api/v1/emails/password_reset` | user | write \| write:accounts | implemented (round 3, birchtree extension) | In | no upstream API route (web-only `/auth/password` upstream); authenticated-self scope to avoid enumeration; explicit 503 without a provider |
 | GET | `/api/v1/accounts/:id/followers` | optional | read | implemented (Phase 3) | In | `REST::AccountSerializer[]`, `Link` cursors |
 | GET | `/api/v1/accounts/:id/following` | optional | read | implemented (Phase 3) | In | |
 | POST | `/api/v1/accounts/:id/follow` | user | follow \| write \| write:follows | implemented (Phase 3) | In | locked target → `requested:true`; `languages[]` sets the D23 per-follow language filter (absent keeps, present-but-empty clears; relationships render `languages`) |
@@ -119,17 +123,24 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 | GET | `/api/v1/timelines/list/{id}` | user | read \| read:lists | implemented (Phase 4) | In | members' statuses under the home gates; the list's `replies_policy` (`list`/`followed`/`none`) governs replies; not owned or unparsable id → 404 `{"error":"Record not found"}`; app-only token → 422; `Cache-Control: private, no-store` |
 | GET | `/api/v1/timelines/link` | optional | read | implemented (Phase 7) | In | link timeline over `PreviewCard` URLs (`?url=`) |
 | GET | `/api/v1/media/:id` | user | write \| write:media | implemented (Phase 4) | In | 206 while unprocessed; 422 on processing failure (Mastodon's controller authorizes write on every action, `show` included) |
-| POST | `/api/v1/media` | user | write \| write:media | implemented (Phase 4) | In | media v1 (multipart, inline processing → 200) |
+| POST | `/api/v1/media` | user | write \| write:media | implemented (Phase 4, stills extended round 3) | In | media v1 (multipart, inline processing → 200); `image/heic`, `image/heif`, `image/tiff` (+`image/x-tiff`) accepted as stills → WebP via `ImageToWebp` (D4); undecodable input commits `Failed` (422), never served raw |
 | PUT | `/api/v1/media/:id` | user | write \| write:media | implemented (Phase 4) | In | description/focus/thumbnail; 206 while unprocessed |
 | DELETE | `/api/v1/media/:id` | user | write \| write:media | implemented (Phase 4) | In | 422 while attached to a status |
-| POST | `/api/v2/media` | user | write \| write:media | implemented (Phase 4) | In | media v2 (multipart; video/audio delayed → 202, images inline → 200) |
+| POST | `/api/v2/media` | user | write \| write:media | implemented (Phase 4, stills extended round 3) | In | media v2 (multipart; video/audio delayed → 202, images inline → 200); HEIC/HEIF/TIFF accepted as stills → WebP (D4) |
 | GET | `/api/v1/notifications` | user | read:notifications | implemented (Phase 4) | In | `limit` 20/max 40 with `limit_param` semantics (`limit=0` → empty page); `types[]`/`exclude_types[]` silently drop unknown values; `group_key` uses the `ungrouped-<id>` fallback (no server-side merging in the v1 profile) |
 | GET | `/api/v1/notifications/:id` | user | read:notifications | implemented (Phase 4) | In | 404 `{"error":"Record not found"}` for foreign/missing |
 | POST | `/api/v1/notifications/clear` | user | write \| write:notifications | implemented (Phase 4) | In | `200 {}` |
 | GET | `/api/v1/notifications/unread_count` | user | read:notifications | implemented (Phase 4) | In | `{"count": N}` = rows newer than the notifications marker (limit default 100, max 1000) |
 | POST | `/api/v1/notifications/:id/dismiss` | user | write \| write:notifications | implemented (Phase 4) | In | `200 {}`; repeat → 404 |
-| GET | `/api/v1/notifications/requests` | user | read:notifications | implemented (Phase 4) | In | always `[]`: this server has no notification-policy filter pipeline yet, so no requests can exist (never fabricated) |
-| GET | `/api/v1/notifications/requests/merged` | user | read:notifications | implemented (Phase 4) | In | `{"merged": true}` (no unmerge work exists) |
+| GET | `/api/v1/notifications/requests` | user | read:notifications | implemented (Phase 4 index, live pipeline round 3) | In | filter → request queue → merge pipeline per upstream `NotifyService`/`UnfilterNotificationsWorker` (D20); filtered mentions/quotes file requests instead of notifications |
+| GET | `/api/v1/notifications/requests/merged` | user | read:notifications | implemented (Phase 4, live round 3) | In | `{"merged": <bool>}` — true when no pending requests remain |
+| GET | `/api/v1/notifications/requests/:id` | user | read:notifications | implemented (round 3) | In | 404 for foreign/missing |
+| POST | `/api/v1/notifications/requests/:id/accept` | user | write:notifications | implemented (round 3) | In | merges the request into notifications and emits `notifications_merged` (payload `"1"`) only when rows actually flip (D20) |
+| POST | `/api/v1/notifications/requests/:id/dismiss` | user | write:notifications | implemented (round 3) | In | silent (no event) |
+| POST | `/api/v1/notifications/requests/accept` | user | write:notifications | implemented (round 3) | In | bulk accept (upstream `requests/accept`) |
+| POST | `/api/v1/notifications/requests/dismiss` | user | write:notifications | implemented (round 3) | In | bulk dismiss |
+| GET | `/api/v1/notifications/policy` | user | read:notifications | implemented (round 3) | In | upstream V1 policy singleton defaults (`private_mentions` + `limited_accounts` = filter, rest accept) |
+| PUT | `/api/v1/notifications/policy` | user | write:notifications | implemented (round 3) | In | set `filter_*` flags; absent flags keep their value; `for_limited_accounts` not settable here, like upstream V1 |
 | GET/POST | `/api/v1/markers` | user | read:statuses / write:statuses | implemented (Phase 4) | In | `timeline[]` on GET; `home[last_read_id]`/`notifications[last_read_id]` on POST (query or body); response `{timeline:{last_read_id,version,updated_at}}`; fresh marker reports `version: 1` |
 | GET | `/api/v1/preferences` | user | read \| read:accounts | implemented (Phase 2) | In | incl. quote-policy defaults |
 | GET | `/api/v1/filters` | user | read \| read:filters | implemented (Phase 4) | In | v1 projection over keyword rows (deprecated upstream since 2022-11-14, but pinned v4.7.3 still serves it); each row's `id` is the keyword id |
@@ -161,7 +172,7 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 | GET | `/api/v1/search` | — | — | out of profile (route absent in v4.7.3) | Out | removed upstream in Mastodon 3.0 (commit `18331fefa2`); only v2 exists in the pinned tag |
 | GET | `/api/v2/search` | optional | read:search | implemented (Phase 7.2) | In | accounts by handle/display name and hashtags by prefix on the database path in every mode; statuses switch by deploy-time configuration (`--search-mode=embedded` default / `database` / `off`, restart to change; authenticated only, like `status_searchable?`); cold/empty embedded index degrades to the database scan; historical unlisted rows join the index through the incremental job only; `resolve` without auth → pinned 401; `collections` always `[]` |
 | GET | `/api/v1/streaming` | user | read \| read:statuses (user:notification: read \| read:notifications) | implemented (Phase 5) | In | WebSocket upgrade (subscribe by `?stream=` or message; any path under the prefix). Without an upgrade, `/api/v1/streaming` alone has no channel and answers `400 Unknown channel requested`. Host redirect when `--streaming-url` names another host (`301`). Contract: `docs/streaming-contract.md` |
-| GET | `/api/v1/streaming/(*any)` | user | read \| read:statuses (user:notification: read \| read:notifications) | implemented (Phase 5) | In | SSE for `user`, `user/notification`, `public`, `public/local`, `public/remote` (`?only_media=true` for media), `hashtag`, `hashtag/local` (`?tag=`), `direct`, `list` (`?list=`); `GET …/health` answers `OK` unauthenticated. Refusals and texts: the contract. Public and hashtag streams apply the viewer's `chosen_languages` when set (D21). `direct` carries `conversation` events since Phase 7 (D18, closed); `public/remote` is silent until Phase 6 (D19) |
+| GET | `/api/v1/streaming/(*any)` | user | read \| read:statuses (user:notification: read \| read:notifications) | implemented (Phase 5) | In | SSE for `user`, `user/notification`, `public`, `public/local`, `public/remote` (`?only_media=true` for media), `hashtag`, `hashtag/local` (`?tag=`), `direct`, `list` (`?list=`); `GET …/health` answers `OK` unauthenticated. Refusals and texts: the contract. Public and hashtag streams apply the viewer's `chosen_languages` when set (D21). `direct` carries `conversation` events since Phase 7 (D18, closed); `public/remote` emits remote statuses since federation (D19, closed round 3) |
 
 ### Conversations (Phase 7)
 
@@ -201,7 +212,7 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| POST | `/api/v1/push/subscription` | user | push | implemented (Phase 7) | In | subscription bound to the access token; VAPID keys from configuration; tickle-only delivery (no encrypted payload yet) |
+| POST | `/api/v1/push/subscription` | user | push | implemented (Phase 7, encrypted payloads round 3) | In | subscription bound to the access token; VAPID keys from configuration; standard subs get RFC 8291 `aes128gcm` encrypted payloads (D42, partly: `access_token`/`icon` empty, never fabricated); legacy subs keep the tickle |
 | GET | `/api/v1/push/subscription` | user | push | implemented (Phase 7) | In | |
 | PUT | `/api/v1/push/subscription` | user | push | implemented (Phase 7) | In | update; `check_push_subscription` guard |
 | PATCH | `/api/v1/push/subscription` | user | push | implemented (Phase 7) | In | alias of PUT |
@@ -348,9 +359,9 @@ All admin rows: auth `user + role`. The role is `admin` (every admin route) or `
 
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
-| POST | `/api/v1/admin/measures` | user + role | admin:read | implemented (Phase 7.3, keys round 2) | In | POST with a read scope upstream (kept). Served: `new_users`, `opened_reports`, `resolved_reports`, `active_users` (password-login telemetry), `instance_follows`, `instance_followers`, `instance_statuses`, `instance_reports`, `instance_accounts`, `instance_media_attachments`. Omitted with reasons (never fabricated): `interactions` (no interaction event log), `tag_accounts`/`tag_uses`/`tag_servers` (7-day tag history only — D40) |
-| POST | `/api/v1/admin/dimensions` | user + role | admin:read | implemented (Phase 7.3, keys round 2) | In | POST with a read scope upstream. Served: `languages`, `sources`, `servers`, `space_usage` (media bytes only), `instance_accounts`, `instance_languages` (bare-code `human_key`). Omitted with reasons: `software_versions` (no version census), `tag_servers`/`tag_languages` (7-day tag history only — D40) |
-| POST | `/api/v1/admin/retention` | user + role | admin:read | implemented (Phase 7.3) | In | POST with a read scope upstream (kept). Cohorts stay authorship-based (sign-in cohorts need per-user sign-in fields + backfill) |
+| POST | `/api/v1/admin/measures` | user + role | admin:read | implemented (Phase 7.3, keys round 2, extended round 3) | In | POST with a read scope upstream (kept). Served: `new_users`, `opened_reports`, `resolved_reports`, `active_users` (password-login telemetry), `instance_follows`, `instance_followers`, `instance_statuses`, `instance_reports`, `instance_accounts`, `instance_media_attachments`, `tag_accounts`/`tag_uses`/`tag_servers` (need `<key>[id]>`; omitted without a resolvable id, never zero-filled). Omitted with reasons (never fabricated): `interactions` (no interaction event log) |
+| POST | `/api/v1/admin/dimensions` | user + role | admin:read | implemented (Phase 7.3, keys round 2, extended round 3) | In | POST with a read scope upstream. Served: `languages`, `sources`, `servers`, `space_usage` (media + measured redb `database` bytes; no postgres/redis/search), `instance_accounts`, `instance_languages` (bare-code `human_key`), `tag_servers`/`tag_languages` (need `<key>[id]>`). Omitted with reasons: `software_versions` (no version census) |
+| POST | `/api/v1/admin/retention` | user + role | admin:read | implemented (Phase 7.3, cohorts round 3) | In | POST with a read scope upstream (kept). Cohorts are sign-in-unioned-with-authorship (superset of upstream sign-in-only; pure sign-in would break the authorship cohort test) |
 
 #### Canonical email blocks and tags
 
@@ -405,7 +416,7 @@ Removed from this section in the 2026-10-17 re-scope: `annual_reports`, `announc
 
 ## Known Phase 4 media deviations / gaps (honesty list)
 
-- **Phase 7.1 shipped (2026-10-20):** ffmpeg-backed post-commit transcode; GIF → WebM/VP9 typed `video`, video → WebM/VP9 + Opus (VP9/WebM + Opus-or-silent within `max_file_size` passes through), stills → WebP (WebP passes through), `small` preview is WebP; metadata carried via `-map_metadata 0`, never stripped; `gifv` never produced (D1–D4, accepted). v1 transcodes inline (`200`); v2 returns `202` for transcoded types, `GET /api/v1/media/:id` answers `206` until `Ready`, `422` on `Failed`. Evidence: `tests/phase7_1_transcode.rs`.
+- **Phase 7.1 shipped (2026-10-20):** ffmpeg-backed post-commit transcode; GIF → WebM/VP9 typed `video`, video → WebM/VP9 + Opus (VP9/WebM + Opus-or-silent within `max_file_size` passes through), stills → WebP (WebP passes through), `small` preview is WebP; metadata carried via `-map_metadata 0`, never stripped; `gifv` never produced (D1–D4, accepted). Round 3: `image/heic`, `image/heif`, `image/tiff` (+`image/x-tiff`) accepted as stills → WebP; undecodable input commits `Failed` (422). True HEIC→WebP byte proof needs an ffmpeg with hevc/heif decode on the verifying machine. v1 transcodes inline (`200`); v2 returns `202` for transcoded types, `GET /api/v1/media/:id` answers `206` until `Ready`, `422` on `Failed`. Evidence: `tests/phase7_1_transcode.rs`, `tests/round3_heic_tiff.rs`.
 - **Blob keys are sharded by a per-upload random 16-hex name** (`{aa}/{bb}/{random16}/original.{ext}`), not the attachment id: bytes must be staged *before* the id-minting commit (`birchtree.md` §5), so the id cannot appear in its own key. The wire URLs are unaffected.
 - **The upload size cap equals the multipart body limit** (`ApiState` carries no `Config`); `Config::validate` enforces `max_file_size ≤ max_body_size`, so the effective cap matches the default 16 MB. The 422 message formats the cap like Rails `number_to_human_size` ("16 MB", "1 KB", …).
 - **A non-numeric `focus` param answers `422 Validation failed: Focus is invalid`** instead of Ruby's `Float()` coercion to `0.0`; a blank focus is ignored (upload) or clears the point (update).
@@ -457,8 +468,8 @@ Implemented 2026-10-17 (D10a, D10b, D11). Evidence: `tests/phase4_1_json_parity.
 
 - **Source-derived, not run against upstream.** The stream names, scope rules, refusal texts, envelopes, heartbeat and redirect come from the pinned source (`streaming/index.js`, `streaming_controller.rb`, the fan-out and feed services at `8ff11c2b`). No live v4.7.3 instance was run: see the Phase 5 verification log.
 - **Birchtree-only refusals:** `429 Too many streaming connections for this token`, `503 Too many streaming connections`, `429 Too many streaming subscriptions` (D14).
-- **Not emitted:** `conversation`, `announcement`, `announcement.reaction`, `announcement.delete` (Phase 7), `notifications_merged` (D20), and `kill` on suspension or disablement (D24). `filters_changed` is never transmitted, as upstream never transmits it (no payload).
-- **Silent by design until their phases:** `direct` (D18), `public:remote` and `public:remote:media` (D19).
+- **Not emitted:** `conversation`, `announcement`, `announcement.reaction`, `announcement.delete` (Phase 7), and `kill` on suspension or disablement (D24). `filters_changed` is never transmitted, as upstream never transmits it (no payload). `notifications_merged` is emitted on real merges only (round 3, D20).
+- **Silent by design until their phases:** `direct` (D18, closed Phase 7).
 
 ## Route inventory discrepancies and gaps (found 2026-10-17)
 
@@ -469,11 +480,11 @@ Recorded, not fixed. Each needs a decision or a contract-review pass.
    - `profile` (`GET`/`PATCH /api/v1/profile`, `DELETE` of avatar and header);
    - `directory` (`GET /api/v1/directory`);
    - `instance` sub-resources (`peers`, `rules`, `domain_blocks`, `terms_of_service` with `:date`, `privacy_policy`, `extended_description`, `translation_languages`, `languages`, `activity`), and `peers/search`;
-   - `emails/confirmations` (`POST`) and `emails/check_confirmation`;
+   - `emails/confirmations` (`POST`) and `emails/check_confirmation` — rowed (round 3, area A); redemption + ownership remain (D12);
    - `domain_blocks/preview`;
    - `tags` (`GET /api/v1/tags/:id`; `follow`, `unfollow`, `feature`, `unfeature`) and `followed_tags`; `featured_tags` (top-level and per-account);
    - accounts sub-resources: `lists`, `identity_proofs`, `familiar_followers`, `email_subscriptions`, `collections`, `in_collections`; top-level `collections` (`GET`/`POST`/`PUT`/`DELETE`, and `items`/`revoke`);
-   - notifications: `requests/:id` (show), `requests/:id/accept|dismiss`, the bulk `requests/accept|dismiss`, and `notifications/policy` (`GET`/`PUT`);
+   - notifications: `requests/:id` (show), `requests/:id/accept|dismiss`, the bulk `requests/accept|dismiss`, and `notifications/policy` (`GET`/`PUT`) — all rowed (round 3, area C);
    - `GET /api/v2/notifications` and its `clear`, `unread_count`, `dismiss`, `:group_key/accounts`, and `policy` sub-routes.
 3. **`GET /api/v1/accounts` (index) had no row.** Resolved in the 2026-10-17 follow-up: the row is in profile at Phase 7, as the account multi-fetch (`id[]`, up to 40).
 4. **`namespace :web` and `/api/web/*` auth.** Resolved as a design decision in the 2026-10-17 follow-up: these routes serve keystodon's first-party mode and use the browser session plus CSRF (Phase 7). Still open: whether first-party `/api/v1/*` calls use OAuth tokens (proposed) or the session.

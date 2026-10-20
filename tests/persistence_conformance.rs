@@ -579,6 +579,7 @@ fn fan_out_notification_job_is_idempotent() {
             actor_id: Some(bob.id),
             status_id: Some(status.id),
             created_at_ms: T0 + 5,
+            filtered: false,
         })
         .unwrap();
     assert!(probe.is_none(), "retried fan-out must not duplicate a row");
@@ -591,6 +592,7 @@ fn fan_out_notification_job_is_idempotent() {
             actor_id: Some(bob.id),
             status_id: Some(status.id),
             created_at_ms: T0 + 6,
+            filtered: false,
         })
         .unwrap();
     assert!(fresh.is_some(), "a fresh interaction must create a row");
@@ -737,6 +739,7 @@ fn interaction_and_job_survive_store_reopen() {
             actor_id: Some(bob_id),
             status_id: Some(status_id),
             created_at_ms: now + 10,
+            filtered: false,
         })
         .unwrap();
     assert!(probe.is_none(), "replayed handler must not duplicate a row");

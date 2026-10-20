@@ -6,10 +6,11 @@
 //! endpoints accept `read`/`read:accounts`; `verify_credentials` and
 //! `update_credentials` require a user token.
 
-use axum::extract::{ConnectInfo, Path, RawQuery, State};
+use axum::extract::{ConnectInfo, Extension, Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 use crate::api::forms::{self, FormBody};
 use crate::api::mastodon::auth::Auth;
@@ -22,6 +23,7 @@ use crate::application::ports::{
 };
 use crate::application::relationships;
 use crate::domain::Error as DomainError;
+use crate::mailer::{MailEnv, MailError};
 
 /// Scope alternatives accepted by the write endpoints.
 const WRITE_SCOPES: &[&str] = &["write", "write:accounts"];
@@ -470,5 +472,178 @@ pub async fn search(
             axum::Json(out).into_response()
         }
         Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Invites + email (round 3, area A).
+//
+// Router wiring is parent-owned; the proposed routes are in the area report:
+//   GET  /invite/:invite_code               -> invite_show
+//   POST /api/v1/emails/confirmations       -> email_confirmation_create
+//   GET  /api/v1/emails/check_confirmation  -> email_confirmation_check
+//   POST /api/v1/emails/password_reset      -> password_reset_create (extension)
+// ---------------------------------------------------------------------------
+
+/// Map a [`MailError`] to an explicit HTTP refusal. Disabled mail is `503`
+/// (never a silent success); transport failure is `502`; a bad address is
+/// `422`.
+fn mail_error_response(err: MailError) -> Response {
+    match err {
+        MailError::Disabled(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(json!({ "error": "Email delivery is not configured" })),
+        )
+            .into_response(),
+        MailError::InvalidRecipient(message) => {
+            ApiError::unprocessable(format!("email {message}")).into_response()
+        }
+        MailError::Transport(_) => (
+            StatusCode::BAD_GATEWAY,
+            axum::Json(json!({ "error": "Email delivery failed" })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /invite/:invite_code` — mirrors `Api::V1::InvitesController#show`
+/// (`app/controllers/api/v1/invites_controller.rb:19-29`): `200
+/// {invite_code, instance_api_url}`, `404` for an unknown code (`find_by!`),
+/// `401 {error: "Invalid invitation code"}` for a known-but-unusable one
+/// (`check_valid_usage!`, before the registrations gate, as upstream).
+pub async fn invite_show(
+    State(state): State<ApiState>,
+    Extension(invites): Extension<Arc<dyn accounts::InviteStore>>,
+    Path(code): Path<String>,
+) -> Response {
+    match accounts::invite_status(&*invites, &code, state.context.now_ms()) {
+        Ok(_) => axum::Json(json!({
+            "invite_code": code,
+            "instance_api_url": format!("{}/api/v2/instance", state.server.public_url),
+        }))
+        .into_response(),
+        Err(DomainError::NotFound(_)) => ApiError::not_found().into_response(),
+        Err(DomainError::Unauthorized(message)) => {
+            ApiError::new(StatusCode::UNAUTHORIZED, message).into_response()
+        }
+        Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
+/// `POST /api/v1/emails/confirmations` — mirrors
+/// `Api::V1::Emails::ConfirmationsController#create`
+/// (`app/controllers/api/v1/emails/confirmations_controller.rb:13-18`):
+/// re-sends the confirmation mail; `200 {}`. Requires a user token with
+/// `write`/`write:accounts` and an unconfirmed address (`403` otherwise, like
+/// upstream `require_user_not_confirmed!`). Without a mail provider the
+/// answer is an explicit `503`, never a fake success.
+///
+/// Not enforced (documented D12 remainder): `created_by_application`
+/// ownership (`require_user_owned_by_application!`) — birchtree stores no
+/// signup-app id yet — and confirmation redemption (no `auth/confirmation`
+/// flow yet, so `email_verified` never flips in-flow).
+pub async fn email_confirmation_create(
+    State(state): State<ApiState>,
+    auth: Auth,
+    Extension(env): Extension<Arc<MailEnv>>,
+) -> Response {
+    if let Err(err) = auth.0.require_scopes(&["write", "write:accounts"]) {
+        return err.into_response();
+    }
+    let account_id = match auth.0.require_user() {
+        Ok(id) => id,
+        Err(err) => return err.into_response(),
+    };
+    let store: &dyn Store = &*state.context.store;
+    let user = match store.user_by_account_id(account_id) {
+        Ok(Some(user)) => user,
+        Ok(None) => return ApiError::not_found().into_response(),
+        Err(err) => return ApiError::from(err).into_response(),
+    };
+    if user.email_verified {
+        return ApiError::forbidden(
+            "This method is only available while the e-mail is awaiting confirmation",
+        )
+        .into_response();
+    }
+    let Some(email) = user.email else {
+        return ApiError::unprocessable("email address is missing").into_response();
+    };
+    // Deterministic per-account token so resends are idempotent (matches the
+    // job-derived token shape; redemption lands with the confirmation flow).
+    let token = crate::application::crypto::sha256_hex(
+        format!("confirmation:{account_id}").as_bytes(),
+    );
+    match accounts::request_confirmation_email(
+        &*env.mailer,
+        &env.from,
+        &email,
+        account_id,
+        &token,
+        &state.server.public_url,
+    ) {
+        Ok(()) => axum::Json(json!({})).into_response(),
+        Err(err) => mail_error_response(err),
+    }
+}
+
+/// `GET /api/v1/emails/check_confirmation` — mirrors
+/// `Api::V1::Emails::ConfirmationsController#check`: `200 true`/`false` for
+/// whether the caller's address is confirmed. User token, `read` scope.
+pub async fn email_confirmation_check(State(state): State<ApiState>, auth: Auth) -> Response {
+    if let Err(err) = auth.0.require_scopes(&["read", "read:accounts"]) {
+        return err.into_response();
+    }
+    let account_id = match auth.0.require_user() {
+        Ok(id) => id,
+        Err(err) => return err.into_response(),
+    };
+    let store: &dyn Store = &*state.context.store;
+    match store.user_by_account_id(account_id) {
+        Ok(Some(user)) => axum::Json(json!(user.email_verified)).into_response(),
+        Ok(None) => ApiError::not_found().into_response(),
+        Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
+/// `POST /api/v1/emails/password_reset` — sends a reset mail to the caller's
+/// own address (`200 {}`). Birchtree extension: upstream has no API reset
+/// route (web-only `/auth/password`). A public forgot-password endpoint
+/// needs an email index the store port does not have yet (proposal in the
+/// area report); scoping to the authenticated user needs none and cannot
+/// enumerate accounts.
+pub async fn password_reset_create(
+    State(state): State<ApiState>,
+    auth: Auth,
+    Extension(env): Extension<Arc<MailEnv>>,
+) -> Response {
+    if let Err(err) = auth.0.require_scopes(&["write", "write:accounts"]) {
+        return err.into_response();
+    }
+    let account_id = match auth.0.require_user() {
+        Ok(id) => id,
+        Err(err) => return err.into_response(),
+    };
+    let store: &dyn Store = &*state.context.store;
+    let user = match store.user_by_account_id(account_id) {
+        Ok(Some(user)) => user,
+        Ok(None) => return ApiError::not_found().into_response(),
+        Err(err) => return ApiError::from(err).into_response(),
+    };
+    let Some(email) = user.email else {
+        return ApiError::unprocessable("email address is missing").into_response();
+    };
+    let token =
+        crate::application::crypto::sha256_hex(format!("password-reset:{account_id}").as_bytes());
+    match accounts::request_password_reset(
+        &*env.mailer,
+        &env.from,
+        &email,
+        account_id,
+        &token,
+        &state.server.public_url,
+    ) {
+        Ok(()) => axum::Json(json!({})).into_response(),
+        Err(err) => mail_error_response(err),
     }
 }

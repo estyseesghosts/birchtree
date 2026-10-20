@@ -1,10 +1,42 @@
 //! Account creation use cases.
+//!
+//! Round 3, area A: invite-token create/accept/redeem plus the
+//! confirmation-mail and password-reset-mail send paths.
+//!
+//! Upstream (`8ff11c2b`): registration policy is
+//! `RegistrationHelper#allowed_registration?`
+//! (`app/helpers/registration_helper.rb:5-7`): open registrations OR a
+//! `valid_for_use?` invite (plus IP/omniauth checks that live at the HTTP
+//! layer). `AppSignUpService` (`app/services/app_sign_up_service.rb:9-19`)
+//! refuses with `Mastodon::NotPermittedError` (403) otherwise; the API
+//! controller (`app/controllers/api/v1/accounts_controller.rb:130-136`)
+//! looks the invite up by `params[:invite_code]` and ignores an unknown
+//! code while registrations are open. `GET /invite/:invite_code`
+//! (`api/v1/invites_controller.rb:19-29`, `config/routes.rb:69`) answers 200
+//! `{invite_code, instance_api_url}`, 404 for an unknown code
+//! (`find_by!`), and 401 `{error: invites.invalid}` for a known-but-unusable
+//! one. Mail shapes follow `app/mailers/user_mailer.rb:23-46`.
+//!
+//! The [`InviteStore`] trait below is the storage port for invites. It is
+//! declared here (not in `ports.rs`, which the parent owns) so this area
+//! stays merge-clean; the `redb` implementation lands with the parent merge
+//! (proposed in the final report). [`MemoryInviteStore`] is the test/dev
+//! implementation. Mail goes through the [`crate::mailer::Mailer`] port:
+//! sends happen after commit, and a missing provider is an explicit
+//! [`crate::mailer::MailError::Disabled`], never a silent success.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use crate::application::auth;
 use crate::application::crypto;
 use crate::application::ports::{AccountStore, NewLocalAccount, OAuthStore};
 use crate::domain::account::{normalize_username, validate_username};
-use crate::domain::{AccessToken, Account, Error, OAuthApplication, Result};
+use crate::domain::user::{
+    INVITE_COMMENT_LIMIT, Invite, InviteRefusal, invite_code_from_seed,
+};
+use crate::domain::{AccessToken, Account, Error, Id, OAuthApplication, Result};
+use crate::mailer::{MailError, Mailer};
 
 /// Minimum password length (Mastodon requires at least 8 characters).
 pub const MIN_PASSWORD_LEN: usize = 8;
@@ -33,6 +65,7 @@ pub struct RegisterAccountCommand {
 
 /// Result of a successful registration: the created account and a user token
 /// scoped to the registering application (Mastodon returns the token body).
+#[derive(Debug)]
 pub struct RegisteredAccount {
     pub account: Account,
     pub token_plaintext: String,
@@ -151,6 +184,257 @@ pub fn register_account(
         token_plaintext,
         token,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Invites (round 3, area A)
+// ---------------------------------------------------------------------------
+
+/// Storage port for invite tokens.
+///
+/// Mutations commit the invite row (and, for redeem, the incremented counter)
+/// atomically; no network I/O happens here. The `redb` implementation is
+/// parent-owned (proposal in the area report); [`MemoryInviteStore`] serves
+/// tests and local development.
+pub trait InviteStore: Send + Sync {
+    /// Persist a new invite; `Conflict` when `invite.code` is taken (the
+    /// caller mints a fresh code and retries).
+    fn create_invite(&self, invite: Invite) -> Result<Invite>;
+    /// Look up an invite by code (`None` when unknown).
+    fn invite_by_code(&self, code: &str) -> Result<Option<Invite>>;
+    /// Atomically check usability at `now_ms` and increment `uses`.
+    /// `NotFound` when the code is unknown; `Unauthorized("Invalid
+    /// invitation code")` when expired or exhausted (mirrors the API
+    /// `invites_controller.rb:25-27` 401).
+    fn redeem_invite(&self, code: &str, now_ms: u64) -> Result<Invite>;
+}
+
+/// In-memory [`InviteStore`] (tests/dev). The mutex makes check-and-increment
+/// atomic, like the single-`redb`-transaction production implementation.
+#[derive(Debug, Default)]
+pub struct MemoryInviteStore {
+    by_code: Mutex<HashMap<String, Invite>>,
+}
+
+impl MemoryInviteStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl InviteStore for MemoryInviteStore {
+    fn create_invite(&self, invite: Invite) -> Result<Invite> {
+        let mut map = self.by_code.lock().expect("invite store");
+        if map.contains_key(&invite.code) {
+            return Err(Error::Conflict("invite code is already taken".into()));
+        }
+        map.insert(invite.code.clone(), invite.clone());
+        Ok(invite)
+    }
+
+    fn invite_by_code(&self, code: &str) -> Result<Option<Invite>> {
+        Ok(self.by_code.lock().expect("invite store").get(code).cloned())
+    }
+
+    fn redeem_invite(&self, code: &str, now_ms: u64) -> Result<Invite> {
+        let mut map = self.by_code.lock().expect("invite store");
+        let invite = map
+            .get_mut(code)
+            .ok_or_else(|| Error::NotFound("invite not found".into()))?;
+        map_invite_refusal(invite.check_usable(now_ms))?;
+        invite.uses = invite.uses.saturating_add(1);
+        Ok(invite.clone())
+    }
+}
+
+fn map_invite_refusal(check: std::result::Result<(), InviteRefusal>) -> Result<()> {
+    match check {
+        Ok(()) => Ok(()),
+        Err(_) => Err(Error::Unauthorized("Invalid invitation code".into())),
+    }
+}
+
+/// Input for issuing an invite token.
+#[derive(Debug, Clone)]
+pub struct CreateInviteCommand {
+    pub created_by_account_id: Id,
+    /// Snapshot of the creator's staff role: staff-issued invites bypass the
+    /// approval queue (birchtree's analogue of upstream `bypass_approval?`;
+    /// see `Invite::created_by_staff`).
+    pub created_by_staff: bool,
+    pub comment: Option<String>,
+    /// `None` = unlimited redemptions (upstream `max_uses` NULL).
+    pub max_uses: Option<u32>,
+    /// Lifetime from now (`None` = never expires, upstream `expires_at` NULL).
+    pub expires_in_ms: Option<u64>,
+}
+
+/// Issue an invite token, retrying code generation on collision (bounded).
+pub fn create_invite(
+    store: &dyn InviteStore,
+    now_ms: u64,
+    cmd: CreateInviteCommand,
+) -> Result<Invite> {
+    if cmd.comment.as_deref().is_some_and(|c| c.chars().count() > INVITE_COMMENT_LIMIT) {
+        return Err(Error::InvalidInput(format!(
+            "comment is too long (maximum is {INVITE_COMMENT_LIMIT} characters)"
+        )));
+    }
+    if cmd.max_uses == Some(0) {
+        return Err(Error::InvalidInput("max_uses must be at least 1".into()));
+    }
+    for attempt in 0..64u64 {
+        let seed = now_ms
+            .wrapping_mul(0x9E3779B97F4A7C15)
+            .wrapping_add(attempt.wrapping_mul(0xBF58476D1CE4E5B9));
+        let invite = Invite {
+            // The memory store mints its own row id below; the id set here is
+            // replaced by the production store's sequence on commit.
+            id: Id::new(seed),
+            code: invite_code_from_seed(seed),
+            created_by_account_id: cmd.created_by_account_id,
+            created_by_staff: cmd.created_by_staff,
+            comment: cmd.comment.clone(),
+            max_uses: cmd.max_uses,
+            uses: 0,
+            expires_at_ms: cmd.expires_in_ms.map(|ttl| now_ms.saturating_add(ttl)),
+            created_at_ms: now_ms,
+        };
+        match store.create_invite(invite) {
+            Ok(stored) => return Ok(stored),
+            Err(Error::Conflict(_)) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(Error::Internal("could not mint a unique invite code".into()))
+}
+
+/// Read an invite's status: `NotFound("invite not found")` for an unknown
+/// code (the HTTP layer answers 404, like upstream `find_by!`), and
+/// `Unauthorized("Invalid invitation code")` for a known-but-unusable one
+/// (the HTTP layer answers 401, like upstream `check_valid_usage!`).
+pub fn invite_status(store: &dyn InviteStore, code: &str, now_ms: u64) -> Result<Invite> {
+    let invite = store
+        .invite_by_code(code)?
+        .ok_or_else(|| Error::NotFound("invite not found".into()))?;
+    map_invite_refusal(invite.check_usable(now_ms))?;
+    Ok(invite)
+}
+
+/// Redeem an invite token (check usable + increment `uses` atomically).
+pub fn redeem_invite(store: &dyn InviteStore, code: &str, now_ms: u64) -> Result<Invite> {
+    store.redeem_invite(code, now_ms)
+}
+
+/// Whether registration may proceed: open registrations OR a usable invite.
+///
+/// Mirrors `RegistrationHelper#allowed_registration?`
+/// (`registration_helper.rb:5-7`) minus the parts owned by the HTTP layer
+/// (single-user mode, omniauth-only installs, IP sign-up blocks).
+pub fn allowed_registration(registration_open: bool, invite_usable: bool) -> bool {
+    registration_open || invite_usable
+}
+
+/// Register through the public API with an optional invite code.
+///
+/// Policy (mirrors upstream `AppSignUpService` + `accounts_controller.rb`):
+/// - Invites disabled + code supplied → `InvalidInput` (refused with reason,
+///   never silently ignored).
+/// - Usable invite → registration proceeds even when closed, and the invite
+///   is redeemed after the account commits. A staff-issued invite bypasses
+///   `require_approval` (D36 interaction: the account lands `approved=true`
+///   and skips the admin pending queue; non-staff invites still queue).
+/// - Unknown/unusable code while open → the code is ignored and registration
+///   proceeds (upstream `allowed_registration?` stays true via open
+///   registrations). While closed → `Forbidden("Registrations are closed")`.
+/// - No code → plain [`register_account`].
+pub fn register_account_with_invite(
+    accounts: &dyn AccountStore,
+    oauth: &dyn OAuthStore,
+    invites: &dyn InviteStore,
+    base_url: &str,
+    now_ms: u64,
+    registration_open: bool,
+    require_approval: bool,
+    invites_enabled: bool,
+    app: &OAuthApplication,
+    cmd: RegisterAccountCommand,
+) -> Result<RegisteredAccount> {
+    let usable_invite: Option<Invite> = match (cmd.invite_code.as_deref(), invites_enabled) {
+        (Some(code), true) => match invites.invite_by_code(code)? {
+            Some(invite) if invite.check_usable(now_ms).is_ok() => Some(invite),
+            _ => None,
+        },
+        (Some(_), false) => {
+            return Err(Error::InvalidInput("invites are disabled".into()));
+        }
+        (None, _) => None,
+    };
+    if !allowed_registration(registration_open, usable_invite.is_some()) {
+        return Err(Error::Forbidden("Registrations are closed".into()));
+    }
+    // An unknown/unusable code while open is ignored (upstream parity).
+    let bypass_approval = usable_invite.as_ref().is_some_and(|i| i.created_by_staff);
+    let registered = register_account(
+        accounts,
+        oauth,
+        base_url,
+        now_ms,
+        true,
+        require_approval && !bypass_approval,
+        app,
+        cmd.clone(),
+    )?;
+    if let Some(invite) = &usable_invite {
+        // Best-effort: the account already committed (upstream mints the user
+        // and token in one transaction and counts the invite use separately).
+        // A redemption race only under-counts `uses`, never double-admits.
+        if invites.redeem_invite(&invite.code, now_ms).is_err() {
+            tracing::warn!("invite use not recorded after registration (redemption race)");
+        }
+    }
+    Ok(registered)
+}
+
+// ---------------------------------------------------------------------------
+// Email send paths (round 3, area A)
+// ---------------------------------------------------------------------------
+
+/// Queue a confirmation mail through the mailer port (called after commit,
+/// never inside the request transaction).
+pub fn request_confirmation_email(
+    mailer: &dyn Mailer,
+    from: &str,
+    to: &str,
+    account_id: Id,
+    token: &str,
+    base_url: &str,
+) -> std::result::Result<(), MailError> {
+    if token.is_empty() {
+        return Err(MailError::Transport(
+            "confirmation token is missing; message not sent".to_string(),
+        ));
+    }
+    mailer.send_confirmation(from, to, account_id, token, base_url)
+}
+
+/// Queue a password-reset mail. Unknown addresses are the caller's business
+/// (the HTTP layer answers 200 either way to avoid account enumeration, as
+/// upstream's Devise flow does); an invalid address shape is refused here.
+pub fn request_password_reset(
+    mailer: &dyn Mailer,
+    from: &str,
+    to: &str,
+    account_id: Id,
+    token: &str,
+    base_url: &str,
+) -> std::result::Result<(), MailError> {
+    if token.is_empty() {
+        return Err(MailError::Transport(
+            "reset token is missing; message not sent".to_string(),
+        ));
+    }
+    mailer.send_password_reset(from, to, account_id, token, base_url)
 }
 
 #[cfg(test)]

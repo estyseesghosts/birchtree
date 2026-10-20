@@ -42,12 +42,13 @@ use crate::api::mastodon::pagination;
 use crate::api::mastodon::ApiState;
 use crate::application::admin_infra as use_cases;
 use crate::application::ports::{
-    AdminDomainBlockPatch, AdminIpBlockPatch, AdminTagPatch, StatusMetricRow, Store,
+    AdminDomainBlockPatch, AdminIpBlockPatch, AdminTagPatch, StatusMetricRow, Store, TimelineFilter,
+    TimelineQuery,
 };
 use crate::domain::{
     AdminAccountOverview, AdminCanonicalEmailBlock, AdminDomainAllow, AdminDomainBlock,
     AdminDomainSeverity, AdminEmailDomainBlock, AdminIpBlock, AdminIpSeverity, AdminMediaOwner,
-    AdminReportTarget, AdminTag, FollowMetricRow, Id,
+    AdminReportTarget, AdminTag, FollowMetricRow, Id, Status,
 };
 
 /// Scope alternatives for admin reads of a sub-scoped resource.
@@ -931,6 +932,100 @@ pub async fn tags_update(State(state): State<ApiState>, auth: Auth, Path(id): Pa
 const METRIC_SCAN_CAP: usize = 200_000;
 const DAY_MS: u64 = 86_400_000;
 
+/// D39 refused keys (round 3): served-or-refused, never zero-filled. Each
+/// known-but-uncomputable key stays absent from the response array (upstream's
+/// `filter_map` drops unknown keys the same way); the reason lives here and
+/// in the dashboard note, not in the wire shape.
+pub const REFUSED_INTERACTIONS: &str =
+    "no unified interaction event log: posts, favourites, reblogs, votes and follows are not journaled as events (upstream `ActivityTracker('activity:interactions')`)";
+pub const REFUSED_SOFTWARE_VERSIONS: &str =
+    "no component-version census is collected (upstream reports mastodon/ruby/postgresql/redis/search/libvips/ffmpeg)";
+/// `tag_*` measures and dimensions require `<key>[id]` (upstream
+/// `params.require(key).permit(:id)` → 400 when missing). Without the id the
+/// key is omitted (lenient where upstream is strict); the reason is recorded
+/// here (D39).
+pub const REFUSED_TAG_NO_ID: &str =
+    "tag measures/dimensions need `<key>[id]` naming a trend-flag or admin-tag row id";
+/// An unknown tag id names no trend-flag or admin-tag row: the key is
+/// omitted, never zero-filled.
+pub const REFUSED_TAG_UNKNOWN_ID: &str = "unknown tag id: no trend-flag or admin-tag row";
+
+/// Bounded tag-status scan backing the `tag_*` measures and dimensions
+/// (round 3, D39): the same hashtag-index source as D40 `tag_history`
+/// (`trends::tag_history` renders the trailing 7 days for display; metrics
+/// need the full request window, so they scan the index directly, newest
+/// entries first up to the `redb` hashtag scan cap).
+const TAG_METRIC_SCAN: usize = 2_000;
+
+struct AllowAllStatuses;
+
+impl TimelineFilter for AllowAllStatuses {
+    fn include(&self, _status: &Status) -> bool {
+        true
+    }
+}
+
+/// Resolve a `tag_*` `<key>[id]>` to its normalized tag name: trend-flag rows
+/// first (the admin trends queue mints the numeric `:id`), then admin tag
+/// rows. `None` names nothing (the key is omitted).
+fn tag_name_for_id(store: &dyn Store, id: Id) -> Option<String> {
+    if let Ok(flags) = store.all_trend_tag_flags()
+        && let Some(flag) = flags.into_iter().find(|flag| flag.id == id)
+    {
+        return Some(flag.name);
+    }
+    if let Ok(Some(row)) = store.admin_tag_by_id(id) {
+        return Some(row.name);
+    }
+    None
+}
+
+/// `(created_at_ms, account_id, language)` per live indexed status carrying
+/// `tag`, newest first, bounded by [`TAG_METRIC_SCAN`].
+fn tag_metric_rows(store: &dyn Store, tag: &str) -> Vec<(u64, Id, Option<String>)> {
+    let page = store.hashtag_timeline(
+        tag,
+        TimelineQuery {
+            limit: TAG_METRIC_SCAN,
+            ..Default::default()
+        },
+        &AllowAllStatuses,
+    );
+    match page {
+        Ok(page) => page
+            .statuses
+            .into_iter()
+            .filter(|status| !status.is_deleted())
+            .map(|status| (status.created_at_ms, status.account_id, status.language.clone()))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Count distinct accounts per day bucket.
+fn daily_distinct(pairs: &[(Id, u64)], buckets: &[u64]) -> Vec<u64> {
+    use std::collections::HashSet;
+    let mut sets: Vec<HashSet<Id>> = buckets.iter().map(|_| HashSet::new()).collect();
+    for (who, time) in pairs {
+        if let Ok(idx) = buckets.binary_search(&(time - time % DAY_MS)) {
+            sets[idx].insert(*who);
+        }
+    }
+    sets.iter().map(|set| set.len() as u64).collect()
+}
+
+/// Count distinct domains per day bucket.
+fn daily_distinct_domains(pairs: &[(String, u64)], buckets: &[u64]) -> Vec<u64> {
+    use std::collections::HashSet;
+    let mut sets: Vec<HashSet<&str>> = buckets.iter().map(|_| HashSet::new()).collect();
+    for (domain, time) in pairs {
+        if let Ok(idx) = buckets.binary_search(&(time - time % DAY_MS)) {
+            sets[idx].insert(domain.as_str());
+        }
+    }
+    sets.iter().map(|set| set.len() as u64).collect()
+}
+
 /// Parse an optional `start_at`/`end_at` form value (RFC 3339 or date).
 /// Absent values default to the trailing 30 days ending now.
 fn metric_window(body: &[(String, String)], now_ms: u64) -> (u64, u64) {
@@ -1278,13 +1373,111 @@ pub async fn measures(State(state): State<ApiState>, auth: Auth, LenientForm(bod
                 }));
             }
             _ => {
+                // `interactions` stays refused (D39, [`REFUSED_INTERACTIONS`]).
+                // `tag_accounts`, `tag_uses` and `tag_servers` are served
+                // above when `<key>[id]>` names a tag; without a resolvable id
+                // they stay omitted ([`REFUSED_TAG_NO_ID`] /
+                // [`REFUSED_TAG_UNKNOWN_ID`]). Unknown keys drop like
+                // upstream's `filter_map`.
+                if let Some(tag_key) = ["tag_accounts", "tag_uses", "tag_servers"]
+                    .into_iter()
+                    .find(|known| *known == key.as_str())
+                {
+                    let param_key = format!("{tag_key}[id]");
+                    let tag = forms::get(&body, param_key.as_str())
+                        .and_then(|raw| raw.trim().parse::<Id>().ok())
+                        .and_then(|id| tag_name_for_id(store, id));
+                    let Some(tag) = tag else {
+                        continue;
+                    };
+                    // Real local counts from the hashtag index (never
+                    // fabricated, never zero-filled): uses, distinct
+                    // accounts and distinct author domains per day.
+                    let rows = tag_metric_rows(store, &tag);
+                    let in_win: Vec<(u64, Id)> = rows
+                        .iter()
+                        .filter(|(t, _, _)| *t >= start && *t <= end)
+                        .map(|(t, who, _)| (*t, *who))
+                        .collect();
+                    let in_prev: Vec<(u64, Id)> = rows
+                        .iter()
+                        .filter(|(t, _, _)| *t >= prev_start && *t <= prev_end)
+                        .map(|(t, who, _)| (*t, *who))
+                        .collect();
+                    match tag_key {
+                        "tag_accounts" => {
+                            let pairs: Vec<(Id, u64)> =
+                                in_win.iter().map(|(t, who)| (*who, *t)).collect();
+                            let prev_pairs: Vec<(Id, u64)> =
+                                in_prev.iter().map(|(t, who)| (*who, *t)).collect();
+                            let counts = daily_distinct(&pairs, &buckets);
+                            let total: u64 = counts.iter().sum();
+                            let previous: u64 =
+                                daily_distinct(&prev_pairs, &buckets).iter().sum();
+                            out.push(json!({
+                                "key": "tag_accounts",
+                                "unit": Value::Null,
+                                "total": total.to_string(),
+                                "previous_total": previous.to_string(),
+                                "data": daily_data(&buckets, &counts),
+                            }));
+                        }
+                        "tag_uses" => {
+                            let times: Vec<u64> = in_win.iter().map(|(t, _)| *t).collect();
+                            let prev_times: Vec<u64> =
+                                in_prev.iter().map(|(t, _)| *t).collect();
+                            let total = times.len() as u64;
+                            let previous = prev_times.len() as u64;
+                            let counts = daily_counts(&times, &buckets);
+                            out.push(json!({
+                                "key": "tag_uses",
+                                "unit": Value::Null,
+                                "total": total.to_string(),
+                                "previous_total": previous.to_string(),
+                                "data": daily_data(&buckets, &counts),
+                            }));
+                        }
+                        _ => {
+                            // `tag_servers`: distinct author domains.
+                            let mut ids: Vec<Id> = rows.iter().map(|(_, who, _)| *who).collect();
+                            ids.sort_unstable();
+                            ids.dedup();
+                            let authors = store.accounts_by_ids(&ids).unwrap_or_default();
+                            let domain_of = |who: &Id| {
+                                authors
+                                    .get(who)
+                                    .map(|account| account.domain.clone())
+                                    .unwrap_or_else(|| local_domain.clone())
+                            };
+                            let dom_win: Vec<(String, u64)> = in_win
+                                .iter()
+                                .map(|(t, who)| (domain_of(who), *t))
+                                .collect();
+                            let dom_prev: Vec<(String, u64)> = in_prev
+                                .iter()
+                                .map(|(t, who)| (domain_of(who), *t))
+                                .collect();
+                            let counts = daily_distinct_domains(&dom_win, &buckets);
+                            let total = {
+                                use std::collections::HashSet;
+                                dom_win.iter().map(|(d, _)| d.as_str()).collect::<HashSet<_>>().len() as u64
+                            };
+                            let previous = {
+                                use std::collections::HashSet;
+                                dom_prev.iter().map(|(d, _)| d.as_str()).collect::<HashSet<_>>().len() as u64
+                            };
+                            out.push(json!({
+                                "key": "tag_servers",
+                                "unit": Value::Null,
+                                "total": total.to_string(),
+                                "previous_total": previous.to_string(),
+                                "data": daily_data(&buckets, &counts),
+                            }));
+                        }
+                    }
+                }
                 // Omitted like unknown keys upstream (`filter_map` drops
-                // them): `interactions` (no unified interaction event log —
-                // posts, favourites, reblogs, votes and follows are not
-                // journaled as events), `tag_accounts`, `tag_uses` and
-                // `tag_servers` (no per-tag daily history store — D40).
-                // Each omitted known key keeps its reason in the endpoint
-                // manifest (D39).
+                // them): `interactions` ([`REFUSED_INTERACTIONS`]).
             }
         }
     }
@@ -1391,6 +1584,20 @@ pub async fn dimensions(State(state): State<ApiState>, auth: Auth, LenientForm(b
                         "human_value": human_size(media_bytes),
                     }),
                 ];
+                // Round 3 (D39): the live database size, measured from the
+                // filesystem — never estimated. postgres/redis/search entries
+                // are never reported: this server has neither (no search
+                // index on disk — the embedded index lives in the same
+                // database file — and no postgres/redis to measure).
+                if let Ok(Some(db_bytes)) = store.admin_db_size_bytes() {
+                    data.push(json!({
+                        "key": "database",
+                        "human_key": "Database",
+                        "value": db_bytes.to_string(),
+                        "unit": "bytes",
+                        "human_value": human_size(db_bytes),
+                    }));
+                }
                 data.truncate(limit);
                 out.push(json!({ "key": "space_usage", "data": data }));
             }
@@ -1440,12 +1647,64 @@ pub async fn dimensions(State(state): State<ApiState>, auth: Auth, LenientForm(b
                 }));
             }
             _ => {
-                // Omitted like unknown keys upstream: `software_versions`
-                // (no component-version census is collected),
-                // `tag_servers`, `tag_languages` (no per-tag domain or
-                // language census — D40, no tag-history store). Each
-                // omitted known key keeps its reason in the endpoint
-                // manifest (D39).
+                // `tag_servers` / `tag_languages` are served below when
+                // `<key>[id]>` names a tag; without a resolvable id they stay
+                // omitted ([`REFUSED_TAG_NO_ID`] / [`REFUSED_TAG_UNKNOWN_ID`]).
+                // `software_versions` stays refused (D39,
+                // [`REFUSED_SOFTWARE_VERSIONS`]). Unknown keys drop like
+                // upstream's `filter_map`.
+                if let Some(tag_key) = ["tag_servers", "tag_languages"]
+                    .into_iter()
+                    .find(|known| *known == key.as_str())
+                {
+                    let param_key = format!("{tag_key}[id]");
+                    let tag = forms::get(&body, param_key.as_str())
+                        .and_then(|raw| raw.trim().parse::<Id>().ok())
+                        .and_then(|id| tag_name_for_id(store, id));
+                    let Some(tag) = tag else {
+                        continue;
+                    };
+                    let rows = tag_metric_rows(store, &tag);
+                    match tag_key {
+                        "tag_servers" => {
+                            let mut ids: Vec<Id> =
+                                rows.iter().map(|(_, who, _)| *who).collect();
+                            ids.sort_unstable();
+                            ids.dedup();
+                            let authors = store.accounts_by_ids(&ids).unwrap_or_default();
+                            let mut counts: HashMap<String, u64> = HashMap::new();
+                            for (at, who, _) in &rows {
+                                if !in_window(*at) {
+                                    continue;
+                                }
+                                let domain = authors
+                                    .get(who)
+                                    .map(|account| account.domain.clone())
+                                    .unwrap_or_else(|| state.server.domain.clone());
+                                *counts.entry(domain).or_insert(0) += 1;
+                            }
+                            out.push(json!({
+                                "key": "tag_servers",
+                                "data": top_counts(counts, limit),
+                            }));
+                        }
+                        _ => {
+                            let mut counts: HashMap<String, u64> = HashMap::new();
+                            for (at, _, language) in &rows {
+                                if !in_window(*at) {
+                                    continue;
+                                }
+                                let locale =
+                                    language.clone().unwrap_or_else(|| "und".to_string());
+                                *counts.entry(locale).or_insert(0) += 1;
+                            }
+                            out.push(json!({
+                                "key": "tag_languages",
+                                "data": top_counts(counts, limit),
+                            }));
+                        }
+                    }
+                }
             }
         }
     }
@@ -1467,9 +1726,14 @@ fn top_counts(counts: HashMap<String, u64>, limit: usize) -> Vec<Value> {
 /// `POST /api/v1/admin/retention` with read scope upstream (kept).
 ///
 /// Cohorts of accounts by creation day (or month), with the share still
-/// posting in each later period. Upstream measures sign-ins; this server has
-/// no login tracking, so activity = authored a status (documented deviation
-/// in the manifest). `start_at`/`end_at` are required (upstream
+/// active in each later period. Upstream measures sign-ins
+/// (`users.current_sign_in_at`); this server unions two real activity
+/// signals: the password sign-in log (round 2 telemetry — API calls on an
+/// existing token are not sign-ins) and authored statuses (posting implies an
+/// active session; bearer tokens here never expire, so sign-ins alone would
+/// miss API-only users). Members with neither signal are never active —
+///
+/// `start_at`/`end_at` are required (upstream
 /// `params.require` → 400 when missing); `frequency` is `day` (default) or
 /// `month`. The window is clamped like upstream (31 days / 12 months back).
 pub async fn retention(State(state): State<ApiState>, auth: Auth, LenientForm(body): LenientForm) -> Response {
@@ -1550,10 +1814,16 @@ pub async fn retention(State(state): State<ApiState>, auth: Auth, LenientForm(bo
     let mut cohort_keys: Vec<u64> = cohorts.keys().copied().collect();
     cohort_keys.sort_unstable();
 
-    // Active periods per account (posting = active).
+    // Active periods per account: authored statuses plus password
+    // sign-ins (round 3 sign-in cohorts; either signal counts).
     let mut active_periods: HashMap<Id, Vec<u64>> = HashMap::new();
     for row in &status_rows {
         active_periods.entry(row.account_id).or_default().push(row.created_at_ms);
+    }
+    if let Ok(sign_ins) = store.admin_sign_ins(METRIC_SCAN_CAP) {
+        for (who, at) in sign_ins {
+            active_periods.entry(who).or_default().push(at);
+        }
     }
     for periods in active_periods.values_mut() {
         periods.sort_unstable();

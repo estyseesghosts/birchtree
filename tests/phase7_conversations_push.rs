@@ -706,7 +706,7 @@ async fn push_delivery_sends_vapid_tickle_and_classifies() {
 async fn push_job_end_to_end_through_fake_endpoint() {
     let srv = TestServer::new(true);
     let alice = token(&srv, "alice", "read write write:statuses");
-    let bob = token(&srv, "bob", "read push read:notifications");
+    let bob = token(&srv, "bob", "read push read:notifications write:notifications");
     let (p256dh, auth_key) = test_push_keys();
 
     // Bob subscribes, pointed at a fake endpoint that answers 410 (gone).
@@ -727,6 +727,13 @@ async fn push_job_end_to_end_through_fake_endpoint() {
     .await;
     assert_eq!(status, StatusCode::OK, "{created}");
     let sub_id: u64 = created["id"].as_str().unwrap().parse().unwrap();
+
+    // Round 3 area C made the upstream-faithful `private_mentions=filter`
+    // default real: a stranger-DM mention now files a notification request
+    // instead of a Mention row. This legacy push test wants the Mention row,
+    // so it opts out explicitly (as a client would via the policy UI).
+    let (status, _) = call(&srv, "PUT", "/api/v1/notifications/policy", Some(&bob), "filter_private_mentions=false").await;
+    assert_eq!(status, StatusCode::OK);
 
     // Alice mentions bob: a Mention notification row exists after the drain.
     let _ = dm(&srv, &alice, "bob", "job hello").await;

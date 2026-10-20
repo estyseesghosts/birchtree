@@ -22,9 +22,11 @@ fn starts_with(haystack: &[u8], needle: &[u8]) -> bool {
 
 /// Classify an upload by its leading bytes.
 ///
-/// Mirrors the Mastodon 4.7.3 accepted lists: images (jpeg/png/gif/webp),
-/// video (mp4/webm/quicktime) and audio (ogg/mp3/wav/flac/m4a). Anything
-/// else returns `None` (the use case answers the content-type 422).
+/// Mirrors the Mastodon 4.7.3 accepted lists — images (jpeg/png/gif/webp),
+/// video (mp4/webm/quicktime) and audio (ogg/mp3/wav/flac/m4a) — plus the
+/// birchtree D4 extension: HEIC/HEIF stills and TIFF stills are accepted as
+/// images and routed to the WebP transcode (`ImageToWebp`). Anything else
+/// returns `None` (the use case answers the content-type 422).
 pub fn sniff(bytes: &[u8]) -> Option<Sniffed> {
     if bytes.len() < 12 {
         return None;
@@ -65,10 +67,42 @@ pub fn sniff(bytes: &[u8]) -> Option<Sniffed> {
             extension: "bmp",
         });
     }
-    // ISO-BMFF containers: mp4/m4v/quicktime/m4a (video vs audio by major
-    // brand, matching how clients treat the extensions).
+    // TIFF stills, little-endian (`II*\0`) and big-endian (`MM\0*`): D4
+    // still images, routed to the WebP transcode like every other still.
+    if starts_with(bytes, &[0x49, 0x49, 0x2A, 0x00])
+        || starts_with(bytes, &[0x4D, 0x4D, 0x00, 0x2A])
+    {
+        return Some(Sniffed {
+            mime_type: "image/tiff",
+            r#type: "image",
+            extension: "tif",
+        });
+    }
+    // ISO-BMFF containers: HEIC/HEIF stills first (D4), then mp4/m4v/...
+    // An `ftyp` box whose major brand is an HEIF brand (`heic`, `heix`,
+    // `hevc`, `heif`, `heis`, `hevm`, `hevx`, `mif1`, `msf1`) is a still
+    // image, never video: it sniffs `image` and the transcode plan maps it
+    // to `ImageToWebp`. Every other brand falls through to the video/audio
+    // classification below.
     if starts_with(&bytes[4..], b"ftyp") {
         let brand = &bytes[8..12];
+        if matches!(
+            brand,
+            b"heic" | b"heix" | b"hevc" | b"hevm" | b"hevx" | b"mif1" | b"msf1"
+        ) {
+            return Some(Sniffed {
+                mime_type: "image/heic",
+                r#type: "image",
+                extension: "heic",
+            });
+        }
+        if matches!(brand, b"heif" | b"heis") {
+            return Some(Sniffed {
+                mime_type: "image/heif",
+                r#type: "image",
+                extension: "heif",
+            });
+        }
         if brand == b"M4A " || brand == b"M4B " {
             return Some(Sniffed {
                 mime_type: "audio/mp4",
@@ -133,18 +167,28 @@ pub fn sniff(bytes: &[u8]) -> Option<Sniffed> {
 }
 
 /// MIME types Mastodon accepts for uploads, restricted to what the sniffer
-/// (and the pure-Rust decoders) actually support: the intersection of
-/// `MediaAttachment::IMAGE_MIME_TYPES`, `VIDEO_MIME_TYPES` and
-/// `AUDIO_MIME_TYPES` with the formats handled here. Note the ISO-BMFF
-/// sniffer classifies by major brand only, so a QuickTime `.mov` (brand
-/// `qt  `) reports `video/mp4` and is accepted as an mp4 container
-/// (documented; no separate `video/quicktime` decoder exists).
+/// (and the ffmpeg/pure-Rust toolchains) actually support: the intersection
+/// of `MediaAttachment::IMAGE_MIME_TYPES`, `VIDEO_MIME_TYPES` and
+/// `AUDIO_MIME_TYPES` with the formats handled here, plus the birchtree D4
+/// extension (`image/heic`, `image/heif`, `image/tiff` — upstream converts
+/// only HEIC/HEIF/AVIF to JPEG and currently accepts none of them, see
+/// `media_attachment.rb:53,64-65,88-95,328-332`; birchtree converts stills
+/// to WebP instead). Note the ISO-BMFF sniffer classifies by major brand
+/// only, so a QuickTime `.mov` (brand `qt  `) reports `video/mp4` and is
+/// accepted as an mp4 container (documented; no separate `video/quicktime`
+/// decoder exists). `image/x-tiff` is the legacy TIFF alias: the sniffer
+/// always reports the canonical `image/tiff`, and the transcode plan maps
+/// both spellings to `ImageToWebp`.
 pub const ACCEPTED_MIME_TYPES: &[&str] = &[
     "image/jpeg",
     "image/png",
     "image/gif",
     "image/webp",
     "image/bmp",
+    "image/heic",
+    "image/heif",
+    "image/tiff",
+    "image/x-tiff",
     "video/mp4",
     "video/webm",
     "audio/ogg",

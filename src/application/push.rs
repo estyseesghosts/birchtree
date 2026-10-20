@@ -15,16 +15,16 @@
 //! (upstream removes gone endpoints the same way). Network I/O never runs
 //! inside a request transaction.
 //!
-//! Delivery deviation (documented, not silent): upstream encrypts a JSON
-//! payload with the subscription keys (aes128gcm) and fans out per
-//! notification with follow-policy gates evaluated at send time. Birchtree
-//! sends an unauthenticated-body tickle under the same VAPID identity and
+//! Delivery (round 3, area C closes the encryption half): standard
+//! subscriptions get an RFC 8291 `aes128gcm`-encrypted JSON payload (the
+//! `Web::NotificationSerializer` shape — see `push_notification_payload` for
+//! the two documented field deviations) under the same VAPID identity and
 //! the same TTL/urgency, with the same policy/alert gates and the same
-//! gone-endpoint cleanup. The wire stays RFC 8030-compliant (a push message
-//! MAY have no body), at the cost that clients cannot render the
-//! notification without fetching. Encrypted payloads are the follow-up once
-//! an ECDH/AES-GCM dependency is vendored; the subscription rows already
-//! carry validated keys for it.
+//! gone-endpoint cleanup. Legacy (`!standard`) subscriptions keep the
+//! VAPID tickle: the wire stays RFC 8030-compliant (a push message MAY have
+//! no body), at the cost that those clients cannot render the notification
+//! without fetching. Upstream's legacy `aesgcm` encoding is not implemented
+//! (recorded in the D42 register note).
 
 use std::collections::HashMap;
 
@@ -175,14 +175,19 @@ pub fn push_audience_origin(endpoint: &str) -> std::result::Result<String, Strin
     }
 }
 
-/// An RFC 8030 delivery request: VAPID headers, empty body (tickle), TTL and
-/// urgency matching upstream's worker.
+/// An RFC 8030 delivery request: VAPID headers, TTL and urgency matching
+/// upstream's worker. `body` is empty (a "tickle" — the client wakes and
+/// fetches) for legacy (`!standard`) subscriptions; for standard
+/// subscriptions it carries the RFC 8291 `aes128gcm` ciphertext with
+/// `content_encoding` set (round 3, area C; closes the D42 encryption gap).
 #[derive(Debug, Clone)]
 pub struct PushRequest {
     pub url: String,
     pub authorization: String,
     pub crypto_key: String,
     pub ttl_secs: u64,
+    pub body: Vec<u8>,
+    pub content_encoding: Option<String>,
 }
 
 pub fn build_push_request(
@@ -205,7 +210,35 @@ pub fn build_push_request(
         authorization: format!("vapid t={jwt}, k={public_canonical}"),
         crypto_key: format!("p256ecdsa={public_canonical}"),
         ttl_secs: PUSH_TTL_SECS,
+        body: Vec::new(),
+        content_encoding: None,
     })
+}
+
+/// Build the encrypted delivery for a standard subscription (upstream
+/// `perform_standard_request`): the same VAPID identity/TTL/urgency as the
+/// tickle, but the body is the RFC 8291 `aes128gcm` encryption of
+/// `payload_json` under the subscription keys.
+///
+/// Key errors name only the role and length (never key bytes) and are
+/// returned for the caller to map onto subscription cleanup, like
+/// upstream's invalid-row destroy.
+pub fn build_push_request_encrypted(
+    subscription: &WebPushSubscription,
+    keys: &VapidKeys,
+    subject: &str,
+    now_ms: u64,
+    payload_json: &[u8],
+) -> std::result::Result<PushRequest, String> {
+    let mut tickle = build_push_request(subscription, keys, subject, now_ms)?;
+    let encrypted = crate::application::push_crypto::encrypt_aes128gcm(
+        &subscription.key_p256dh,
+        &subscription.key_auth,
+        payload_json,
+    )?;
+    tickle.body = encrypted.body;
+    tickle.content_encoding = Some(encrypted.content_encoding.to_string());
+    Ok(tickle)
 }
 
 fn subscription_key_trimmed(raw: &str) -> &str {
@@ -234,25 +267,107 @@ pub fn classify_push_response(status: u16) -> PushOutcome {
     }
 }
 
-/// Send one tickle through `client` (the safe outbound client in production;
-/// any `reqwest::Client` in tests).
+/// Send one delivery through `client` (the safe outbound client in
+/// production; any `reqwest::Client` in tests). Tickles go out bodiless;
+/// encrypted requests carry `Content-Type: application/octet-stream` and
+/// their `Content-Encoding` (upstream's standard request adds the same
+/// pair, plus `Authorization`, `Ttl`/`TTL`, `Urgency` and `Unsubscribe-URL`;
+/// the unsubscribe URL is a web-route concern and stays out of this
+/// transport type).
 pub async fn deliver_push(
     client: &reqwest::Client,
     request: &PushRequest,
 ) -> PushOutcome {
-    let response = client
+    let mut outgoing = client
         .post(&request.url)
         .header("Authorization", &request.authorization)
         .header("Crypto-Key", &request.crypto_key)
         .header("TTL", request.ttl_secs.to_string())
-        .header("Urgency", "normal")
-        .body(Vec::new())
-        .send()
-        .await;
+        .header("Urgency", "normal");
+    if let Some(encoding) = &request.content_encoding {
+        outgoing = outgoing
+            .header("Content-Type", "application/octet-stream")
+            .header("Content-Encoding", encoding.clone());
+    }
+    let response = outgoing.body(request.body.clone()).send().await;
     match response {
         Ok(response) => classify_push_response(response.status().as_u16()),
         Err(err) => PushOutcome::Retry(format!("push send failed: {err}")),
     }
+}
+
+/// Build the encrypted-payload plaintext for one notification: the JSON of
+/// upstream's `Web::NotificationSerializer`
+/// (`app/serializers/web/notification_serializer.rb`):
+/// `{access_token, preferred_locale, notification_id, notification_type,
+/// icon, title, body}`.
+///
+/// Two documented deviations (never fabricated):
+/// - `access_token` is `""`: the token plaintext is not recoverable
+///   server-side (only its hash is stored), so there is nothing honest to
+///   embed. Upstream embeds the subscription's token.
+/// - `icon` is `""`: this server stores no per-account avatars yet (the REST
+///   account DTO always serves the missing-avatar asset), so there is no
+///   actor avatar URL to embed. Upstream serves the actor's avatar URL.
+/// - `preferred_locale` is `"en"`: no locale is stored on the subscription
+///   or user. `title` mirrors `notification_mailer.*.subject` (`en.yml`)
+///   with the actor's display name (or username); `body` is the status
+///   spoiler/source text truncated to 140 characters (upstream strips the
+///   rendered HTML and truncates the same way), falling back to the actor's
+///   bio text when there is no status.
+pub fn push_notification_payload(
+    store: &dyn crate::application::ports::Store,
+    notification: &Notification,
+) -> std::result::Result<Vec<u8>, Error> {
+    let actor = match notification.actor_id {
+        Some(actor_id) => store.account_by_id(actor_id)?,
+        None => None,
+    };
+    let name = actor
+        .as_ref()
+        .map(|account| {
+            if account.display_name.trim().is_empty() {
+                account.username.clone()
+            } else {
+                account.display_name.clone()
+            }
+        })
+        .unwrap_or_default();
+    let title = match notification.r#type.as_str() {
+        "favourite" => format!("{name} favorited your post"),
+        "follow" => format!("{name} is now following you"),
+        "follow_request" => format!("Pending follower: {name}"),
+        "mention" => format!("You were mentioned by {name}"),
+        "quote" => format!("{name} quoted your post"),
+        "reblog" => format!("{name} boosted your post"),
+        "poll" => format!("A poll by {name} has ended"),
+        _ => format!("New notification from {name}"),
+    };
+    let mut body_text = match notification.status_id {
+        Some(status_id) => match store.status_by_id(status_id)? {
+            Some(status) => status
+                .spoiler_text
+                .clone()
+                .filter(|spoiler| !spoiler.trim().is_empty())
+                .unwrap_or(status.source_text.clone()),
+            None => String::new(),
+        },
+        None => String::new(),
+    };
+    if body_text.trim().is_empty() {
+        body_text = actor.as_ref().map(|account| account.note.clone()).unwrap_or_default();
+    }
+    let body_text: String = body_text.chars().take(140).collect();
+    let payload = serde_json::json!({
+        "access_token": "",
+        "preferred_locale": "en",
+        "notification_id": notification.id.to_string(),
+        "notification_type": notification.r#type.as_str(),
+        "icon": "",
+        "title": title,
+        "body": body_text,
+    });
+    serde_json::to_vec(&payload).map_err(|err| Error::Internal(format!("push payload: {err}")))
 }
 
 /// What the durable job does after one attempt.
@@ -270,7 +385,9 @@ pub enum PushJobOutcome {
 ///
 /// Loads both rows, skips stale notifications (older than the 48 h TTL),
 /// checks the subscription's policy/alert gates against the notification,
-/// and sends the tickle. Missing rows complete silently (upstream rescues
+/// then sends: an RFC 8291 `aes128gcm`-encrypted JSON payload for standard
+/// subscriptions (round 3, area C), the VAPID tickle for legacy
+/// (`!standard`) ones. Missing rows complete silently (upstream rescues
 /// `RecordNotFound` the same way).
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_push_job(
@@ -322,8 +439,27 @@ pub async fn handle_push_job(
     if !notification_activity_present(store, &notification)? {
         return Ok(PushJobOutcome::Complete);
     }
-    let request =
-        build_push_request(&subscription, keys, subject, now_ms).map_err(Error::Internal)?;
+    // Standard subscriptions get the encrypted payload (upstream
+    // `perform_standard_request`); legacy ones keep the tickle (upstream
+    // `perform_legacy_request` used `aesgcm`, which this server does not
+    // implement — the tickle stays RFC 8030-compliant and is documented in
+    // the D42 register note).
+    let request = if subscription.standard {
+        let payload_json = push_notification_payload(store, &notification)?;
+        match build_push_request_encrypted(&subscription, keys, subject, now_ms, &payload_json) {
+            Ok(request) => request,
+            // Unusable keys (corrupt or undecodable rows that passed the
+            // write-time validation): drop the subscription, like upstream's
+            // invalid-row destroy. Never retries: the keys will not heal.
+            // The reason names only roles and lengths, never key bytes.
+            Err(message) => {
+                tracing::warn!(reason = message, "web_push_delivery: dropping subscription");
+                return Ok(PushJobOutcome::DeleteSubscriptionAndComplete(subscription.id));
+            }
+        }
+    } else {
+        build_push_request(&subscription, keys, subject, now_ms).map_err(Error::Internal)?
+    };
     match deliver_push(client, &request).await {
         PushOutcome::Delivered => Ok(PushJobOutcome::Complete),
         PushOutcome::Gone => Ok(PushJobOutcome::DeleteSubscriptionAndComplete(

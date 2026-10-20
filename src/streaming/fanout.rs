@@ -29,6 +29,9 @@ pub(crate) fn process(core: &Core, event: StreamEvent) {
             }
         }
         StreamEvent::Notification { notification_id } => notification(core, notification_id),
+        StreamEvent::NotificationsMerged { recipient_id } => {
+            notifications_merged(core, recipient_id)
+        }
         // Bump before any `Retract` for the same viewer, so the retraction's
         // frames carry the new epoch.
         StreamEvent::PolicyChanged { viewers } => core.bump_epochs(&viewers),
@@ -242,6 +245,32 @@ fn notification(core: &Core, notification_id: Id) {
             Ok(None) => {}
             Err(err) => warn("notification render", err),
         }
+    }
+}
+
+/// A notification request was accepted: the merge signal, to the
+/// recipient's `user` (with notifications in scope) and `user:notification`
+/// streams (round 3, area C; closes D20).
+///
+/// Upstream's `UnfilterNotificationsWorker` publishes
+/// `{event: :notifications_merged, payload: '1'}` on the recipient's
+/// notifications channel (`app/workers/unfilter_notifications_worker.rb:42`);
+/// the streaming server forwards it to both subscriptions. The payload is
+/// the raw string `1`, like `delete`'s raw id — not a JSON document.
+fn notifications_merged(core: &Core, recipient: Id) {
+    for (conn, sub) in core.subscriptions() {
+        if sub.viewer != recipient {
+            continue;
+        }
+        let wanted = match sub.kind {
+            StreamKind::User => sub.notifications_scope,
+            StreamKind::UserNotification => true,
+            _ => false,
+        };
+        if !wanted {
+            continue;
+        }
+        core.deliver(&conn, Frame::new("notifications_merged", sub.names.clone(), Arc::from("1")));
     }
 }
 

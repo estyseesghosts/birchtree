@@ -9,6 +9,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 
 use crate::api::forms;
+use crate::api::forms::LenientForm;
 use crate::api::mastodon::auth::Auth;
 use crate::api::mastodon::dto;
 use crate::api::mastodon::errors::ApiError;
@@ -17,9 +18,10 @@ use crate::api::mastodon::status_view::load_status_views;
 use crate::api::mastodon::{ApiState, ServerInfo};
 use crate::application::notifications::{
     self, COUNT_DEFAULT_LIMIT, COUNT_MAX_LIMIT, DEFAULT_LIMIT, MAX_LIMIT, NotificationQuery,
+    PolicyChanges,
 };
 use crate::application::ports::Store;
-use crate::domain::{Id, NotificationType};
+use crate::domain::{Id, NotificationRequest, NotificationType};
 
 /// Read scopes for notification reads.
 const READ_SCOPES: &[&str] = &["read", "read:notifications"];
@@ -326,28 +328,404 @@ pub async fn unread_count(
     }
 }
 
-/// `GET /api/v1/notifications/requests` — always empty: this server does not
-/// filter notifications yet, so no requests can exist (never fabricated).
-pub async fn requests_index(State(state): State<ApiState>, auth: Auth) -> Response {
+/// `GET /api/v1/notifications/requests` — the recipient's live request rows,
+/// newest first (round 3, area C; closes the always-`[]` D20 interim).
+/// Suspended senders are excluded (upstream `without_suspended`); a request
+/// whose actor or last status row is gone renders `null` for that half,
+/// never fabricated.
+pub async fn requests_index(State(state): State<ApiState>, auth: Auth, uri: Uri) -> Response {
     if let Err(err) = auth.0.require_scopes(READ_SCOPES) {
         return err.into_response();
     }
-    if let Err(err) = auth.0.require_user() {
-        return err.into_response();
+    let recipient = match auth.0.require_user() {
+        Ok(id) => id,
+        Err(err) => return err.into_response(),
+    };
+    let pairs = match uri.query() {
+        Some(query) => forms::parse(query.as_bytes()),
+        None => Vec::new(),
+    };
+    // Upstream `limit_param(DEFAULT_ACCOUNTS_LIMIT)`: absent -> 40.
+    let limit: usize = match forms::get(&pairs, "limit") {
+        None => 40,
+        Some(raw) => {
+            let value: i64 = raw.parse().unwrap_or(0);
+            (value.unsigned_abs() as usize).min(80)
+        }
+    };
+    let page = match pagination::parse(
+        None,
+        forms::get(&pairs, "max_id"),
+        forms::get(&pairs, "since_id"),
+        forms::get(&pairs, "min_id"),
+        limit,
+        80,
+    ) {
+        Ok(page) => page,
+        Err(err) => return err.into_response(),
+    };
+    let store: &dyn Store = &*state.context.store;
+    let rows = match notifications::requests(store, recipient) {
+        Ok(rows) => rows,
+        Err(err) => return ApiError::from(err).into_response(),
+    };
+    let rows: Vec<NotificationRequest> = rows
+        .into_iter()
+        .filter(|row| {
+            if let Some(max_id) = page.max_id {
+                if row.id.value() >= max_id.value() {
+                    return false;
+                }
+            }
+            if let Some(since_id) = page.since_id {
+                if row.id.value() <= since_id.value() {
+                    return false;
+                }
+            }
+            if let Some(min_id) = page.min_id {
+                if row.id.value() <= min_id.value() {
+                    return false;
+                }
+            }
+            true
+        })
+        .take(page.limit)
+        .collect();
+    match render_requests(&state.server, store, state.context.now_ms(), recipient, rows) {
+        Ok((body, first, last)) => {
+            let mut response = axum::Json(body).into_response();
+            if let Some(link) = pagination::link_header(&uri, last, first) {
+                if let Ok(value) =
+                    axum::http::header::HeaderValue::from_str(&link)
+                {
+                    response
+                        .headers_mut()
+                        .insert(axum::http::header::LINK, value);
+                }
+            }
+            response
+        }
+        Err(err) => err.into_response(),
     }
-    let _ = &state;
-    axum::Json(Vec::<Value>::new()).into_response()
 }
 
-/// `GET /api/v1/notifications/requests/merged` — `{"merged": true}`: there is
-/// no unmerge work because nothing is filtered.
+/// Render request rows (`REST::NotificationRequestSerializer`): `{id,
+/// created_at, updated_at, notifications_count, account, last_status}`.
+/// `notifications_count` is a string, like upstream's `.to_s`.
+fn render_requests(
+    server: &ServerInfo,
+    store: &dyn Store,
+    now_ms: u64,
+    recipient: Id,
+    rows: Vec<NotificationRequest>,
+) -> Result<(Vec<Value>, Option<Id>, Option<Id>), ApiError> {
+    let first = rows.first().map(|row| row.id);
+    let last = rows.last().map(|row| row.id);
+    let actor_ids: Vec<Id> = rows.iter().map(|row| row.from_account_id).collect();
+    let accounts = store.accounts_by_ids(&actor_ids)?;
+    let stats = store.account_stats_by_ids(&actor_ids)?;
+    let status_ids: Vec<Id> = rows.iter().filter_map(|row| row.last_status_id).collect();
+    let statuses = store.statuses_by_ids(&status_ids)?;
+    let views = load_status_views(server, store, Some(recipient), statuses, now_ms)?;
+    let status_json: Vec<(Id, Value)> = views
+        .into_iter()
+        .map(|view| {
+            let id = view.status.id;
+            let json = dto::status_json(
+                server,
+                Some(recipient),
+                now_ms,
+                &view,
+                dto::StatusSourceMode::Content,
+            );
+            (id, json)
+        })
+        .collect();
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(actor) = accounts.get(&row.from_account_id) else {
+            continue;
+        };
+        // Suspended senders are excluded, like upstream.
+        if actor.suspended {
+            continue;
+        }
+        let account = dto::account_json_with_stats(server, actor, stats.get(&row.from_account_id));
+        let last_status = row
+            .last_status_id
+            .and_then(|id| status_json.iter().find(|(sid, _)| *sid == id))
+            .map(|(_, json)| json.clone())
+            .unwrap_or(Value::Null);
+        let count = store
+            .count_filtered_notifications(recipient, row.from_account_id)
+            .unwrap_or(0);
+        out.push(serde_json::json!({
+            "id": row.id.to_string(),
+            "created_at": iso_ms(row.created_at_ms),
+            "updated_at": iso_ms(row.updated_at_ms),
+            "notifications_count": count.to_string(),
+            "account": account,
+            "last_status": last_status,
+        }));
+    }
+    Ok((out, first, last))
+}
+
+fn iso_ms(ms: u64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64)
+        .map(|time| {
+            time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        })
+        .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string())
+}
+
+/// `GET /api/v1/notifications/requests/merged` — `{"merged": bool}`:
+/// accepts run synchronously, so this is exactly "no pending requests"
+/// (upstream `requests#merged?` reads its async worker counter instead).
 pub async fn requests_merged(State(state): State<ApiState>, auth: Auth) -> Response {
     if let Err(err) = auth.0.require_scopes(READ_SCOPES) {
         return err.into_response();
     }
-    if let Err(err) = auth.0.require_user() {
+    let recipient = match auth.0.require_user() {
+        Ok(id) => id,
+        Err(err) => return err.into_response(),
+    };
+    let store: &dyn Store = &*state.context.store;
+    match notifications::merged(store, recipient) {
+        Ok(merged) => axum::Json(serde_json::json!({ "merged": merged })).into_response(),
+        Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
+/// `GET /api/v1/notifications/requests/:id`.
+pub async fn requests_show(
+    State(state): State<ApiState>,
+    auth: Auth,
+    Path(raw): Path<String>,
+) -> Response {
+    if let Err(err) = auth.0.require_scopes(READ_SCOPES) {
         return err.into_response();
     }
-    let _ = &state;
-    axum::Json(serde_json::json!({ "merged": true })).into_response()
+    let recipient = match auth.0.require_user() {
+        Ok(id) => id,
+        Err(err) => return err.into_response(),
+    };
+    let Ok(id) = raw.parse::<Id>() else {
+        return ApiError::not_found().into_response();
+    };
+    let store: &dyn Store = &*state.context.store;
+    match notifications::request_show(store, recipient, id) {
+        Ok(row) => {
+            match render_requests(
+                &state.server,
+                store,
+                state.context.now_ms(),
+                recipient,
+                vec![row],
+            ) {
+                Ok((mut body, _, _)) => {
+                    match body.pop() {
+                        Some(value) => axum::Json(value).into_response(),
+                        // A suspended sender renders nothing (no fabrication).
+                        None => ApiError::not_found().into_response(),
+                    }
+                }
+                Err(err) => err.into_response(),
+            }
+        }
+        Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
+/// `POST /api/v1/notifications/requests/:id/accept` — unhide the actor's
+/// rows and emit `notifications_merged` (only on a real merge). `200 {}`.
+pub async fn requests_accept(
+    State(state): State<ApiState>,
+    auth: Auth,
+    Path(raw): Path<String>,
+) -> Response {
+    if let Err(err) = auth.0.require_scopes(WRITE_SCOPES) {
+        return err.into_response();
+    }
+    let recipient = match auth.0.require_user() {
+        Ok(id) => id,
+        Err(err) => return err.into_response(),
+    };
+    let Ok(id) = raw.parse::<Id>() else {
+        return ApiError::not_found().into_response();
+    };
+    let store: &dyn Store = &*state.context.store;
+    match notifications::accept_request(store, &*state.context.streaming, recipient, id) {
+        Ok(_) => axum::Json(serde_json::json!({})).into_response(),
+        Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
+/// `POST /api/v1/notifications/requests/:id/dismiss` — delete the actor's
+/// filtered rows and the request. Silent (no event). `200 {}`.
+pub async fn requests_dismiss(
+    State(state): State<ApiState>,
+    auth: Auth,
+    Path(raw): Path<String>,
+) -> Response {
+    if let Err(err) = auth.0.require_scopes(WRITE_SCOPES) {
+        return err.into_response();
+    }
+    let recipient = match auth.0.require_user() {
+        Ok(id) => id,
+        Err(err) => return err.into_response(),
+    };
+    let Ok(id) = raw.parse::<Id>() else {
+        return ApiError::not_found().into_response();
+    };
+    let store: &dyn Store = &*state.context.store;
+    match notifications::dismiss_request(store, recipient, id) {
+        Ok(_) => axum::Json(serde_json::json!({})).into_response(),
+        Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
+/// Bulk `id[]` ids from the query string and/or the form/JSON body
+/// (upstream scopes the set to the recipient's rows; unknown or foreign ids
+/// simply match nothing).
+fn bulk_ids(uri: &Uri, body: &[(String, String)]) -> Vec<Id> {
+    let mut ids = Vec::new();
+    if let Some(query) = uri.query() {
+        for (key, value) in forms::parse(query.as_bytes()) {
+            if key == "id" || key == "id[]" {
+                if let Ok(id) = value.parse::<Id>() {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+    for raw in forms::all(body, "id") {
+        if let Ok(id) = raw.parse::<Id>() {
+            ids.push(id);
+        }
+    }
+    ids.sort_by_key(|id| id.value());
+    ids.dedup_by_key(|id| id.value());
+    ids
+}
+
+/// `POST /api/v1/notifications/requests/accept` — bulk accept. `200 {}`.
+pub async fn requests_accept_bulk(
+    State(state): State<ApiState>,
+    auth: Auth,
+    uri: Uri,
+    LenientForm(body): LenientForm,
+) -> Response {
+    if let Err(err) = auth.0.require_scopes(WRITE_SCOPES) {
+        return err.into_response();
+    }
+    let recipient = match auth.0.require_user() {
+        Ok(id) => id,
+        Err(err) => return err.into_response(),
+    };
+    let ids = bulk_ids(&uri, &body);
+    let store: &dyn Store = &*state.context.store;
+    match notifications::accept_requests_bulk(store, &*state.context.streaming, recipient, &ids) {
+        Ok(_) => axum::Json(serde_json::json!({})).into_response(),
+        Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
+/// `POST /api/v1/notifications/requests/dismiss` — bulk dismiss. `200 {}`.
+pub async fn requests_dismiss_bulk(
+    State(state): State<ApiState>,
+    auth: Auth,
+    uri: Uri,
+    LenientForm(body): LenientForm,
+) -> Response {
+    if let Err(err) = auth.0.require_scopes(WRITE_SCOPES) {
+        return err.into_response();
+    }
+    let recipient = match auth.0.require_user() {
+        Ok(id) => id,
+        Err(err) => return err.into_response(),
+    };
+    let ids = bulk_ids(&uri, &body);
+    let store: &dyn Store = &*state.context.store;
+    match notifications::dismiss_requests_bulk(store, recipient, &ids) {
+        Ok(_) => axum::Json(serde_json::json!({})).into_response(),
+        Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
+/// `GET /api/v1/notifications/policy` (`REST::V1::NotificationPolicySerializer`).
+pub async fn policy_show(State(state): State<ApiState>, auth: Auth) -> Response {
+    if let Err(err) = auth.0.require_scopes(READ_SCOPES) {
+        return err.into_response();
+    }
+    let recipient = match auth.0.require_user() {
+        Ok(id) => id,
+        Err(err) => return err.into_response(),
+    };
+    let store: &dyn Store = &*state.context.store;
+    match notifications::policy(store, recipient) {
+        Ok(policy) => match policy_json(store, recipient, &policy) {
+            Ok(body) => axum::Json(body).into_response(),
+            Err(err) => ApiError::from(err).into_response(),
+        },
+        Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
+/// `PUT /api/v1/notifications/policy` — set `filter_*` flags (absent flags
+/// keep their value; `for_limited_accounts` is not settable here, exactly
+/// like upstream's V1 params).
+pub async fn policy_update(
+    State(state): State<ApiState>,
+    auth: Auth,
+    LenientForm(body): LenientForm,
+) -> Response {
+    if let Err(err) = auth.0.require_scopes(WRITE_SCOPES) {
+        return err.into_response();
+    }
+    let recipient = match auth.0.require_user() {
+        Ok(id) => id,
+        Err(err) => return err.into_response(),
+    };
+    let flag = |name: &str| forms::get(&body, name).map(|raw| bool_cast(raw));
+    let changes = PolicyChanges {
+        filter_not_following: flag("filter_not_following"),
+        filter_not_followers: flag("filter_not_followers"),
+        filter_new_accounts: flag("filter_new_accounts"),
+        filter_private_mentions: flag("filter_private_mentions"),
+        filter_bots: flag("filter_bots"),
+    };
+    let store: &dyn Store = &*state.context.store;
+    match notifications::update_policy(store, recipient, changes) {
+        Ok(policy) => match policy_json(store, recipient, &policy) {
+            Ok(rendered) => axum::Json(rendered).into_response(),
+            Err(err) => ApiError::from(err).into_response(),
+        },
+        Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
+fn policy_json(
+    store: &dyn Store,
+    recipient: Id,
+    policy: &crate::domain::NotificationPolicy,
+) -> Result<Value, ApiError> {
+    let requests = store.notification_requests(recipient)?;
+    let mut pending_notifications = 0u64;
+    for row in &requests {
+        pending_notifications += store
+            .count_filtered_notifications(recipient, row.from_account_id)
+            .unwrap_or(0);
+    }
+    Ok(serde_json::json!({
+        "filter_not_following": policy.filter_not_following(),
+        "filter_not_followers": policy.filter_not_followers(),
+        "filter_new_accounts": policy.filter_new_accounts(),
+        "filter_private_mentions": policy.filter_private_mentions(),
+        "filter_bots": policy.filter_bots(),
+        "summary": {
+            "pending_requests_count": requests.len() as u64,
+            "pending_notifications_count": pending_notifications,
+        },
+    }))
 }

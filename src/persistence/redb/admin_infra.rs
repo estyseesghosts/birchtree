@@ -856,6 +856,17 @@ impl AdminInfraStore for RedbStore {
         String::new()
     }
 
+    /// Round 3 (D39 `space_usage`): the live `redb` file size, measured from
+    /// the filesystem — never estimated. `None` when the file cannot be
+    /// statted (the caller omits the entry). postgres/redis sizes are never
+    /// reported: this server has neither.
+    fn admin_db_size_bytes(&self) -> Result<Option<u64>> {
+        match std::fs::metadata(self.path()) {
+            Ok(meta) => Ok(Some(meta.len())),
+            Err(_) => Ok(None),
+        }
+    }
+
     fn admin_accounts_overview(&self, cap: usize) -> Result<Vec<AdminAccountOverview>> {
         let read = self.begin_read()?;
         let accounts = read.open_table(ACCOUNTS)?;

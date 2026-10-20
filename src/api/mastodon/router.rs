@@ -5,6 +5,7 @@
 //! id. Unimplemented endpoints are absent (they 404) rather than stubbed.
 
 use axum::Router;
+use axum::Extension;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::response::Response;
@@ -21,6 +22,10 @@ pub fn build_router(state: ApiState) -> Router {
     let max_body = state.max_body_size;
     let rate_multiplier = state.rate_limit_multiplier;
     let ip_block_state = state.clone();
+    let invites: std::sync::Arc<dyn crate::application::accounts::InviteStore> =
+        std::sync::Arc::new(crate::application::accounts::MemoryInviteStore::default());
+    let mail_env: std::sync::Arc<crate::mailer::MailEnv> =
+        std::sync::Arc::new(crate::mailer::MailEnv::disabled());
     Router::new()
         // Runtime probes.
         .route("/health", get(health))
@@ -54,6 +59,23 @@ pub fn build_router(state: ApiState) -> Router {
             get(endpoints::accounts::relationships),
         )
         .route("/api/v1/accounts/:id", get(endpoints::accounts::show))
+        // Invites + email (round 3, area A). `MailEnv::disabled()` makes the
+        // mail endpoints answer an explicit 503 until an SMTP provider is
+        // configured; `MemoryInviteStore` is the dev/test backend — the
+        // durable redb implementation is follow-up work (see D12).
+        .route("/invite/:invite_code", get(endpoints::accounts::invite_show))
+        .route(
+            "/api/v1/emails/confirmations",
+            post(endpoints::accounts::email_confirmation_create),
+        )
+        .route(
+            "/api/v1/emails/check_confirmation",
+            get(endpoints::accounts::email_confirmation_check),
+        )
+        .route(
+            "/api/v1/emails/password_reset",
+            post(endpoints::accounts::password_reset_create),
+        )
         // Relationship writes (each returns a fresh RelationshipSerializer).
         .route(
             "/api/v1/accounts/:id/follow",
@@ -373,6 +395,34 @@ pub fn build_router(state: ApiState) -> Router {
             "/api/v1/notifications/requests/merged",
             get(endpoints::notifications::requests_merged),
         )
+        // Notification-request pipeline (round 3, area C): upstream
+        // `notifications/requests` member + bulk accept/dismiss and the
+        // `notifications/policy` singleton (`config/routes/api.rb:178-194`).
+        .route(
+            "/api/v1/notifications/requests/:id",
+            get(endpoints::notifications::requests_show),
+        )
+        .route(
+            "/api/v1/notifications/requests/:id/accept",
+            post(endpoints::notifications::requests_accept),
+        )
+        .route(
+            "/api/v1/notifications/requests/:id/dismiss",
+            post(endpoints::notifications::requests_dismiss),
+        )
+        .route(
+            "/api/v1/notifications/requests/accept",
+            post(endpoints::notifications::requests_accept_bulk),
+        )
+        .route(
+            "/api/v1/notifications/requests/dismiss",
+            post(endpoints::notifications::requests_dismiss_bulk),
+        )
+        .route(
+            "/api/v1/notifications/policy",
+            get(endpoints::notifications::policy_show)
+                .put(endpoints::notifications::policy_update),
+        )
         .route(
             "/api/v1/notifications/:id",
             get(endpoints::notifications::show),
@@ -486,6 +536,8 @@ pub fn build_router(state: ApiState) -> Router {
         // Federation (Phase 6): WebFinger, NodeInfo, the actor document and the
         // inboxes. The crate's middleware sits on these routes only.
         .merge(crate::activitypub::http::routes::<ApiState>(state.federation.clone()))
+        .layer(Extension(invites))
+        .layer(Extension(mail_env))
         .with_state(state)
         // Malformed JSON is refused before any handler runs (Rails parses
         // params before the action); this sits inside the rate limiter, which
