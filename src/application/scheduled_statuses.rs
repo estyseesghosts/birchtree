@@ -77,6 +77,7 @@ pub fn schedule_status(
     license_policy: &str,
     place_policy: &str,
     place_id: Option<Id>,
+    alt_text_policy: &str,
 ) -> Result<ScheduledStatus> {
     let account_id = cmd.account_id;
     validate_time(scheduled_at_ms, now_ms)?;
@@ -125,7 +126,7 @@ pub fn schedule_status(
         }
     }
 
-    let params = command_params(&cmd, max_chars, license_policy, place_policy, place_id);
+    let params = command_params(&cmd, max_chars, license_policy, place_policy, place_id, alt_text_policy);
     store.create_scheduled(
         NewScheduledStatus {
             account_id,
@@ -194,6 +195,7 @@ pub fn publish_scheduled_job(
         &publish_license_policy(&row.params),
         &publish_place_policy(&row.params),
         publish_place_id(&row.params),
+        &publish_alt_text_policy(&row.params),
     ) {
         Ok(created) => Ok(Some(created.status.id)),
         Err(err) => {
@@ -216,6 +218,7 @@ fn command_params(
     license_policy: &str,
     place_policy: &str,
     place_id: Option<Id>,
+    alt_text_policy: &str,
 ) -> serde_json::Value {
     let mut params = serde_json::Map::new();
     params.insert("max_status_chars".into(), serde_json::json!(max_chars));
@@ -228,6 +231,8 @@ fn command_params(
     if let Some(id) = place_id {
         params.insert("place_id".into(), serde_json::json!(id.value()));
     }
+    // Core extension CORE-T: same replay rule as the other policies.
+    params.insert("alt_text_policy".into(), serde_json::json!(alt_text_policy));
     if let Some(text) = &cmd.text {
         params.insert("text".into(), serde_json::json!(text));
     }
@@ -295,6 +300,15 @@ fn publish_place_id(params: &serde_json::Value) -> Option<Id> {
         .get("place_id")
         .and_then(|v| v.as_u64())
         .map(Id::new)
+}
+
+/// Alt-text policy stored alongside; old rows replay as `off`.
+fn publish_alt_text_policy(params: &serde_json::Value) -> String {
+    params
+        .get("alt_text_policy")
+        .and_then(|v| v.as_str())
+        .unwrap_or("off")
+        .to_string()
 }
 
 /// Rebuild a creation command from stored params (missing/unknown keys are

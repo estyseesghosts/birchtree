@@ -306,7 +306,7 @@ async fn edit_delete_visibility_change_converge() {
             poll: None,
             quote_approval_policy: None,
         },
-        "off", "off", None,
+        "off", "off", None, "off",
     )
     .unwrap();
     index_now(&srv, &index, id);

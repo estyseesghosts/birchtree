@@ -144,6 +144,7 @@ fn staging_sweep_clears_terminal_rows_and_spares_pending() {
         16 * 1024 * 1024,
         "off",
         None,
+        "off",
     )
     .expect("upload");
     assert_eq!(ready.state, MediaState::Ready);

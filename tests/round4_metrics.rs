@@ -90,7 +90,7 @@ fn post(
             application_website: None,
             idempotency_key: key.map(str::to_string),
         },
-        500, "off", "off", None,
+        500, "off", "off", None, "off",
     )
     .expect("post")
     .status
@@ -163,7 +163,7 @@ fn idempotent_reply_replay_journals_once() {
             application_website: None,
             idempotency_key: Some("reply-k1".to_string()),
         },
-        500, "off", "off", None,
+        500, "off", "off", None, "off",
     )
     .expect("first reply");
     assert!(!first.replayed);
@@ -187,7 +187,7 @@ fn idempotent_reply_replay_journals_once() {
             application_website: None,
             idempotency_key: Some("reply-k1".to_string()),
         },
-        500, "off", "off", None,
+        500, "off", "off", None, "off",
     )
     .expect("replay");
     assert!(second.replayed, "same idempotency key replays");

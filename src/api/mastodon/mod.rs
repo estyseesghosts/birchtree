@@ -11,6 +11,8 @@ pub mod endpoints;
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use axum::response::Response;
+
 use crate::application::context::Context;
 
 pub use router::build_router;
@@ -94,12 +96,38 @@ pub struct ServerInfo {
     /// `off`). Gates `place_id` on writes; the DTO layer omits `location`
     /// when `off`.
     pub place_policy: String,
+    /// Core extension CORE-T (mirrors `Config::alt_text_policy`, default
+    /// `off`). Local writes only: `nag` adds `X-Birchtree-Alt-Text-Nag: 1`
+    /// on success responses with undescribed image/video; `block` 422s
+    /// those writes instead.
+    pub alt_text_policy: String,
+}
+
+/// Core extension CORE-T nag signal: when `policy == "nag"` and at least
+/// one covered attachment (`image`/`video`/`gifv`) in `attachments`
+/// (`(type, description)` pairs) lacks a description, set
+/// `X-Birchtree-Alt-Text-Nag: 1` on the success response. A header (not a
+/// JSON field) keeps the pinned exact-DTO-key contracts intact. Identity
+/// otherwise.
+pub fn with_alt_text_nag(
+    mut response: Response,
+    policy: &str,
+    attachments: &[(String, String)],
+) -> Response {
+    if crate::application::alt_text_policy::nag_signal(policy, attachments) {
+        response.headers_mut().insert(
+            crate::application::alt_text_policy::NAG_HEADER_NAME,
+            axum::http::HeaderValue::from_static(
+                crate::application::alt_text_policy::NAG_HEADER_VALUE,
+            ),
+        );
+    }
+    response
 }
 
 /// Host and optional explicit port of a separately configured streaming base.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StreamingHost {
-    pub scheme: String,
+pub struct StreamingHost {    pub scheme: String,
     pub host: String,
     pub port: Option<u16>,
 }
@@ -220,6 +248,7 @@ impl ServerInfo {
             remote_topic_feed_access: cfg.remote_topic_feed_access.clone(),
             license_policy: cfg.license_policy.clone(),
             place_policy: cfg.place_policy.clone(),
+            alt_text_policy: cfg.alt_text_policy.clone(),
         }
     }
 }

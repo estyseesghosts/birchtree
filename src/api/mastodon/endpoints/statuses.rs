@@ -112,9 +112,26 @@ fn apply_filter_results(
     Ok(())
 }
 
+/// Core extension CORE-T: `(type, description)` pairs for the nag signal.
+/// A lookup failure reads as no attachments (no nag), never a 500: the
+/// status already committed.
+fn alt_pairs(store: &dyn Store, media_ids: &[Id]) -> Vec<(String, String)> {
+    store
+        .media_by_ids(media_ids)
+        .map(|rows| {
+            media_ids
+                .iter()
+                .filter_map(|id| {
+                    rows.get(id)
+                        .map(|m| (m.r#type.clone(), m.description.clone()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Assemble and render one status as 200 JSON.
-fn status_response(
-    state: &ApiState,
+fn status_response(    state: &ApiState,
     viewer: Option<Id>,
     status: Status,
     source: StatusSourceMode,
@@ -506,6 +523,7 @@ pub async fn create(
             &state.server.license_policy,
             &state.server.place_policy,
             place_id,
+            &state.server.alt_text_policy,
         ) {
             Ok(row) => {
                 let media = store
@@ -526,7 +544,7 @@ pub async fn create(
         };
     }
 
-    match statuses::create_status(store, &state.server.public_url, state.context.now_ms(), cmd, state.server.max_status_chars, &state.server.license_policy, &state.server.place_policy, place_id) {
+    match statuses::create_status(store, &state.server.public_url, state.context.now_ms(), cmd, state.server.max_status_chars, &state.server.license_policy, &state.server.place_policy, place_id, &state.server.alt_text_policy) {
         Ok(created) => {
             // An idempotent replay committed nothing new, so nothing streams.
             if !created.replayed {
@@ -538,7 +556,13 @@ pub async fn create(
                     &created.status,
                 );
             }
-            status_response(&state, Some(viewer), created.status, StatusSourceMode::Content)
+            // Core extension CORE-T: nag header on success when enabled.
+            let attachments = alt_pairs(store, &created.status.media_ids);
+            crate::api::mastodon::with_alt_text_nag(
+                status_response(&state, Some(viewer), created.status, StatusSourceMode::Content),
+                &state.server.alt_text_policy,
+                &attachments,
+            )
         }
         Err(err) => match err {
             // Reply/quote misses keep their exact custom messages.
@@ -646,7 +670,7 @@ pub async fn update(
         quote_approval_policy: field("quote_approval_policy"),
     };
     let store: &dyn Store = &*state.context.store;
-    match statuses::update_status(store, state.context.now_ms(), cmd, &state.server.license_policy, &state.server.place_policy, place_id) {
+    match statuses::update_status(store, state.context.now_ms(), cmd, &state.server.license_policy, &state.server.place_policy, place_id, &state.server.alt_text_policy) {
         Ok(maybe_status) => {
             // No changes: reload and answer 200 with the unchanged status.
             let status = match maybe_status {
@@ -661,7 +685,13 @@ pub async fn update(
                     _ => return ApiError::not_found().into_response(),
                 },
             };
-            status_response(&state, Some(viewer), status, StatusSourceMode::Content)
+            // Core extension CORE-T: nag header on success when enabled.
+            let attachments = alt_pairs(store, &status.media_ids);
+            crate::api::mastodon::with_alt_text_nag(
+                status_response(&state, Some(viewer), status, StatusSourceMode::Content),
+                &state.server.alt_text_policy,
+                &attachments,
+            )
         }
         Err(err) => ApiError::from(err).into_response(),
     }

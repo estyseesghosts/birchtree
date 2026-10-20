@@ -1044,6 +1044,7 @@ fn converted_meta_follows_the_derived_blob() {
         16 * 1024 * 1024,
         "off",
         None,
+        "off",
     )
     .expect("upload");
     assert_eq!(media.state, MediaState::Ready);

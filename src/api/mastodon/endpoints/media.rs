@@ -112,8 +112,17 @@ pub async fn update(
         state.context.now_ms(),
         &state.server.license_policy,
         license,
+        &state.server.alt_text_policy,
     ) {
-        Ok(media) => media_response(&state, media),
+        // Core extension CORE-T: nag header on success when enabled.
+        Ok(media) => {
+            let attachments = [(media.r#type.clone(), media.description.clone())];
+            crate::api::mastodon::with_alt_text_nag(
+                media_response(&state, media),
+                &state.server.alt_text_policy,
+                &attachments,
+            )
+        }
         Err(err) => ApiError::from(err).into_response(),
     }
 }
@@ -252,6 +261,7 @@ async fn upload(state: &ApiState, auth: &Auth, request: Request, delay: bool) ->
         transcode_ref,
         &state.server.license_policy,
         license,
+        &state.server.alt_text_policy,
     ) {
         Ok(media) => {
             let status = if delay && media.state != MediaState::Ready {
@@ -259,11 +269,17 @@ async fn upload(state: &ApiState, auth: &Auth, request: Request, delay: bool) ->
             } else {
                 StatusCode::OK
             };
-            (
+            let response = (
                 status,
                 axum::Json(dto::media_attachment_json(&state.server, &media)),
             )
-                .into_response()
+                .into_response();
+            // Core extension CORE-T: nag header on success when enabled.
+            crate::api::mastodon::with_alt_text_nag(
+                response,
+                &state.server.alt_text_policy,
+                &[(media.r#type.clone(), media.description.clone())],
+            )
         }
         Err(err) => upload_error(err).into_response(),
     }

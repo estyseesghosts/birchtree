@@ -175,6 +175,7 @@ pub fn create_status(
     license_policy: &str,
     place_policy: &str,
     place_id: Option<Id>,
+    alt_text_policy: &str,
 ) -> Result<CreateStatusResult> {
     let CreateStatusCommand {
         account_id,
@@ -390,6 +391,23 @@ pub fn create_status(
                 true,
                 &effective,
             )?;
+        }
+    }
+
+    // Core extension CORE-T: under `block`, a top-level or reply write
+    // leaving an image/video/gifv attachment without a description is a
+    // 422 (local writes only; text-only posts unaffected). Missing rows
+    // are left to the store's attachability check (same 422 family).
+    if matches!(alt_text_policy, "nag" | "block") && !media_ids.is_empty() {
+        let attached = store.media_by_ids(&media_ids)?;
+        let mut pairs = Vec::with_capacity(media_ids.len());
+        for id in &media_ids {
+            if let Some(media) = attached.get(id) {
+                pairs.push((media.r#type.clone(), media.description.clone()));
+            }
+        }
+        if pairs.len() == media_ids.len() {
+            crate::application::alt_text_policy::check_block(alt_text_policy, &pairs)?;
         }
     }
 
@@ -708,6 +726,7 @@ pub fn update_status(
     license_policy: &str,
     place_policy: &str,
     place_id: Option<Option<Id>>,
+    alt_text_policy: &str,
 ) -> Result<Option<Status>> {
     let status = store
         .status_by_id(cmd.status_id)?
@@ -795,6 +814,28 @@ pub fn update_status(
             QuotePolicy::from_wire(&raw)
                 .ok_or_else(|| Error::InvalidInput(ERR_RECORD_INVALID.into()))?,
         );
+    }
+    // Core extension CORE-T: same block gate as creation, evaluated
+    // against the resulting attachment set (patched or stored). Replies
+    // are NOT exempt here (the rule covers every write leaving an
+    // undescribed image/video); text-only edits pass.
+    if matches!(alt_text_policy, "nag" | "block") {
+        let resulting: Vec<Id> = match &update.media_ids {
+            Some(ids) => ids.clone(),
+            None => status.media_ids.clone(),
+        };
+        if !resulting.is_empty() {
+            let attached = store.media_by_ids(&resulting)?;
+            let mut pairs = Vec::with_capacity(resulting.len());
+            for id in &resulting {
+                if let Some(media) = attached.get(id) {
+                    pairs.push((media.r#type.clone(), media.description.clone()));
+                }
+            }
+            if pairs.len() == resulting.len() {
+                crate::application::alt_text_policy::check_block(alt_text_policy, &pairs)?;
+            }
+        }
     }
     // Tags are re-derived on every edit (steady-state write path): the
     // effective text is the edited text, or the stored text when the edit

@@ -387,6 +387,7 @@ fn tiff_upload_defers_then_converges_to_webp() {
         Some(&config),
         "off",
         None,
+        "off",
     )
     .expect("tiff upload must be accepted");
     assert_eq!(media.mime_type, "image/tiff");
@@ -448,6 +449,7 @@ fn heic_upload_converts_inline_to_webp() {
         Some(&config),
         "off",
         None,
+        "off",
     )
     .expect("heic upload must be accepted");
     assert_eq!(media.mime_type, "image/heic");
@@ -520,6 +522,7 @@ fn tiff_without_a_toolchain_is_refused_not_silently_served() {
         birchtree::media::transcode::DEFAULT_MAX_FILE_SIZE,
         "off",
         None,
+        "off",
     )
     .expect_err("toolchain-less tiff upload must be refused");
     assert!(
