@@ -26,6 +26,8 @@ Each contract file carries a `Status:` line at the top: `Draft` or `Frozen`.
 | `streaming-contract.md` | Draft | §2.6, §6 |
 | `remote-media-cache-plan.md` | Draft | §7 Phase 6 (from `storage-cache.md` review) |
 | `testing.md` | Draft | §8 |
+| `configuration.md` | Draft | operator config (JSON file + flags) |
+| `config-schema.json` | Draft (pinned to `src/config.rs` by test) | operator config keys |
 | `logs/` | append-only verification evidence | §3 |
 
 Source-audit authority: Mastodon v4.7.3 (`~/fedifedifedi/mastodon`, commit `8ff11c2b`); route inventory from `config/routes/api.rb`; behavior explanations from controllers/services/policies/serializers/workers as cited in `birchtree.md`.

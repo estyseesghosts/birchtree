@@ -31,7 +31,8 @@ pub use backfill::{BACKFILL_DEFAULT_BATCH, BACKFILL_MAX_BATCH, BackfillProgress,
 pub use embedded::EmbeddedIndex;
 
 /// Status-search backend selection (configuration value; default `embedded`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SearchMode {
     /// In-process full-text index. On by default (D6, decided 2026-10-17).
     #[default]

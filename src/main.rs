@@ -35,7 +35,10 @@ struct Args {
 fn parse_args(cfg: &mut Config) -> Args {
     let mut args = Args::default();
     for arg in std::env::args().skip(1) {
-        if let Some(v) = arg.strip_prefix("--public-url=") {
+        if let Some(_path) = arg.strip_prefix("--config=") {
+            // Consumed before parsing (sets the base config this call
+            // overrides); see main().
+        } else if let Some(v) = arg.strip_prefix("--public-url=") {
             cfg.public_url = v.to_string();
         } else if let Some(v) = arg.strip_prefix("--data-dir=") {
             cfg.data_dir = v.into();
@@ -561,13 +564,35 @@ async fn serve(cfg: Config) {
     tracing::info!("birchtree stopped");
 }
 
+/// Base configuration: the `--config=PATH` JSON file over the compiled
+/// defaults, when the flag is present (first occurrence wins). CLI flags
+/// applied later by `parse_args` override file values. Load errors are fatal
+/// and name the path.
+fn config_base() -> Config {
+    let path = std::env::args()
+        .skip(1)
+        .filter_map(|arg| arg.strip_prefix("--config=").map(str::to_string))
+        .next();
+    match path {
+        None => Config::default(),
+        Some(path) => Config::load_from_file(std::path::Path::new(&path)).unwrap_or_else(|err| {
+            eprintln!("configuration error: {err}");
+            std::process::exit(1);
+        }),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     observability::init();
 
-    let mut cfg = Config::default();
+    let mut cfg = config_base();
     let args = parse_args(&mut cfg);
 
+    if let Err(err) = cfg.resolve_env_indirect() {
+        eprintln!("configuration error: {err}");
+        std::process::exit(1);
+    }
     if let Err(err) = cfg.validate() {
         eprintln!("configuration error: {err}");
         std::process::exit(1);

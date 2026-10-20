@@ -2,8 +2,31 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Millis-since-epoch style `Duration` encoding for the JSON config file:
+/// a plain number of milliseconds (`worker_poll_interval_ms`).
+mod serde_millis {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &Duration, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_u64(value.as_millis() as u64)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Duration, D::Error> {
+        Ok(Duration::from_millis(u64::deserialize(de)?))
+    }
+}
+
 /// Server configuration. Validated before any services are built.
-#[derive(Debug, Clone)]
+///
+/// JSON keys match the field names, except `worker_poll_interval_ms`
+/// (milliseconds). Every key is optional in the file: absent keys take the
+/// [`Default`] values below. Unknown keys are rejected (typo safety).
+/// CLI flags override file values; `validate()` runs once over the merged
+/// result.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Public base URL used for actor/object URIs (must be http/https).
     pub public_url: String,
@@ -19,7 +42,9 @@ pub struct Config {
     /// URLs count as 23). Default 500 (Mastodon parity); configurable up to
     /// 3000 (Misskey parity) via `--max-status-chars=`.
     pub max_status_chars: usize,
-    /// Worker poll interval when the queue is empty.
+    /// Worker poll interval when the queue is empty. JSON key
+    /// `worker_poll_interval_ms` (milliseconds).
+    #[serde(rename = "worker_poll_interval_ms", with = "serde_millis")]
     pub worker_poll_interval: Duration,
     /// Whether new account registration is open. Phase 1 keeps this closed;
     /// the CLI bootstrap is always available.
@@ -259,6 +284,43 @@ impl Config {
     /// Whether outbound mail has a configured provider.
     pub fn mail_enabled(&self) -> bool {
         self.smtp_url.is_some()
+    }
+
+    /// Load a JSON config file over the defaults. Unknown keys, unreadable
+    /// files and malformed JSON are hard errors naming the path. Call
+    /// [`Config::resolve_env_indirect`] afterwards (CLI flags first).
+    pub fn load_from_file(path: &std::path::Path) -> Result<Self, String> {
+        let bytes = std::fs::read(path)
+            .map_err(|err| format!("--config {}: {err}", path.display()))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|err| format!("--config {}: {err}", path.display()))
+    }
+
+    /// Resolve `env:VAR_NAME` indirections on the secret-carrying fields
+    /// (`smtp_url`, `vapid_private_key`): the value is read from the
+    /// environment so operators need not store secrets in the config file.
+    /// Unset variables are a hard error naming the variable.
+    pub fn resolve_env_indirect(&mut self) -> Result<(), String> {
+        let smtp_indirect = self
+            .smtp_url
+            .as_deref()
+            .and_then(|url| url.strip_prefix("env:"))
+            .map(str::to_string);
+        if let Some(name) = smtp_indirect {
+            let value = std::env::var(&name)
+                .map_err(|_| format!("config: env var {name} is not set (referenced by smtp_url)"))?;
+            self.smtp_url = Some(value);
+        }
+        let vapid_indirect = self
+            .vapid_private_key
+            .strip_prefix("env:")
+            .map(str::to_string);
+        if let Some(name) = vapid_indirect {
+            let value = std::env::var(&name)
+                .map_err(|_| format!("config: env var {name} is not set (referenced by vapid_private_key)"))?;
+            self.vapid_private_key = value;
+        }
+        Ok(())
     }
 
     /// Normalize the public URL (strip trailing slash) for actor/object URIs.

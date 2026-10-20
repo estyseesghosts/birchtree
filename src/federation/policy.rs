@@ -35,6 +35,25 @@ pub struct Cidr {
     prefix: u8,
 }
 
+impl std::fmt::Display for Cidr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.network, self.prefix)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Cidr {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(de)?;
+        Cidr::parse(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+impl serde::Serialize for Cidr {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(&self.to_string())
+    }
+}
+
 impl Cidr {
     /// Parse `addr/prefix` or a bare address (a host route).
     pub fn parse(text: &str) -> Result<Self, PolicyError> {
