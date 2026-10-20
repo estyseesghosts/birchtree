@@ -121,3 +121,18 @@ parts + `docs/*` parent-owned; subagents propose snippets):
   8ff11c2b:` cites, never the drifted worktree) + register row where a
   divergence remains; `cargo test --test fix4_p2_*` + one
   `cargo check --all-targets` (lock contention: wait/retry).
+
+## P2a merge + close-out (parent, after all three workers landed)
+
+- P2a follow-ups merged by parent: phase3 context-order test fix,
+  filter PUT/PATCH routes, lists `limit=0` (+ new test), authorize→
+  authorizer notification (corrected propose-add to replace), follow-request
+  `since_id` (namespace D50), quotes cursor rekey + schema v16 migration.
+  Full debug suite green (60 binaries), incl. new limit=0 test.
+- P2b/P2c follow-ups merged by parent (see merge session block above).
+- Commits: `372f216` (P0/P1), `f1cda48` (P2), `163ee81` (D50–D52 docs).
+- Remaining: `cargo test --release` (running) + live HTTP smoke of new
+  routes; final commit if release is green. Open product questions for the
+  operator: password-reset redemption flow shape; suggestion-ranking source
+  confirmation; `site_terms`/extended/privacy text settings (authoring
+  surface unbuilt); avatar/header pipeline for update_credentials.
