@@ -133,3 +133,20 @@ account→reblog mapping behind.
   deferred to Phase 7 (manifest says `planned (Phase 7)`).
 - Notifications are *created* (deduplicated, job-driven) but have no read
   surface yet — Phase 4.
+
+## Status 2026-10-20 (freshness pass, worker W1)
+
+Three "Open / deferred" bullets above are stale at HEAD and are superseded,
+not rewritten: JSON request bodies on REST writes ARE accepted
+(`src/api/json_body.rs:30-33`, `LenientForm` in `src/api/forms.rs:131-156`,
+shipped in Phase 4.1); profile `fields_attributes`/`discoverable`/
+`indexable`/`hide_collections` ARE persisted (see the 2026-10-20 note in
+`docs/phase-2-exit-criteria.md`); `accounts/lookup` + `/search` ship in
+Phase 7, not "deferred to Phase 7" as future work
+(`src/api/mastodon/router.rs:66-67`). Conversation mutes + notification read
+surface shipped in Phase 4/7 (`src/api/mastodon/router.rs:270-275`). Tag
+objects still use the tag name as `id` (no tag table) unless a later phase
+says otherwise. Of the Phase 2 carry-overs: invite/approval modes are now
+implemented (see the 2026-10-20 note in `docs/phase-2-exit-criteria.md`);
+email-confirmation enforcement, min-age policy and `locale`/`time_zone`/
+`date_of_birth` handling remain as stated above.

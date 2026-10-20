@@ -395,7 +395,7 @@ The v4.7.3 [`Doorkeeper configuration`](https://github.com/mastodon/mastodon/blo
 - Support authorization-code flow with **PKCE S256**; verify exact redirect URI matching, state, one-time code use, short-lived authorization codes, allowed scopes, app/client identity and safe redirect handling.
 - Match Mastodon’s token-lifetime configuration instead of arbitrarily expiring all tokens or assuming refresh tokens are enabled. In v4.7.3, access tokens have no default expiration; refresh tokens are not enabled by default. Revocation is still required.
 - Enforce documented scopes centrally, including broad and granular scopes such as `read`, `write`, `follow`, `push`, `profile`, and endpoint-level `read:statuses`, `write:statuses`, `read:accounts`, `read:notifications`, etc. App-only/client-credentials tokens are not user tokens; endpoint authorization must distinguish them.
-- Phase 7.3 adds the `admin:read` and `admin:write` scope families and their per-resource sub-scopes (for example `admin:read:reports`), which the pinned Doorkeeper configuration registers as optional scopes. Birchtree's scope registry does not list them yet. Admin routes also require a moderator-or-admin role (Mastodon's `Admin::PermissionsConcern`). Birchtree has no role model, and its `create-account` CLI creates accounts without roles. Phase 7.3 adds two roles, `admin` and `moderator`, with CLI-managed grants (decided 2026-10-17; the permission split is in Phase 7.3). Admin routes are absent (404) until then.
+- Phase 7.3 adds the `admin:read` and `admin:write` scope families and their per-resource sub-scopes (for example `admin:read:reports`), which the pinned Doorkeeper configuration registers as optional scopes. Birchtree's scope registry lists them (`src/api/oauth/scopes.rs:48-55`). Admin routes also require a moderator-or-admin role (Mastodon's `Admin::PermissionsConcern`). Birchtree has the role model (`src/domain/user.rs:13-20`, `UserRole::Admin`/`Moderator`/`None`) with CLI grants (`src/main.rs:195-196` `--role=`, `src/main.rs:244` `grant-role`; roles decided 2026-10-17, shipped in Phase 7.3). Admin routes are mounted with role-before-scope enforcement (`src/api/mastodon/router.rs:304-322`).
 - Do not invent OAuth metadata or userinfo endpoints unless verified in the pinned route/config and needed by the target clients.
 - The authorization code flow needs an authenticated browser session and authorization/consent UI. Since this project has no full frontend, render a minimal safe login/consent page on the server; bootstrap the initial local account by CLI. This is protocol support, not an application frontend.
 
@@ -408,6 +408,8 @@ Create stable DTO packers for Status, Account, Relationship, Notification, Poll,
 ## 7. Implementation phases and exit gates
 
 Each phase starts with source/contract review, adds a focused module and tests, records executed evidence in a dated `docs/logs/` entry, and ends with a listed gate. Do not mark a phase complete because routes compile.
+
+**Status 2026-10-20:** the 2026-10-20 fix round is DONE and shipped (commits `372f216` P0 privacy + P1 builds, `f1cda48` P2 confirmed rows, `163ee81`/`f03c0c8` docs + verification evidence; `docs/fix-plan.md` §"Status 2026-10-20"; gate `cargo test --release` 60 suites green + live smoke in `docs/logs/2026-10-20-fix-plan-verification.md`). Phases 0–4, 4.1, 5, 6 (partial: follow lifecycle + content flows shipped, thread-completion + federation tail phased), 7, 7.1, 7.2 and 7.3 are shipped (per-phase notes below). Next: Phase 8 performance qualification.
 
 ### Phase 0 — Freeze source contracts and initialize the crate
 
@@ -497,6 +499,8 @@ Moved up on 2026-10-17. These gaps break the compatibility bar for ordinary clie
 
 **Exit:** two-instance interop tests pass for both directions, including follow lifecycle, posts, edits, deletes, replies, media, reactions, boosts, quotes and retries; remote thread completion passes its interop cases in `docs/federation-contract.md` (parent chain, hop cap, read-time descendant crawl, authorized fetch); duplicate activity delivery is harmless; SSRF/signature/body-limit security tests pass.
 
+**Status 2026-10-20 (partial):** follow lifecycle + content flows shipped — inbound `Follow/Accept/Reject/Undo/Create/Update/Delete/Like/Announce/Block/Flag/QuoteRequest` dispatch (`src/activitypub/activities.rs:46-57`) into application use cases (`src/application/federation_inbound.rs:100,233-244,272-326,350-462,525-622`), outbound `Create/Update/Delete/Like/Announce/vote` builders (`src/activitypub/outgoing.rs:210-352`), `outbox`/`followers`/`following` collections (`src/activitypub/http.rs:328-447`), per-destination retry/cooldown/quarantine, bounded dedup, SSRF-safe client. Thread completion is implemented (ingest-time one-hop `ResolveParent` + read-time `CrawlReplies`, `src/federation/threads.rs:1-142`, `JobKind` in `src/domain/job.rs:54-56`). Evidence: `docs/logs/2026-10-17-phase-6-verification.md`, `docs/logs/2026-10-17-phase-6-interop-run.out` (Follow family 14/14), `docs/logs/2026-10-18-phase-6-interop-run.out` (content both directions). Tail phased per `docs/fix-plan.md` P3: Move/Add/Remove, relays, remote emoji, note/featured collections, follower sync (D32 refuse-position stands until each lands). §8 item 11 parity suite still not run for federation.
+
 ### Phase 7 — Broader 4.7.3 public API parity
 
 Complete the route manifest systematically: remaining account APIs, tag and emoji endpoints, relation collection reads, markers/preferences, directory/collections where part of the target, and the long tail of user-facing endpoints.
@@ -506,8 +510,8 @@ In profile, client-facing groups (each route is a row in `docs/endpoint-manifest
 - **Accounts:** `GET /api/v1/accounts?id[]=…`, a multi-fetch of up to 40 ids (`id[]` upstream, `422` above the limit). Unapproved and pending-deletion accounts are omitted. Lookup and search go in the same phase.
 - **Conversations:** `GET /api/v1/conversations`, `DELETE /api/v1/conversations/:id`, `POST …/read`, `POST …/unread`, and conversation mutes (`POST /api/v1/statuses/:id/mute|unmute`, `write:mutes`). Remote direct messages wait for Phase 6.
 - **Suggestions:** `/api/v1/suggestions` (deprecated upstream since 2021-05-16; the response carries the `Deprecation` header) and `/api/v2/suggestions`. FASP-sourced entries stay out of profile until a FASP integration exists, and are never fabricated.
-- **Announcements:** list, dismiss, and reactions. Announcements are authored through the CLI, so no admin API is needed for them.
-- **Donation campaigns:** `GET /api/v1/donation_campaigns` returns `204` unless the operator configures a campaign API URL.
+- **Announcements:** list, dismiss, and reactions. Authoring is through the admin API (`src/api/mastodon/router.rs:201-204`, fix round P1/S2, schema v14 in `src/persistence/redb/migrations.rs:446`), not CLI-only and not HTML-only (upstream authors via HTML; the API authoring surface is new and admin-gated). **Status 2026-10-20:** shipped (`docs/logs/2026-10-20-fix-plan-verification.md`).
+- **Donation campaigns:** `GET /api/v1/donation_campaigns` answers honest-absence `404` (P3 operator decision 2026-10-20: the outbound campaign fetch is not built, so no success-shaped `204`; `src/api/mastodon/endpoints/donation_campaigns.rs:8-24`). **Status 2026-10-20:** shipped as honest absence.
 - **Web Push:** `/api/v1/push/subscription` (`push` scope). VAPID keys come from configuration. Delivery is a post-commit job (§5), and the push-service HTTP client follows the outbound safety rules.
 - **First-party client (keystodon):** `/api/web/*` (embeds, settings, web push subscriptions) is in profile. Upstream guards these routes with the Devise session and CSRF (`protect_from_forgery with: :exception`), not OAuth bearer tokens, and birchtree's plan does the same. Phase 7 adds the prerequisites: a first-party session login (reusing the Phase 2 login session), CSRF tokens for state-changing `/api/web/*` requests, and serving keystodon's built bundle from birchtree (artifact source and mount path fixed when the bundle exists). Proposed default: keystodon's first-party mode uses OAuth bearer tokens for every `/api/v1/*` call, issued to a first-party application, and the session covers login, consent and `/api/web/*` only. That keeps one auth path for the API. Confirm before implementation.
 - **Third-party client (keystodon):** OAuth only, against any host. Birchtree's contract for it is §6.3 and Phase 2.
@@ -517,6 +521,8 @@ Keep the server-rendered admin dashboard and the Mastodon web app explicitly exc
 Prioritize by actual client usage and contract dependencies, but every skipped route remains an explicit compatibility gap. Repeat endpoint inventory whenever upgrading the target release. Do not silently mix v4.7.3 behavior with `main`.
 
 **Exit:** every endpoint in the Phase 7 client-facing groups has a matching request/response/auth/error test; the target client smoke suite passes (keystodon, once it is available); remaining exclusions are published and obvious. Phases 7.1–7.3 have their own exits.
+
+**Status 2026-10-20:** shipped. Conversations, suggestions (real ranking + member dismiss, schema v13), directory, userinfo, announcements (+ admin authoring), instance sub-resources, push, `/api/web/*`, and reports are mounted (`src/api/mastodon/router.rs:189-206,268-282`); donation campaigns ship as honest-absence 404. Evidence: `docs/logs/2026-10-20-phase-7-loose-verification.md`, `docs/logs/2026-10-20-gaps-round3-verification.md`, `docs/logs/2026-10-20-fix-plan-verification.md`. keystodon is still not on the development machine, so the unmodified-client smoke remains pending (§8 item 11).
 
 ### Phase 7.1 — Media transcoding
 
@@ -534,6 +540,8 @@ Prioritize by actual client usage and contract dependencies, but every skipped r
 
 **Exit:** fixture tests for each input class (JPEG, HEIC, PNG, TIFF, GIF, VP9 WebM passthrough, non-VP9 video, VP9 video over the size limit); a metadata test that the EXIF payload survives conversion where the target format holds it; v1 `200` and v2 `202` lifecycle tests; startup-validation tests; crash tests for partial derived blobs.
 
+**Status 2026-10-20:** shipped. The transcode job runs ffmpeg off the async runtime (`src/jobs/worker.rs:107-139`, wiring `src/jobs/transcode.rs:1-12`, implementation `src/media/transcode.rs`); the pipeline toggle is `src/api/mastodon/mod.rs:59`. Evidence: `docs/logs/2026-10-20-gaps-round3-verification.md` (HEIC/TIFF → WebP).
+
 ### Phase 7.2 — Search engine
 
 - Status search uses an **embedded** full-text library behind a search backend port. It is not Elasticsearch and not an external service. The library is chosen at scoping time; candidates such as Tantivy are to be evaluated for license, maintenance, and fit with an in-process Rust design.
@@ -545,6 +553,8 @@ Prioritize by actual client usage and contract dependencies, but every skipped r
 
 **Exit:** search parity fixtures for statuses in all three modes and for accounts; index consistency under edit, delete and visibility change; backfill resume and crash tests; the `database` mode matches the Phase 4 interim behavior.
 
+**Status 2026-10-20:** shipped. Three modes behind one response contract (`src/search/mod.rs:3-12`, `SearchMode::Embedded` default in `src/config.rs:94-97,191`); backfill worker `src/jobs/tag_backfill.rs`. Evidence: `docs/logs/2026-10-20-gaps-round3-verification.md`.
+
 ### Phase 7.3 — Administration, moderation, trends and analytics
 
 - **Roles (decided 2026-10-17):** two roles on local users, `admin` and `moderator`, granted through CLI commands that extend `create-account`. Proposed permission split, to confirm against upstream's permission set when this phase is scoped: `moderator` covers reports and account actions (the `admin:*:reports` and `admin:*:accounts` routes, read and write); `admin` covers every admin route. Also required: registration approval modes (a Phase 2 gap) for the `approve` and `reject` routes; account suspension, silence and sensitive state; server-level domain allow and block rules; email-domain and canonical email blocks (both need email confirmation, a Phase 2 gap); IP block enforcement in the request path (trusted-proxy client IP, Phase 1); an audit trail for admin actions (proposed default: on, one record per admin write).
@@ -554,6 +564,8 @@ Prioritize by actual client usage and contract dependencies, but every skipped r
 - **Annual reports:** generation is a durable job; the reads use `read:accounts` and the generate and read-marking writes use `write:accounts`.
 
 **Exit:** role-gated tests match the upstream forbidden response for a user without the role; scope tests cover each admin family; every admin route has a fixture-backed test or an explicit planned-gap entry; approval-workflow tests for trends; the operator can grant roles through the CLI.
+
+**Status 2026-10-20:** shipped. Roles `admin`/`moderator` with CLI grants (`src/domain/user.rs:13-20`, `src/main.rs:195-196,244`); scope families in the registry (`src/api/oauth/scopes.rs:46-55`); admin accounts/reports/infra/trends routes mounted (`src/api/mastodon/router.rs:304-322` + `admin_infra::routes()`); measures/dimensions/retention moderator-widened (fix round P3). Evidence: `docs/logs/2026-10-20-phase-7-3-verification.md`, `docs/logs/2026-10-20-gaps-round2-verification.md`, `state/logs/2026-10-20-phase7-3-admin-accounts-reports-subagent-b.md`.
 
 ### Phase 8 — Performance qualification and optional feed materialization
 
@@ -581,6 +593,8 @@ Required suites:
 
 11. **Unmodified-client parity (the compatibility bar):** run the same client flows against birchtree and against a pinned Mastodon v4.7.3 instance, using unmodified clients. Compare what the client sees: request acceptance, response bodies, status codes, headers the client reads, pagination, streaming events and error text. Score the suite as the share of observations that match upstream. The bar is at least 98% overall, and 100% on the core flows (proposed). Every non-matching observation must be in the deviation register. Run this suite at every phase exit from Phase 3 on, and extend it for each phase.
 
+**Status 2026-10-20:** still not run — no parity harness exists in the tree (no `parity` module under `src/`; the only parity references are inline comments). Every phase exit from 4.1 on records this gap explicitly (`docs/phase-4-1-exit-criteria.md` Parity §, `docs/phase-5-exit-criteria.md:31` with escalation E1). All parity claims to date are source-derived from the pin `8ff11c2b` and protocol-tested against birchtree only.
+
 Use source-level fixtures and docs as a starting point, not the sole oracle. A passing internal mock does not prove client compatibility.
 
 ## 9. Non-goals and unresolved risks
@@ -590,7 +604,7 @@ Use source-level fixtures and docs as a starting point, not the sole oracle. A p
 - No multi-node mode until its storage adapter, media arrangement, ownership/routing and the shared conformance suite are implemented and tested.
 - No promise that a single-node `redb` setup will match Mastodon’s high-degree home-feed performance. Mastodon’s Redis-backed home/list feed materialization is a major architectural difference that requires measurement.
 - No blind copying of the Rails data model, cache keys, callbacks or Sidekiq job names. Translate externally visible outcomes into Rust contracts.
-- Admin API compatibility is in profile (Phase 7.3), but it does not ship before its prerequisites: a role model, CLI role grants, registration approval modes, and the enforcement points listed in Phase 7.3. Until then admin routes are absent (404), never success-shaped. Registration policy and moderation keep operator controls (CLI and configuration), and the admin API does not imply a web admin UI.
+- Admin API compatibility is in profile (Phase 7.3), and it has shipped with its prerequisites: the role model (`src/domain/user.rs:13-20`), CLI role grants (`src/main.rs:195-196,244`), registration approval modes, and the enforcement points listed in Phase 7.3. Admin routes are mounted with role-before-scope enforcement (`src/api/mastodon/router.rs:304-322`), never success-shaped. Registration policy and moderation keep operator controls (CLI and configuration), and the admin API does not imply a web admin UI.
 
 Open decisions, each to be resolved in the phase named rather than left implicit: supported signup/verification modes (Phase 2 gaps; needed by the Phase 7.3 approval routes); exact target clients (keystodon, in both modes, once it is available on this machine; client smoke tests wait for it); whether collections are in the declared profile (push is in, Phase 7); the embedded search library (Phase 7.2); the image target format and the other Phase 7.1 sub-decisions; keystodon's bundle mount path and artifact source, and whether first-party `/api/v1/*` calls use OAuth (proposed) or the session (Phase 7); the admin permission split and audit trail (Phase 7.3; proposed defaults in Phase 7.3);  maximum status/media limits; local-only or closed-registration default; whether public web/ActivityPub object routes are part of the first federation milestone (Phase 6); and latency/resource acceptance thresholds (Phase 8). Decided 2026-10-17 and no longer open: read-time ancestor completion for logged-in viewers (deviation D5); admin and moderator roles; the domain-block correction; search on by default with an administrator switch (D6); JSON request bodies moved up to Phase 4.1; the 98% bar; video as VP9 WebM with passthrough, GIF as VP9 WebM, and still images as WebP (D2–D4); the home follow cap at 1000 (D10a); exclusive lists matching upstream (D10b); no `206` for the home feed (D9).
 

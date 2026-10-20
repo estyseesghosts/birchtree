@@ -27,7 +27,7 @@ Per `architecture.md`: parse + remote lookups before the transaction; one short 
 
 ## Migrations
 
-Each migration/index backfill: versioned, bounded, restartable, idempotent. Schema/migration metadata table tracks applied versions.
+Each migration/index backfill: versioned, bounded, restartable, idempotent. Schema/migration metadata table tracks applied versions. Current `SCHEMA_VERSION` is 16 (`src/persistence/redb/schema.rs:560`); the quote-cursor rekey landed in v16 and the confirmation/approval identity stores in v15 (see `docs/endpoint-manifest.md` and `docs/compatibility-profile.md` D36).
 
 ## Conformance tests (`tests/persistence_conformance.rs`)
 

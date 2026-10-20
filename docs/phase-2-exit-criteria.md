@@ -105,3 +105,20 @@ pinned contract.
   asset paths.
 - Registration `locale`, `time_zone`, `date_of_birth` are accepted/ignored
   (min-age policy not implemented).
+
+## Status 2026-10-20 (freshness pass, worker W1)
+
+Three "Open / deferred" bullets above are stale at HEAD and are superseded,
+not rewritten: account profile fields ARE persisted now (bot, discoverable,
+indexable, hide_collections, fields/attribution — parsed in
+`src/api/mastodon/endpoints/accounts.rs:221-271,416-430`, shipped by the
+2026-10-20 fix round, `docs/fix-plan.md` P2 `#11d`); `GET
+/api/v1/accounts/lookup` and `/search` ARE implemented
+(`src/api/mastodon/router.rs:66-67`); invite-gated registration IS
+implemented (HTTP registration consumes invites via
+`register_account_with_invite`, `src/api/mastodon/endpoints/accounts.rs:112`;
+`GET /invite/:invite_code` at `src/api/mastodon/router.rs:84`) and approval
+mode exists (`--registration-require-approval`,
+`src/main.rs:113-114`, with admin approve/reject at
+`src/api/mastodon/router.rs:313-314`). Email-confirmation enforcement and
+min-age policy remain as stated. Metrics remain Phase 8 work.

@@ -92,3 +92,17 @@ tests prove primary mutation + job atomicity; secret handling tests pass.
   kinds are not enqueued before then.
 - Phase 0 route-inventory review against `config/routes/api.rb` remains open
   (`docs/phase-0-exit-criteria.md`); Phase 1 did not depend on it.
+
+## Status 2026-10-20 (freshness pass, worker W1)
+
+Two "Open / deferred" bullets above are stale at HEAD and are superseded,
+not rewritten: HTTP cursor/`Link` headers shipped in Phase 2
+(`src/api/mastodon/pagination.rs`, wired in Phase 3), and media storage +
+processing shipped in Phase 4 with transcoding in Phase 7.1 (transcode job
+`src/jobs/worker.rs:107-139`, implementation `src/media/transcode.rs`).
+Email confirmation transport shipped 2026-10-20 (SMTP via durable jobs;
+`src/mailer/mod.rs:19-25` `SmtpMailer` through `lettre`, transport at
+`:289-307`; `state/logs/2026-10-20-email-smtp.md`). Metrics and
+performance thresholds remain Phase 8 work; MFA/password reset remain as
+stated. The Phase 0 route-inventory review is still open (see the
+2026-10-20 note in `docs/phase-0-exit-criteria.md`).

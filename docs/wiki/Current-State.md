@@ -1,162 +1,74 @@
 # Current state
 
-Status: 2026-10-17, Phase 5 (streaming) implemented; Phase 6 (federation) is next. The §8 item 11 parity harness is not built or run (see `docs/phase-5-exit-criteria.md`, escalation E1).
+This page says what the server does today. It is written for a smart reader with no programming background: what works, what is deliberately left out, and what is still planned. Short code pointers sit in hidden comments for the engineers; they are not needed to understand the page.
 
-## Implemented
+Status: late October 2026. Everything planned through Phase 7.3 is built and green. The October fix round (privacy, builds, confirmed rows) is finished and merged — it is history, not in-flight work. Next is Phase 8: measuring speed and robustness under load.
 
-Repository and contracts:
+<!-- docs/logs/2026-10-20-fix-plan-verification.md:1-13; docs/logs/2026-10-20-phase-7-3-verification.md:36-52 -->
 
-- Repository layout per `birchtree.md` §3 (one Cargo package, `domain` ← `application` ← adapters)
-- `AGENTS.md`, `docs/` contracts, `docs/wiki/`, append-only `state/logs/` and `docs/logs/`
-- `scripts/smoke-all.sh` full gate (check + test + phase1/2/3/4 smokes);
-  `.github/workflows/ci.yml` release-build CI
+## What works today
 
-Runtime (Phase 1):
+**Accounts and sign-in.** Apps register themselves, people register accounts when the operator opens registration, and sign-in uses the standard Mastodon handshake including the extra-strong app proof (PKCE, a secret handshake that stops stolen codes from being reused). Scopes (permission labels like "read posts" vs "write posts") are enforced on every call. The first account is made from the command line, so you are never locked out.
 
-- Structured `tracing` logging with `RUST_LOG` filtering and secret redaction
-- `GET /health` and `GET /ready` probes; unknown routes return 404
-- Graceful shutdown on SIGINT/SIGTERM; configuration validation; data-dir
-  path permissions (`0700`); body limits; trusted-proxy client-IP handling
-- CLI: `serve`, `create-account` (plus test-only `crash-harness`)
-- Mastodon-shaped snowflake IDs (numeric ordering, decimal-string wire) and a
-  monotonic `Clock`
-- Versioned `redb` schema + migration runner (now at **v5**: domain-block row ids
-  and id index (2026-10-17); v4 added Phase 4 timeline
-  index + backfill), narrow
-  persistence ports, atomic mutation + job commits, durable job queue with
-  lease/backoff/quarantine, in-process worker
+<!-- src/api/mastodon/router.rs:189-206; src/api/oauth/scopes.rs:113; src/main.rs:193 -->
 
-OAuth, registration and read APIs (Phase 2):
+**Posts and conversations around them.** Write, read, edit (with history), delete, reply threads, re-posts, likes, saves, pins (up to 5), polls with expiry, and quote posts with the quoted author's approval rules (open to everyone, followers only, or nobody). Posting twice by accident creates only one post (repeat-safe keys kept for one hour per account).
 
-- `POST /api/v1/apps`, `GET/POST /oauth/authorize` (login + consent),
-  `POST /oauth/token` (PKCE S256 + client-credentials), `POST /oauth/revoke`
-- `POST /api/v1/accounts` registration (open/closed policy), account
-  show/verify/update credentials, `GET /api/v1/instance`, `/api/v2/instance`,
-  `/api/v1/preferences`
-- Scope enforcement (any-of), Mastodon error shapes, rate-limit headers,
-  form parsing, pagination widget
+<!-- src/application/statuses.rs:313,487; src/application/policy.rs:312 -->
 
-Local statuses, relationships, interactions (Phase 3):
+**People controls.** Follow (locked accounts get approve/deny requests), unfollow, remove-a-follower, block (which also undoes follows both ways), block-a-whole-domain, mute (with timers), profile notes, endorsements (pinned profiles), follower/following lists, and per-account counters kept correct at the moment of change.
 
-- **Statuses:** create/show/edit/delete, `source`, `context`, `history`,
-  multi-fetch (`id[]`), replies, reblogs/unreblog, pins, `favourited_by`/
-  `reblogged_by`, exact `REST::StatusSerializer` DTO (per-viewer flags,
-  `pinned` only when pinnable, source-mode delete body), `Idempotency-Key`
-  replay (1 h, per account)
-- **Visibility/policy:** one policy module (`application/policy.rs`) for
-  fetch/reblog/favourite/bookmark/quote gates across public/unlisted/private/
-  direct with blocks, follows and mentions; privacy-matrix tested
-- **Relationships:** follow (locked → follow requests with list/authorize/
-  reject), unfollow, remove-from-followers, blocks (mutual unfollow +
-  endorsement cleanup), domain blocks (upstream shape since 2026-10-17:
-  newest first, row-id paging), mutes with duration/notifications,
-  account notes, endorsements, follower/following lists, real
-  `REST::RelationshipSerializer` aggregates, per-account counters
-  (`account_stats`) updated atomically
-- **Interactions:** favourites/bookmarks (idempotent, counters never
-  negative), pins (limit 5, four exact 422s), status counts
-- **Polls:** create with status, vote (`choices[]`, four exact 422s,
-  single-choice re-vote rejected, multiple add-a-choice), `hide_totals`
-  masking, expiry (lazy + `PollExpired` job)
-- **Quotes:** local auto-accept state machine, `quote` DTO (content only when
-  accepted; shallow nesting one level down), `quotes_count`, revoke,
-  quote list, `quote_approval_policy` + interaction-policy endpoint,
-  `quote_approval {automatic, manual, current_user}`
-- **Notifications:** records created by deduplicated `FanOutNotification`
-  jobs committed with their interaction (read surface: Phase 4)
-- **Media relations:** attachment metadata + order validated, `url:null`
-  while unprocessed (bytes served in Phase 4)
-- Schema **v3**: statuses/versions/pins/favourites/bookmarks/follows/blocks/
-  domain-blocks/mutes/notes/endorsements/polls/quotes/notifications/
-  idempotency/stats/media/mentions/hashtag tables + bounded composite indexes
+<!-- src/application/relationships/, src/application/policy.rs -->
 
-Media, timelines, notifications, client usability (Phase 4):
+**Who sees what.** One shared rulebook decides fetch, reply, re-post, like, quote, save, list membership, and delivery for public, unlisted (visible but not advertised), followers-only, and direct (mentioned people only) posts, including blocks and domain blocks. The October fix round closed three privacy gaps here (re-posts inheriting your default privacy, viewer-side block/mute/domain checks on reads and actions, and ungated undo of a re-post).
 
-- **Media:** v1 and v2 multipart upload (MIME sniffing → 422, description/focus),
-  v2 video/audio `202` with a `ProcessMedia` job (`206` → `200`),
-  `GET`/`PUT`/`PATCH`/`DELETE /api/v1/media/:id`, stored bytes served with the
-  sniffed content type
-- **Timelines:** home, public (`local`/`remote`/`only_media`), tag and list
-  reads; exclusive `max_id`/`since_id`/`min_id` cursors, `Link` headers,
-  `limit` clamped to 40; viewer-aware filtering; bounded index scans (sparse-filter
-  test: 286 index entries walked, 13 read transactions for a page of 20)
-- **Notifications:** index with `types[]`/`exclude_types[]`, show, clear,
-  dismiss, `unread_count`, markers (`GET`/`POST /api/v1/markers`);
-  `requests` always `[]`
-- **Lists, filters, search, custom emoji, scheduled statuses:** see
-  `docs/compatibility-profile.md` (Phase 4 section)
-- **Client usability:** `scripts/smoke-phase4.sh` drives the workflow over HTTP
-  with curl (not a third-party Mastodon client)
+<!-- src/application/policy.rs:27-55,312-316; docs/fix-plan.md:54-63 -->
 
-Tests:
+**Pictures, video, lists, filters, notifications.** Uploads (v1 answers at once, v2 answers "still working" then "ready"), descriptions and focus points, per-person lists (including private lists whose members are hidden from home), word/content filters, notifications with types, markers (remember-my-place), and scheduled posts.
 
-- `cargo test` — **221 passed, 0 failed** (includes 23 `phase4_timelines`; the
-  2026-10-17 domain-block correction adds two tests; evidence in
-  `docs/logs/2026-10-17-domain-blocks-correction.md`)
-- `cargo check --all-targets` — zero warnings
-- `scripts/smoke-phase1.sh` → `SMOKE_OK`; `scripts/smoke-phase2.sh` →
-  `SMOKE_PHASE2_OK`; `scripts/smoke-phase3.sh` → `SMOKE_PHASE3_OK`;
-  `scripts/smoke-phase4.sh` → `SMOKE_PHASE4_OK`
-- `bash scripts/smoke-all.sh` → `smoke-all: green`
-- Full Phase 4 verification output: `docs/logs/2026-10-17-phase-4-verification.md`
+<!-- src/api/mastodon/router.rs:465-543; src/media/blob_store.rs -->
 
-## Phase 4.1 (parity gap closure, implemented 2026-10-17)
+**Search.** Status search runs on a built-in index that lives inside the server (on by default; the operator can switch to a simple recent-scan or turn status search off). Only public and unlisted posts are indexed — followers-only and direct posts never enter the index. Account and hashtag search use the database path in every mode.
 
-- JSON request bodies (`application/json`) on every REST write endpoint that
-  reads a body; flattened into the form key model; malformed JSON answered as
-  upstream does (D11). `POST /oauth/authorize` stays form-only (browser consent).
-- Exclusive-list members are left out of home; the viewer's own statuses and
-  list timelines are unaffected (D10b).
-- Home reads the 1000 most recent follows; account cache 2000; the store's
-  author cap is 1001. The home merge is now a lazy k-way merge, which fixed
-  a silent drop of the oldest follows' posts that the 1000 cap exposed (D10a).
-- `POST /api/v1/lists` accepts `replies_policy` and `exclusive`, as upstream does.
-- Evidence: `docs/logs/2026-10-17-phase-4-1-verification.md`.
+<!-- src/search/mod.rs:6-21,36-63; src/config.rs:94-97 -->
 
-## Phase 5 (streaming, implemented 2026-10-17)
+**Media conversion.** Pictures become WebP and moving pictures become WebM video automatically after upload, by a background job. A missing or broken converter stops the server at startup rather than silently skipping work. The server never strips photo metadata.
 
-- SSE (`GET /api/v1/streaming/{channel}`) and WebSocket (any path under `/api/v1/streaming`, subscribe by `?stream=` or message) for `user`, `user:notification`, `public` (local, remote and media variants), `hashtag`, `hashtag:local`, `list`, and `direct` (accepted; silent until Phase 7). Events `update`, `status.update`, `delete`, `notification`.
-- Gates are the REST timeline policies (`application::timelines`), so streams and timelines share one policy. Live changes apply: block and mute retract the blocker's home and list statuses; block, mute, unfollow, remove-follower and domain block drop in-flight frames (policy epochs).
-- Bounds (D14): 512 connections (`503`), 16 per token (`429`), 16 subscriptions per WebSocket, 256 frames or 1 MiB per connection, a 30 s stall timeout, fail-closed overflow. Heartbeats: SSE `:thump` every 15 s, WebSocket ping every 30 s.
-- Host discovery: `urls.streaming` from the public URL, or `--streaming-url` (a `301` to a different configured host, D16).
-- Contract: `docs/streaming-contract.md`. Evidence: `docs/logs/2026-10-17-phase-5-verification.md`. Tests: `tests/phase5_streaming.rs` (31), `scripts/smoke-phase5.sh`.
+<!-- src/media/transcode.rs:1-52; src/config.rs:98-117,383-406 -->
 
-## Not yet implemented
+**Live updates.** Apps can subscribe to home, notifications, local/global, hashtag, list, and direct-message streams and get new posts, edits, deletes, and notifications as they happen, with heartbeats and sane limits. Blocking or muting someone retracts their posts from your live views.
 
-- Phase 4 open items: see Known gaps below
-- Phase 6 federation (incl. remote quote requests, remote
-  statuses, and remote thread completion)
-- Phase 7: account multi-fetch (`GET /api/v1/accounts`), account lookup/search,
-  relation collection reads (`blocks`/`mutes`/`favourites`/`bookmarks`), tags, conversations, suggestions, announcements, donation
-  campaigns, Web Push, first-party client (`/api/web/*`, keystodon bundle)
-- Phase 7.1 media transcoding (GIF and video → WebM/VP9; stills → WebP); Phase 7.2 search engine;
-  Phase 7.3 admin/moderation API, reports, trends, annual reports; Phase 8 metrics
-- Every unimplemented route is explicitly absent (404), never a
-  success-shaped stub — see `docs/endpoint-manifest.md`
+<!-- src/streaming/hub.rs:60-63; src/streaming/http.rs:2,23-59; src/api/mastodon/router.rs:565-580 -->
 
-## Known gaps
+**Talking to other servers.** Servers find each other, fetch each other's profiles, and exchange follows (accept/reject/undo), posts, edits, deletes, likes, boosts, blocks, polls, and quote decisions, with per-destination retries and quarantines so one broken server cannot hold up the rest.
 
-- Email-confirmation enforcement (no SMTP; `MailSender` is a logging adapter)
-- Invite/approval registration modes; registration
-  `locale`/`time_zone`/`date_of_birth` ignored
-- Profile `discoverable`/`indexable`/`hide_collections`/`fields_attributes`
-  accepted but not persisted
-- Tag DTOs use the tag name as `id`; conversation mutes planned with conversations (Phase 7);
-  `application` always shown (preference not stored)
-- Phase 4 open items:
-  - Cross-surface visibility parity is not one suite (per-surface coverage)
-  - Wall time of page loaders is not measured (transaction/item counts only)
-  - Home reads only the 1000 most recent follows (D10a, accepted; raised from 500 in Phase 4.1)
-  - Tag feed excludes reblog wrappers, matching upstream (closed 2026-10-17)
-  - `remote=true` is empty until federation (Phase 6)
-  - No `206 Mastodon-Async-Refresh` regeneration for timelines (fan-out on read)
-  - Notification requests always `[]`; notification-policy filter pipeline later
-  - Account-payload emoji arrays are `[]` until Phase 7
-  - Planned, not code gaps: transcoding (Phase 7.1), search engine (Phase 7.2),
-    admin/moderation API (Phase 7.3)
-- Phase 5 open items (register rows): `direct` and `public:remote` silent until Phases 7 and 6 (D18, D19); `notifications_merged` never sent (D20); `chosen_languages` filter not applied (D21); no `kill` on suspension until Phase 7.3 (D24)
-- Policy gaps shared with REST, escalated (decision needed): home ignores blocks and mutes on mentions (D22) and follow languages (D23); notifications from blocked or muted accounts are created (D26); hashtag normalization differs from upstream for accented tags (D25)
-- Details and the full deferral lists: `docs/phase-4-exit-criteria.md`,
-  `docs/phase-3-exit-criteria.md` (plus `phase-2-exit-criteria.md`,
-  `phase-1-exit-criteria.md`, and the still-open route-inventory review in
-  `phase-0-exit-criteria.md`)
+<!-- src/activitypub/http.rs:1-4,42-44; src/federation/delivery.rs:13,21,55-61; src/federation/net.rs:5,102-175 -->
+
+**Operator and moderation tools.** Two staff roles (manager and admin; the manager handles accounts and reports, the admin handles everything), granted from the command line. Reports queue, domain/email/IP rules, trend approvals (only approved tags, links, and posts are shown publicly), yearly per-account summaries, and usage statistics. Public instance pages (peers, rules, languages, activity, terms placeholder) are served from real data or answer an honest 404 when there is nothing to show.
+
+<!-- src/api/mastodon/auth.rs:71-127; src/api/mastodon/router.rs:304-345; src/domain/user.rs:5; src/config.rs:89-93,138-165 -->
+
+## Deliberately left out (not bugs)
+
+- No `gifv` video type: moving pictures are served as WebM by decision.
+- No translation service, no spell-out of remote emoji, no rich collections UI.
+- Changing settings requires a restart; there is no live-reload mode.
+- Fine-grained per-action staff permissions beyond the two roles are future work (recorded as D35).
+- The long federation tail (account moves, relays and forwarded inboxes, follower-count syncing, note collections, remote counters) is its own future phase, not part of today.
+- Announcements are authored through the admin API only (manual publish/unpublish); no web authoring page. Donation campaigns answer 404 unless the operator wires a campaign service. Password-reset links send real mail but the "choose a new password" page shape is undecided (operator decision).
+- The web app beyond login/approve and the served companion-app files is out of scope, as is any admin web dashboard.
+
+<!-- src/media/transcode.rs:6-21; src/config.rs:91-93; docs/TODOs.md:15-102; src/api/mastodon/endpoints/admin_infra.rs:18 -->
+
+## Still planned, with no dates promised
+
+- **Phase 8 — performance qualification.** Measure release builds (speed, memory, queue delays) on realistic data for every surface above, including conversion, search, admin lists, and live-update fan-out; compare the current read-on-request timeline design against an optional precomputed feed; publish numbers and thresholds. The operational metrics endpoint does not exist yet.
+- **Smaller named follow-ups** (operator decisions where noted): avatar/header upload through the media pipeline, rule translations, language display names, unproduced notification/streaming event types, remote-media previews, live lookup of unknown remote accounts, and the remote-media cache program (budgets, eviction, accounting).
+
+<!-- birchtree.md:558-565; docs/TODOs.md:15-200 -->
+
+## How we know it works
+
+Every phase shipped with executed evidence, not reasoning: warning-free checks, full test suites green, live HTTP smokes, and two-server interop runs against real Mastodon 4.7.3 where applicable. The detailed receipts live in `docs/logs/` (dated verification notes) and `state/logs/` (session notes). Anything unimplemented answers an explicit error, never a fake success.
+
+<!-- docs/logs/2026-10-20-fix-plan-verification.md; docs/logs/2026-10-20-phase-7-3-verification.md -->

@@ -18,3 +18,18 @@ Source: `birchtree.md` §9, Phase 0.
 - [ ] `cargo check`/`cargo test` baseline runs (see `state/logs/` for the green run).
 
 Phase 0 is not exited until every box above is checked with executed evidence.
+
+## Status 2026-10-20 (freshness pass, worker W1)
+
+Implementation at HEAD satisfies the substance: the crate layout of
+`birchtree.md` §3 exists (`src/` carries `domain`, `application`, `api`,
+`activitypub`, `federation`, `streaming`, `jobs`, `media`, `search`,
+`persistence`, `config.rs`, `observability.rs`); the route inventory exists
+as `docs/endpoint-manifest.md` (506 lines, one row per method/path from
+`config/routes/api.rb` at `8ff11c2b`); the fix round closed 2026-10-20
+(`docs/fix-plan.md` Status section; gate in
+`docs/logs/2026-10-20-fix-plan-verification.md`). The unchecked boxes above
+are checklist debt, not code gaps — except the route-inventory review, which
+remains explicitly open (see also `docs/phase-1-exit-criteria.md:93-94` and
+`docs/phase-4-exit-criteria.md:159-160`). No box is re-checked by this note;
+a proper exit still needs the review recorded with evidence.

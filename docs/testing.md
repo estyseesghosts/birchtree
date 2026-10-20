@@ -18,7 +18,10 @@ Required suites:
 10. Performance and abuse — high-degree graphs, sparse indexes, large/malformed bodies, upload exhaustion, slow hosts, retry storms.
 
 Gate: `bash scripts/smoke-all.sh` (`cargo check --all-targets` + `cargo test` +
-`scripts/smoke-phase{1,2,3,4,5}.sh`) green before claiming phase completion.
+`scripts/smoke-phase1.sh` … `scripts/smoke-phase6.sh`) green before claiming
+phase completion. Phase 7 smokes (`scripts/smoke-phase7.sh`,
+`smoke-phase7-1.sh`, `smoke-phase7-2.sh`, `smoke-phase7-3.sh`) run separately
+and are not part of `smoke-all.sh` (verified 2026-10-20).
 
 ## Implemented suites (Phase 1)
 
@@ -62,3 +65,19 @@ Gate: `bash scripts/smoke-all.sh` (`cargo check --all-targets` + `cargo test` +
 | Media | `tests/phase4_media.rs` (+ unit tests in `src/media/*`, `application/media.rs`) | multipart v1/v2 flows, 200/202/206/422/404 semantics, exact error bodies, processing lifecycle via the real job handler, byte-exact file serving, description/focus updates, in-usage delete |
 | Filters | `tests/phase4_filters.rs` | v1/v2 CRUD key sets, exact 422 bodies, multi-keyword deprecation guard, keyword/status sub-resources, `filter_results` matching (whole_word, expiry, context narrowing) |
 | Smoke | `scripts/smoke-phase4.sh` | live binary: media upload → post → timelines (Link + cache headers) → notifications + markers → lists → scheduled → search → emoji → `Vary: Authorization` → `SMOKE_PHASE4_OK` |
+
+## Implemented suites (Phase 6/7 — added 2026-10-20; files pre-date this table)
+
+| Suite | File | Covers (per file header) |
+|---|---|---|
+| Phase 6 content | `tests/phase6_content.rs` | notes/renotes/likes/blocks/flags/quotes/edits/deletes, remote media staging, outbound events, thread completion (store + use cases, no network) |
+| Phase 6 federation | `tests/phase6_federation.rs` | discovery docs, inbox refusal path, verify rules, follow-command store invariants, delivery-job settlement |
+| Phase 7 conversations/push | `tests/phase7_conversations_push.rs` | conversations, conversation mutes, Web Push (real router + fake push endpoint) |
+| Phase 7.1 transcode | `tests/phase7_1_transcode.rs` | transcode decision table, startup validation, ffmpeg construction, EXIF/metadata, v1/v2 lifecycle, crash safety |
+| Phase 7.2 search | `tests/phase7_2_search.rs` | `GET /api/v2/search` across `embedded`/`database`/`off` backends |
+| Phase 7.3 admin | `tests/phase7_3_admin_*.rs`, `tests/phase7_3_roles.rs`, `tests/phase7_3_trends.rs`, `tests/phase7_3_annual_reports.rs` | admin accounts/reports, infra (domain/IP/email blocks), roles, trends, annual reports |
+| Fix-round regressions | `tests/fix4_*.rs`, `tests/round3_*.rs`, `tests/round4_*.rs` | P0 privacy, P1 builds (suggestions/announcements/instance/admin), P2 rows, invites/email, push crypto, metrics |
+
+Note: `tests/` stays flat (only `tests/common/` is a subdirectory) — the
+planned `tests/api_contract/` etc. subdirectories from the matrix intro were
+never created (`docs/TODOs.md` verification-debt row).

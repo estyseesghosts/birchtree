@@ -22,7 +22,7 @@ Visibility and authorization policy contract (per `birchtree.md` §4.3).
 - `can_interact(viewer, status, op)` — op ∈ {quote, reblog, favourite, reply, bookmark, report}
 - `withheld(viewer, status, reason)` — blocks, domain blocks, mutes, unavailability, filters
 
-Blocks and domain blocks apply consistently to read/interaction/distribution. Mutes/filters suppress feed/notification display only; never used as the sole authorization check. "Hidden from this timeline" is never the only authorization check.
+Blocks, domain blocks, and — since the fix round (F2, 2026-10-20; D45/D46) — viewer-side mutes apply consistently to read/interaction/distribution: `can_fetch_full` denies when the viewer blocks or mutes the author (`src/application/policy.rs:102-129`), stricter than upstream's `StatusPolicy#show?` by operator decision. Filters suppress feed/notification display only; never used as the sole authorization check. "Hidden from this timeline" is never the only authorization check.
 
 Quote policy: `public`/`followers`/`nobody`; private/direct statuses force `nobody`. Direct/private mention quotes get additional mention authorization.
 
@@ -52,9 +52,10 @@ supplies the viewer/author relationship facts (block/follow/mute, expiry-aware).
 - Pins: owner-only, never reblogs, never direct (422 exact messages),
   maximum 5 per account.
 - Blocks/domain blocks gate reads (per the table above), follows and
-  interactions; mutes suppress nothing at authorization time (display
-  suppression is a Phase 4 read-surface concern) — mute state feeds the
-  relationship DTO and notification flags only.
+  interactions; since the fix round (F2, D46, `src/application/policy.rs:120-129`)
+  viewer-mutes-author also denies at fetch time (stricter than upstream, which
+  has no mute concept in `show?`). Mute state additionally feeds the
+  relationship DTO and notification flags.
 - Quote-policy downgrade: local `private`/`direct` statuses store
   `quote_approval_policy = nobody` regardless of the submitted value
   (`downgrade_quote_policy` parity), and the interaction-policy endpoint

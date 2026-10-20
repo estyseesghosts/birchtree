@@ -158,3 +158,26 @@ Full pasted output: `docs/logs/2026-10-17-phase-4-verification.md`.
   handoff.
 - Phase 0 route-inventory review against v4.7.3 remains open
   (`docs/phase-0-exit-criteria.md`).
+
+## Status 2026-10-20 (freshness pass, worker W1)
+
+Several "Open / deferred" bullets above are closed at HEAD and are
+superseded, not rewritten: exclusive lists ARE applied to home
+(`src/application/timelines.rs:49-105`, `ViewerScope::seed_exclusive` /
+`on_exclusive_list`; Phase 4.1 evidence
+`docs/logs/2026-10-17-phase-4-1-verification.md`); the home cap is 1000, not
+500 (`HOME_AUTHOR_CAP` in `src/application/timelines.rs:26`,
+`ACCOUNT_CACHE_CAP` at `:34`, store `AUTHORS_CAP` in
+`src/persistence/redb/timelines.rs:39-41`); the tag-feed reblog question is
+closed (D10c: wrappers carry no hashtags, excluded by design); the
+transcoding, search-engine and admin-scope decisions are all settled AND
+shipped (Phase 7.1 `src/jobs/transcode.rs:1-12`, Phase 7.2
+`src/search/mod.rs:3-12` with `SearchMode` in `src/config.rs:94-97`,
+admin scopes `src/api/oauth/scopes.rs:46-55`). Remote statuses, remote
+media, and domain blocks on remote accounts now exist (Phase 6 content
+flows; `src/application/federation_inbound.rs:100`,
+`src/persistence/redb/federation_content.rs:455-505`). Still open as
+stated: the cross-surface parity matrix, wall-time measurement, the
+`Cache-Control` deviation record, account-payload emoji arrays (Phase 7
+scope), the notification-policy pipeline, and the Phase 0 route-inventory
+review.

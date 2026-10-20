@@ -49,9 +49,9 @@ message). Without a provider the endpoints answer `503` and registration
 mails only reach the log. Mail bodies/subjects mirror upstream
 `UserMailer` (Devise defaults); token links point at the public URL.
 
-## File-only keys
+## File-only keys (no CLI flag)
 
-These have no CLI flag and can only be set via the file: `max_file_size`,
+These can only be set via the file: `max_file_size`,
 `worker_poll_interval_ms`, `trends_enabled`, `invites_enabled`,
 `peers_api_enabled` (default true), `activity_api_enabled` (default true),
 `domain_blocks_public` (default false, upstream default hidden),
@@ -61,6 +61,19 @@ These have no CLI flag and can only be set via the file: `max_file_size`,
 `remote_topic_feed_access` (default `public`; `public`/`authenticated`/
 `disabled`). Non-`public` feed gates require login on the public, tag and
 link timelines (anonymous → 401); `disabled` serves `[]` to non-staff.
+Every other key has both a file key and a CLI flag (`src/main.rs:42-169`):
+`--public-url`, `--data-dir`, `--listen`, `--trusted-proxy` (repeatable),
+`--max-body-size`, `--max-status-chars`, `--site-title`, `--site-description`,
+`--site-contact-email`, `--site-contact-username`, `--streaming-url`,
+`--federation-allow-http`, `--federation-authorized-fetch`,
+`--federation-extra-ca`, `--federation-allow-private`, `--debug-weak-rate-limits` /
+`--rate-limit-multiplier`, `--registration-open` / `--registration-closed`,
+`--registration-require-approval`, `--search-mode`, `--no-transcode`,
+`--ffmpeg-path`, `--webp-quality`, `--vp9-crf`, `--vp9-cpu-used`,
+`--opus-bitrate-kbps`, `--transcode-wall-time-secs`,
+`--transcode-max-output-bytes`, `--transcode-max-memory-bytes`,
+`--vapid-public-key`, `--vapid-private-key`, `--smtp-url`, `--mail-from`,
+`--web-client-dir`.
 
 ## Reloading
 

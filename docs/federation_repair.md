@@ -32,3 +32,25 @@ Noise, not causes: `422 … untagged enum Activity` for quote Creates, `misskey�
 2. Boost: mint wrapper `{local_base}/users/{booster}/statuses/{reblog_id}` in `reblog_status` — thread base/username in like `create_status statuses.rs:334-340` does. No migration (one-shot dedup keys).
 
 Verify: fresh run `grep -c "FAIL.*media.*bt-" features.out==0`, `GET /statuses/:id` shows `remote_url` immediately + `url` in seconds; Announce body `id.host==actor.host`, 403 count →0, bt→bt renote 0→1→0 non-vacuous, bt→pt/masto unchanged + `cargo test`.
+
+## Verification 2026-10-20 (docs worker W3, code read at HEAD, no re-run)
+
+- **§2 Boost — FIXED.** `reblog_links` now mints the wrapper on the
+  booster's actor URI (`src/persistence/redb/statuses.rs:288-292`, incl. the
+  comment citing the domain-check refusal); `reblog_status` threads the
+  booster's `actor_uri` through (`statuses.rs:1388-1400`); the delivery path
+  sends `boost.uri` as the Announce `id`
+  (`src/federation/events.rs:107-114`) via `outgoing::announce`
+  (`src/activitypub/outgoing.rs:336-349`), so `id.host == actor.host`.
+  No TODO filed.
+- **§1 Media `remote_url` — still open, already tracked.** `REMOTE_MEDIA_SOURCE`
+  is stored (`src/persistence/redb/federation_content.rs:455-469`) and the eager
+  fetch path stages bytes to per-row `remote/{media_id}` keys
+  (`src/federation/media.rs:23-102`, key at `:83`), but `media_attachment_json`
+  still hardcodes `"remote_url": Null` (`src/api/mastodon/dto.rs:669-670`).
+  Carried by `docs/TODOs.md` ("Remote media fidelity" row) — not double-filed
+  here. Pending rows keep `url: null`, which matches the Mastodon
+  `not_processed?` contract (`dto.rs:653-659`).
+- **§1 secondary (shared `remote/small.png` collision) — gone.** Previews land
+  under the per-media key (`media.rs:83`); `TODOs.md` records "per-media blob
+  keys already shard correctly."

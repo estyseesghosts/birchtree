@@ -47,7 +47,7 @@
     "vapid_private_key": { "type": "string", "description": "Base64url VAPID private key. Accepts \"env:VAR\" indirection. Never logged." },
     "web_client_dir": { "type": ["string", "null"], "description": "Dir with keystodon's built bundle. Null = /app/* 404s." },
     "invites_enabled": { "type": "boolean", "description": "Honor invite tokens. No CLI flag; file-only." },
-    "smtp_url": { "type": ["string", "null"], "description": "smtp:// or smtps:// provider URL. Null = mail explicitly disabled (503). Accepts \"env:VAR\" indirection. No CLI flag; file-only." },
-    "mail_from": { "type": ["string", "null"], "description": "Envelope sender. Required when smtp_url is set. No CLI flag; file-only." }
+    "smtp_url": { "type": ["string", "null"], "description": "smtp:// or smtps:// provider URL. Null = mail explicitly disabled (503). Accepts \"env:VAR\" indirection. CLI: --smtp-url." },
+    "mail_from": { "type": ["string", "null"], "description": "Envelope sender. Required when smtp_url is set. CLI: --mail-from." }
   }
 }

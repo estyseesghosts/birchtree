@@ -14,6 +14,8 @@ Each contract file carries a `Status:` line at the top: `Draft` or `Frozen`.
 | `phase-4-exit-criteria.md` | Tracking checklist | §9 Phase 4 |
 | `phase-4-1-exit-criteria.md` | Tracking checklist | §7 Phase 4.1, §8 item 11 |
 | `phase-5-exit-criteria.md` | Tracking checklist | §7 Phase 5, §8 items 8 and 11 |
+| `phase-6-exit-criteria.md` | Tracking checklist (in progress; content flows shipped, tail phased) | §7 Phase 6, §8 items 7 and 11 |
+| `TODOs.md` | Tracking list (remaining gaps after 2026-10-20 fix round) | post-fix-round queue |
 | `architecture.md` | Draft | §3 |
 | `source-audit-v4.7.3.md` | Draft | §2 |
 | `compatibility-profile.md` | Draft | §1, §6 |
@@ -26,7 +28,7 @@ Each contract file carries a `Status:` line at the top: `Draft` or `Frozen`.
 | `streaming-contract.md` | Draft | §2.6, §6 |
 | `remote-media-cache-plan.md` | Draft | §7 Phase 6 (from `storage-cache.md` review) |
 | `testing.md` | Draft | §8 |
-| `fix-plan.md` | Draft | post-audit fix queue (P0 verified → P3 decisions) |
+| `fix-plan.md` | Shipped 2026-10-20 (fix round done; status section inside) | post-audit fix queue (P0 shipped → P3 decided) |
 | `configuration.md` | Draft | operator config (JSON file + flags) |
 | `config-schema.json` | Draft (pinned to `src/config.rs` by test) | operator config keys |
 | `logs/` | append-only verification evidence | §3 |

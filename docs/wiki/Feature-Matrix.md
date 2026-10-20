@@ -1,39 +1,43 @@
 # Feature matrix
 
-Status: in progress (filled in as phases exit). Phases 1–5 and 4.1 (runtime/`redb`/IDs/bootstrap, OAuth/registration/read APIs, local statuses/relationships/interactions, media/timelines/notifications/client usability, parity gap closure, streaming) landed; later-phase user-facing rows stay `planned` until their phase. Rows added by the 2026-10-17 scope expansion are `planned` only.
+How birchtree compares with Mastodon 4.7.3, feature by feature, in plain words. "Built" means working today with passing tests; "planned" means not yet built (only Phase 8 items remain planned). Anything built but deliberately different is noted.
 
-| Feature | Mastodon 4.7.3 | birchtree | Status |
-|---|---|---|---|
-| Account registration + OAuth (auth-code, PKCE S256, client-credentials) | yes | partial | implemented (Phase 2: app registration, authorize/consent, token/revoke, registration policy open/closed, scopes; email confirmation not enforced, invite/approval modes pending) |
-| Instance discovery + preferences | yes | partial | implemented (Phase 2: `/api/v1/instance`, `/api/v2/instance`, `/api/v1/preferences`) |
-| Account read/update DTOs + relationships (read) | yes | partial | implemented (Phase 2 show/credentials; Phase 3 real relationship aggregates + counters; account multi-fetch, lookup and search planned Phase 7) |
-| Statuses: create/read/edit/delete, source, context, history, multi-fetch | yes | yes | implemented (Phase 3, incl. `Idempotency-Key` replay and exact error shapes) |
-| Visibility: public/unlisted/private/direct | yes | yes | implemented (Phase 3 policy matrix over real endpoints; applied to timelines in Phase 4; cross-surface parity suite open) |
-| Quotes: state machine, policy, revocation, interaction policy | yes | yes | implemented (Phase 3 local only; remote quote requests Phase 6) |
-| Relationships: follow (requests), block, mute, favourite, bookmark, pin/endorse, notes, domain blocks | yes | yes | implemented (Phase 3; domain blocks corrected to the upstream shape 2026-10-17; collection reads `GET blocks/mutes/favourites/bookmarks` pending Phase 7) |
-| Polls: create/vote/expiry (local) | yes | yes | implemented (Phase 3 create/vote via status + `/api/v1/polls/:id`; federation updates Phase 6) |
-| Media attachment relations/order (metadata only) | yes | partial | implemented (Phase 3 relations + DTO shape; Phase 4 upload, processing lifecycle, file serving; transcoding planned Phase 7.1) |
-| Media v1/v2, lists, filters, search | yes | partial | implemented (Phase 4: media v1/v2 with processing lifecycle, lists, filters v1/v2 with `filtered` annotation, v2 search over the local corpus; transcoding planned Phase 7.1; search library planned Phase 7.2) |
-| Timelines: home/public/local/hashtag/list | yes | partial | implemented (Phase 4; Phase 4.1: exclusive-list members hidden from home (D10b), home reads the 1000 most recent follows (D10a); open: `remote=true` empty until Phase 6; tag feed excludes reblog wrappers, matching upstream) |
-| JSON request bodies on REST write endpoints | yes | yes | implemented (Phase 4.1, D11; `POST /oauth/authorize` consent form stays form-only; parity source-derived) |
-| Notifications: records and read surface | yes | partial | implemented (Phase 3 deduplicated records via jobs; Phase 4 index, show, clear, dismiss, `unread_count`, markers; `requests` always `[]`) |
-| Streaming: SSE + WebSocket | yes | partial | implemented (Phase 5: `user`, `user:notification`, `public` and variants, `hashtag`, `list` with live policy and retraction; `direct` and `public:remote` silent until Phases 7 and 6; upstream's parity not run, see the Phase 5 exit criteria) |
-| Federation: WebFinger, inbox, signed delivery, activities | yes | — | planned (Phase 6) |
-| Remote thread completion (ancestors at ingest and on logged-in context reads, deviation D5; descendants on authenticated context reads; crawl across hosts as upstream) | yes | — | planned (Phase 6; see `docs/federation-contract.md`) |
-| Account multi-fetch `GET /api/v1/accounts?id[]`, lookup, search | yes | — | planned (Phase 7; multi-fetch up to 40 ids) |
-| Conversations: threads, read/unread/delete, conversation mutes | yes | — | planned (Phase 7) |
-| Suggestions: v1 (deprecated upstream) and v2 | yes | — | planned (Phase 7; FASP-sourced entries out of profile) |
-| Announcements: list, dismiss, reactions | yes | — | planned (Phase 7; authored by CLI) |
-| Donation campaigns | yes | — | planned (Phase 7; `204` unless the operator configures a campaign API) |
-| Push notifications: Web Push subscriptions and delivery | yes | — | planned (Phase 7; VAPID keys from configuration) |
-| First-party client: `/api/web/*` (embeds, settings, web push subscriptions), session login, CSRF, keystodon bundle | yes | — | planned (Phase 7; first-party mode, browser session + CSRF on `/api/web/*`) |
-| Third-party client OAuth (keystodon as a client of any host) | yes | partial | implemented for birchtree as host (Phase 2 OAuth); keystodon-as-client interop tested when keystodon is available |
-| Media transcoding: GIF and video → WebM/VP9 (video passthrough when already VP9 WebM within the size limit); still images → WebP; EXIF never stripped | yes (animated GIF → MP4 `gifv`; video transcoded) | — | planned (Phase 7.1; no `gifv` by decision; VP9 and WebP decided) |
-| Search: status search (embedded library, on by default; admins can switch it off), account search (database) | yes (status search requires Elasticsearch) | partial | interim local corpus; embedded library planned (Phase 7.2); on by default is a recorded deviation (D6) |
-| Admin API: `/api/v1/admin/*`, `/api/v2/admin/accounts` | yes | — | planned (Phase 7.3; roles `admin` and `moderator`, CLI-granted) |
-| Moderation: reports (create, moderator queue) | yes | — | planned (Phase 7.3; remote Flag Phase 6) |
-| Trends: public reads and admin approval | yes | — | planned (Phase 7.3) |
-| Admin metrics: measures, dimensions, retention | yes | — | planned (Phase 7.3) |
-| Annual reports | yes | — | planned (Phase 7.3) |
-| Unmodified-client parity suite (identical client experience, the compatibility bar) | yes | — | planned (`birchtree.md` §8 item 11; run at each phase exit from Phase 3; not run for Phases 0–5, escalation E1 in `docs/phase-5-exit-criteria.md`) |
-| `redb` single-node storage | n/a (Mastodon uses PostgreSQL+Redis) | — | partial (Phase 1 schema/ports/atomicity/crash tests; Phase 3 schema v3 status/relationship/poll/quote tables) |
+<!-- birchtree.md:4-6; docs/logs/2026-10-20-fix-plan-verification.md:1-13 -->
+
+| Area | What it is | birchtree today |
+|---|---|---|
+| Sign-up and sign-in | Register apps and accounts, approve apps, log in, manage tokens and permissions | built (open/closed/approval modes; email delivery needs the operator to configure mail; login codes are single-use and short-lived) |
+| Profiles and instance info | Names, bios, pictures, counters, server name and rules, preferences | built (profile pictures via upload are a named follow-up; rule translations and language display names are simplified) |
+| Posts | Write, read, edit with history, delete, replies, threads, multi-fetch | built, including repeat-safe posting |
+| Privacy levels | Public, unlisted (visible but not advertised), followers-only, direct (mentioned only) | built, under one shared rulebook |
+| Quotes | Quote another post with the author's approval rules, list and revoke quotes | built locally and across servers |
+| Following and people controls | Follow (with approval for locked accounts), block, block-a-domain, mute, notes, endorsements, lists | built |
+| Likes, saves, pins | Like (favourite), save (bookmark), pin up to 5 | built, counters kept correct |
+| Polls | Attach a poll, vote, hide totals until close, expiry | built locally and across servers |
+| Media | Upload pictures/video/audio, descriptions, processing states, serve files | built; conversion to WebP/WebM runs as a background job |
+| Timelines | Home, local, global, hashtag, list, account views with page cursors | built (home reads the 1000 most recent follows; private-list members hidden from home) |
+| Notifications and markers | Who reacted to you, clear and dismiss, remember-my-place markers, scheduled posts | built (a few rare event types arrive with their features; requests list stays empty) |
+| Filters and lists | Word/content filters, per-person lists | built |
+| Search | Find posts, accounts, hashtags | built (built-in index on by default, switchable to scan or off; only public/unlisted posts indexed) |
+| Live updates | Streams of new posts, edits, deletes, notifications | built over one-way and two-way connections, with shared visibility rules and limits |
+| Finding other servers | "Where is this account?" lookup, "what is this server?" card, profiles, inboxes | built |
+| Server-to-server posts and actions | Exchange posts, edits, deletes, replies, media, likes, boosts, polls, quote decisions, reports | built (content flows; moves, relays, forwarded inboxes, follower-count syncing, and collections are the parked tail) |
+| Thread completion | Fill in missing parents and replies on remote conversations | parked as its own future phase |
+| Conversations (direct-message threads) | Thread list, read/unread, mute a thread | built |
+| Suggestions | "Who to follow" and profile directory | built (honest local ranking; richer sources are an operator decision) |
+| Announcements | Server news, dismiss, react | built (authored through the admin API) |
+| Donation banner | Optional campaign link | honest absence (404 unless the operator wires a campaign service) |
+| Push notifications | Web push subscriptions and delivery | built (needs the operator's push keys; older rows without tokens send nothing rather than fake it) |
+| Companion-app endpoints | Settings, embeds, push setup for the first-party app | built (bundle directory serves files when the operator installs it) |
+| Staff roles | Manager (accounts and reports) and admin (everything), granted from the command line | built (finer per-action flags parked as D35) |
+| Reports | File a report, staff queue, assign and resolve | built |
+| Trends | Public tags/links/posts, staff approvals | built (only approved items shown publicly) |
+| Yearly summaries | Per-account year in review, generate and mark-read | built |
+| Statistics | Measures, dimensions, retention for staff | built (staff-wide read; operational metrics endpoint is Phase 8) |
+| Speed and scale | Measured performance, precomputed feeds if numbers justify them | planned (Phase 8; current design reads on request with bounded scans) |
+
+<!-- src/api/mastodon/router.rs:189-206,270-282,306-345,465-543,565-567; src/activitypub/http.rs:42-44; src/search/mod.rs:6-21; src/media/transcode.rs:1-22; src/api/mastodon/auth.rs:71-127; src/config.rs:94-100 -->
+
+Notes on the fine print: resending the same request does not duplicate work; private and direct posts never leak through search, trends, timelines, streams, or server-to-server delivery; unbuilt routes answer an explicit error rather than invented data.
+
+<!-- src/application/policy.rs; src/jobs/queue.rs -->

@@ -13,6 +13,16 @@ Sequencing: lands after the in-flight D12/D39/D42 workers (adjacent files),
 one fix round, severity order. Gate per item: contract test + register row
 where a divergence remains.
 
+## Status 2026-10-20 (fix round COMPLETE — addendum, worker W3)
+
+Fix round is done and merged: `372f216` (P0 privacy + P1 builds),
+`f1cda48` (P2 confirmed rows), `163ee81` (D50–D52 rows, triage verdicts),
+`f03c0c8` (verification evidence: release green + live smoke),
+`7d6e386` (TODOs sweep). The pre-round language below ("triage queue, not
+work items yet", "P2 fix workers launch … when the worktree is quiet") is
+stale and superseded — kept for provenance, do not act on it. Remaining
+genuine gaps live in `docs/TODOs.md`, not in this plan's queue.
+
 ## Status 2026-10-20 (fix round, parent log)
 
 - **Step 0 triage DONE (read-only worker).** Every P2 bullet re-verified

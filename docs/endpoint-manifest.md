@@ -34,9 +34,9 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 | GET | `/api/v1/instance/activity` | none | — | implemented (fix round) | In | 12 trailing 7-day `{week, statuses, logins, registrations}` windows, string values; 404 when `activity_api_enabled` is off (default on) |
 | GET | `/api/v1/instance/extended_description` | none | — | implemented (fix round) | In | unset shape `{updated_at:null,content:""}` (no authoring surface yet) |
 | GET | `/api/v1/instance/translation_languages` | none | — | implemented (fix round) | In | `{}` (no translation provider configured) |
-| GET | `/api/v1/instance/privacy_policy` | none | — | planned | In | 404 until the policy-text setting lands |
-| GET | `/api/v1/instance/terms_of_service` | none | — | planned | In | 404 until the terms-text setting lands |
-| GET | `/api/v1/instance/terms_of_service/:date` | none | — | planned | In | as above |
+| GET | `/api/v1/instance/privacy_policy` | none | — | implemented (fix round) | In | honest 404: no policy text configured or bundled, so nothing is fabricated (`src/api/mastodon/endpoints/instance.rs:396-398`, `src/api/mastodon/router.rs:57`) |
+| GET | `/api/v1/instance/terms_of_service` | none | — | implemented (fix round) | In | honest 404: no terms rows exist, matching upstream's unconfigured behavior (`src/api/mastodon/endpoints/instance.rs:406-408`, `src/api/mastodon/router.rs:55`) |
+| GET | `/api/v1/instance/terms_of_service/:date` | none | — | implemented (fix round) | In | honest 404: every date is unknown with no terms rows (`src/api/mastodon/endpoints/instance.rs:414-416`, `src/api/mastodon/router.rs:56`) |
 | GET | `/api/v1/accounts` | optional | read \| read:accounts | implemented (Phase 7) | In | multi-fetch `id[]` (up to 40; above that `422 Mastodon::ValidationError`); unapproved and pending-deletion accounts omitted (upstream `set_accounts`) |
 | POST | `/api/v1/accounts` | app | write \| write:accounts | implemented (Phase 2) | In | registration; returns a user token |
 | GET | `/api/v1/accounts/verify_credentials` | user | profile \| read \| read:accounts | implemented (Phase 2, source/role fix round) | In | `CredentialAccountSerializer` (real counters); `source` renders stored profile fields/discoverable/hide_collections/indexable/attribution (`null`/defaults when never set); `role` is real for staff (`Admin`/`Moderator` + permission bitmask), legacy `User` shape otherwise |
@@ -403,7 +403,7 @@ All admin rows: auth `user + role`. The role is `admin` (every admin route) or `
 
 ### Bullet-only entries (excluded, or not yet rowed)
 
-Removed from this section in the 2026-10-17 re-scope: `annual_reports`, `announcements`, `conversations`, `donation_campaigns`, `suggestions`, `POST /api/v1/reports`, `namespace :admin`, `v2` admin, `push/*`, `web/*`. Each is now a row above with a planned phase. The entries below remain as bullets because they are not yet rowed or are excluded.
+Rowed since the 2026-10-17 re-scope (each has a row above with its phase): `annual_reports`, `announcements` (+ admin authoring), `conversations` (+ mutes), `donation_campaigns`, `suggestions` (+ directory, userinfo), `POST /api/v1/reports`, `namespace :admin`, v2 admin accounts, `push/*`, `web/*`, `GET /api/v1/accounts` (multi-fetch), `directory`, the instance sub-resources (`peers`, `rules`, `domain_blocks`, `terms_of_service` + `:date`, `privacy_policy`, `extended_description`, `translation_languages`, `languages`, `activity`), `emails/confirmations` + `check_confirmation` + `password_reset` + `GET /auth/confirmation`, domain blocks (index/create/destroy), `tags` follow/unfollow/feature/unfeature + `followed_tags` + featured tags (top-level and per-account), and the notification-requests + `notifications/policy` surface. The entries below remain as bullets because they are not yet rowed or are excluded.
 
 - `GET /api/v1/oembed` — public oEmbed; not in initial profile (record as gap if clients need it). **Out.**
 - `namespace :v1_alpha` — experimental/legacy (`accounts/collections`, `collections/*`); explicitly **Out**.
@@ -494,17 +494,13 @@ Implemented 2026-10-17 (D10a, D10b, D11). Evidence: `tests/phase4_1_json_parity.
 Recorded, not fixed. Each needs a decision or a contract-review pass.
 
 1. **Domain-block route shape: resolved 2026-10-17.** The Phase 3 rows now match the pinned tag: `GET`, `POST` and `DELETE /api/v1/domain_blocks`, with numeric row-id paging and the domain as a parameter. The correction is recorded in `birchtree.md` §7 Phase 3 item 6 and in `docs/logs/2026-10-17-domain-blocks-correction.md`.
-2. **Pinned routes not yet rowed, outside this re-scope.** Each needs a row in Phase 7 or later:
+2. **Pinned routes not yet rowed (narrowed fix round, 2026-10-20).** `directory`, the instance sub-resources, `emails/*`, domain blocks, `tags`/`followed_tags`/`featured_tags`, and the notification-requests + `policy` surface are rowed above and removed from this list. Each remaining item needs a row in Phase 7 or later:
    - `profile` (`GET`/`PATCH /api/v1/profile`, `DELETE` of avatar and header);
-   - `directory` (`GET /api/v1/directory`);
-   - `instance` sub-resources (`peers`, `rules`, `domain_blocks`, `terms_of_service` with `:date`, `privacy_policy`, `extended_description`, `translation_languages`, `languages`, `activity`), and `peers/search`;
-   - `emails/confirmations` (`POST`) and `emails/check_confirmation` — rowed (round 3, area A); redemption + ownership remain (D12);
+   - `peers/search` (instance peer search; `peers` itself is rowed above);
    - `domain_blocks/preview`;
-   - `tags` (`GET /api/v1/tags/:id`; `follow`, `unfollow`, `feature`, `unfeature`), `followed_tags`, `featured_tags` (top-level and per-account) — already rowed above (Phase 7);
    - accounts sub-resources: `lists`, `identity_proofs`, `email_subscriptions`, `collections`, `in_collections` still to row; `familiar_followers` already rowed above (Phase 7); top-level `collections` (`GET`/`POST`/`PUT`/`DELETE`, and `items`/`revoke`) still to row;
-   - notifications: `requests/:id` (show), `requests/:id/accept|dismiss`, the bulk `requests/accept|dismiss`, and `notifications/policy` (`GET`/`PUT`) — all rowed (round 3, area C);
    - `GET /api/v2/notifications` and its `clear`, `unread_count`, `dismiss`, `:group_key/accounts`, and `policy` sub-routes.
 3. **`GET /api/v1/accounts` (index) had no row.** Resolved in the 2026-10-17 follow-up: the row is in profile at Phase 7, as the account multi-fetch (`id[]`, up to 40).
 4. **`namespace :web` and `/api/web/*` auth.** Resolved as a design decision in the 2026-10-17 follow-up: these routes serve keystodon's first-party mode and use the browser session plus CSRF (Phase 7). Still open: whether first-party `/api/v1/*` calls use OAuth tokens (proposed) or the session.
-5. **Scope registry comment.** `src/api/oauth/scopes.rs` says the admin scopes "are accepted for storage but never granted". `KNOWN_SCOPES` does not list any `admin:*` scope, so they are rejected today. This is a comment or code mismatch for Phase 7.3 to resolve.
+5. **Scope registry comment: resolved (fix round).** `KNOWN_SCOPES` lists the `admin:*` families (`src/api/oauth/scopes.rs:48-63`), so admin scopes validate and are grantable through the normal scope check; the old "accepted for storage but never granted / rejected today" wording no longer applies.
 6. **`/api/v1/trends` and `/api/v1/trends/tags` in the pinned tag** serve the same action (`trends/tags#index`). Birchtree's rows keep both; the alias is deprecated upstream.

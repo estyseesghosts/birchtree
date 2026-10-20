@@ -36,6 +36,19 @@ separate stores), not greenfield construction. Current phase is Phase 5
 (streaming); federation is Phase 6 (`birchtree.md` §7). Freeze this design
 before Phase 6 media work.
 
+> Verification 2026-10-20 (docs worker W3, read-only vs HEAD): the stub
+> premise above still holds. `src/media/remote_cache.rs:1` and
+> `src/federation/remote_media.rs:1` are both still one-line stubs; the eager
+> fetch path is as described (`FetchRemoteMedia` enqueue at
+> `src/application/federation_inbound.rs:181`,
+> `set_remote_media_source` at `:134`, worker at
+> `src/federation/media.rs:23-102`, per-row `remote/{media_id}` key at `:83`);
+> line citations elsewhere in this plan have drifted by a few lines as code
+> moved (e.g. `REMOTE_MEDIA_SOURCE` table/fns now at
+> `src/persistence/redb/schema.rs:375` /
+> `src/persistence/redb/federation_content.rs:455-479`) but the substance is
+> unchanged. No build started; plan stays a plan.
+
 ## 2. Corrections adopted from the review
 
 1. **Byte budgets + eviction, not TTL alone.** Time-based expiry and a global

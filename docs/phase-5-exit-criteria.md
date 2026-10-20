@@ -47,3 +47,16 @@ Source: `birchtree.md` §7 Phase 5 ("Streaming") and §8 items 8 and 11. Contrac
 - **E4. Hashtag normalization** (D25). Changing `normalize_tag` alters the REST tag timeline.
 - **E5. Bounds and the retraction cap** (D14, D15). The values are birchtree's choice (recommended, not decided). The operator may set them.
 - **E6. AGENTS.md** (not edited, per the brief). Its Phase 4 paragraph should say Phase 4.1 is implemented; its Phase 5 line should say Phase 5 is implemented, pending the exit decision.
+
+## Status 2026-10-20 (freshness pass, worker W1)
+
+E6 is resolved without touching this file's history: `AGENTS.md:19-26` now
+carries the status line ("fix round complete (2026-10-20), Phase 8 next",
+phases listed incl. 4.1/5/6-partial/7/7.1/7.2/7.3). E2's shared-policy area
+was reworked by the 2026-10-20 fix round (viewer-side mute/domain gates
+`src/application/policy.rs:21-80`, folded into `can_fetch_full` at
+`:120-123`; strictness deltas registered D45/D46/D47 per `docs/fix-plan.md`
+P0) — a later worker should re-check D22/D23 against the
+new gates rather than assuming this file's E2 text. E1 (parity harness) is
+still open, consistent with `birchtree.md` §8 item 11's 2026-10-20 note.
+E3–E5 remain as stated.

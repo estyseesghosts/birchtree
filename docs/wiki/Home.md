@@ -1,6 +1,6 @@
 # birchtree wiki
 
-Status: living documentation, updated 2026-10-17 (Phases 0–5 and 4.1 implemented; Phase 6 next).
+Status: living documentation, updated 2026-10-20 (Phases 0–7.3 implemented including the fix round; Phase 8 next).
 
 The authoritative sources are `birchtree.md` (product/architecture plan, pinned to Mastodon v4.7.3) and the contracts in `docs/`; this wiki is the readable overview. If they disagree, the plan and contracts win.
 

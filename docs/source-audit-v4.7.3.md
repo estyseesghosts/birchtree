@@ -42,4 +42,4 @@ Authority: Mastodon v4.7.3 (`~/fedifedifedi/mastodon`, commit `8ff11c2bb7b9f0714
 
 ## Differences between public API docs and implementation (to record per endpoint in Phase 0/1)
 
-None recorded yet — pending endpoint-by-endpoint review against `config/routes/api.rb` and the controllers above.
+None recorded yet — pending endpoint-by-endpoint review against `config/routes/api.rb` and the controllers above. (2026-10-20: still true post-fix-round; the round did targeted pin verification of specific rows only — see `docs/fix-plan.md` — not this full review. Tracked in `docs/TODOs.md` verification debt.)

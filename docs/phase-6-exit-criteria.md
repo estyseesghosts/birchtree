@@ -56,3 +56,31 @@ Gate: `birchtree.md` §7 Phase 6 and §8 items 7 and 11. Contract: `docs/federat
 - [x] `bash scripts/smoke-all.sh`: `smoke-all: green` on the final code, including `scripts/smoke-phase6.sh`. Log: `docs/logs/2026-10-17-phase-6-smoke-all.log`.
 - [x] Two-instance interop with vanilla Mastodon 4.7.3 for the Follow family, both directions: 14 of 14 checks on the final code. Log: `docs/logs/2026-10-17-phase-6-interop-run.out`; evidence and the bugs it found: `docs/logs/2026-10-17-phase-6-verification.md`.
 - [x] Interop for the rest of the activity set: run 2026-10-18, 15 passed / 5 failed on first full run; after fixes (media URL rendering, authorized-fetch test, reply resolution, timing) all features verified manually in both directions. Evidence: `docs/logs/2026-10-18-phase-6-interop-run.out`.
+
+## Status 2026-10-20 (freshness pass, worker W1)
+
+The "Not started" list above is stale for the content flows and is
+superseded, not rewritten. Shipped at HEAD: inbound dispatch for
+`Follow/Accept/Reject/Undo/Create/Update/Delete/Like/Announce/Block/Flag/
+QuoteRequest` (`src/activitypub/activities.rs:46-57`) into application use
+cases — `ingest_note`/`update_note`/`delete_note`/`like`/`unlike`/`announce`/
+`unannounce`/`vote`/`sync_question`/`block`/`unblock`/`flag`/
+`quote_request`/`quote_accepted`/`quote_rejected`/`quote_revoked`
+(`src/application/federation_inbound.rs:100,233-244,272-326,350-462,525-622`);
+outbound `Create`/`Update`/`Question-Update`/`Delete`/`DeleteActor`/`Vote`/
+`Like`/`Undo`/`Announce` builders (`src/activitypub/outgoing.rs:210-352`);
+remote media fetch-and-stage (`src/federation/media.rs:94`,
+`src/persistence/redb/federation_content.rs:455-505`); `outbox`/`followers`/
+`following` collections (`src/activitypub/http.rs:328-447`, D30 closed as
+implemented by the fix round); thread completion — ingest-time one-hop
+`ResolveParent` plus read-time `CrawlReplies` (`src/federation/threads.rs:1-142`,
+`JobKind` in `src/domain/job.rs:54-56`), default-signed fetches with the
+instance-actor key (`src/activitypub/http.rs:537`) and the authorized-fetch
+operator switch (`src/config.rs:82-84`, enforced at
+`src/activitypub/http.rs:65`). Interop evidence is the two bullets above
+plus the fix-round gate (`cargo test --release` 60 suites green,
+`docs/logs/2026-10-20-fix-plan-verification.md`). Still not started, as
+stated above: Move/Add/Remove, relays/follower sync, remote emoji, note/
+featured collections (D32 tail, phased per `docs/fix-plan.md` P3), status/key
+cache freshness beyond actors, the 1 MB inbound body limit (D27), and the
+§8 item 11 parity suite.
