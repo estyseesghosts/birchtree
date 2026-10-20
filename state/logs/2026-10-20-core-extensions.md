@@ -44,16 +44,53 @@ in `e63b39a` via `rm --cached`; disk copies intact).
   actor) NOT yet landed — remote rows store NULL; follows in Stage 1
   before gate (or documented deferral).
 
-## WSL guest failure (separate investigation)
+## WSL guest failure (revised: bench implicated)
 - Guest died ~18:58–19:00 EDT (prev boot Sun 18 Oct 15:22 → register dump
-  18:58:03; reboot 19:00:47). No bench process exists
-  (`scripts/bench-local.py` was never created; nothing in history/ps).
-- Cause: sustained memory pressure from ~18:38 (journald/resolved cache
-  flushes), weston SIGSEGV 18:48–51, docker health timeouts 18:55. No
-  OOM-killer lines; likely host-level WSL restart under pressure.
-- Lesson: three parallel full worktree builds (~2.7 GB RSS each, load ~25)
-  recreate that shape — serialize heavy builds in Stage 2.
+  18:58:03; reboot 19:00:47). The earlier "no bench" claim was wrong:
+  `/root/bench/run8` (12-node federated stress, 25 users/node, T+3h19m at
+  18:45 EDT, 10 nodes up incl. transcode/media workloads) was live through
+  the whole window: memory pressure from ~18:38, weston SIGSEGV 18:48–51,
+  docker health timeouts 18:55, silence 18:58. run8's status loop kept
+  writing until 18:57. Verdict: run8 very likely OOMed/starved the 19 GB
+  guest (no OOM-killer lines in the journal, but the shape fits).
+- run9 started 19:29 (post-reboot) and is ACTIVE now (solo-load 19:49,
+  watcher/status loops) alongside this session's gate — shared-box
+  contention to keep in mind.
+- Lesson stands: serialize heavy builds; one worktree build at a time.
 
 ## Open
-- CORE-P / CORE-T merges pending worker final reports.
+- ~~CORE-P / CORE-T merges pending worker final reports.~~ DONE: parent
+  merged all three slices from worker deliverables (`17a118a`,
+  `973dce3`; details in sections added below).
 - Stage 1 gate: `scripts/smoke-all.sh` + 3x `coreext` suites, then `C_CORE`.
+
+## CORE-P merge (`17a118a`, 13/13 green)
+- New: `src/domain/place.rs`, `src/application/place_policy.rs`,
+  `src/persistence/redb/places.rs` (PlaceStore: upsert/place_by_id/
+  places_by_ids/link_remote_place with same-name dedupe so remote input
+  can't hijack local names), `tests/coreext_places.rs`.
+- Wiring: `Status.place_id` inline (schema v18); NewStatus/StatusUpdate;
+  place edits count as real edits; endpoint parse (`off` ignores incl.
+  unparsable, else 422); enforced gate in use cases; scheduled persist +
+  replay; `ServerInfo.place_policy`; StatusView batch + `location` DTO
+  (`{"id","name","longitude","latitude","country"}`, omitted when off);
+  AP emit via FedContext policies (attachment `license`, Note
+  `location`; sender place ids opaque) + ingest (license
+  validated-or-NULL, location mints local rows); `preferredLicense`
+  actor field deferred (external `Person` type can't carry it).
+- Regressions: phase6_*, round3_remote_timeline, fix4_p2_fedpush,
+  phase7_web_odds, emoji_remote_ingest all green.
+
+## CORE-T merge (`973dce3`, 8/8 green)
+- `src/application/alt_text_policy.rs` promoted to first-class module
+  (domain errors); block enforced in media upload/update + status
+  create/edit (resulting set; replies NOT exempt — every write leaving
+  an undescribed image/video 422s; text/audio unaffected); nag header
+  on v1/v2 media + status create/edit successes; scheduled persist.
+- `tests/coreext_alttext.rs`: pure + HTTP matrix + flip coverage
+  (grandfathered rows 422 on later writes under block).
+- Pre-existing quirk reused: attached media rows 404 on re-update
+  (load_addressable_media), so the clear-description test uses a fresh row.
+
+## Stage 1 gate
+- `scripts/smoke-all.sh` running in background (-> C_CORE on green).
