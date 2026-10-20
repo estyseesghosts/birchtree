@@ -48,6 +48,9 @@
     "web_client_dir": { "type": ["string", "null"], "description": "Dir with keystodon's built bundle. Null = /app/* 404s." },
     "invites_enabled": { "type": "boolean", "description": "Honor invite tokens. No CLI flag; file-only." },
     "smtp_url": { "type": ["string", "null"], "description": "smtp:// or smtps:// provider URL. Null = mail explicitly disabled (503). Accepts \"env:VAR\" indirection. CLI: --smtp-url." },
-    "mail_from": { "type": ["string", "null"], "description": "Envelope sender. Required when smtp_url is set. CLI: --mail-from." }
+    "mail_from": { "type": ["string", "null"], "description": "Envelope sender. Required when smtp_url is set. CLI: --mail-from." },
+    "license_policy": { "type": "string", "enum": ["off", "unenforced", "enforced"], "description": "Core extension CORE-L: license policy. off = disabled (license params accepted-and-ignored). unenforced = enabled optional. enforced = enabled mandatory on top-level non-DM statuses with media. Default off." },
+    "place_policy": { "type": "string", "enum": ["off", "unenforced", "enforced"], "description": "Core extension CORE-P: place policy. off = disabled (place_id accepted-and-ignored). unenforced = enabled optional. enforced = enabled mandatory on top-level non-DM statuses. Default off." },
+    "alt_text_policy": { "type": "string", "enum": ["off", "nag", "block"], "description": "Core extension CORE-T: alt-text policy (local writes only). off = no change. nag = allow but return a documented nag signal. block = 422 when image/video lacks a description. Default off." }
   }
 }

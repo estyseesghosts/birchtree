@@ -179,6 +179,12 @@ fn parse_args(cfg: &mut Config) -> Args {
             cfg.mail_from = Some(v.to_string());
         } else if let Some(v) = arg.strip_prefix("--web-client-dir=") {
             cfg.web_client_dir = Some(std::path::PathBuf::from(v));
+        } else if let Some(v) = arg.strip_prefix("--license-policy=") {
+            cfg.license_policy = v.to_string();
+        } else if let Some(v) = arg.strip_prefix("--place-policy=") {
+            cfg.place_policy = v.to_string();
+        } else if let Some(v) = arg.strip_prefix("--alt-text-policy=") {
+            cfg.alt_text_policy = v.to_string();
         } else if let Some(v) = arg.strip_prefix("--mode=") {
             args.harness_mode = Some(v.to_string());
         } else if arg.starts_with("--") {

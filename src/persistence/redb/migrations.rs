@@ -17,7 +17,8 @@ use super::schema::{
     LISTS, LISTS_BY_ACCOUNT, LIST_MEMBERS, LOCAL_USERS, MARKERS, MEDIA, MEDIA_BY_OWNER,
     MEMBERSHIPS_BY_ACCOUNT, MENTIONS_BY_ACCOUNT, META, MUTES, MUTES_BY_MUTED, NOTIFICATIONS,
     NOTIFICATIONS_BY_RECIPIENT, NOTIFICATION_DEDUP, OAUTH_APPS, POLL_BY_STATUS, POLLS, POLL_VOTES,
-    QUOTES, QUOTES_BY_QUOTED, QUOTES_BY_QUOTING, REBLOGS_BY_ACCOUNT, SCHEDULED_BY_ACCOUNT,
+    QUOTES, QUOTES_BY_QUOTED, QUOTES_BY_QUOTING, PLACES, PLACES_BY_NAME,
+    REBLOGS_BY_ACCOUNT, SCHEDULED_BY_ACCOUNT,
     SCHEDULED_STATUSES, SESSIONS, STATUSES, STATUS_AUTHOR_INDEX, STATUS_PARENT_INDEX,
     STATUS_PINS, STATUS_REBLOG_INDEX, STATUS_VERSIONS, TIMELINE_LOCAL, TIMELINE_PUBLIC,
 };
@@ -457,6 +458,25 @@ pub fn apply(db: &Database) -> Result<u64, StoreError> {
         // shape; no backfill (pre-v15 accounts have no recorded code).
         if current < 15 {
             let _ = write.open_table(schema::INVITE_USES)?;
+        }
+
+        // Step v17 (Stage 1 CORE-L): licenses ride inline in the existing
+        // `media` and `accounts` JSON blobs (`MediaAttachment.license`,
+        // `Account.default_license`, both `Option<u8>` with serde default).
+        // No new tables; pre-v17 rows decode as NULL. Open-only for
+        // forward-compat stamping.
+        if current < 17 {
+            let _ = write.open_table(schema::MEDIA)?;
+            let _ = write.open_table(schema::ACCOUNTS)?;
+        }
+
+        // Step v18 (Stage 1 CORE-P): places stub. New `places` /
+        // `places_by_name` tables; `Status.place_id` rides inline in the
+        // existing `statuses` JSON blob (serde default None). No backfill.
+        if current < 18 {
+            let _ = write.open_table(schema::PLACES)?;
+            let _ = write.open_table(schema::PLACES_BY_NAME)?;
+            let _ = write.open_table(schema::STATUSES)?;
         }
 
         // Step v16: rekey `QUOTES_BY_QUOTED` from

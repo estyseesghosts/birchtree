@@ -162,6 +162,19 @@ pub struct Config {
     /// way as the live gates. File-only.
     pub local_topic_feed_access: String,
     pub remote_topic_feed_access: String,
+    /// Core extension: license policy (Stage 1 CORE-L). `off` (default,
+    /// disabled: license params accepted-and-ignored), `unenforced`
+    /// (enabled, optional), `enforced` (enabled, mandatory on top-level
+    /// non-DM statuses with media). File + CLI/env override per existing
+    /// config pattern.
+    pub license_policy: String,
+    /// Core extension: place policy (Stage 1 CORE-P). `off` (default),
+    /// `unenforced`, `enforced`. File + CLI/env override.
+    pub place_policy: String,
+    /// Core extension: alt-text policy (Stage 1 CORE-T). `off` (default),
+    /// `nag` (allow but signal), `block` (422 when image/video lacks a
+    /// description). Local writes only. File + CLI/env override.
+    pub alt_text_policy: String,
 }
 
 impl Default for Config {
@@ -211,6 +224,9 @@ impl Default for Config {
             remote_live_feed_access: "public".to_string(),
             local_topic_feed_access: "public".to_string(),
             remote_topic_feed_access: "public".to_string(),
+            license_policy: "off".to_string(),
+            place_policy: "off".to_string(),
+            alt_text_policy: "off".to_string(),
         }
     }
 }
@@ -290,6 +306,22 @@ impl Config {
         if !["public", "authenticated"].contains(&self.local_topic_feed_access.as_str()) {
             return Err(
                 "local_topic_feed_access must be one of public, authenticated".to_string(),
+            );
+        }
+        // Core extension policies (Stage 1): strict three-state enums.
+        if !["off", "unenforced", "enforced"].contains(&self.license_policy.as_str()) {
+            return Err(
+                "license_policy must be one of off, unenforced, enforced".to_string(),
+            );
+        }
+        if !["off", "unenforced", "enforced"].contains(&self.place_policy.as_str()) {
+            return Err(
+                "place_policy must be one of off, unenforced, enforced".to_string(),
+            );
+        }
+        if !["off", "nag", "block"].contains(&self.alt_text_policy.as_str()) {
+            return Err(
+                "alt_text_policy must be one of off, nag, block".to_string(),
             );
         }
         if let Some(base) = &self.streaming_api_base_url {

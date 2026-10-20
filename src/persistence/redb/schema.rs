@@ -557,7 +557,14 @@ pub fn audit_target_prefix(target_type: &str, target_id: &str) -> Vec<u8> {
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// Current schema version. Bump with a new migration step.
-pub const SCHEMA_VERSION: u64 = 16;
+pub const SCHEMA_VERSION: u64 = 18;
+
+/// Core extensions (Stage 1): places stub (schema v18).
+/// Places by numeric place id -> JSON `Place`.
+pub const PLACES: TableDefinition<u64, &[u8]> = TableDefinition::new("places");
+
+/// Place lookup by name (unique): `name_utf8` -> place id.
+pub const PLACES_BY_NAME: TableDefinition<&str, u64> = TableDefinition::new("places_by_name");
 
 /// All table names, for diagnostics and migration verification.
 pub const TABLE_NAMES: &[&str] = &[
@@ -661,6 +668,8 @@ pub const TABLE_NAMES: &[&str] = &[
     "email_index",
     "email_tokens",
     "interaction_events",
+    "places",
+    "places_by_name",
 ];
 
 /// Build the fixed 16-byte scheduling key used by [`JOBS_INDEX`].

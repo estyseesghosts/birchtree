@@ -80,3 +80,30 @@ Every other key has both a file key and a CLI flag (`src/main.rs:42-169`):
 Configuration loads once at startup; changing the file or flags requires a
 restart. There is no runtime/admin toggle for any key (matches upstream:
 Mastodon has no runtime backend switches either; see D6).
+
+## Core extension policies (Stage 1; default off, Mastodon parity when off)
+
+Three-state server-admin policies, set via JSON file keys with CLI/env
+override per the existing config pattern:
+
+- `license_policy: "off" | "unenforced" | "enforced"` (default `"off"`).
+  `off` = disabled: license params accepted-and-ignored (stored NULL),
+  wire omits `license` / `preferredLicense`. `unenforced` = enabled,
+  optional (round-trip local + wire, 422 on out-of-enum). `enforced` =
+  enabled, mandatory: effective license (per-attachment else author
+  default) must be non-NULL on top-level non-DM statuses with media,
+  else Mastodon-compatible 422. Replies and DMs exempt. Media upload
+  alone never 422s for licenses.
+- `place_policy: "off" | "unenforced" | "enforced"` (default `"off"`).
+  `off` = disabled: `place_id` accepted-and-ignored (stored NULL), wire
+  omits `location`. `unenforced` = enabled, optional (unknown place_id
+  → existing 422 path; missing place allowed). `enforced` = enabled,
+  mandatory: top-level non-DM statuses require a resolvable place_id,
+  else 422. Replies and DMs exempt. No proximity/discover/geo-search.
+- `alt_text_policy: "off" | "nag" | "block"` (default `"off"`). Local
+  writes only; federation ingest never drops for missing alt-text.
+  `off` = no behavior change. `nag` = allow upload/post but return a
+  documented nag signal (one signal, pinned in endpoint-manifest +
+  tested, same on v1/v2 media + statuses). `block` = 422 when an
+  image/video attachment is left without a description (media v1/v2
+  POST, status create/edit). Text-only posts unaffected.
