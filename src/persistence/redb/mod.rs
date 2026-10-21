@@ -37,6 +37,10 @@ pub mod search;
 pub mod federation;
 pub mod federation_content;
 
+// Storage overhaul (`docs/database.md`): durable remote-cache metadata +
+// accounting behind `CacheStore` (parent merge of Agent B's snippet).
+pub mod remote_cache;
+
 // D39 remainder: unified interaction-event journal backing the admin
 // `interactions` measure. Table + migration are schema v12 (parent); the
 // `InteractionLog` implementation lands with the metrics work.

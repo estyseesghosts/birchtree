@@ -332,6 +332,73 @@ pub trait BlobStore: Send + Sync {
     fn delete(&self, key: &str) -> Result<()>;
     /// Whether a blob exists.
     fn exists(&self, key: &str) -> Result<bool>;
+
+    /// Filesystem root this handle writes under, when the handle is backed
+    /// by the filesystem (storage overhaul, `docs/database.md` Agent C).
+    /// The fetch path uses it to stage response bodies to `tmp/{rand}.part`
+    /// under the byte cap and atomically rename onto the key. `None` keeps
+    /// the legacy buffered path (in-memory test doubles).
+    fn root_path(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    /// Publish an already-staged tmp file onto `key` (atomic rename; storage
+    /// overhaul, Agent C). The default refuses; `FsBlobStore` resolves the
+    /// key under its root and renames.
+    fn publish_tmp(&self, _tmp: &std::path::Path, _key: &str) -> Result<()> {
+        Err(Error::Internal("publish_tmp is not implemented".into()))
+    }
+
+    /// Stream `bytes` under `key` without buffering the whole body: the
+    /// implementation stages to `tmp/{rand}.part` under `max_bytes`
+    /// (`media::fetch_stream::stage_slices_capped` shape) and atomically
+    /// renames on success. Default impl buffers (back-compat for test doubles);
+    /// `FsBlobStore` overrides with tmp+rename.
+    fn put_streamed(&self, key: &str, bytes: &[u8], max_bytes: u64) -> Result<()> {
+        if bytes.len() as u64 > max_bytes {
+            return Err(Error::InvalidInput(format!("stream body exceeds {max_bytes} bytes")));
+        }
+        self.put(key, bytes)
+    }
+}
+
+/// Which byte pool a blob handle addresses (`docs/database.md` Agent A).
+/// Durable = local uploads, never evicted; cache = remote fetches, evictable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobPool {
+    Durable,
+    Cache,
+}
+
+/// Access to both blob pools. The durable handle keeps the pre-overhaul
+/// `<data_dir>/media` root (lazy-move readable); the cache handle owns the
+/// fresh `<data_dir>/media_cache` root. Agent B's fetch path takes `Cache`.
+pub trait BlobStores: Send + Sync {
+    fn pool(&self, pool: BlobPool) -> std::sync::Arc<dyn BlobStore>;
+}
+
+/// Remote-cache metadata + accounting (`docs/database.md` Step 0).
+/// Payloads < 64 KiB; evict batches bounded (<= 500 rows).
+pub trait CacheStore: Send + Sync {
+    fn cache_get(&self, source_url: &str, variant: &str)
+        -> Result<Option<crate::media::remote_cache::RemoteCacheEntry>>;
+    fn cache_put_metadata(&self, entry: crate::media::remote_cache::RemoteCacheEntry) -> Result<()>;
+    fn cache_mark_stored(
+        &self, source_url: &str, variant: &str, blob_key: &str,
+        size: u64, etag: Option<String>, now_ms: u64,
+    ) -> Result<()>;
+    /// Drop the byte mapping, keep the metadata shell; returns the blob key
+    /// the caller must delete. `None` when already shell-only / missing.
+    fn cache_mark_evicted(&self, source_url: &str, variant: &str) -> Result<Option<String>>;
+    fn cache_touch(&self, source_url: &str, variant: &str, now_ms: u64) -> Result<()>;
+    fn cache_accounting(&self) -> Result<crate::media::remote_cache::CacheUsage>;
+    /// Bounded victim batch (<= 500): expired-then-LRU within `need_class`,
+    /// then other classes, never avatar unless need is avatar. One txn for
+    /// mapping+accounting; caller deletes the returned keys (own keys only).
+    fn cache_evict_batch(
+        &self, need: crate::media::remote_cache::MediaClass,
+        bytes_to_free: u64, now_ms: u64, cap: usize,
+    ) -> Result<Vec<String>>;
 }
 
 /// Durable job queue.
@@ -2163,6 +2230,7 @@ pub trait Store:
     + crate::application::conversations::ConversationStore
     + crate::application::push::PushSubscriptionStore
     + WebStore
+    + CacheStore
 {
 }
 impl<T> Store for T where
@@ -2196,6 +2264,7 @@ impl<T> Store for T where
     + crate::application::conversations::ConversationStore
     + crate::application::push::PushSubscriptionStore
     + WebStore
+    + CacheStore
 {
 }
 

@@ -47,6 +47,22 @@
     "vapid_private_key": { "type": "string", "description": "Base64url VAPID private key. Accepts \"env:VAR\" indirection. Never logged." },
     "web_client_dir": { "type": ["string", "null"], "description": "Dir with keystodon's built bundle. Null = /app/* 404s." },
     "invites_enabled": { "type": "boolean", "description": "Honor invite tokens. No CLI flag; file-only." },
+    "durable_dir": { "type": ["string", "null"], "description": "Durable (local-upload) media root. Null = <data_dir>/media (pre-overhaul path). No CLI flag; file-only." },
+    "cache_dir": { "type": ["string", "null"], "description": "Remote-media cache root. Null = <data_dir>/media_cache. Must differ from durable_dir. No CLI flag; file-only." },
+    "remote_cache": {
+      "type": "object",
+      "description": "Remote-media cache budgets + lifecycle (Step 0 skeleton).",
+      "properties": {
+        "mode": { "type": "string", "enum": ["disabled", "on_demand", "warm"] },
+        "global_cap_bytes": { "type": "integer", "minimum": 1 },
+        "avatar_emoji_cap_bytes": { "type": "integer", "minimum": 1 },
+        "preview_cap_bytes": { "type": "integer", "minimum": 1 },
+        "full_cap_bytes": { "type": "integer", "minimum": 1 },
+        "avatar_retention_days": { "type": "integer", "minimum": 1 },
+        "warming": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
     "smtp_url": { "type": ["string", "null"], "description": "smtp:// or smtps:// provider URL. Null = mail explicitly disabled (503). Accepts \"env:VAR\" indirection. CLI: --smtp-url." },
     "mail_from": { "type": ["string", "null"], "description": "Envelope sender. Required when smtp_url is set. CLI: --mail-from." }
   }

@@ -90,6 +90,14 @@ pub enum JobKind {
     /// handler is idempotent (a row that already has metadata is a no-op)
     /// and never fabricates card fields.
     PreviewCardFetch,
+    /// Evict remote-cache bytes back under the global/class caps (storage
+    /// overhaul, `docs/database.md` Step 0). Bounded batch (<= 500 rows);
+    /// payload < 64 KiB; evicts bytes only, never durable local media.
+    CacheEvict,
+    /// Idempotent storage reconciler sweep (storage overhaul, Step 0):
+    /// orphans, missing blobs, stale metadata, unfinished deletions.
+    /// Bounded batch (<= 500 rows); payload < 64 KiB.
+    ReconcileStorage,
 }
 
 impl JobKind {
@@ -116,6 +124,8 @@ impl JobKind {
             JobKind::TagBackfill => "tag_backfill",
             JobKind::AccountDeletionBatch => "account_deletion_batch",
             JobKind::PreviewCardFetch => "preview_card_fetch",
+            JobKind::CacheEvict => "cache_evict",
+            JobKind::ReconcileStorage => "reconcile_storage",
         }
     }
 }

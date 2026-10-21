@@ -304,6 +304,10 @@ pub fn handle_with_transcode(
         // does not have: the worker owns `WebPushDelivery`, and offline
         // drains complete it without doing work.
         JobKind::WebPushDelivery => Ok(()),
+        // Storage overhaul skeletons (Step 0): agents B/C own the bodies.
+        // No-op until their batches land; payloads stay < 64 KiB, batches
+        // bounded to 500 rows, no blobs in the transaction.
+        JobKind::CacheEvict | JobKind::ReconcileStorage => Ok(()),
         JobKind::DeliverActivity => Err(Error::Internal(
             "deliver_activity runs in the job worker (federation::delivery), not here".into(),
         )),

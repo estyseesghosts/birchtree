@@ -18,6 +18,59 @@ mod serde_millis {
     }
 }
 
+/// Remote-media cache backing mode (`docs/remote-media-cache-plan.md` §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteCacheMode {
+    /// No persistence; direct/streaming proxy delivery (no proxy design yet).
+    Disabled,
+    /// Fetch on first request, cache, auto-evict (default).
+    OnDemand,
+    /// Proactive fetch behind config + rate limit + budget (scoped warming).
+    Warm,
+}
+
+impl Default for RemoteCacheMode {
+    fn default() -> Self {
+        Self::OnDemand
+    }
+}
+
+/// Byte budgets + lifecycle for the remote-media cache (Step 0 skeleton:
+/// config surface only; enforcement lands with agents B/C).
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RemoteCacheConfig {
+    pub mode: RemoteCacheMode,
+    /// Hard global byte cap (all classes + in-flight).
+    pub global_cap_bytes: u64,
+    /// Reserved class: avatars, headers, custom emoji.
+    pub avatar_emoji_cap_bytes: u64,
+    /// Reserved class: image previews / thumbnails.
+    pub preview_cap_bytes: u64,
+    /// Reserved class: full image originals.
+    pub full_cap_bytes: u64,
+    /// Avatar/emoji entry retention in days.
+    pub avatar_retention_days: u64,
+    /// Scoped warming reuse of `FetchRemoteMedia` (off by default,
+    /// relay-excluded when enabled).
+    pub warming: bool,
+}
+
+impl Default for RemoteCacheConfig {
+    fn default() -> Self {
+        Self {
+            mode: RemoteCacheMode::OnDemand,
+            global_cap_bytes: 512 * 1024 * 1024,
+            avatar_emoji_cap_bytes: 128 * 1024 * 1024,
+            preview_cap_bytes: 256 * 1024 * 1024,
+            full_cap_bytes: 128 * 1024 * 1024,
+            avatar_retention_days: 30,
+            warming: false,
+        }
+    }
+}
+
 /// Server configuration. Validated before any services are built.
 ///
 /// JSON keys match the field names, except `worker_poll_interval_ms`
@@ -162,6 +215,15 @@ pub struct Config {
     /// way as the live gates. File-only.
     pub local_topic_feed_access: String,
     pub remote_topic_feed_access: String,
+    /// Filesystem root for durable (local-upload) media bytes. `None`
+    /// (default) means `<data_dir>/media` (the pre-overhaul path, kept as the
+    /// durable root; remote rows with bytes there stay readable).
+    pub durable_dir: Option<PathBuf>,
+    /// Filesystem root for the remote-media cache. `None` (default) means
+    /// `<data_dir>/media_cache` (new root; never holds durable bytes).
+    pub cache_dir: Option<PathBuf>,
+    /// Remote-media cache budgets + lifecycle (`docs/database.md` Step 0).
+    pub remote_cache: RemoteCacheConfig,
 }
 
 impl Default for Config {
@@ -211,6 +273,9 @@ impl Default for Config {
             remote_live_feed_access: "public".to_string(),
             local_topic_feed_access: "public".to_string(),
             remote_topic_feed_access: "public".to_string(),
+            durable_dir: None,
+            cache_dir: None,
+            remote_cache: RemoteCacheConfig::default(),
         }
     }
 }
@@ -330,6 +395,36 @@ impl Config {
                 }
             }
         }
+        // Remote-media cache budgets (`docs/database.md` Step 0): caps > 0,
+        // distinct roots, global covers the reserved classes. The 40 MiB
+        // per-file ceiling (`federation::media::MAX_REMOTE_MEDIA_BYTES`)
+        // stays inside the class/global budgets (not a config key).
+        if self.remote_cache.global_cap_bytes == 0 {
+            return Err("remote_cache.global_cap_bytes must be > 0".to_string());
+        }
+        if self.remote_cache.avatar_emoji_cap_bytes == 0 {
+            return Err("remote_cache.avatar_emoji_cap_bytes must be > 0".to_string());
+        }
+        if self.remote_cache.preview_cap_bytes == 0 {
+            return Err("remote_cache.preview_cap_bytes must be > 0".to_string());
+        }
+        if self.remote_cache.full_cap_bytes == 0 {
+            return Err("remote_cache.full_cap_bytes must be > 0".to_string());
+        }
+        if self.remote_cache.avatar_retention_days == 0 {
+            return Err("remote_cache.avatar_retention_days must be > 0".to_string());
+        }
+        let reserved = self
+            .remote_cache
+            .avatar_emoji_cap_bytes
+            .saturating_add(self.remote_cache.preview_cap_bytes)
+            .saturating_add(self.remote_cache.full_cap_bytes);
+        if self.remote_cache.global_cap_bytes < reserved {
+            return Err("remote_cache.global_cap_bytes must cover the reserved class caps".to_string());
+        }
+        if self.cache_dir_resolved() == self.durable_dir_resolved() {
+            return Err("cache_dir and durable_dir must be different directories".to_string());
+        }
         Ok(())
     }
 
@@ -408,6 +503,22 @@ impl Config {
     /// Path of the `redb` database file.
     pub fn database_path(&self) -> PathBuf {
         self.data_dir.join("birchtree.redb")
+    }
+
+    /// Durable (local-upload) media root. Explicit `durable_dir` wins;
+    /// otherwise `<data_dir>/media` (the pre-overhaul path).
+    pub fn durable_dir_resolved(&self) -> PathBuf {
+        self.durable_dir
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("media"))
+    }
+
+    /// Remote-cache media root. Explicit `cache_dir` wins; otherwise
+    /// `<data_dir>/media_cache`.
+    pub fn cache_dir_resolved(&self) -> PathBuf {
+        self.cache_dir
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("media_cache"))
     }
 }
 
@@ -495,5 +606,53 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(cfg.normalized_public_url(), "https://example.social");
+    }
+
+    #[test]
+    fn remote_cache_defaults_match_plan_budgets() {
+        let cfg = Config::default();
+        assert_eq!(cfg.remote_cache.mode, RemoteCacheMode::OnDemand);
+        assert_eq!(cfg.remote_cache.global_cap_bytes, 512 * 1024 * 1024);
+        assert_eq!(cfg.remote_cache.avatar_emoji_cap_bytes, 128 * 1024 * 1024);
+        assert_eq!(cfg.remote_cache.preview_cap_bytes, 256 * 1024 * 1024);
+        assert_eq!(cfg.remote_cache.full_cap_bytes, 128 * 1024 * 1024);
+        assert_eq!(cfg.remote_cache.avatar_retention_days, 30);
+        assert!(!cfg.remote_cache.warming);
+        assert!(cfg.validate().is_ok());
+        // Distinct default roots; durable keeps the pre-overhaul path.
+        assert_ne!(cfg.cache_dir_resolved(), cfg.durable_dir_resolved());
+        assert_eq!(cfg.durable_dir_resolved(), cfg.data_dir.join("media"));
+        assert_eq!(cfg.cache_dir_resolved(), cfg.data_dir.join("media_cache"));
+    }
+
+    #[test]
+    fn remote_cache_round_trips_through_json() {
+        let cfg = Config {
+            transcoding_enabled: false,
+            ..Config::default()
+        };
+        let json = serde_json::to_value(&cfg).expect("serializes");
+        let back: Config = serde_json::from_value(json).expect("round-trips");
+        assert_eq!(
+            back.remote_cache.global_cap_bytes,
+            cfg.remote_cache.global_cap_bytes
+        );
+        assert!(back.validate().is_ok());
+    }
+
+    #[test]
+    fn remote_cache_rejects_bad_budgets_and_shared_root() {
+        let mut cfg = Config {
+            transcoding_enabled: false,
+            ..Config::default()
+        };
+        cfg.remote_cache.global_cap_bytes = 1;
+        assert!(cfg.validate().is_err());
+        let mut cfg = Config {
+            transcoding_enabled: false,
+            ..Config::default()
+        };
+        cfg.cache_dir = Some(cfg.durable_dir_resolved());
+        assert!(cfg.validate().is_err());
     }
 }

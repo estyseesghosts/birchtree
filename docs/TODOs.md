@@ -146,26 +146,16 @@ Conventions: `D##` = row in `docs/compatibility-profile.md`;
 - **Web embeds remote fetch/sanitize.** `GET /api/web/embeds/:id` answers
   404 for signed-in remote reads; the remote fetch/sanitize pass is unbuilt.
 
-## Remote-media cache program (`docs/remote-media-cache-plan.md`, still a stub)
+## Remote-cache cache program (`docs/remote-media-cache-plan.md`, storage overhaul landed 2026-10-21)
 
-- Cache lifecycle: budgets + eviction (time expiry AND a global byte cap),
-  per-class limits with a hard global cap (512 MiB proposed).
-- Lazy fetch by default (metadata-first, fetch on first request) instead of
-  ingest-time fetch.
-- Durable-uploads isolation: separate remote-cache store + migration of
-  existing `remote/*` keys; metadata model (source URL, blob key, class,
-  size, fetch/last-access/expiry, ETag validators); no content-addressed
-  sharing (frozen decision).
-- Bounded ingest + periodic idempotent reconciler; accounting (total +
-  per-class bytes incl. in-flight reservations); safe eviction (never touch
-  local media); observability routing (interim log/health vs admin metrics).
-- Acceptance tests (cap under concurrency, local survival, oversize abort,
-  evicted re-fetch); normatives to
-  `federation-contract.md`/`persistence-conformance.md`.
-- Open questions: media-fetch signing (unsigned GET vs instance-actor
-  dereference requirement); per-file ceiling reconciliation (40 MiB
-  `MAX_REMOTE_MEDIA_BYTES` vs class caps); direct/streaming proxy delivery
-  (disabled mode has no design).
+- Landed: two blob pools (`media_durable` + `media_cache`, tmp+rename, `0700`), `REMOTE_CACHE`/`CACHE_ACCOUNTING` tables (schema v17), `CacheEvict`/`ReconcileStorage` jobs (skeleton arms), metadata-first ingest shells, in-flight reservations + byte-LRU+TTL eviction (avatar reserve), stream-to-disk fetch (`tmp/{rand}.part`, mid-body abort), idempotent reconciler, `STORAGE_METRICS` + `/health` interim channel. Evidence `state/logs/2026-10-21-storage-overhaul.md`; suites `storage_two_pools` (3), `storage_cache_evict` (7), `storage_reconcile` (6).
+- Remaining follow-ups (not regressions — behavior preserved):
+  - Eager `FetchRemoteMedia` enqueue still fires at ingest; the flip to pure on-demand (enqueue only on cache miss at the media GET path) lands with the miss-path trigger.
+  - `remote/*` bytes still live under the durable root; routing them through `BlobStores::pool(Cache)` + reconciler copy-and-repoint is open.
+  - `upload_media` still buffers the request body (endpoint streams it); disk-staging the upload path awaits request-body streaming at the endpoint layer.
+  - Durable `CacheStore` redb mirror is implemented; restart re-seeding of the process ledger from it is open.
+  - Open questions carried (not absorbed): media-fetch signing (unsigned GET vs instance-actor dereference); per-file ceiling reconciliation (40 MiB vs class caps); disabled-mode direct/streaming proxy has no design.
+- Normatives still to port: `federation-contract.md` / `persistence-conformance.md` cache rows (`REMOTE_CACHE`, `stage_remote_media`, bench-run5 media notes).
 
 ## Verification debt (tests, metrics, contract freeze)
 

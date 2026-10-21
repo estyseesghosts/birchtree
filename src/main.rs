@@ -373,12 +373,27 @@ async fn shutdown_signal() {
 
 async fn serve(cfg: Config) {
     let (store, clock, ids) = build_store(&cfg);
-    let blobs: Arc<dyn birchtree::application::ports::BlobStore> =
-        Arc::new(birchtree::media::blob_store::FsBlobStore::open(cfg.data_dir.join("media"))
-            .unwrap_or_else(|err| {
-                eprintln!("open blob store: {err}");
-                std::process::exit(1);
-            }));
+    // Storage overhaul (`docs/database.md` Agent A): open the durable +
+    // cache roots as a pair (distinct roots enforced by `Config::validate`
+    // and re-checked here). All traffic still goes through the durable
+    // handle (lazy-move readable); the cache root is created now so the
+    // fetch path can be repointed without a flag day (follow-up: route
+    // `remote/*` keys through `BlobStores::pool(BlobPool::Cache)`).
+    let (durable_blobs, cache_blobs) =
+        birchtree::media::blob_store::FsBlobStore::open_pair(
+            cfg.durable_dir_resolved(),
+            cfg.cache_dir_resolved(),
+        )
+        .unwrap_or_else(|err| {
+            eprintln!("open blob stores: {err}");
+            std::process::exit(1);
+        });
+    let _ = cache_blobs;
+    // Storage overhaul (Agent B): install the operator budgets into the
+    // process-wide cache admission ledger (in-flight reservations gate the
+    // fetch path before any byte is read).
+    birchtree::media::remote_cache::configure_process_ledger(cfg.remote_cache.clone());
+    let blobs: Arc<dyn birchtree::application::ports::BlobStore> = Arc::new(durable_blobs);
     let server = Arc::new(ServerInfo::from_config(&cfg));
     // Phase 7.2/7.3 startup seeds: the search index is in-memory derived
     // state, so a restart re-seeds its backfill chain when empty; the tag
@@ -721,7 +736,7 @@ fn run_sweep_transcode_orphans(cfg: &Config, args: &Args) -> ! {
         birchtree::media::transcode::TMP_SWEEP_CAP,
     );
     let (store, _clock, _ids) = build_store(cfg);
-    let blobs = birchtree::media::blob_store::FsBlobStore::open(cfg.data_dir.join("media"))
+    let blobs = birchtree::media::blob_store::FsBlobStore::open(cfg.durable_dir_resolved())
         .unwrap_or_else(|err| {
             eprintln!("open media store: {err}");
             std::process::exit(1);

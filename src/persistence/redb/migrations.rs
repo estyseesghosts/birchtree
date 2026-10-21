@@ -513,6 +513,15 @@ pub fn apply(db: &Database) -> Result<u64, StoreError> {
             }
         }
 
+        // Step v17: storage overhaul skeletons (`docs/database.md` Step 0):
+        // `REMOTE_CACHE` (metadata-first records, per-row store keys) and
+        // `CACHE_ACCOUNTING` (total / per-class / in-flight counters). Tables
+        // only; agents B/C own the port functions. No backfill.
+        if current < 17 {
+            let _ = write.open_table(schema::REMOTE_CACHE)?;
+            let _ = write.open_table(schema::CACHE_ACCOUNTING)?;
+        }
+
         {
             let mut meta = write.open_table(META)?;
             meta.insert(
@@ -524,7 +533,6 @@ pub fn apply(db: &Database) -> Result<u64, StoreError> {
     write.commit()?;
     Ok(target)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

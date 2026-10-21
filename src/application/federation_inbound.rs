@@ -133,7 +133,7 @@ pub fn ingest_note(store: &dyn Store, note: RemoteNote, poll: Option<RemotePoll>
         })?;
         store.set_remote_media_source(media.id, &attachment.source_url)?;
         media_ids.push(media.id);
-        pending_fetches.push(media.id);
+        pending_fetches.push((media.id, attachment.source_url.clone()));
     }
     let status = store.create_status(
         NewStatus {
@@ -176,7 +176,21 @@ pub fn ingest_note(store: &dyn Store, note: RemoteNote, poll: Option<RemotePoll>
             now_ms,
         )?;
     }
-    for media_id in pending_fetches {
+    for (media_id, source_url) in pending_fetches {
+        // Metadata-first shell in the cache ledger (storage overhaul,
+        // `docs/database.md` Agent B): no bytes, no accounting change. The
+        // eager `FetchRemoteMedia` enqueue below is kept until the
+        // fetch-on-first-request miss path lands (follow-up); warming stays
+        // off by default behind `should_warm`. Empty sources skip the shell
+        // (the job quarantines them as before).
+        if !source_url.is_empty() {
+            crate::federation::media::record_metadata_first(
+                store as &dyn crate::application::federation_ports::FederationContentStore,
+                media_id,
+                &source_url,
+                now_ms,
+            )?;
+        }
         store.enqueue(
             JobKind::FetchRemoteMedia,
             serde_json::json!({ "media_id": media_id.value() }),

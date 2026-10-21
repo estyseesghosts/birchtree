@@ -553,11 +553,42 @@ pub fn audit_target_prefix(target_type: &str, target_id: &str) -> Vec<u8> {
     prefix
 }
 
+// ---------------------------------------------------------------------------
+// Storage overhaul (schema v17, `docs/database.md` Step 0): remote-media
+// cache metadata + accounting. Skeletons only — no logic here; agents B/C own
+// the port functions. `REMOTE_CACHE` key = `(source_url, variant)` encoded by
+// [`remote_cache_key`]; the value holds the per-row store key (index ≠
+// bytes), class, size, last-use, expiry and validators. No `BLOB_REFCOUNT` in
+// v1 (per-row keys, safe eviction = delete the row's own key).
+// ---------------------------------------------------------------------------
+
+/// Remote-cache entries: `remote_cache_key(source_url, variant)` -> JSON
+/// `RemoteCacheEntry` (`blob_key`, `class`, `size`, `last_use`, `expiry`,
+/// `etag`). Metadata survives byte eviction for re-fetch.
+pub const REMOTE_CACHE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("remote_cache");
+
+/// Cache accounting singleton table: `"total"` / `"class:<name>"` /
+/// `"in_flight"` -> JSON byte counters. One `redb` transaction updates the
+/// counters with the mapping change they describe.
+pub const CACHE_ACCOUNTING: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("cache_accounting");
+
+/// Key for [`REMOTE_CACHE`]: `source_url_utf8 || 0xFF || variant_utf8`.
+/// `0xFF` cannot appear in a URL or in the closed variant set, so the
+/// `(source_url, variant)` pair round-trips exactly.
+pub fn remote_cache_key(source_url: &str, variant: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(source_url.len() + variant.len() + 1);
+    key.extend_from_slice(source_url.as_bytes());
+    key.push(0xFF);
+    key.extend_from_slice(variant.as_bytes());
+    key
+}
+
 /// Key under `META` holding the applied schema version (big-endian `u64`).
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// Current schema version. Bump with a new migration step.
-pub const SCHEMA_VERSION: u64 = 16;
+pub const SCHEMA_VERSION: u64 = 17;
 
 /// All table names, for diagnostics and migration verification.
 pub const TABLE_NAMES: &[&str] = &[
@@ -661,6 +692,8 @@ pub const TABLE_NAMES: &[&str] = &[
     "email_index",
     "email_tokens",
     "interaction_events",
+    "remote_cache",
+    "cache_accounting",
 ];
 
 /// Build the fixed 16-byte scheduling key used by [`JOBS_INDEX`].
