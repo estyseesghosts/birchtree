@@ -129,6 +129,8 @@ fn register_cmd(username: &str, invite_code: Option<&str>) -> RegisterAccountCom
         reason: None,
         invite_code: invite_code.map(str::to_string),
         display_name: None,
+        time_zone: None,
+        date_of_birth: None,
     }
 }
 

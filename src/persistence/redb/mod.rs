@@ -41,6 +41,13 @@ pub mod federation_content;
 // accounting behind `CacheStore` (parent merge of Agent B's snippet).
 pub mod remote_cache;
 
+// Gaps batch (`docs/gaps.md` Step 0): collections rows (G-C owns this module).
+pub mod collections;
+
+// Gaps batch G-E (`docs/gaps.md`, parent merge of S4): second-factor rows
+// over `TOTP_SECRETS` / `WEBAUTHN_CREDS`.
+pub mod second_factor;
+
 // D39 remainder: unified interaction-event journal backing the admin
 // `interactions` measure. Table + migration are schema v12 (parent); the
 // `InteractionLog` implementation lands with the metrics work.

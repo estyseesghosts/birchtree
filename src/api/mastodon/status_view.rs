@@ -351,11 +351,30 @@ impl<'a> StatusViewContext<'a> {
         }
         shortcodes.sort();
         shortcodes.dedup();
-        let emojis: Vec<serde_json::Value> = shortcodes
+        let mut emojis: Vec<serde_json::Value> = shortcodes
             .iter()
             .filter_map(|shortcode| self.emoji_entities.get(shortcode))
             .map(|emoji| dto::custom_emoji_json(self.server, emoji, false))
             .collect();
+        // Remote emoji (federation tail, G-D): shortcodes with no local row
+        // render from the remote table (never picker-visible, never listed).
+        let missing: Vec<String> = shortcodes
+            .iter()
+            .filter(|shortcode| !self.emoji_entities.contains_key(*shortcode))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            for row in self.store.remote_emojis_by_shortcodes(&missing)? {
+                // Staged bytes serve through the `system/` asset route, like
+                // local emoji (the row stores the asset path, not the origin
+                // URL, so renders never hotlink the origin).
+                let url = self.server.asset_url(&row.url);
+                emojis.push(crate::activitypub::objects::remote_emoji_entity(
+                    &row.shortcode,
+                    &url,
+                ));
+            }
+        }
 
         Ok(dto::StatusView {
             status,

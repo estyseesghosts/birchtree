@@ -245,7 +245,7 @@ pub fn familiar_followers(
         .filter(|id| {
             followed_accounts
                 .get(id)
-                .is_none_or(|account| !account.suspended)
+                .is_none_or(|account| !account.suspended && account.hide_collections != Some(true))
         })
         .collect();
 
@@ -257,8 +257,15 @@ pub fn familiar_followers(
         if target.suspended {
             continue;
         }
-        // `hide_collections` does not exist in this server's account model
-        // (no collections surface): every visible target is listed.
+        // `hide_collections` (gaps G-C/D52): a flagged target yields an
+        // empty familiar list (counts/edges stay on their own reads).
+        if target.hide_collections == Some(true) {
+            entries.push(FamiliarEntry {
+                target_id,
+                familiar_ids: Vec::new(),
+            });
+            continue;
+        }
         // Accounts followed by BOTH the viewer and the target (mutual
         // follows), fully paged on the target side and intersected with
         // the viewer's visible follows.

@@ -44,6 +44,9 @@ pub struct FedContext {
     pub media_client: reqwest::Client,
     /// Authorized fetch: reads of our documents need a valid HTTP signature.
     pub authorized_fetch: bool,
+    /// Relay peers public activities forward to (federation tail, G-D).
+    /// Empty = no relay traffic.
+    pub relays: Arc<Vec<String>>,
 }
 
 /// The crate's configuration for this server.
@@ -62,6 +65,7 @@ pub async fn build_config(
     debug: bool,
     instance: Option<&instance::InstanceActor>,
     authorized_fetch: bool,
+    relays: &[String],
 ) -> Result<FederationConfig<FedContext>, String> {
     let domain = host_of(public_url).ok_or_else(|| format!("public url has no host: {public_url}"))?;
     let client = net::middleware_client(http)?;
@@ -82,6 +86,7 @@ pub async fn build_config(
             http: Arc::new(http.clone()),
             media_client,
             authorized_fetch,
+            relays: Arc::new(relays.to_vec()),
         })
         .client(client)
         .url_verifier(Box::new(net::PolicyVerifier::new(http)))

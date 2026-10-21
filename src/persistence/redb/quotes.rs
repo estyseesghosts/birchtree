@@ -20,7 +20,10 @@ use super::{decode, encode, RedbStore, StoreError, StoreResult};
 const SCAN_CAP: usize = 500;
 
 /// Read one quote row inside an existing transaction.
-fn read_quote_txn(write: &WriteTransaction, quote_id: Id) -> StoreResult<Option<QuoteRecord>> {
+/// Read one quote row under the held write transaction (shared with the
+/// `quoted_update` fan-out scan in `super::statuses`, which cannot call the
+/// port method — it opens its own write txn and cannot nest).
+pub(super) fn read_quote_txn(write: &WriteTransaction, quote_id: Id) -> StoreResult<Option<QuoteRecord>> {
     let quotes = write.open_table(QUOTES)?;
     match quotes.get(quote_id.value())? {
         Some(guard) => Ok(Some(decode(guard.value())?)),

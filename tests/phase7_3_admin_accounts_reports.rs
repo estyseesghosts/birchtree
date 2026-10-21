@@ -278,13 +278,13 @@ async fn admin_accounts_show_shape_and_404() {
     assert_eq!(body["locale"], serde_json::json!("en"));
     assert_eq!(body["account"]["id"], f.user_id.to_string());
     assert_eq!(body["account"]["username"], "plain");
-    assert_eq!(body["role"]["id"], "user");
+    assert_eq!(body["role"]["id"], 0);
     assert_eq!(body["role"]["name"], "User");
     // Moderator row carries its role.
     let uri = format!("/api/v1/admin/accounts/{}", f.mod_id);
     let (status, _, bytes) = send(&f.router, get_request(&uri, Some(&f.mod_token), None)).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(json(&bytes)["role"]["id"], "moderator");
+    assert_eq!(json(&bytes)["role"]["id"], 1);
     // Unknown id → 404, empty filter → [] with no Link header.
     let (status, _, bytes) = send(
         &f.router,
@@ -377,7 +377,7 @@ async fn admin_accounts_filters_v1_and_v2() {
     assert_eq!(status, StatusCode::OK);
     let rows = json(&bytes);
     assert!(rows.as_array().unwrap().iter().any(|r| r["id"] == f.mod_id.to_string()));
-    assert!(rows.as_array().unwrap().iter().all(|r| r["role"]["id"] != "user"));
+    assert!(rows.as_array().unwrap().iter().all(|r| r["role"]["id"] != 0));
     let (status, _, bytes) = send(
         &f.router,
         get_request("/api/v2/admin/accounts?role_ids[]=admin", Some(&f.admin_token), None),

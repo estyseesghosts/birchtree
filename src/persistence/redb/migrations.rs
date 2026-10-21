@@ -522,6 +522,37 @@ pub fn apply(db: &Database) -> Result<u64, StoreError> {
             let _ = write.open_table(schema::CACHE_ACCOUNTING)?;
         }
 
+        // Step v18: gaps batch skeletons (`docs/gaps.md` Step 0):
+        // `COLLECTIONS` + `COLLECTION_ITEMS` (G-C), `TOTP_SECRETS` +
+        // `WEBAUTHN_CREDS` (G-E). Tables only; the agents own the port
+        // functions. No backfill.
+        if current < 18 {
+            let _ = write.open_table(schema::COLLECTIONS)?;
+            let _ = write.open_table(schema::COLLECTION_ITEMS)?;
+            let _ = write.open_table(schema::TOTP_SECRETS)?;
+            let _ = write.open_table(schema::WEBAUTHN_CREDS)?;
+        }
+
+        // Step v19: rule translations table (gaps batch G-A). Table only;
+        // no backfill (a fresh table is empty, and empty renders
+        // `translations: {}`).
+        if current < 19 {
+            let _ = write.open_table(schema::RULE_TRANSLATIONS)?;
+        }
+
+        // Step v20: remote emoji table (gaps batch G-D). Table only; rows
+        // arrive through the `FetchRemoteEmoji` ingest path. No backfill.
+        if current < 20 {
+            let _ = write.open_table(schema::REMOTE_EMOJI)?;
+        }
+
+        // Step v21: durable WebAuthn challenges (gaps finish; G-E left them
+        // memory-scoped). Table only; single-use rows removed on take, TTL
+        // enforced by callers via `live_at`. No backfill.
+        if current < 21 {
+            let _ = write.open_table(schema::WEBAUTHN_CHALLENGES)?;
+        }
+
         {
             let mut meta = write.open_table(META)?;
             meta.insert(

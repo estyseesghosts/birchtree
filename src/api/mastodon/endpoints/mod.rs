@@ -36,3 +36,5 @@ pub mod push;
 pub mod relations_extra;
 pub mod timelines_link;
 pub mod web;
+// Gaps batch (`docs/gaps.md` Step 0): G-C owns this module.
+pub mod collections;

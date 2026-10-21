@@ -664,6 +664,16 @@ impl AnnualReportStore for RedbStore {
             let mut index = write.open_table(ANNUAL_REPORTS_BY_ACCOUNT)?;
             index.insert(key.as_slice(), report.id.value())?;
         }
+        // D51 `annual_report` to the report owner, same transaction (G-B
+        // producer). The early `Ok(report)` return above stays silent: a
+        // duplicate insert is not a new report.
+        for job in crate::application::notifications::emit_annual_report(input.account_id, now_ms)
+        {
+            super::jobs::insert_job(
+                &write,
+                &Job::new(self.next_id(), job.kind, job.payload, now_ms, now_ms),
+            )?;
+        }
         write.commit()?;
         Ok(report)
     }

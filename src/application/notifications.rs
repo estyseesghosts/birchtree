@@ -13,10 +13,11 @@
 use serde_json::{Value, json};
 
 use crate::application::ports::{NewNotification, Store, StreamingSink};
+use crate::application::push::PushSubscriptionStore;
 use crate::application::streaming::StreamEvent;
 use crate::domain::{
     Error, Id, Notification, NotificationPolicy, NotificationRequest, NotificationType, PolicyAction,
-    Result, Visibility,
+    Result, Visibility, WebPushSubscription,
 };
 
 /// Mastodon `DEFAULT_NOTIFICATIONS_LIMIT` / doubled maximum.
@@ -183,13 +184,18 @@ pub struct NotificationQuery {
     /// `None` = no actor filter.
     pub from_account: Option<Id>,
     /// Accepted for upstream param parity (`browserable_params` permits
-    /// `include_filtered`), but filtered rows cannot be served yet: the store
-    /// page excludes them and no store call lists them. DEFERRED (not a gap):
-    /// pushing `from_account`/`include_filtered` into the store page is a
-    /// bounded perf optimization only — the `index` fill loop below is
-    /// correct (cursor-stable, full pages) with the current store shape, and
-    /// a naive in-page filter would break the loop's end-of-scan detection.
-    /// Revisit only with measured scan pressure.
+    /// `include_filtered`): when true the caller is expected to ALSO fetch
+    /// the recipient's filtered rows (via the `filtered_notifications_page`
+    /// store listing — parent snippet on `ports.rs` + `redb`) and merge them
+    /// with [`merge_filtered_index`]. The store page below still excludes
+    /// filtered rows (upstream's default notification scope), so an
+    /// unsupplemented `index` call with this flag behaves like `false` —
+    /// never fabricated rows. DEFERRED (not a gap): pushing
+    /// `from_account`/`include_filtered` into the store page is a bounded
+    /// perf optimization only — the `index` fill loop below is correct
+    /// (cursor-stable, full pages) with the current store shape, and a naive
+    /// in-page filter would break the loop's end-of-scan detection. Revisit
+    /// only with measured scan pressure.
     pub include_filtered: bool,
 }
 
@@ -255,9 +261,17 @@ pub fn index(
 /// Whether a notification is hidden from the browserable surface: upstream's
 /// `without_suspended` join drops rows whose actor is suspended (or gone —
 /// the inner join drops actor-less rows too).
+///
+/// Actor-less rows (`moderation_warning`, `annual_report`,
+/// `severed_relationships`, `admin.*`) are VISIBLE here: upstream maps those
+/// to the recipient's own account (`notification.rb#set_from_account`), and
+/// the REST render falls back to the recipient's account for them (endpoint
+/// snippet). The pre-existing `None => true` rule would hide exactly the
+/// D51 rows this module now produces, so it was narrowed to suspended/gone
+/// actors only.
 fn notification_excluded(store: &dyn Store, notification: &Notification) -> Result<bool> {
     let Some(actor_id) = notification.actor_id else {
-        return Ok(true);
+        return Ok(false);
     };
     match store.account_by_id(actor_id)? {
         Some(actor) => Ok(actor.suspended),
@@ -637,4 +651,433 @@ pub fn dismiss_requests_bulk(
 /// "merged" is exactly "no pending requests".
 pub fn merged(store: &dyn Store, recipient: Id) -> Result<bool> {
     Ok(store.notification_requests(recipient)?.is_empty())
+}
+
+// ---------------------------------------------------------------------------
+// D51 producers + D52 read-path follow-ups (gaps batch, G-B).
+// ---------------------------------------------------------------------------
+//
+// Upstream reference: `app/models/notification.rb` (`PROPERTIES`, `TYPES`,
+// `set_from_account`, `browserable`), `app/services/notify_service.rb`,
+// `app/services/fan_out_on_write_service.rb`,
+// `app/serializers/concerns/notification_fallback_concern.rb` (all at the
+// v4.7.3 pin `8ff11c2b`, verified against upstream `main` where the pin
+// source was unavailable).
+//
+// Shape of every producer below: a PURE builder returning
+// `(JobKind::FanOutNotification, payload)` pairs. The triggering mutation's
+// transaction inserts each pair with `super::jobs::insert_job` in the SAME
+// transaction (`birchtree.md` §5: mutation + indexes + counters + jobs
+// commit atomically; fan-out runs after commit via the `FanOutNotification`
+// handler). The builder never touches storage, so it cannot observe a
+// half-committed state; recipient selection happens at the call site from
+// data the transaction already holds (or from bounded pre-existing-row
+// reads, which are unaffected by the open write). Call-site insertions live
+// in files owned by others — each builder names its file + anchor and the
+// parent merges the verbatim snippet from the final report.
+//
+// A builder given an empty recipient list returns `[]`: no fabricated rows.
+// Types whose trigger feature does not exist yet (`severed_relationships`
+// — domain blocks sever nothing; `added_to_collection`/`collection_update`
+// — no collections surface) have real builders but no call site, so the
+// observable outcome matches upstream with no such activity (verified by
+// `tests/gaps_notifications.rs`, which asserts empty pages for them).
+
+use crate::domain::JobKind;
+
+/// One durable fan-out job to insert in the triggering transaction.
+#[derive(Debug, Clone)]
+pub struct PendingFanOut {
+    pub kind: JobKind,
+    pub payload: serde_json::Value,
+}
+
+fn pending(
+    recipient_id: Id,
+    kind: NotificationType,
+    actor_id: Option<Id>,
+    status_id: Option<Id>,
+    now_ms: u64,
+) -> PendingFanOut {
+    PendingFanOut {
+        kind: JobKind::FanOutNotification,
+        payload: fan_out_payload(recipient_id, kind, actor_id, status_id, now_ms),
+    }
+}
+
+fn pending_for_many(
+    recipients: &[Id],
+    kind: NotificationType,
+    actor_id: Option<Id>,
+    status_id: Option<Id>,
+    now_ms: u64,
+) -> Vec<PendingFanOut> {
+    recipients
+        .iter()
+        .map(|recipient| pending(*recipient, kind, actor_id, status_id, now_ms))
+        .collect()
+}
+
+/// `status` — "someone whose posts you asked to be notified about posted"
+/// (upstream: followers with `Follow.notify`, fanned out on write).
+/// Call site: `persistence/redb/statuses.rs::create_status`, after the
+/// mentions block, before `write.commit()`. `notify_followers` = author's
+/// followers with `follow.notify` set (bounded scan at the snippet).
+pub fn emit_status_for_followers(
+    author_id: Id,
+    status_id: Id,
+    notify_followers: &[Id],
+    now_ms: u64,
+) -> Vec<PendingFanOut> {
+    pending_for_many(
+        notify_followers,
+        NotificationType::Status,
+        Some(author_id),
+        Some(status_id),
+        now_ms,
+    )
+}
+
+/// `update` — "a status you boosted was edited" (upstream
+/// `docs.joinmastodon.org/entities/Notification`). Recipients = accounts
+/// holding a live reblog wrapper of the edited status.
+/// Call site: `persistence/redb/statuses.rs::update_status`, before the
+/// `:861` commit. Recipients via `self.reblogged_by(id, None, cap)`.
+pub fn emit_update_for_rebloggers(
+    editor_id: Id,
+    status_id: Id,
+    reblogger_ids: &[Id],
+    now_ms: u64,
+) -> Vec<PendingFanOut> {
+    pending_for_many(
+        reblogger_ids,
+        NotificationType::Update,
+        Some(editor_id),
+        Some(status_id),
+        now_ms,
+    )
+}
+
+/// `quoted_update` — "a status you quoted was edited". Recipients = authors
+/// of accepted quotes of the edited status; actor = the quoted author.
+/// Call site: `persistence/redb/statuses.rs::update_status`, before the
+/// `:861` commit. Recipients via `self.quotes_of_status(id, None, cap)`
+/// (accepted states only, authors of the quoting statuses).
+pub fn emit_quoted_update_for_quoters(
+    quoted_author_id: Id,
+    quoted_status_id: Id,
+    quoter_ids: &[Id],
+    now_ms: u64,
+) -> Vec<PendingFanOut> {
+    pending_for_many(
+        quoter_ids,
+        NotificationType::QuotedUpdate,
+        Some(quoted_author_id),
+        Some(quoted_status_id),
+        now_ms,
+    )
+}
+
+/// `moderation_warning` — "a moderator acted on your account". Actor-less:
+/// upstream `set_from_account` maps warning/severance/annual-report rows to
+/// the recipient's own account, and the REST render falls back to it.
+/// Call site: `persistence/redb/admin.rs::admin_account_action`, after the
+/// `ACCOUNT_WARNINGS` insert, before `write.commit()`.
+pub fn emit_moderation_warning(target_account_id: Id, now_ms: u64) -> Vec<PendingFanOut> {
+    vec![pending(
+        target_account_id,
+        NotificationType::ModerationWarning,
+        None,
+        None,
+        now_ms,
+    )]
+}
+
+/// `annual_report` — "your yearly report is ready". Actor-less (see
+/// [`emit_moderation_warning`]).
+/// Call site: `persistence/redb/trends.rs::insert_annual_report`, before
+/// `write.commit()`.
+pub fn emit_annual_report(account_id: Id, now_ms: u64) -> Vec<PendingFanOut> {
+    vec![pending(
+        account_id,
+        NotificationType::AnnualReport,
+        None,
+        None,
+        now_ms,
+    )]
+}
+
+/// `admin.sign_up` — "someone signed up", to every admin. Actor = the new
+/// account.
+/// Call site: account creation (`application/accounts.rs` registration path
+/// + `create_local_account` store txn; G-E owned). Recipients via
+/// `admin_accounts_page` with `staff_only` filtered to role `admin`.
+pub fn emit_admin_sign_up(
+    new_account_id: Id,
+    admin_ids: &[Id],
+    now_ms: u64,
+) -> Vec<PendingFanOut> {
+    pending_for_many(
+        admin_ids,
+        NotificationType::AdminSignUp,
+        Some(new_account_id),
+        None,
+        now_ms,
+    )
+}
+
+/// `admin.report` — "a new report was filed", to staff (admins +
+/// moderators). Actor = the reporter.
+/// Call site: `persistence/redb/federation_content.rs::insert_report`,
+/// before `write.commit()`. Recipients via `admin_accounts_page` with
+/// `staff_only` (both roles; upstream notifies reviewers, which here is the
+/// whole staff set).
+pub fn emit_admin_report(
+    reporter_id: Id,
+    staff_ids: &[Id],
+    now_ms: u64,
+) -> Vec<PendingFanOut> {
+    pending_for_many(
+        staff_ids,
+        NotificationType::AdminReport,
+        Some(reporter_id),
+        None,
+        now_ms,
+    )
+}
+
+/// `severed_relationships` — "follow relationships were severed by a
+/// moderation/block event". Actor-less (see [`emit_moderation_warning`]).
+/// UNWIRED: `domain_block` severs nothing (no follow cascade exists), and
+/// blocks sever endorsements only — so there is no trigger transaction yet.
+/// The builder is real; the test pins the empty observable outcome until a
+/// sever cascade lands.
+pub fn emit_severed_relationships(recipient_id: Id, now_ms: u64) -> Vec<PendingFanOut> {
+    vec![pending(
+        recipient_id,
+        NotificationType::SeveredRelationships,
+        None,
+        None,
+        now_ms,
+    )]
+}
+
+/// `added_to_collection` — "someone added you to a collection".
+/// Actor = the collection owner.
+/// UNWIRED: no collections surface yet (G-C). Real builder, no call site.
+pub fn emit_added_to_collection(
+    member_id: Id,
+    owner_id: Id,
+    now_ms: u64,
+) -> Vec<PendingFanOut> {
+    vec![pending(
+        member_id,
+        NotificationType::AddedToCollection,
+        Some(owner_id),
+        None,
+        now_ms,
+    )]
+}
+
+/// `collection_update` — "a collection you are in was updated".
+/// Actor = the collection owner.
+/// UNWIRED: no collections surface yet (G-C). Real builder, no call site.
+pub fn emit_collection_update(
+    member_ids: &[Id],
+    owner_id: Id,
+    now_ms: u64,
+) -> Vec<PendingFanOut> {
+    pending_for_many(
+        member_ids,
+        NotificationType::CollectionUpdate,
+        Some(owner_id),
+        None,
+        now_ms,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// `include_filtered` merge (D52-adjacent read path; G-B application half).
+// ---------------------------------------------------------------------------
+
+/// Merge a store page (unfiltered rows, newest first) with a filtered-rows
+/// listing for `include_filtered=true` (upstream `browserable` serves
+/// filtered rows when `include_filtered` is set — or whenever `account_id`
+/// narrows the page).
+///
+/// Both inputs are expected pre-windowed by the caller; this re-applies the
+/// query's actor filter and exclusive numeric cursors defensively, merges
+/// newest-first by NUMERIC id (decimal-string ids never compare
+/// lexicographically), and truncates to `limit`. Pure: fully testable
+/// without storage.
+pub fn merge_filtered_index(
+    page: Vec<Notification>,
+    filtered: Vec<Notification>,
+    query: &NotificationQuery,
+) -> Vec<Notification> {
+    let mut out: Vec<Notification> = Vec::with_capacity(page.len() + filtered.len());
+    for notification in page.into_iter().chain(filtered) {
+        if query
+            .from_account
+            .is_some_and(|actor| notification.actor_id != Some(actor))
+        {
+            continue;
+        }
+        if let Some(max_id) = query.max_id {
+            if notification.id.value() >= max_id.value() {
+                continue;
+            }
+        }
+        if let Some(since_id) = query.since_id {
+            if notification.id.value() <= since_id.value() {
+                continue;
+            }
+        }
+        if let Some(min_id) = query.min_id {
+            if notification.id.value() <= min_id.value() {
+                continue;
+            }
+        }
+        out.push(notification);
+    }
+    out.sort_by(|a, b| b.id.value().cmp(&a.id.value()));
+    out.truncate(query.limit);
+    out
+}
+
+// ---------------------------------------------------------------------------
+// `supported_types` fallback rendering (D52-adjacent read path).
+// ---------------------------------------------------------------------------
+
+/// Upstream `Notification::PROPERTIES[*][:baseline]` (verified against the
+/// pin): baseline clients render these types natively, so they never carry
+/// a `fallback`. Every other type is a fallback candidate.
+pub fn baseline_type(kind: NotificationType) -> bool {
+    !matches!(
+        kind,
+        NotificationType::SeveredRelationships
+            | NotificationType::ModerationWarning
+            | NotificationType::AdminSignUp
+            | NotificationType::AdminReport
+            | NotificationType::AddedToCollection
+            | NotificationType::CollectionUpdate
+    )
+}
+
+/// Whether the v1 index/show must attach a `fallback` object to this
+/// notification (upstream `NotificationFallbackConcern#needs_fallback?`):
+/// - `None` (`supported_types[]` absent) → never: the parameter "is required
+///   to get any notification fallback at all".
+/// - baseline types, or types the client listed → never.
+/// - `severed_relationships` needs its severance event, `admin.report` its
+///   report, collection types their collection (`activity_present`); without
+///   the activity "we can't do much" → no fallback (never fabricated).
+/// - everything else non-baseline → fallback.
+pub fn needs_fallback(
+    kind: NotificationType,
+    supported: Option<&[NotificationType]>,
+    activity_present: bool,
+) -> bool {
+    let Some(supported) = supported else {
+        return false;
+    };
+    if baseline_type(kind) || supported.contains(&kind) {
+        return false;
+    }
+    match kind {
+        NotificationType::SeveredRelationships
+        | NotificationType::AdminReport
+        | NotificationType::AddedToCollection
+        | NotificationType::CollectionUpdate => activity_present,
+        _ => true,
+    }
+}
+
+/// Build the `fallback` object for a non-baseline notification (upstream
+/// `NotificationFallbackConcern#fallback`: `{title, summary, description}` —
+/// note the third key is `description`, not the docs-site `details`; the
+/// concern source wins).
+///
+/// Titles mirror the upstream locale strings with the actor's display name
+/// (`@user`) substituted for the mention links (no HTML linkification
+/// server-side here — plain text, never fabricated links). Summaries point
+/// at signing in to review, like upstream's generic summary. `description`
+/// is always null, exactly like upstream (`description: nil`).
+pub fn fallback_for(kind: NotificationType, actor_name: &str) -> serde_json::Value {
+    const SIGN_IN_SUMMARY: &str = "Sign in to review this notification in full.";
+    let title = match kind {
+        NotificationType::SeveredRelationships => {
+            "Some of your follow relationships were severed".to_string()
+        }
+        NotificationType::ModerationWarning => {
+            "A moderator has taken action on your account".to_string()
+        }
+        NotificationType::AdminSignUp => format!("@{actor_name} signed up"),
+        NotificationType::AdminReport => format!("@{actor_name} filed a new report"),
+        NotificationType::AddedToCollection => format!("@{actor_name} added you to a collection"),
+        NotificationType::CollectionUpdate => {
+            "A collection you are featured in was updated".to_string()
+        }
+        _ => format!("New notification from @{actor_name}"),
+    };
+    json!({
+        "title": title,
+        "summary": SIGN_IN_SUMMARY,
+        "description": null,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Pre-token push backfill (D52-adjacent; G-B application half).
+// ---------------------------------------------------------------------------
+
+/// Outcome of [`backfill_push_unsubscribe`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushBackfillOutcome {
+    /// No subscription for this token: nothing to heal (never created).
+    Missing,
+    /// The row already carries an unsubscribe URL: returned untouched (no
+    /// write, so `updated_at_ms` is stable).
+    Complete(WebPushSubscription),
+    /// A pre-token/pre-URL row was re-saved with its token minted (when it
+    /// had none) and its absolute URL built: it now sends `Unsubscribe-URL`.
+    Healed(WebPushSubscription),
+}
+
+/// Backfill the bearer unsubscribe token + absolute URL on a push row that
+/// predates them ("send-or-mark"): subscriptions created before the fix
+/// round carry no token/URL and send no header — never fabricated at send
+/// time. New subscriptions are complete at creation (the endpoint passes the
+/// public base URL), and any `create`/`update` re-saves an old row through
+/// `upsert_push_subscription`, which mints a missing token and rebuilds the
+/// URL. This helper heals one row on demand (wired by the parent snippet
+/// into the push show/update paths, which have the base URL): read the
+/// token's row; leave complete rows untouched; re-upsert incomplete rows
+/// with identical endpoint/keys/policy/alerts plus the base URL. It never
+/// creates a row (`Missing` when the token has none).
+pub fn backfill_push_unsubscribe(
+    store: &dyn PushSubscriptionStore,
+    token_id: Id,
+    base_url: &str,
+    now_ms: u64,
+) -> Result<PushBackfillOutcome> {
+    let Some(row) = store.push_subscription_by_token(token_id)? else {
+        return Ok(PushBackfillOutcome::Missing);
+    };
+    if row.unsubscribe_url.is_some() {
+        return Ok(PushBackfillOutcome::Complete(row));
+    }
+    let healed = store.upsert_push_subscription(
+        row.token_id,
+        row.user_id,
+        row.endpoint.clone(),
+        row.key_p256dh.clone(),
+        row.key_auth.clone(),
+        row.standard,
+        row.policy.clone(),
+        row.alerts.clone(),
+        Some(base_url),
+        now_ms,
+    )?;
+    Ok(PushBackfillOutcome::Healed(healed))
 }

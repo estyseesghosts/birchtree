@@ -6,13 +6,14 @@ use redb::ReadableTable;
 
 use crate::application::accounts::InviteStore;
 use crate::application::ports::{
-    AccountProfileUpdate, AccountStore, NewLocalAccount, UserSettingsUpdate,
+    AccountProfileUpdate, AccountStore, AdminAccountFilter, AdminStore, NewLocalAccount,
+    UserSettingsUpdate,
 };
 use crate::domain::user::{EmailToken, Invite};
-use crate::domain::{Account, Error, Id, LocalUser, Result, SignInEvent, UserRole};
+use crate::domain::{Account, AccountStats, Error, Id, LocalUser, Result, SignInEvent, UserRole};
 
 use super::schema::{
-    ACCOUNTS, EMAIL_INDEX, EMAIL_TOKENS, HANDLE_INDEX, INVITES, LOCAL_USERS,
+    ACCOUNTS, ACCOUNT_STATS, EMAIL_INDEX, EMAIL_TOKENS, HANDLE_INDEX, INVITES, LOCAL_USERS,
 };
 use super::{decode, encode, RedbStore, StoreResult};
 
@@ -114,6 +115,10 @@ impl AccountStore for RedbStore {
             // text and consumed invite code (INVITE_USES, same transaction).
             locale: input.locale,
             invite_request: input.invite_request,
+            // G-E registration captures: IANA time zone + date of birth
+            // (validated at the application layer; `None` for pre-batch rows).
+            time_zone: input.time_zone,
+            date_of_birth: input.date_of_birth,
             // Reading preferences start unset (upstream defaults apply).
             web_display_media: None,
             web_expand_spoilers: None,
@@ -196,6 +201,44 @@ impl AccountStore for RedbStore {
                     input.now_ms,
                 );
                 super::jobs::insert_job(&write, &mail_job)?;
+            }
+        }
+
+        // D51 `admin.sign_up` to admins, same transaction (G-B producer).
+        // Fires for every created account incl. operator-created ones (an
+        // account WAS created; honest).
+        {
+            use crate::application::notifications::emit_admin_sign_up;
+            let staff = self.admin_accounts_page(
+                &AdminAccountFilter {
+                    staff_only: true,
+                    ..Default::default()
+                },
+                None,
+                None,
+                None,
+                false,
+                5000,
+            )?;
+            let admins: Vec<Id> = staff
+                .into_iter()
+                .filter(|(_, user)| {
+                    user.as_ref()
+                        .is_some_and(|u| u.role == crate::domain::UserRole::Admin)
+                })
+                .map(|(account, _)| account.id)
+                .collect();
+            for job in emit_admin_sign_up(account_id, &admins, input.now_ms) {
+                super::jobs::insert_job(
+                    &write,
+                    &crate::domain::Job::new(
+                        self.next_id(),
+                        job.kind,
+                        job.payload,
+                        input.now_ms,
+                        input.now_ms,
+                    ),
+                )?;
             }
         }
 
@@ -362,6 +405,60 @@ impl AccountStore for RedbStore {
         Ok(account)
     }
 
+    /// Record the account this one moved to (federation `Move`, G-D parent
+    /// merge of S4). Remote rows included. ONE transaction; `None` clears.
+    /// No fan-out: the move itself already fanned out through the migrated
+    /// follows.
+    fn set_moved_to(&self, account_id: Id, moved_to: Option<Id>, _now_ms: u64) -> Result<Account> {
+        let write = self.begin_write()?;
+        let mut account: Account = {
+            let accounts = write.open_table(ACCOUNTS)?;
+            match accounts.get(account_id.value())? {
+                Some(guard) => decode(guard.value())?,
+                None => return Err(Error::NotFound(format!("account {account_id}"))),
+            }
+        };
+        account.moved_to = moved_to;
+        {
+            let mut accounts = write.open_table(ACCOUNTS)?;
+            accounts.insert(account_id.value(), encode(&account)?.as_slice())?;
+        }
+        write.commit()?;
+        Ok(account)
+    }
+
+    fn set_remote_stats(
+        &self,
+        account_id: Id,
+        followers: Option<u64>,
+        following: Option<u64>,
+        statuses: Option<u64>,
+    ) -> Result<AccountStats> {
+        let write = self.begin_write()?;
+        let mut stats = {
+            let table = write.open_table(ACCOUNT_STATS)?;
+            match table.get(account_id.value())? {
+                Some(guard) => decode(guard.value())?,
+                None => AccountStats::default(),
+            }
+        };
+        if let Some(v) = followers {
+            stats.followers_count = v;
+        }
+        if let Some(v) = following {
+            stats.following_count = v;
+        }
+        if let Some(v) = statuses {
+            stats.statuses_count = v;
+        }
+        {
+            let mut table = write.open_table(ACCOUNT_STATS)?;
+            table.insert(account_id.value(), encode(&stats)?.as_slice())?;
+        }
+        write.commit()?;
+        Ok(stats)
+    }
+
     fn update_user_settings(
         &self,
         account_id: Id,
@@ -430,6 +527,27 @@ impl AccountStore for RedbStore {
             }
         };
         user.role = role;
+        {
+            let mut users = write.open_table(LOCAL_USERS)?;
+            users.insert(account_id.value(), encode(&user)?.as_slice())?;
+        }
+        write.commit()?;
+        Ok(user)
+    }
+
+    fn set_user_password(&self, account_id: Id, password_hash: String) -> Result<LocalUser> {
+        if password_hash.is_empty() {
+            return Err(Error::InvalidInput("password hash is empty".into()));
+        }
+        let write = self.begin_write()?;
+        let mut user: LocalUser = {
+            let users = write.open_table(LOCAL_USERS)?;
+            match users.get(account_id.value())? {
+                Some(guard) => decode(guard.value())?,
+                None => return Err(Error::NotFound(format!("local user for {account_id}"))),
+            }
+        };
+        user.password_hash = password_hash;
         {
             let mut users = write.open_table(LOCAL_USERS)?;
             users.insert(account_id.value(), encode(&user)?.as_slice())?;

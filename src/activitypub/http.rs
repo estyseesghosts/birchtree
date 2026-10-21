@@ -48,6 +48,7 @@ where
         .route("/users/:username/quote_authorizations/:id", get(quote_authorization))
         .route("/users/:username/followers", get(followers))
         .route("/users/:username/following", get(following))
+        .route("/users/:username/collections/featured", get(featured_tags))
         .route("/users/:username/outbox", get(outbox))
         .route("/users/:username/inbox", post(personal_inbox))
         .route("/inbox", post(shared_inbox))
@@ -230,6 +231,19 @@ async fn deliver_to_inbox(data: &Data<FedContext>, activity: ActivityData) -> Re
     match receive_activity::<WithContext<Activity>, ActorRecord, FedContext>(activity, data).await {
         Ok(()) => Ok(StatusCode::ACCEPTED),
         Err(err) => {
+            // D32-narrow (G-D): a well-formed activity of a kind outside the
+            // profile is accepted-and-dropped (202, never retried upstream);
+            // malformed, misaddressed and refused bodies keep their 4xx.
+            if matches!(err, FedError::Unsupported(_)) {
+                tracing::info!(
+                    target: "birchtree::federation",
+                    direction = "inbound",
+                    status = 202,
+                    error = %err,
+                    "unsupported activity accepted and dropped"
+                );
+                return Ok(StatusCode::ACCEPTED);
+            }
             tracing::warn!(
                 target: "birchtree::federation",
                 direction = "inbound",
@@ -322,9 +336,8 @@ pub async fn quote_authorization(
 /// `OrderedCollectionPage` (`partOf`, `totalItems`, actor-URI `orderedItems`,
 /// `next`/`prev`).
 ///
-/// Divergence note: our account rows do not persist `hide_collections`, so
-/// the collection is always listed (upstream hides the member list but keeps
-/// the counts when the flag is set).
+/// `hide_collections` (gaps G-C/D52, like upstream): pages serve empty
+/// `orderedItems` while the base document keeps the real `totalItems`.
 pub async fn followers(
     Path(username): Path<String>,
     Query(query): Query<CollectionQuery>,
@@ -349,6 +362,32 @@ pub async fn following(
 ) -> Result<FederationJson<serde_json::Value>, FedError> {
     require_signed(&data, &headers, &method, &uri).await?;
     federation_collection(&username, &query, &data, false).await
+}
+
+/// `GET /users/{username}/collections/featured`: the featured-tags collection
+/// (upstream `PersonSerializer#featured_tags`), one page over the account's
+/// featured tags (federation tail, G-D).
+pub async fn featured_tags(
+    Path(username): Path<String>,
+    data: Data<FedContext>,
+    headers: axum::http::HeaderMap,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+) -> Result<FederationJson<serde_json::Value>, FedError> {
+    require_signed(&data, &headers, &method, &uri).await?;
+    let account = local_account(&data, &username).await?;
+    let tags = data.app.store.featured_tags_of(account.id)?;
+    let pairs: Vec<(String, u64)> = tags
+        .into_iter()
+        .map(|t| (t.tag, t.created_at_ms))
+        .collect();
+    Ok(FederationJson(
+        crate::activitypub::objects::featured_tags_collection_doc(
+            &account.actor_uri,
+            &data.public_url,
+            &pairs,
+        ),
+    ))
 }
 
 /// Query parameters of the collection routes: numbered `page` for the
@@ -403,6 +442,26 @@ async fn federation_collection(
     let page: u64 = page_raw.parse().map_err(|_| not_found("page"))?;
     if page == 0 || page > COLLECTION_MAX_PAGE {
         return Err(not_found("page"));
+    }
+    // `hide_collections` (gaps G-C/D52): members hidden, counts stay — the
+    // base document above already carries the real `totalItems`; pages serve
+    // empty `orderedItems`.
+    if account.hide_collections == Some(true) {
+        let mut page_doc = json!({
+            "@context": crate::activitypub::outgoing::context(),
+            "id": format!("{base}?page={page}"),
+            "type": "OrderedCollectionPage",
+            "partOf": base,
+            "totalItems": total,
+            "orderedItems": Vec::<String>::new(),
+        });
+        if (page as usize) * COLLECTION_PER_PAGE < total as usize {
+            page_doc["next"] = json!(format!("{base}?page={}", page + 1));
+        }
+        if page > 1 {
+            page_doc["prev"] = json!(format!("{base}?page={}", page - 1));
+        }
+        return Ok(FederationJson(page_doc));
     }
     let store = &*data.app.store;
     // Newest-first cursor walk: rows up to the end of the wanted page, then

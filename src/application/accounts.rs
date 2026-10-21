@@ -28,12 +28,20 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use crate::application::admin_infra as admin_infra_uc;
 use crate::application::auth;
 use crate::application::crypto;
-use crate::application::ports::{AccountStore, NewLocalAccount, OAuthStore};
+use crate::application::ports::{
+    AccountStore, AdminInfraStore, NewLocalAccount, OAuthStore,
+};
 use crate::domain::account::{normalize_username, validate_username};
+use crate::domain::admin_infra::AdminEmailDomainBlock;
 use crate::domain::user::{
-    INVITE_COMMENT_LIMIT, EmailTokenKind, Invite, InviteRefusal, invite_code_from_seed,
+    BACKUP_CODE_BYTES, BACKUP_CODE_COUNT, INVITE_COMMENT_LIMIT, TOTP_SECRET_LEN, EmailTokenKind,
+    Invite, InviteRefusal, TotpRecord, WebauthnChallenge, WebauthnCredential, WebauthnPurpose,
+    base32_decode, base32_encode, check_date_of_birth_with_min_age, consume_backup_code_hash,
+    invite_code_from_seed, validate_time_zone, verify_totp_at, verify_webauthn_assertion,
+    verify_webauthn_registration,
 };
 use crate::domain::{AccessToken, Account, Error, Id, LocalUser, OAuthApplication, Result};
 use crate::mailer::{MailError, Mailer};
@@ -61,6 +69,10 @@ pub struct RegisterAccountCommand {
     pub reason: Option<String>,
     pub invite_code: Option<String>,
     pub display_name: Option<String>,
+    /// IANA time-zone name (`time_zone` param, upstream `user.time_zone`).
+    pub time_zone: Option<String>,
+    /// Date of birth (`YYYY-MM-DD`, upstream `user.date_of_birth`).
+    pub date_of_birth: Option<String>,
 }
 
 /// Result of a successful registration: the created account and a user token
@@ -123,6 +135,9 @@ pub fn create_account(
         locale: None,
         invite_request: None,
         invite_code: None,
+        // The CLI takes no time zone or date of birth either.
+        time_zone: None,
+        date_of_birth: None,
     })
 }
 
@@ -194,6 +209,10 @@ pub fn register_account(
         locale: cmd.locale.filter(|locale| !locale.trim().is_empty()),
         invite_request: cmd.reason.filter(|reason| !reason.trim().is_empty()),
         invite_code: cmd.invite_code.filter(|code| !code.trim().is_empty()),
+        // G-E captures: validated upstream by `register_account_with_profile`
+        // (direct `register_account_with_invite` callers pass `None`).
+        time_zone: cmd.time_zone.filter(|tz| !tz.trim().is_empty()),
+        date_of_birth: cmd.date_of_birth.filter(|dob| !dob.trim().is_empty()),
     })?;
 
     let (token_plaintext, token) =
@@ -521,6 +540,652 @@ pub fn request_password_reset(
         ));
     }
     mailer.send_password_reset(from, to, account_id, token, base_url)
+}
+
+// ---------------------------------------------------------------------------
+// Second factor: TOTP (+ backup codes) and WebAuthn (G-E).
+//
+// Upstream (`8ff11c2b`): TOTP lives on `User#otp_secret`/`otp_required_for_login`
+// (Devise two-factor, 6-digit SHA1 TOTP + recovery codes); WebAuthn lives on
+// `WebauthnCredential` with a session-held challenge (`SessionsController`
+// `#webauthn` ceremony). Here the storage port is [`SecondFactorStore`]
+// (declared here so this area stays merge-clean; the `redb` port mapping
+// onto `TOTP_SECRETS`/`WEBAUTHN_CREDS` is proposed in the G-E report).
+// [`MemorySecondFactorStore`] is the test/dev implementation.
+//
+// Secrecy rules (see `tests/secret_handling.rs` conventions): TOTP seeds,
+// backup-code plaintexts and credential ids are authentication material —
+// they are returned to the caller exactly once, stored only hashed
+// (backup codes) or inside the 0700 `redb` file (seeds/keys), and never
+// logged. [`TotpRecord`] and [`WebauthnCredential`] redact themselves from
+// `Debug` output.
+// ---------------------------------------------------------------------------
+
+use rand::Rng as _;
+
+/// Uniform login-gate refusal for any second-factor failure (wrong TOTP,
+/// spent or unknown backup code, unconfirmed enrollment): one message, so
+/// the gate is never an oracle for which credential failed.
+pub const INVALID_2FA_MESSAGE: &str = "Invalid two-factor authentication code";
+
+/// Which second factor authenticated a login (returned to the caller; the
+/// kind alone is safe to log — it carries no secret material).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecondFactorKind {
+    Totp,
+    BackupCode,
+    WebAuthn,
+}
+
+/// Storage port for second-factor rows.
+///
+/// TOTP secrets are keyed by account id (one enrollment per account);
+/// WebAuthn credentials by raw credential id (many per account);
+/// challenges are single-use (taken exactly once, then gone).
+pub trait SecondFactorStore: Send + Sync {
+    fn totp_for(&self, account_id: Id) -> Result<Option<TotpRecord>>;
+    fn put_totp(&self, record: TotpRecord) -> Result<TotpRecord>;
+    fn delete_totp(&self, account_id: Id) -> Result<bool>;
+    fn webauthn_for_account(&self, account_id: Id) -> Result<Vec<WebauthnCredential>>;
+    fn webauthn_by_credential_id(
+        &self,
+        credential_id: &[u8],
+    ) -> Result<Option<WebauthnCredential>>;
+    fn put_webauthn(&self, credential: WebauthnCredential) -> Result<WebauthnCredential>;
+    fn delete_webauthn(&self, account_id: Id, credential_id: &[u8]) -> Result<bool>;
+    fn store_webauthn_challenge(&self, challenge: WebauthnChallenge) -> Result<()>;
+    fn take_webauthn_challenge(
+        &self,
+        challenge_b64: &str,
+    ) -> Result<Option<WebauthnChallenge>>;
+}
+
+#[derive(Debug, Default)]
+struct SecondFactorInner {
+    totp: HashMap<u64, TotpRecord>,
+    webauthn_by_id: HashMap<Vec<u8>, WebauthnCredential>,
+    webauthn_by_account: HashMap<u64, Vec<Vec<u8>>>,
+    challenges: HashMap<String, WebauthnChallenge>,
+}
+
+/// In-memory [`SecondFactorStore`] (tests/dev). Mutex-serialized like the
+/// single-transaction production port.
+#[derive(Debug, Default)]
+pub struct MemorySecondFactorStore {
+    inner: Mutex<SecondFactorInner>,
+}
+
+impl MemorySecondFactorStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl SecondFactorStore for MemorySecondFactorStore {
+    fn totp_for(&self, account_id: Id) -> Result<Option<TotpRecord>> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("second-factor store")
+            .totp
+            .get(&account_id.value())
+            .cloned())
+    }
+
+    fn put_totp(&self, record: TotpRecord) -> Result<TotpRecord> {
+        self.inner
+            .lock()
+            .expect("second-factor store")
+            .totp
+            .insert(record.account_id.value(), record.clone());
+        Ok(record)
+    }
+
+    fn delete_totp(&self, account_id: Id) -> Result<bool> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("second-factor store")
+            .totp
+            .remove(&account_id.value())
+            .is_some())
+    }
+
+    fn webauthn_for_account(&self, account_id: Id) -> Result<Vec<WebauthnCredential>> {
+        let inner = self.inner.lock().expect("second-factor store");
+        let ids = inner
+            .webauthn_by_account
+            .get(&account_id.value())
+            .cloned()
+            .unwrap_or_default();
+        Ok(ids
+            .iter()
+            .filter_map(|id| inner.webauthn_by_id.get(id).cloned())
+            .collect())
+    }
+
+    fn webauthn_by_credential_id(
+        &self,
+        credential_id: &[u8],
+    ) -> Result<Option<WebauthnCredential>> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("second-factor store")
+            .webauthn_by_id
+            .get(credential_id)
+            .cloned())
+    }
+
+    fn put_webauthn(&self, credential: WebauthnCredential) -> Result<WebauthnCredential> {
+        let mut inner = self.inner.lock().expect("second-factor store");
+        if let Some(old) = inner.webauthn_by_id.get(&credential.credential_id).cloned()
+            && old.account_id != credential.account_id
+            && let Some(ids) = inner.webauthn_by_account.get_mut(&old.account_id.value())
+        {
+            ids.retain(|id| *id != credential.credential_id);
+        }
+        inner
+            .webauthn_by_account
+            .entry(credential.account_id.value())
+            .or_default()
+            .retain(|id| *id != credential.credential_id);
+        inner
+            .webauthn_by_account
+            .entry(credential.account_id.value())
+            .or_default()
+            .push(credential.credential_id.clone());
+        inner
+            .webauthn_by_id
+            .insert(credential.credential_id.clone(), credential.clone());
+        Ok(credential)
+    }
+
+    fn delete_webauthn(&self, account_id: Id, credential_id: &[u8]) -> Result<bool> {
+        let mut inner = self.inner.lock().expect("second-factor store");
+        let owned = inner
+            .webauthn_by_id
+            .get(credential_id)
+            .is_some_and(|cred| cred.account_id == account_id);
+        if !owned {
+            return Ok(false);
+        }
+        inner.webauthn_by_id.remove(credential_id);
+        if let Some(ids) = inner.webauthn_by_account.get_mut(&account_id.value()) {
+            ids.retain(|id| id.as_slice() != credential_id);
+        }
+        Ok(true)
+    }
+
+    fn store_webauthn_challenge(&self, challenge: WebauthnChallenge) -> Result<()> {
+        self.inner
+            .lock()
+            .expect("second-factor store")
+            .challenges
+            .insert(challenge.challenge_b64.clone(), challenge);
+        Ok(())
+    }
+
+    fn take_webauthn_challenge(
+        &self,
+        challenge_b64: &str,
+    ) -> Result<Option<WebauthnChallenge>> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("second-factor store")
+            .challenges
+            .remove(challenge_b64))
+    }
+}
+
+fn random_bytes<const N: usize>() -> [u8; N] {
+    let mut buf = [0u8; N];
+    rand::rng().fill_bytes(&mut buf);
+    buf
+}
+
+/// A fresh TOTP enrollment: the `otpauth://` URI and base32 secret, each
+/// shown to the owner exactly once (the secret is never returned again).
+#[derive(Debug, Clone)]
+pub struct TotpEnrollment {
+    pub otpauth_uri: String,
+    pub secret_base32: String,
+}
+
+/// Begin a TOTP enrollment: mint a secret and store it unconfirmed.
+/// `Conflict` when an enrollment already exists (revoke first).
+pub fn enroll_totp(
+    store: &dyn SecondFactorStore,
+    username: &str,
+    domain: &str,
+    account_id: Id,
+    now_ms: u64,
+) -> Result<TotpEnrollment> {
+    if store.totp_for(account_id)?.is_some() {
+        return Err(Error::Conflict(
+            "a second factor is already enrolled for this account".into(),
+        ));
+    }
+    let secret = random_bytes::<TOTP_SECRET_LEN>();
+    let secret_base32 = base32_encode(&secret);
+    store.put_totp(TotpRecord {
+        account_id,
+        secret_base32: secret_base32.clone(),
+        created_at_ms: now_ms,
+        confirmed: false,
+        backup_hashes: Vec::new(),
+        last_counter: 0,
+    })?;
+    Ok(TotpEnrollment {
+        otpauth_uri: format!(
+            "otpauth://totp/{domain}:{username}?secret={secret_base32}&issuer={domain}&algorithm=SHA1&digits=6&period=30"
+        ),
+        secret_base32,
+    })
+}
+
+/// Mint fresh backup-code plaintexts (shown once; only hashes are stored).
+fn mint_backup_codes() -> Vec<String> {
+    (0..BACKUP_CODE_COUNT)
+        .map(|_| crate::application::crypto::random_token_hex(BACKUP_CODE_BYTES))
+        .collect()
+}
+
+/// Confirm an enrollment with a live TOTP code: flips `confirmed`, seeds the
+/// replay counter, mints backup codes, and returns the plaintext codes
+/// (shown once — the caller displays them, then drops them).
+pub fn confirm_totp(
+    store: &dyn SecondFactorStore,
+    account_id: Id,
+    code: &str,
+    now_ms: u64,
+) -> Result<Vec<String>> {
+    let mut record = store
+        .totp_for(account_id)?
+        .ok_or_else(|| Error::NotFound("no second-factor enrollment exists".into()))?;
+    if record.confirmed {
+        return Err(Error::InvalidInput(
+            "second factor is already confirmed".into(),
+        ));
+    }
+    let secret = base32_decode(&record.secret_base32)
+        .map_err(|_| Error::InvalidInput("second-factor enrollment is corrupt".into()))?;
+    let counter = verify_totp_at(&secret, code, now_ms, record.last_counter).ok_or_else(|| {
+        Error::InvalidInput(INVALID_2FA_MESSAGE.into())
+    })?;
+    record.confirmed = true;
+    record.last_counter = counter;
+    let codes = mint_backup_codes();
+    record.backup_hashes = codes
+        .iter()
+        .map(|code| crate::domain::user::hash_backup_code(code))
+        .collect();
+    store.put_totp(record)?;
+    Ok(codes)
+}
+
+/// Revoke a TOTP enrollment (and its backup codes + WebAuthn credentials
+/// stay untouched — they are revoked separately).
+pub fn revoke_totp(store: &dyn SecondFactorStore, account_id: Id) -> Result<bool> {
+    store.delete_totp(account_id)
+}
+
+/// Verify a login second factor: a live TOTP code first, then a backup code.
+/// Any failure is the uniform [`INVALID_2FA_MESSAGE`] refusal — the gate
+/// never reveals whether TOTP or backup codes were tried, or whether the
+/// account enrolls a factor at all. Backup codes are single-use: a consumed
+/// code is removed before returning.
+pub fn verify_second_factor(
+    store: &dyn SecondFactorStore,
+    account_id: Id,
+    code: &str,
+    now_ms: u64,
+) -> Result<SecondFactorKind> {
+    let unauthorized = || Error::Unauthorized(INVALID_2FA_MESSAGE.into());
+    let mut record = store.totp_for(account_id)?.ok_or_else(unauthorized)?;
+    if !record.confirmed {
+        return Err(unauthorized());
+    }
+    let secret = base32_decode(&record.secret_base32).map_err(|_| unauthorized())?;
+    if let Some(counter) = verify_totp_at(&secret, code, now_ms, record.last_counter) {
+        record.last_counter = counter;
+        store.put_totp(record)?;
+        return Ok(SecondFactorKind::Totp);
+    }
+    if consume_backup_code_hash(&mut record.backup_hashes, code) {
+        store.put_totp(record)?;
+        return Ok(SecondFactorKind::BackupCode);
+    }
+    Err(unauthorized())
+}
+
+/// Burn the same CPU as a real TOTP check without a record, so a login for
+/// an account without MFA does not return measurably faster.
+fn dummy_mfa_verify(now_ms: u64) {
+    let _ = verify_totp_at(&[0u8; TOTP_SECRET_LEN], "000000", now_ms, 0);
+}
+
+/// Password login with second-factor staging.
+///
+/// - Wrong password (or unknown/disabled/unapproved account) → the uniform
+///   `Unauthorized("Invalid username or password")`, with a dummy MFA check
+///   so timing reveals nothing about MFA enrollment.
+/// - Right password, no confirmed factor → `Authenticated`.
+/// - Right password, factor enrolled, no `mfa_code` → `MfaRequired` (the
+///   adapter renders the second-factor step; the returned [`LocalUser`]
+///   carries no secret material beyond the pre-existing password hash).
+/// - Right password + `mfa_code` → `Authenticated`, or the uniform
+///   [`INVALID_2FA_MESSAGE`] refusal.
+///
+/// The staged shape mirrors upstream's two-step web login: the OTP error is
+/// only reachable after the password passed, so the distinct messages are
+/// not an enumeration oracle.
+pub enum LoginOutcome {
+    Authenticated(LocalUser),
+    MfaRequired(LocalUser),
+}
+
+pub fn login_with_mfa(
+    accounts: &dyn AccountStore,
+    mfa: &dyn SecondFactorStore,
+    username: &str,
+    domain: &str,
+    password: &str,
+    mfa_code: Option<&str>,
+    now_ms: u64,
+) -> Result<LoginOutcome> {
+    let invalid_password = || Error::Unauthorized("Invalid username or password".into());
+    let Some(user) = auth::authenticate_password(accounts, username, domain, password)?
+    else {
+        dummy_mfa_verify(now_ms);
+        return Err(invalid_password());
+    };
+    let totp_enrolled = matches!(mfa.totp_for(user.account_id)?, Some(record) if record.confirmed);
+    let webauthn_enrolled = !mfa.webauthn_for_account(user.account_id)?.is_empty();
+    if !totp_enrolled && !webauthn_enrolled {
+        return Ok(LoginOutcome::Authenticated(user));
+    }
+    match mfa_code {
+        None => Ok(LoginOutcome::MfaRequired(user)),
+        Some(code) => match verify_second_factor(mfa, user.account_id, code, now_ms) {
+            Ok(_) => Ok(LoginOutcome::Authenticated(user)),
+            Err(_) => Err(Error::Unauthorized(INVALID_2FA_MESSAGE.into())),
+        },
+    }
+}
+
+/// Mint a registration ceremony challenge (returned to the adapter, which
+/// hands it to the authenticator; the row is consumed by
+/// [`finish_webauthn_registration`]).
+pub fn begin_webauthn_registration(
+    store: &dyn SecondFactorStore,
+    account_id: Id,
+    now_ms: u64,
+) -> Result<WebauthnChallenge> {
+    let challenge = WebauthnChallenge::mint(
+        account_id,
+        WebauthnPurpose::Registration,
+        &random_bytes::<32>(),
+        now_ms,
+    )?;
+    store.store_webauthn_challenge(challenge.clone())?;
+    Ok(challenge)
+}
+
+/// Finish a registration ceremony: consume the challenge (single-use —
+/// unknown, expired, or already-used challenges are indistinguishable) and
+/// persist the verified credential. `Conflict` when the credential id is
+/// already registered.
+pub fn finish_webauthn_registration(
+    store: &dyn SecondFactorStore,
+    rp_id: &str,
+    origin: &str,
+    challenge_b64: &str,
+    now_ms: u64,
+    client_data_json: &[u8],
+    attestation_object: &[u8],
+) -> Result<WebauthnCredential> {
+    let challenge = store
+        .take_webauthn_challenge(challenge_b64)?
+        .ok_or_else(|| {
+            Error::InvalidInput(
+                "WebAuthn challenge is unknown, expired, or already used".into(),
+            )
+        })?;
+    let parsed = verify_webauthn_registration(
+        rp_id,
+        origin,
+        &challenge,
+        now_ms,
+        client_data_json,
+        attestation_object,
+    )?;
+    if store
+        .webauthn_by_credential_id(&parsed.credential_id)?
+        .is_some()
+    {
+        return Err(Error::Conflict(
+            "this security key is already registered".into(),
+        ));
+    }
+    let mut point = vec![0x04u8];
+    point.extend_from_slice(&parsed.x);
+    point.extend_from_slice(&parsed.y);
+    store.put_webauthn(WebauthnCredential {
+        account_id: challenge.account_id,
+        credential_id: parsed.credential_id,
+        public_key_uncompressed: point,
+        sign_count: parsed.sign_count,
+        created_at_ms: now_ms,
+    })
+}
+
+/// Mint an authentication ceremony challenge.
+pub fn begin_webauthn_authentication(
+    store: &dyn SecondFactorStore,
+    account_id: Id,
+    now_ms: u64,
+) -> Result<WebauthnChallenge> {
+    let challenge = WebauthnChallenge::mint(
+        account_id,
+        WebauthnPurpose::Authentication,
+        &random_bytes::<32>(),
+        now_ms,
+    )?;
+    store.store_webauthn_challenge(challenge.clone())?;
+    Ok(challenge)
+}
+
+/// Finish an authentication ceremony: consume the challenge and verify the
+/// assertion against the stored credential, persisting the new sign count.
+/// Any failure is a client error with no oracle beyond the staged flow
+/// (the challenge row is gone either way — no second probe).
+pub fn finish_webauthn_authentication(
+    store: &dyn SecondFactorStore,
+    rp_id: &str,
+    origin: &str,
+    challenge_b64: &str,
+    now_ms: u64,
+    credential_id: &[u8],
+    client_data_json: &[u8],
+    authenticator_data: &[u8],
+    signature_der: &[u8],
+) -> Result<(WebauthnCredential, SecondFactorKind)> {
+    let challenge = store
+        .take_webauthn_challenge(challenge_b64)?
+        .ok_or_else(|| {
+            Error::InvalidInput(
+                "WebAuthn challenge is unknown, expired, or already used".into(),
+            )
+        })?;
+    let mut credential = store
+        .webauthn_by_credential_id(credential_id)?
+        .ok_or_else(|| Error::InvalidInput("WebAuthn credential is unknown".into()))?;
+    let sign_count = verify_webauthn_assertion(
+        &credential,
+        rp_id,
+        origin,
+        &challenge,
+        now_ms,
+        client_data_json,
+        authenticator_data,
+        signature_der,
+    )?;
+    credential.sign_count = sign_count;
+    let stored = store.put_webauthn(credential)?;
+    Ok((stored, SecondFactorKind::WebAuthn))
+}
+
+// ---------------------------------------------------------------------------
+// Registration profile + email-block policy (G-E).
+// ---------------------------------------------------------------------------
+
+/// Outcome of the email-block policy check at registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmailPolicyOutcome {
+    /// Proceed with the instance's approval setting.
+    Allow,
+    /// A matching `allow_with_approval` domain block: the account lands
+    /// `approved = false` (admin pending queue) even on open instances.
+    RequireApproval,
+}
+
+/// Extra registration fields captured alongside [`RegisterAccountCommand`].
+/// (Separate struct — not new fields on the command — so the current
+/// endpoint construction keeps compiling until the parent wires the new
+/// params; see the G-E report snippet.)
+#[derive(Debug, Clone, Default)]
+pub struct RegistrationProfile {
+    /// IANA time-zone name (`time_zone` param, upstream `user.time_zone`).
+    pub time_zone: Option<String>,
+    /// Date of birth (`YYYY-MM-DD`, upstream `user.date_of_birth`).
+    pub date_of_birth: Option<String>,
+}
+
+/// Evaluate the email-block policy for a signup address (pure: the caller
+/// loads the rows, this decides).
+///
+/// - A matching canonical-email block → refuse `InvalidInput` (422
+///   `Validation failed: Email is blocked`), confirmed or not.
+/// - A matching email-domain block with `allow_with_approval = false` →
+///   refuse (422 `Validation failed: Email domain is blocked`).
+/// - A matching domain block with `allow_with_approval = true` →
+///   [`EmailPolicyOutcome::RequireApproval`] (the account queues for admin
+///   approval instead of landing usable).
+/// - Otherwise [`EmailPolicyOutcome::Allow`].
+///
+/// Reconciliation with confirmation redemption (D12): blocks gate *signup*
+/// only. [`confirm_email`] stays live for blocked addresses (a block created
+/// after signup never strands confirmation), and already-confirmed legacy
+/// accounts keep logging in — the matrix is pinned by
+/// `tests/gaps_auth_moderation.rs`.
+pub fn check_registration_email(
+    domain_blocks: &[AdminEmailDomainBlock],
+    canonical_blocked: bool,
+    email: &str,
+) -> Result<EmailPolicyOutcome> {
+    let address = email.trim();
+    let domain = address
+        .rsplit_once('@')
+        .map(|(_, domain)| domain)
+        .filter(|domain| !domain.is_empty() && !address.starts_with('@'))
+        .ok_or_else(|| Error::InvalidInput("email is invalid".into()))?;
+    if canonical_blocked {
+        return Err(Error::InvalidInput(
+            "Validation failed: Email is blocked".into(),
+        ));
+    }
+    for block in domain_blocks {
+        if block.domain.eq_ignore_ascii_case(domain) {
+            if block.allow_with_approval {
+                return Ok(EmailPolicyOutcome::RequireApproval);
+            }
+            return Err(Error::InvalidInput(
+                "Validation failed: Email domain is blocked".into(),
+            ));
+        }
+    }
+    Ok(EmailPolicyOutcome::Allow)
+}
+
+/// Register through the public API with the G-E policy gates: `time_zone` /
+/// `date_of_birth` capture + min-age refusal, and email-domain /
+/// canonical-email block enforcement reconciled with confirmation state.
+///
+/// Under-age dates are refused with the 422 shape
+/// (`InvalidInput("Validation failed: ...")`); blocked addresses likewise.
+/// An `allow_with_approval` domain match forces the approval queue. All
+/// other policy delegates to [`register_account_with_invite`].
+///
+/// Persistence note: `time_zone`/`date_of_birth` are validated here and
+/// carried on the command, so the invite path persists them on the credential
+/// row in the same transaction as the account.
+#[allow(clippy::too_many_arguments)]
+pub fn register_account_with_profile(
+    accounts: &dyn AccountStore,
+    oauth: &dyn OAuthStore,
+    invites: &dyn InviteStore,
+    infra: &dyn AdminInfraStore,
+    base_url: &str,
+    now_ms: u64,
+    registration_open: bool,
+    require_approval: bool,
+    invites_enabled: bool,
+    minimum_age_years: u8,
+    app: &OAuthApplication,
+    profile: &RegistrationProfile,
+    cmd: RegisterAccountCommand,
+) -> Result<RegisteredAccount> {
+    if let Some(time_zone) = profile.time_zone.as_deref().map(str::trim).filter(|tz| !tz.is_empty()) {
+        validate_time_zone(time_zone)?;
+    }
+    if let Some(date_of_birth) = profile
+        .date_of_birth
+        .as_deref()
+        .map(str::trim)
+        .filter(|dob| !dob.is_empty())
+    {
+        check_date_of_birth_with_min_age(date_of_birth, now_ms, minimum_age_years)?;
+    }
+    // Carry the validated captures on the command so the invite path persists
+    // them on the credential row in the same transaction as the account.
+    let mut cmd = cmd;
+    cmd.time_zone = profile.time_zone.clone();
+    cmd.date_of_birth = profile.date_of_birth.clone();
+    // Email blocks gate signup only (confirmation redemption stays live).
+    // Domains are unique at creation, so one targeted index read replaces
+    // the old 1000-row page scan.
+    let email_domain = cmd
+        .email
+        .rsplit_once('@')
+        .map(|(_, domain)| domain.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let domain_blocks: Vec<AdminEmailDomainBlock> = if email_domain.is_empty() {
+        Vec::new()
+    } else {
+        infra
+            .email_domain_block_for_domain(&email_domain)?
+            .into_iter()
+            .collect()
+    };
+    let canonical_hash = admin_infra_uc::canonical_email_hash(&cmd.email);
+    let canonical_blocked = !infra.admin_canonical_blocks_for_hash(&canonical_hash)?.is_empty();
+    let force_approval =
+        check_registration_email(&domain_blocks, canonical_blocked, &cmd.email)?
+            == EmailPolicyOutcome::RequireApproval;
+    register_account_with_invite(
+        accounts,
+        oauth,
+        invites,
+        base_url,
+        now_ms,
+        registration_open,
+        require_approval || force_approval,
+        invites_enabled,
+        app,
+        cmd,
+    )
 }
 
 #[cfg(test)]

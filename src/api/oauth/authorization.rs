@@ -16,10 +16,11 @@ use crate::api::mastodon::ApiState;
 use crate::api::oauth::consent_page;
 use crate::api::oauth::pkce;
 use crate::api::oauth::scopes;
+use crate::application::accounts::{self, SecondFactorStore};
 use crate::application::auth;
 use crate::application::crypto;
 use crate::application::ports::Store;
-use crate::domain::{Id, OAuthApplication};
+use crate::domain::{Error as DomainError, Id, OAuthApplication};
 
 /// Cookie name for the browser session.
 pub const SESSION_COOKIE: &str = "birchtree_session";
@@ -260,13 +261,37 @@ pub async fn authorize_post(
 ) -> Response {
     let pairs = forms::parse(&body);
 
-    // Login submission.
+    // Login submission. Second-factor gate (G-E): `login_with_mfa` returns
+    // `MfaRequired` when a confirmed factor is enrolled and no `otp_attempt`
+    // was posted; the re-rendered page collects it and the resubmission
+    // verifies the code before any session is issued. No session, no
+    // telemetry, and no account enumeration beyond the pre-existing password
+    // step (the OTP error is only reachable after the password passed).
     if let Some(username) = field(&pairs, "username") {
         let password = field(&pairs, "password").unwrap_or("");
         let store: &dyn Store = &*state.context.store;
+        let mfa: &dyn SecondFactorStore = &*state.context.store;
         let domain = state.server.domain.clone();
-        match auth::authenticate_password(store, username, &domain, password) {
-            Ok(Some(user)) => {
+        let mfa_code = field(&pairs, "otp_attempt");
+        match accounts::login_with_mfa(
+            store,
+            mfa,
+            username,
+            &domain,
+            password,
+            mfa_code,
+            state.context.now_ms(),
+        ) {
+            Ok(accounts::LoginOutcome::MfaRequired(_user)) => {
+                let prepared = prepare(&state, &pairs);
+                let hidden = prepared.map(|p| p.hidden_fields()).unwrap_or_default();
+                let body = consent_page::login_page(
+                    &hidden,
+                    Some("Enter your two-factor authentication code"),
+                );
+                return (StatusCode::OK, body).into_response();
+            }
+            Ok(accounts::LoginOutcome::Authenticated(user)) => {
                 // D39: one sign-in event per completed password login (the
                 // admin `active_users` telemetry). Recording is best-effort:
                 // the login itself already succeeded. The client IP backs
@@ -314,10 +339,19 @@ pub async fn authorize_post(
                     Err(_) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "login failed"),
                 }
             }
-            Ok(None) | Err(_) => {
+            Err(err) => {
                 let prepared = prepare(&state, &pairs);
                 let hidden = prepared.map(|p| p.hidden_fields()).unwrap_or_default();
-                let body = consent_page::login_page(&hidden, Some("Invalid username or password"));
+                let message = match &err {
+                    DomainError::Unauthorized(msg)
+                        if msg.as_str()
+                            == crate::application::accounts::INVALID_2FA_MESSAGE =>
+                    {
+                        "Invalid two-factor authentication code"
+                    }
+                    _ => "Invalid username or password",
+                };
+                let body = consent_page::login_page(&hidden, Some(message));
                 return (StatusCode::OK, body).into_response();
             }
         }

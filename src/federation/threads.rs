@@ -312,3 +312,433 @@ pub fn read_time_completion(store: &dyn Store, root: &crate::domain::Status, now
     )?;
     Ok(Some(refresh_id))
 }
+
+// ---------------------------------------------------------------------------
+// Quote re-verification (federation tail, G-D): the `QuoteReverify` job.
+// ---------------------------------------------------------------------------
+
+/// Hops per re-verify chain: one job re-verifies one quote; a quote whose
+/// quoted status is itself a quoting status with its own live quote enqueues
+/// the next hop. Past this, the chain stops with the remaining quotes kept.
+pub const QUOTE_REVERIFY_MAX_HOPS: u64 = 8;
+/// Fetches per re-verify chain: each hop performs at most one approval fetch.
+/// Past this budget the chain stops with every remaining quote kept as-is.
+pub const QUOTE_REVERIFY_FETCH_BUDGET: u64 = 100;
+/// Largest accepted quote-authorization document (matches the remote-document
+/// body cap in the federation contract).
+pub const QUOTE_REVERIFY_MAX_BODY_BYTES: u64 = 200 * 1024;
+
+/// What one re-verify step decided, before any fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuoteReverifyPlan {
+    /// Nothing to do (missing, non-accepted, or no live quote left).
+    Done,
+    /// Positive local evidence the quote is dead (the quoted status is
+    /// missing or deleted): revoke it.
+    Revoke,
+    /// The quoted status is alive here; check the remote authorization.
+    CheckRemote,
+    /// The quoted status is alive and itself quotes another live status:
+    /// check this one remotely, then continue the chain (hop + 1).
+    CheckRemoteThenChain { next_quote_id: Id },
+}
+
+/// Decide a `QuoteReverify` step from local state only (no fetch). Pending
+/// quotes are left to the request flow (`Done`): re-verification polices
+/// accepted quotes. Anything unaccepted stays exactly as it is — a
+/// federation lookup never rolls back committed local state by itself.
+pub fn plan_quote_reverify(
+    store: &dyn Store,
+    quote_id: Id,
+) -> Result<QuoteReverifyPlan> {
+    use crate::domain::QuoteState;
+    let Some(quote) = store.quote_by_id(quote_id)? else {
+        return Ok(QuoteReverifyPlan::Done);
+    };
+    if quote.state != QuoteState::Accepted {
+        return Ok(QuoteReverifyPlan::Done);
+    }
+    let Some(quoted) = store.status_by_id(quote.quoted_status_id)? else {
+        return Ok(QuoteReverifyPlan::Revoke);
+    };
+    if quoted.is_deleted() {
+        return Ok(QuoteReverifyPlan::Revoke);
+    }
+    // A nested quote (the quoted status itself quotes another live status)
+    // chains one hop deeper, under the hop cap.
+    if let Some(nested) = store.quote_by_quoting(quote.quoted_status_id)?
+        && nested.state == QuoteState::Accepted
+        && let Some(nested_quoted) = store.status_by_id(nested.quoted_status_id)?
+        && !nested_quoted.is_deleted()
+    {
+        return Ok(QuoteReverifyPlan::CheckRemoteThenChain { next_quote_id: nested.id });
+    }
+    Ok(QuoteReverifyPlan::CheckRemote)
+}
+
+/// Run one `QuoteReverify` job (payload `{quote_id, hop?, fetches?}`): one hop
+/// per job, under the hop cap and the fetch budget. Terminal outcomes return
+/// `Ok` with the quote kept or revoked; transient fetch failures retry with
+/// the queue's backoff. A failed fetch NEVER revokes: only positive evidence
+/// (a missing/deleted quoted status locally, or a 404/410 on the
+/// authorization fetch) moves an accepted quote to revoked, keeping the
+/// quoted status's counter in step via `set_quote_state`.
+pub async fn run_quote_reverify(
+    config: &activitypub_federation::config::FederationConfig<FedContext>,
+    job: &crate::domain::Job,
+) -> std::result::Result<(), DeliveryError> {
+    let payload = &job.payload;
+    let quote_id = payload
+        .get("quote_id")
+        .and_then(serde_json::Value::as_u64)
+        .map(Id::new)
+        .ok_or_else(|| DeliveryError::Quarantine("quote_reverify job has no quote".into()))?;
+    let hop = payload.get("hop").and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let fetches = payload.get("fetches").and_then(serde_json::Value::as_u64).unwrap_or(0);
+    if hop >= QUOTE_REVERIFY_MAX_HOPS || fetches >= QUOTE_REVERIFY_FETCH_BUDGET {
+        tracing::info!(
+            target: "birchtree::federation",
+            direction = "inbound",
+            kind = "QuoteReverify",
+            quote = quote_id.value(),
+            hop,
+            outcome = "stopped: hop cap / fetch budget, quote kept",
+            "thread"
+        );
+        return Ok(());
+    }
+    let ctx: &FedContext = config;
+    let store = &*ctx.app.store;
+    let now = ctx.app.now_ms();
+    let retry = |e: crate::domain::Error| DeliveryError::Retry(e.to_string());
+    let plan = plan_quote_reverify(store, quote_id).map_err(retry)?;
+    match plan {
+        QuoteReverifyPlan::Done => Ok(()),
+        QuoteReverifyPlan::Revoke => {
+            revoke_verified(store, quote_id, now).map_err(retry)?;
+            Ok(())
+        }
+        QuoteReverifyPlan::CheckRemote => {
+            check_authorization_remote(ctx, store, quote_id, hop, fetches, None, now).await
+        }
+        QuoteReverifyPlan::CheckRemoteThenChain { next_quote_id } => {
+            check_authorization_remote(ctx, store, quote_id, hop, fetches, Some(next_quote_id), now).await
+        }
+    }
+}
+
+/// Revoke a quote whose death is positively evidenced, and queue its
+/// `Delete` of the `QuoteAuthorization` for the quoting server (a no-op when
+/// the quoted author is remote — the event worker only sends for locals).
+fn revoke_verified(store: &dyn Store, quote_id: Id, now_ms: u64) -> Result<()> {
+    use crate::domain::QuoteState;
+    let Some(quote) = store.quote_by_id(quote_id)? else {
+        return Ok(());
+    };
+    if quote.state != QuoteState::Accepted {
+        return Ok(());
+    }
+    store.set_quote_state(quote.id, QuoteState::Revoked, None, None)?;
+    store.enqueue_event(
+        quote.quoted_account_id,
+        serde_json::json!({"event": "quote_revoke", "quote_id": quote.id.value()}),
+        now_ms,
+    )?;
+    tracing::info!(
+        target: "birchtree::federation",
+        direction = "inbound",
+        kind = "QuoteReverify",
+        quote = quote.id.value(),
+        outcome = "revoked: quoted status is gone",
+        "thread"
+    );
+    Ok(())
+}
+
+/// Fetch the quote's authorization document (one fetch, the job's hop) and
+/// settle: 404/410 revokes (the quoted author withdrew it); a usable document
+/// keeps the quote; anything else retries with backoff (state untouched).
+/// `chain` continues a nested quote one hop deeper after this hop settles.
+async fn check_authorization_remote(
+    ctx: &FedContext,
+    store: &dyn Store,
+    quote_id: Id,
+    hop: u64,
+    fetches: u64,
+    chain: Option<Id>,
+    now_ms: u64,
+) -> std::result::Result<(), DeliveryError> {
+    use crate::domain::QuoteState;
+    let retry = |e: crate::domain::Error| DeliveryError::Retry(e.to_string());
+    let Some(quote) = store.quote_by_id(quote_id).map_err(retry)? else {
+        return Ok(());
+    };
+    if quote.state != QuoteState::Accepted {
+        return Ok(());
+    }
+    let Some(approval) = quote.approval_uri.clone() else {
+        // A local-policy quote carries no remote authorization to check.
+        // Still continue a nested chain, if any.
+        if let Some(next) = chain {
+            store
+                .enqueue(
+                    JobKind::QuoteReverify,
+                    serde_json::json!({ "quote_id": next.value(), "hop": hop + 1, "fetches": fetches }),
+                    now_ms,
+                )
+                .map_err(retry)?;
+        }
+        return Ok(());
+    };
+    let url = Url::parse(&approval).map_err(|e| DeliveryError::Quarantine(e.to_string()))?;
+    if let Err(policy) = crate::federation::policy::check_url(&url, ctx.http.allow_http, &ctx.http.allowlist) {
+        // A refused authorization URL is not evidence of death: keep the quote.
+        tracing::info!(
+            target: "birchtree::federation",
+            direction = "inbound",
+            kind = "QuoteReverify",
+            quote = quote.id.value(),
+            outcome = %format!("kept: authorization url refused by policy: {policy}"),
+            "thread"
+        );
+        return Ok(());
+    }
+    let response = ctx
+        .media_client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/activity+json, application/ld+json")
+        .send()
+        .await
+        .map_err(|e| DeliveryError::Retry(e.to_string()))?;
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
+        revoke_verified(store, quote.id, now_ms).map_err(retry)?;
+        return Ok(());
+    }
+    if status.is_server_error()
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+    {
+        return Err(DeliveryError::Retry(format!("authorization server answered {status}")));
+    }
+    if !status.is_success() {
+        // Any other client answer is not evidence of death: keep the quote.
+        return Ok(());
+    }
+    if let Some(declared) = response.content_length()
+        && declared > QUOTE_REVERIFY_MAX_BODY_BYTES
+    {
+        return Ok(());
+    }
+    // Bounded read: the authorization document is tiny; anything past the
+    // remote-document cap is not evidence of anything — keep the quote.
+    use futures_util::StreamExt as _;
+    let mut body: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| DeliveryError::Retry(e.to_string()))?;
+        if body.len() as u64 + chunk.len() as u64 > QUOTE_REVERIFY_MAX_BODY_BYTES {
+            return Ok(());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let _doc: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(doc) => doc,
+        Err(_) => return Ok(()),
+    };
+    if let Some(next) = chain {
+        store
+            .enqueue(
+                JobKind::QuoteReverify,
+                serde_json::json!({ "quote_id": next.value(), "hop": hop + 1, "fetches": fetches + 1 }),
+                now_ms,
+            )
+            .map_err(retry)?;
+    }
+    tracing::info!(
+        target: "birchtree::federation",
+        direction = "inbound",
+        kind = "QuoteReverify",
+        quote = quote.id.value(),
+        outcome = "kept: authorization still resolves",
+        "thread"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `collection_update` notifications (federation tail, G-D).
+// ---------------------------------------------------------------------------
+
+/// Enqueue a `collection_update` notification for `recipient` about an
+/// activity of `actor` on `status` (a poll tally refresh, a featured-collection
+/// change, ...). The `FanOutNotification` job dedups, so repeated triggers are
+/// harmless; self-notifications are skipped by the fan-out. The trigger sites
+/// live outside this layer (remote poll sync, G-C collection fan-out) — see
+/// the parent-merge call-site snippets in the G-D report.
+pub fn enqueue_collection_update(
+    store: &dyn Store,
+    recipient_id: Id,
+    actor_id: Option<Id>,
+    status_id: Option<Id>,
+    now_ms: u64,
+) -> Result<()> {
+    if actor_id == Some(recipient_id) {
+        return Ok(());
+    }
+    let payload = crate::application::notifications::fan_out_payload(
+        recipient_id,
+        crate::domain::NotificationType::CollectionUpdate,
+        actor_id,
+        status_id,
+        now_ms,
+    );
+    store.enqueue(JobKind::FanOutNotification, payload, now_ms)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Follower/counter refresh (federation tail, parent finish).
+// ---------------------------------------------------------------------------
+
+/// Body cap for one collection document fetch (base docs are tiny).
+pub const SYNC_COLLECTION_BODY_BYTES: u64 = 200 * 1024;
+
+/// Pure parse of a collection base document's `totalItems`: a non-negative
+/// integer within the remote-hint bound, else `None` (absurd claims are
+/// dropped, never clamped into authority).
+pub fn collection_total_of(doc: &serde_json::Value) -> Option<u64> {
+    let total = doc.get("totalItems")?.as_u64()?;
+    if total > crate::activitypub::objects::MAX_REMOTE_COUNT_HINT {
+        return None;
+    }
+    Some(total)
+}
+
+/// Fetch one collection base document's `totalItems` (signed client,
+/// SSRF/redirect/size rules). Transport failures retry; anything else
+/// (refused URL, non-2xx, oversize, unparseable, absurd) keeps current state.
+async fn fetch_collection_total(
+    ctx: &FedContext,
+    url: &str,
+) -> std::result::Result<Option<u64>, DeliveryError> {
+    let url = Url::parse(url).map_err(|e| DeliveryError::Quarantine(e.to_string()))?;
+    if crate::federation::policy::check_url(&url, ctx.http.allow_http, &ctx.http.allowlist)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    let response = ctx
+        .media_client
+        .get(url)
+        .header(
+            reqwest::header::ACCEPT,
+            "application/activity+json, application/ld+json",
+        )
+        .send()
+        .await
+        .map_err(|e| DeliveryError::Retry(e.to_string()))?;
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+    if let Some(declared) = response.content_length()
+        && declared > SYNC_COLLECTION_BODY_BYTES
+    {
+        return Ok(None);
+    }
+    use futures_util::StreamExt as _;
+    let mut body: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| DeliveryError::Retry(e.to_string()))?;
+        if body.len() as u64 + chunk.len() as u64 > SYNC_COLLECTION_BODY_BYTES {
+            return Ok(None);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let doc: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(doc) => doc,
+        Err(_) => return Ok(None),
+    };
+    Ok(collection_total_of(&doc))
+}
+
+/// Refresh one remote account's counters from its served collections
+/// (`{actor}/followers`, `{actor}/following`, `{actor}/outbox` base docs'
+/// `totalItems`).
+///
+/// * Local accounts are skipped (local counters are authoritative).
+/// * Suspended/missing rows are skipped.
+/// * Absurd claims are dropped per field; provided fields overwrite the
+///   remote row (follow/unfollow activities keep local-involving rows in
+///   step on an ongoing basis).
+/// * Payload `{account_id}`; bounded to three small fetches, no row
+///   reconciliation (follow rows stay activity-driven).
+pub async fn run_sync_followers(
+    config: &activitypub_federation::config::FederationConfig<FedContext>,
+    job: &crate::domain::Job,
+) -> std::result::Result<(), DeliveryError> {
+    let account_id = job
+        .payload
+        .get("account_id")
+        .and_then(|v| v.as_u64())
+        .map(Id::new)
+        .ok_or_else(|| DeliveryError::Quarantine("sync_followers job has no account".into()))?;
+    let ctx: &FedContext = config;
+    let store = &*ctx.app.store;
+    let retry = |e: crate::domain::Error| DeliveryError::Retry(e.to_string());
+    let Some(account) = store.account_by_id(account_id).map_err(retry)? else {
+        return Ok(());
+    };
+    if account.local || account.suspended {
+        return Ok(());
+    }
+    let base = account.actor_uri.trim_end_matches('/');
+    let followers = fetch_collection_total(ctx, &format!("{base}/followers")).await?;
+    let following = fetch_collection_total(ctx, &format!("{base}/following")).await?;
+    let statuses = fetch_collection_total(ctx, &format!("{base}/outbox")).await?;
+    if followers.is_none() && following.is_none() && statuses.is_none() {
+        return Ok(());
+    }
+    store
+        .set_remote_stats(account.id, followers, following, statuses)
+        .map_err(retry)?;
+    tracing::info!(
+        target: "birchtree::federation",
+        direction = "inbound",
+        kind = "SyncFollowers",
+        account = %account.actor_uri,
+        "refreshed remote counters"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collection_total_parses_bounded_ints() {
+        assert_eq!(
+            collection_total_of(&serde_json::json!({"totalItems": 12})),
+            Some(12)
+        );
+        assert_eq!(
+            collection_total_of(&serde_json::json!({"totalItems": 0})),
+            Some(0)
+        );
+        assert_eq!(collection_total_of(&serde_json::json!({})), None);
+        assert_eq!(
+            collection_total_of(&serde_json::json!({"totalItems": -1})),
+            None
+        );
+        assert_eq!(
+            collection_total_of(&serde_json::json!({"totalItems": u64::MAX})),
+            None
+        );
+        assert_eq!(
+            collection_total_of(&serde_json::json!({"totalItems": 100_000_001u64})),
+            None
+        );
+    }
+}

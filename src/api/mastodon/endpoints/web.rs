@@ -6,10 +6,11 @@
 //! - `PUT/PATCH /api/web/settings` — web UI settings sync (`require_user!`).
 //! - `GET /api/web/embeds/:id` — OEmbed for a status: local statuses render
 //!   the pinned `OEmbedSerializer` JSON under the status `show?` policy;
-//!   remote statuses require a signed-in session and an outbound oEmbed
-//!   fetch (remote fetch needs an HTML discovery + sanitizer pass; until
-//!   then a signed-in remote read answers 404 like a failed fetch —
-//!   never fabricated).
+//!   remote statuses require a signed-in session and complete an outbound
+//!   oEmbed fetch (HTML discovery for the `json+oembed` link, then a
+//!   policy-checked fetch, parsed + sanitized by
+//!   `activitypub::objects::{fetch_remote_embed, sanitize_embed_html}`;
+//!   fetch failures answer the fetch-failure 404 — never fabricated).
 //! - `POST /api/web/push_subscriptions`, `PUT/PATCH /:id`, `DELETE /:id` —
 //!   session-bound web push subscriptions (`require_user!` except destroy,
 //!   which finds the row by its unsubscribe token and always answers 200).
@@ -422,10 +423,83 @@ pub async fn embeds_show(
     if viewer.is_none() {
         return ApiError::new(StatusCode::UNAUTHORIZED, "Authentication required").into_response();
     }
-    // No HTML discovery/sanitizer pass exists yet (see PATCHES): a remote
-    // oEmbed fetch cannot be completed safely, so answer the fetch-failure
-    // 404 rather than fabricating a document.
-    ApiError::not_found().into_response()
+    // G-D remote fetch+sanitize (fetch_remote_embed + parse_remote_embed +
+    // sanitize_embed_html in activitypub::objects; SSRF/size/time/redirect
+    // rules enforced by the policy-checked `fetcher` before any byte is read).
+    let fed: &crate::activitypub::FedContext = &state.federation;
+    let client = fed.media_client.clone();
+    let allow_http = fed.http.allow_http;
+    let allowlist = fed.http.allowlist.clone();
+    let fetcher = move |url: String| {
+        let client = client.clone();
+        let allowlist = allowlist.clone();
+        async move {
+            let parsed = url::Url::parse(&url).map_err(|e| e.to_string())?;
+            crate::federation::policy::check_url(&parsed, allow_http, &allowlist)
+                .map_err(|e| e.to_string())?;
+            let response = client
+                .get(parsed)
+                .header(
+                    axum::http::header::ACCEPT,
+                    "application/json+oembed, application/json",
+                )
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            let status = response.status().as_u16();
+            use futures_util::StreamExt as _;
+            let mut body: Vec<u8> = Vec::new();
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| e.to_string())?;
+                if body.len() as u64 + chunk.len() as u64
+                    > crate::activitypub::objects::MAX_OEMBED_BYTES
+                {
+                    break;
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok::<_, String>((status, body))
+        }
+    };
+    // Discovery: scan the remote status page HTML for the json+oembed link,
+    // then fetch it. Both fetches go through the policy-checked `fetcher`.
+    let page = match fetcher(status.url.clone()).await {
+        Ok(page) => page,
+        Err(_) => return ApiError::not_found().into_response(),
+    };
+    if page.0 != 200 {
+        return ApiError::not_found().into_response();
+    }
+    let html = String::from_utf8_lossy(&page.1);
+    let href = {
+        // minimal `application/json+oembed" href="..."` scan
+        let mut found = None;
+        for chunk in html.split("application/json+oembed").skip(1) {
+            if let Some(h) = chunk.split("href=\"").nth(1).and_then(|r| r.split('"').next()) {
+                found = Some(h.to_string());
+                break;
+            }
+        }
+        found
+    };
+    let Some(href) = href else {
+        return ApiError::not_found().into_response();
+    };
+    let query = forms::parse(uri.query().unwrap_or("").as_bytes());
+    let width = forms::get(&query, "width").and_then(|r| r.parse().ok());
+    let height = forms::get(&query, "height").and_then(|r| r.parse().ok());
+    match crate::activitypub::objects::fetch_remote_embed(
+        |u| fetcher(u),
+        &href,
+        width,
+        height,
+    )
+    .await
+    {
+        Ok(embed) => axum::Json(embed.into_json()).into_response(),
+        Err(_) => ApiError::not_found().into_response(),
+    }
 }
 
 /// Pinned `OEmbedSerializer` projection: `type`/`version` constants,

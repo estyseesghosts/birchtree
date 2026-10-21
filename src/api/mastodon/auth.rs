@@ -12,9 +12,12 @@
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
+use axum::http::StatusCode;
 
 use crate::api::mastodon::ApiState;
 use crate::api::mastodon::errors::{ApiError, ApiResult};
+use crate::application::accounts::SecondFactorStore;
+use crate::domain::user::AdminAction;
 use crate::application::ports::{AccountStore, Store};
 use crate::domain::{AccessToken, Id, OAuthApplication, UserRole};
 
@@ -125,6 +128,82 @@ impl Authenticated {
         }
         self.require_scopes(scopes)?;
         Ok(role)
+    }
+
+    /// Fine-grained gate (D35): the caller's role must carry the upstream
+    /// permission flag for `action` (role check first, exactly like
+    /// upstream's `PermissionsConcern` → controller `authorize` order), then
+    /// the token must carry one of `scopes`.
+    ///
+    /// This is the same check as [`Authenticated::require_admin`] with the
+    /// coarse area replaced by the per-action flag: a moderator passes
+    /// exactly the actions its bitmask covers (`view_accounts`,
+    /// `moderate_account`, `review_reports`, plus the upstream moderator
+    /// flags — dashboard, audit log, feeds, taxonomies — as the remaining
+    /// admin modules adopt this gate), an admin passes every action, and a
+    /// role-less account passes none. New routes should call this;
+    /// `require_admin` stays for the existing area-level call sites.
+    pub fn require_admin_action(
+        &self,
+        store: &dyn AccountStore,
+        action: AdminAction,
+        scopes: &[&str],
+    ) -> ApiResult<UserRole> {
+        let user_id = self.require_user()?;
+        let role = store
+            .user_by_account_id(user_id)
+            .map_err(ApiError::from)?
+            .map(|user| user.role)
+            .unwrap_or(UserRole::None);
+        if !role.allows(action) {
+            return Err(ApiError::role_forbidden());
+        }
+        self.require_scopes(scopes)?;
+        Ok(role)
+    }
+
+    /// True when the account must complete a second factor at login: a
+    /// confirmed TOTP enrollment or at least one WebAuthn credential exists.
+    /// Store errors fail closed (the login flow treats them as an internal
+    /// error, never as "no MFA").
+    pub fn mfa_required(
+        &self,
+        mfa: &dyn SecondFactorStore,
+        user_id: Id,
+    ) -> ApiResult<bool> {
+        let totp = mfa
+            .totp_for(user_id)
+            .map_err(ApiError::from)?
+            .is_some_and(|record| record.confirmed);
+        if totp {
+            return Ok(true);
+        }
+        Ok(!mfa
+            .webauthn_for_account(user_id)
+            .map_err(ApiError::from)?
+            .is_empty())
+    }
+
+    /// Verify a TOTP/backup-code second factor at the login gate. Any
+    /// failure — unknown account enrollment, unconfirmed enrollment, wrong
+    /// or spent code — is the same `401 {"error":"Invalid two-factor
+    /// authentication code"}`: the gate never reveals which credential
+    /// failed. (WebAuthn assertions run through the challenge ceremony in
+    /// `application::accounts`, not through this single-code gate.)
+    pub fn verify_second_factor(
+        &self,
+        mfa: &dyn SecondFactorStore,
+        user_id: Id,
+        code: &str,
+        now_ms: u64,
+    ) -> ApiResult<()> {
+        match crate::application::accounts::verify_second_factor(mfa, user_id, code, now_ms) {
+            Ok(_) => Ok(()),
+            Err(_) => Err(ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                crate::application::accounts::INVALID_2FA_MESSAGE,
+            )),
+        }
     }
 }
 

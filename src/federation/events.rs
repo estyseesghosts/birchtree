@@ -228,6 +228,40 @@ pub async fn run(config: &FederationConfig<FedContext>, job: &crate::domain::Job
         other => return Err(quarantine(format!("unknown federation event {other}"))),
     };
 
+    // G-D relays: public content activities also forward to each configured
+    // relay peer (same fixed bytes; per-host budget via `RelayForward`).
+    // Targeted activities (likes, flags, quotes, blocks, profile/deletion
+    // bookkeeping) never leave their addressed inboxes, and non-public
+    // statuses never reach a relay — this allowlist is deliberately narrower
+    // than "everything but deletes/blocks", so moderation traffic (Flag) and
+    // direct/private content cannot leak to relays.
+    if matches!(
+        event.as_str(),
+        "create" | "update" | "delete" | "announce" | "question_update"
+    ) {
+        let relay_public = uint("status_id")
+            .and_then(|id| store.status_by_id(id).ok().flatten())
+            .is_some_and(|status| status.visibility == Visibility::Public);
+        if relay_public {
+            for relay in crate::federation::delivery::relay_inboxes(ctx.relays.as_slice()) {
+                for body in &bodies {
+                    store
+                        .enqueue(
+                            JobKind::RelayForward,
+                            serde_json::json!({
+                                "sender_id": author.id.value(),
+                                "relay_inbox": relay.as_str(),
+                                "activity_uri": body.get("id").and_then(Value::as_str).unwrap_or_default(),
+                                "body": body,
+                            }),
+                            now,
+                        )
+                        .map_err(retry)?;
+                }
+            }
+        }
+    }
+
     for body in &bodies {
         let activity_uri = body.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
         tracing::debug!(target: "birchtree::federation", direction = "outbound", event = %event, activity = %activity_uri, destinations = inboxes.len(), "event planned");

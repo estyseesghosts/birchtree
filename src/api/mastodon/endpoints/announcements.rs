@@ -174,12 +174,32 @@ async fn react(
             state.context.now_ms(),
             state.context.next_id(),
         ) {
-            Ok(_) => (StatusCode::OK, axum::Json(json!({}))).into_response(),
+            Ok(_) => {
+                // Announcement streaming (gaps G-B): reactions ride the
+                // `announcement.reaction` event on `user` streams.
+                state.streams.publish_announcement(
+                    crate::streaming::hub::AnnouncementEvent::Reaction {
+                        announcement_id,
+                        name: name.to_string(),
+                    },
+                );
+                (StatusCode::OK, axum::Json(json!({}))).into_response()
+            }
             Err(err) => ApiError::from(err).into_response(),
         }
     } else {
         match uc::remove_reaction(&*db, announcement_id, viewer, name) {
-            Ok(_) => (StatusCode::OK, axum::Json(json!({}))).into_response(),
+            Ok(_) => {
+                // Announcement streaming (gaps G-B): reactions ride the
+                // `announcement.reaction` event on `user` streams.
+                state.streams.publish_announcement(
+                    crate::streaming::hub::AnnouncementEvent::Reaction {
+                        announcement_id,
+                        name: name.to_string(),
+                    },
+                );
+                (StatusCode::OK, axum::Json(json!({}))).into_response()
+            }
             Err(err) => ApiError::from(err).into_response(),
         }
     }
@@ -358,7 +378,19 @@ pub async fn admin_create(
         now_ms,
         state.context.next_id(),
     ) {
-        Ok(row) => row,
+        Ok(row) => {
+            // Announcement streaming (gaps G-B): a published row rides the
+            // `announcement` event on `user` streams (scheduled rows publish
+            // on their explicit publish instead).
+            if row.published {
+                state.streams.publish_announcement(
+                    crate::streaming::hub::AnnouncementEvent::Published {
+                        announcement_id: row.id,
+                    },
+                );
+            }
+            row
+        }
         Err(err) => return ApiError::from(err).into_response(),
     };
     match render_announcement(&state.server, &*state.context.store, db, &row, viewer).await
@@ -425,7 +457,14 @@ pub async fn admin_destroy(
     };
     let db = db_for(&state.context.store);
     match uc::destroy_announcement(&*db, id) {
-        Ok(_) => (StatusCode::OK, axum::Json(json!({}))).into_response(),
+        Ok(_) => {
+            // Announcement streaming (gaps G-B): destroys ride
+            // `announcement.delete` on `user` streams.
+            state.streams.publish_announcement(
+                crate::streaming::hub::AnnouncementEvent::Deleted { announcement_id: id },
+            );
+            (StatusCode::OK, axum::Json(json!({}))).into_response()
+        }
         Err(err) => ApiError::from(err).into_response(),
     }
 }
@@ -472,6 +511,19 @@ async fn admin_flip(state: &ApiState, auth: &Auth, raw: &str, publish: bool) -> 
     };
     match row {
         Ok(row) => {
+            // Announcement streaming (gaps G-B): explicit publish/unpublish
+            // ride `announcement` / `announcement.delete` on `user` streams.
+            // (Plain `admin_update` publishes nothing: no upstream broadcast
+            // was found for edits.)
+            if publish {
+                state.streams.publish_announcement(
+                    crate::streaming::hub::AnnouncementEvent::Published { announcement_id: row.id },
+                );
+            } else {
+                state.streams.publish_announcement(
+                    crate::streaming::hub::AnnouncementEvent::Deleted { announcement_id: row.id },
+                );
+            }
             match render_announcement(&state.server, &*state.context.store, db, &row, viewer)
                 .await
             {

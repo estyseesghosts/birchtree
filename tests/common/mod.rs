@@ -247,6 +247,7 @@ pub fn federation_config_with(
                 debug,
                 None,
                 false,
+                &[],
             ))
             .expect("federation config")
     })

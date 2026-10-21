@@ -15,7 +15,8 @@ use crate::domain::{
     Account, AdminAccountOverview, AdminAuditRecord, AdminCanonicalEmailBlock, AdminDomainAllow,
     AdminDomainBlock, AdminDomainSeverity, AdminEmailDomainBlock, AdminIpBlock, AdminIpSeverity,
     AdminMediaOwner, AdminReportTarget, AdminTag, Error, Follow, FollowMetricRow, Id,
-    MediaAttachment, Report, Result, Rule, SignInEvent, Status,
+    MediaAttachment, Report, Result, Rule, RuleTranslation, SignInEvent, Status,
+    RULE_LOCALE_LIMIT, RULE_TEXT_LIMIT,
 };
 
 use super::schema::{
@@ -23,7 +24,8 @@ use super::schema::{
     ADMIN_CANONICAL_EMAIL_BLOCK_BY_HASH, ADMIN_DOMAIN_ALLOWS, ADMIN_DOMAIN_ALLOW_BY_DOMAIN,
     ADMIN_DOMAIN_BLOCKS, ADMIN_DOMAIN_BLOCK_BY_DOMAIN, ADMIN_EMAIL_DOMAIN_BLOCKS,
     ADMIN_EMAIL_DOMAIN_BLOCK_BY_DOMAIN, ADMIN_IP_BLOCKS, ADMIN_IP_BLOCK_BY_IP, ADMIN_TAGS,
-    ADMIN_TAG_BY_NAME, FOLLOWS, HASHTAG_INDEX, MEDIA, REPORTS, RULES, SIGN_INS, STATUSES,
+    ADMIN_TAG_BY_NAME, FOLLOWS, HASHTAG_INDEX, MEDIA, REPORTS, RULES, RULE_TRANSLATIONS, SIGN_INS,
+    STATUSES,
 };
 use super::{decode, encode, RedbStore};
 
@@ -325,6 +327,24 @@ impl AdminInfraStore for RedbStore {
 
     fn admin_email_domain_block_by_id(&self, id: Id) -> Result<Option<AdminEmailDomainBlock>> {
         get_by_desc(self, ADMIN_EMAIL_DOMAIN_BLOCKS, id)
+    }
+
+    fn email_domain_block_for_domain(&self, domain: &str) -> Result<Option<AdminEmailDomainBlock>> {
+        // Domains are unique at creation (`admin_create_email_domain_block`
+        // refuses duplicates), so the by-domain index holds at most one row.
+        let normalized = use_cases::normalize_domain(domain);
+        if normalized.is_empty() {
+            return Ok(None);
+        }
+        let found: Option<u64> = {
+            let read = self.begin_read()?;
+            let by_domain = read.open_table(ADMIN_EMAIL_DOMAIN_BLOCK_BY_DOMAIN)?;
+            by_domain.get(normalized.as_str())?.map(|guard| guard.value())
+        };
+        let Some(id) = found else {
+            return Ok(None);
+        };
+        get_by_desc(self, ADMIN_EMAIL_DOMAIN_BLOCKS, Id::new(id))
     }
 
     fn admin_email_domain_blocks_page(
@@ -1048,6 +1068,80 @@ impl AdminInfraStore for RedbStore {
             }
         }
         Ok(out)
+    }
+
+    fn admin_rule_translations(&self) -> Result<Vec<RuleTranslation>> {
+        let read = self.begin_read()?;
+        let table = read.open_table(RULE_TRANSLATIONS)?;
+        let mut out = Vec::new();
+        for entry in table.iter()? {
+            let (_, value) = entry?;
+            out.push(decode(value.value())?);
+        }
+        out.sort_by(|a: &RuleTranslation, b: &RuleTranslation| {
+            a.rule_id
+                .value()
+                .cmp(&b.rule_id.value())
+                .then_with(|| a.locale.cmp(&b.locale))
+        });
+        Ok(out)
+    }
+
+    fn admin_set_rule_translation(
+        &self,
+        rule_id: Id,
+        locale: String,
+        text: String,
+        hint: String,
+        now_ms: u64,
+    ) -> Result<RuleTranslation> {
+        let locale = locale.trim().to_string();
+        if locale.is_empty()
+            || locale.len() > RULE_LOCALE_LIMIT
+            || !locale.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err(Error::InvalidInput(format!(
+                "rule locale {locale:?} is not a BCP-47 tag"
+            )));
+        }
+        if text.chars().count() > RULE_TEXT_LIMIT {
+            return Err(Error::InvalidInput("Validation failed: Text is too long".into()));
+        }
+        let write = self.begin_write()?;
+        {
+            let rules = write.open_table(RULES)?;
+            if rules.get(rule_id.value())?.is_none() {
+                return Err(Error::NotFound(format!("rule {rule_id}")));
+            }
+        }
+        let row = RuleTranslation {
+            rule_id,
+            locale: locale.clone(),
+            text,
+            hint,
+            updated_at_ms: now_ms,
+        };
+        {
+            let mut table = write.open_table(RULE_TRANSLATIONS)?;
+            table.insert(
+                super::schema::rule_translation_key(rule_id.value(), &locale).as_str(),
+                encode(&row)?.as_slice(),
+            )?;
+        }
+        write.commit()?;
+        Ok(row)
+    }
+
+    fn admin_delete_rule_translation(&self, rule_id: Id, locale: &str) -> Result<bool> {
+        let write = self.begin_write()?;
+        let removed = {
+            let mut table = write.open_table(RULE_TRANSLATIONS)?;
+            table
+                .remove(super::schema::rule_translation_key(rule_id.value(), locale).as_str())?
+                .is_some()
+        };
+        write.commit()?;
+        Ok(removed)
     }
 
     fn admin_hashtag_names(&self, cap: usize) -> Result<Vec<String>> {

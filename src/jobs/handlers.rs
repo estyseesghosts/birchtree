@@ -196,6 +196,7 @@ pub fn handle_with_transcode(
         | JobKind::ResolveParent
         | JobKind::CrawlReplies
         | JobKind::FetchRemoteMedia
+        | JobKind::FetchRemoteEmoji
         | JobKind::PreviewCardFetch => Ok(()),
         JobKind::GenerateAnnualReport => {            let account_id = job
                 .payload
@@ -308,6 +309,17 @@ pub fn handle_with_transcode(
         // No-op until their batches land; payloads stay < 64 KiB, batches
         // bounded to 500 rows, no blobs in the transaction.
         JobKind::CacheEvict | JobKind::ReconcileStorage => Ok(()),
+        // Gaps batch skeletons (`docs/gaps.md` Step 0): G-C owns
+        // `CollectionFanout`, G-D owns `QuoteReverify` + `RelayForward`.
+        // `CollectionFanout` runs here (sync use case over the same store);
+        // the federation tail kinds stay worker-owned no-ops in the drain.
+        JobKind::CollectionFanout => {
+            crate::application::collections::handle_fanout(store, store, job)
+        }
+        // `SyncFollowers` needs the async HTTP client, which the sync drain
+        // does not have: the worker owns it, and offline drains complete it
+        // without doing work (same shape as `WebPushDelivery`).
+        JobKind::QuoteReverify | JobKind::RelayForward | JobKind::SyncFollowers => Ok(()),
         JobKind::DeliverActivity => Err(Error::Internal(
             "deliver_activity runs in the job worker (federation::delivery), not here".into(),
         )),

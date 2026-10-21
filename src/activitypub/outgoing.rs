@@ -195,6 +195,7 @@ fn note_inner(store: &dyn Store, public_url: &str, status: &Status) -> Result<Va
             }
         }
     }
+    note["replies"] = crate::activitypub::objects::note_replies_value(&status.uri, status.replies_count);
     Ok(note)
 }
 

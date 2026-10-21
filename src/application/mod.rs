@@ -34,3 +34,5 @@ pub mod conversations;
 pub mod push;
 pub mod push_crypto;
 pub mod web;
+// Gaps batch (`docs/gaps.md` Step 0): G-C owns this module.
+pub mod collections;

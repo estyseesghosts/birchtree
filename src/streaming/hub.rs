@@ -79,6 +79,41 @@ impl Default for Limits {
     }
 }
 
+/// A committed announcement change (gaps batch, G-B; closes the streaming
+/// half of the announcements TODO).
+///
+/// Upstream (`PublishAnnouncementReactionWorker`, the publish/delete Rails
+/// paths) publishes `announcement`, `announcement.reaction` and
+/// `announcement.delete` to `timeline:{account.id}` — i.e. every connected
+/// `user` stream — for every active account with a live subscription. The
+/// `user:notification` stream (the `:notifications` channel) does NOT carry
+/// them. Payloads (docs.joinmastodon.org/methods/streaming):
+/// - `announcement`: the Announcement JSON, rendered per subscriber (`read`
+///   and reaction `me` flags are per-viewer);
+/// - `announcement.reaction`: `{name, count, announcement_id}` (+
+///   `url`/`static_url` for custom emoji);
+/// - `announcement.delete`: the bare announcement id string (the row is
+///   gone, like a status `delete`).
+///
+/// Dismissals (mutes) publish nothing: read state is per-user, exactly like
+/// upstream.
+#[derive(Debug, Clone)]
+pub enum AnnouncementEvent {
+    /// A row was published (admin create with past/no schedule, or explicit
+    /// publish). The hub re-reads the row; a missing/unpublished row sends
+    /// nothing (a delete raced the publish).
+    Published { announcement_id: Id },
+    /// A reaction was added or removed. The hub recomputes the count at
+    /// delivery (like the upstream worker); a missing row sends nothing.
+    Reaction {
+        announcement_id: Id,
+        name: String,
+    },
+    /// A row was unpublished or destroyed. Carries the id because the row
+    /// may be gone; the payload is the bare id string.
+    Deleted { announcement_id: Id },
+}
+
 /// One frame for a transport to write.
 #[derive(Debug)]
 pub struct Frame {
@@ -356,12 +391,20 @@ impl Core {
 }
 
 /// The fan-out thread: drains events, runs the policy, queues frames.
-fn run(core: Arc<Core>, rx: mpsc::Receiver<StreamEvent>) {
+///
+/// Announcement events ride a second bounded queue with the same overflow
+/// policy (overflow closes every stream rather than dropping an event
+/// silently). One thread drains both so frame order per subscription stays
+/// commit-ordered per event source.
+fn run(core: Arc<Core>, rx: mpsc::Receiver<StreamEvent>, arx: mpsc::Receiver<AnnouncementEvent>) {
     loop {
         match rx.recv_timeout(SWEEP_INTERVAL) {
             Ok(event) => super::fanout::process(&core, event),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
+        }
+        while let Ok(announcement) = arx.try_recv() {
+            super::fanout::process_announcement(&core, announcement);
         }
         if core.overflow.swap(false, Ordering::AcqRel) {
             tracing::warn!("stream event queue overflowed; closing every stream");
@@ -384,6 +427,7 @@ pub struct HubStats {
 pub struct Hub {
     core: Arc<Core>,
     events: SyncSender<StreamEvent>,
+    announcements: SyncSender<AnnouncementEvent>,
 }
 
 impl Hub {
@@ -396,6 +440,7 @@ impl Hub {
         limits: Limits,
     ) -> Self {
         let (events, rx) = mpsc::sync_channel(limits.event_queue.max(1));
+        let (announcements, arx) = mpsc::sync_channel(limits.event_queue.max(1));
         let core = Arc::new(Core {
             limits,
             store,
@@ -409,9 +454,9 @@ impl Hub {
         let thread_core = core.clone();
         std::thread::Builder::new()
             .name("birchtree-streams".into())
-            .spawn(move || run(thread_core, rx))
+            .spawn(move || run(thread_core, rx, arx))
             .expect("spawn stream fan-out thread");
-        Self { core, events }
+        Self { core, events, announcements }
     }
 
     /// The configured bounds.
@@ -481,6 +526,22 @@ impl Hub {
 impl StreamingSink for Hub {
     fn publish(&self, event: StreamEvent) {
         match self.events.try_send(event) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                self.core.dropped_events.fetch_add(1, Ordering::AcqRel);
+                self.core.overflow.store(true, Ordering::Release);
+            }
+            Err(TrySendError::Disconnected(_)) => {}
+        }
+    }
+}
+
+impl Hub {
+    /// Publish a committed announcement change (adapter calls this after the
+    /// use case commits, never inside a storage transaction). Non-blocking;
+    /// the same overflow policy as [`StreamingSink::publish`] applies.
+    pub fn publish_announcement(&self, event: AnnouncementEvent) {
+        match self.announcements.try_send(event) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 self.core.dropped_events.fetch_add(1, Ordering::AcqRel);

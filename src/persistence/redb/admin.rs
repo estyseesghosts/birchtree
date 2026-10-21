@@ -102,8 +102,9 @@ fn role_matches(user: Option<&LocalUser>, filter: &AdminAccountFilter) -> bool {
     if !filter.role_names.is_empty() {
         let role = user.map(|u| u.role).unwrap_or(UserRole::None);
         let wanted = |name: &str| match name.to_ascii_lowercase().as_str() {
-            "admin" => role == UserRole::Admin,
-            "moderator" => role == UserRole::Moderator,
+            "admin" | "2" => role == UserRole::Admin,
+            "moderator" | "1" => role == UserRole::Moderator,
+            "user" | "0" => role == UserRole::None,
             _ => false,
         };
         if !filter.role_names.iter().any(|n| wanted(n)) {
@@ -608,6 +609,17 @@ impl AdminStore for RedbStore {
                 "warning",
                 &warning.id.to_string(),
                 now_ms,
+            )?;
+        }
+        // D51 `moderation_warning` to the action target, same transaction
+        // (G-B producer). Every action type records a strike upstream
+        // (`process_strike!`), so every action notifies — including
+        // suspend/disable (honest history on a row the user may re-read).
+        for job in crate::application::notifications::emit_moderation_warning(account_id, now_ms)
+        {
+            super::jobs::insert_job(
+                &write,
+                &Job::new(self.next_id(), job.kind, job.payload, now_ms, now_ms),
             )?;
         }
 

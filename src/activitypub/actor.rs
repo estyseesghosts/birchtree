@@ -209,6 +209,18 @@ impl Object for ActorRecord {
             followers: self.account.local.then(|| Url::parse(&format!("{}/followers", self.account.actor_uri)).ok()).flatten(),
             following: self.account.local.then(|| Url::parse(&format!("{}/following", self.account.actor_uri)).ok()).flatten(),
             outbox: self.account.local.then(|| Url::parse(&format!("{}/outbox", self.account.actor_uri)).ok()).flatten(),
+            // G-D: `None` until the move flow records a successor via
+            // `set_moved_to`; then this renders `{successor_actor_uri}` so
+            // verifiers can check the link-back (D32a).
+            also_known_as: None,
+            // Local rows serve `{actor}/collections/featured`; remotes carry
+            // none (same convention as followers/following/outbox above).
+            featured_tags: self.account.local.then(|| {
+                Url::parse(&crate::activitypub::objects::featured_tags_collection_uri(
+                    &self.account.actor_uri,
+                ))
+                .ok()
+            }).flatten(),
             icon,
             image,
         })
@@ -306,6 +318,16 @@ pub struct Person {
     pub following: Option<Url>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outbox: Option<Url>,
+    /// `alsoKnownAs` aliases (federation tail, G-D): populated on local
+    /// rows once the move flow sets a successor (S4); parsed but not yet
+    /// link-checked on ingest (recorded as D32a).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub also_known_as: Option<Vec<Url>>,
+    /// `featuredTags` collection URI, served at `{actor}/collections/featured`
+    /// for local rows (federation tail, G-D; `None` for remotes, like the
+    /// followers/following/outbox collections).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub featured_tags: Option<Url>,
     /// Avatar (`icon`) and header (`image`) attachments, present only while
     /// the account references a staged blob (upstream `avatar_exists?` /
     /// `header_exists?`). Remote avatar caching is out of profile: remote

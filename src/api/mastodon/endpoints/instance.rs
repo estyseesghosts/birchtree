@@ -15,8 +15,9 @@
 //! when unconfigured — never a fabricated document.
 
 use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap};
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{Value, json};
@@ -25,7 +26,7 @@ use crate::api::mastodon::errors::ApiError;
 use crate::api::mastodon::ApiState;
 use crate::api::mastodon::dto::{self, InstanceStats};
 use crate::application::ports::Store;
-use crate::domain::{Account, AdminDomainBlock, AdminDomainSeverity, Id};
+use crate::domain::{Account, AdminDomainBlock, AdminDomainSeverity, Id, Rule};
 
 /// Bounded full-table scans backing the instance counters (round 3, D31).
 const INSTANCE_SCAN_CAP: usize = 200_000;
@@ -156,6 +157,9 @@ pub async fn peers_index(State(state): State<ApiState>) -> Response {
 /// `hint`, `translations`; `app/serializers/rest/rule_serializer.rb:3-12`).
 /// Upstream order is `(priority, id)` (`app/models/rule.rb:27`); local rules
 /// carry no priority (all-zero upstream default), so id order matches.
+/// `translations` is `{locale: {text, hint}}` (4.4+); a rule with no
+/// translation rows renders `{}` and clients fall back to the base
+/// `text`/`hint`.
 pub async fn rules_index(State(state): State<ApiState>) -> Response {
     let store: &dyn Store = &*state.context.store;
     let mut rules = match store.admin_rules() {
@@ -163,21 +167,45 @@ pub async fn rules_index(State(state): State<ApiState>) -> Response {
         Err(err) => return ApiError::from(err).into_response(),
     };
     rules.sort_by_key(|rule| rule.id);
-    let body: Vec<Value> = rules
-        .iter()
-        .map(|rule| {
-            json!({
-                "id": rule.id.to_string(),
-                "text": rule.text,
-                "hint": rule.hint,
-                // No rule translations are stored; upstream renders `{}` for
-                // untranslated rules (`rule_serializer.rb:8-10`
-                // `translations.to_h` over zero rows).
-                "translations": {},
-            })
-        })
-        .collect();
+    let translations = match store.admin_rule_translations() {
+        Ok(rows) => rows,
+        Err(err) => return ApiError::from(err).into_response(),
+    };
+    let mut by_rule: HashMap<Id, BTreeMap<&str, &crate::domain::RuleTranslation>> = HashMap::new();
+    for row in &translations {
+        by_rule.entry(row.rule_id).or_default().insert(row.locale.as_str(), row);
+    }
+    let body: Vec<Value> = rules.iter().map(|rule| rule_json(rule, &by_rule)).collect();
     Json(body).into_response()
+}
+
+/// Render one rule with its translations (`REST::RuleSerializer` shape).
+/// Locales sort ascending (BTreeMap); an untranslated rule renders
+/// `translations: {}` exactly like upstream's `translations.to_h` over zero
+/// rows.
+fn rule_json(
+    rule: &Rule,
+    by_rule: &HashMap<Id, BTreeMap<&str, &crate::domain::RuleTranslation>>,
+) -> Value {
+    let translations: serde_json::Map<String, Value> = by_rule
+        .get(&rule.id)
+        .map(|rows| {
+            rows.iter()
+                .map(|(locale, row)| {
+                    (
+                        locale.to_string(),
+                        json!({ "text": row.text, "hint": row.hint }),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({
+        "id": rule.id.to_string(),
+        "text": rule.text,
+        "hint": rule.hint,
+        "translations": Value::Object(translations),
+    })
 }
 
 /// Whether the public domain-blocks list is served. Upstream hides it by
@@ -267,35 +295,103 @@ pub async fn domain_blocks_index(State(state): State<ApiState>) -> Response {
     Json(rows.iter().map(public_domain_block_json).collect::<Vec<_>>()).into_response()
 }
 
-/// `GET /api/v1/instance/languages` — languages in use.
+/// `GET /api/v1/instance/languages` — the locale catalog.
 ///
 /// Upstream (`app/controllers/api/v1/instances/languages_controller.rb:9-12`)
 /// renders every key of `LanguagesHelper::SUPPORTED_LOCALES` (the ISO-639
 /// catalog, `app/helpers/languages_helper.rb:236`) with its localized name
 /// (`LanguagePresenter`, `language_presenter.rb`; `REST::LanguageSerializer`
-/// `code`/`name`). Birchtree bundles no locale catalog, so this serves the
-/// distinct languages of indexed statuses with `name` set to the code itself
-/// (recorded divergence until a catalog lands).
-pub async fn languages_show(State(state): State<ApiState>) -> Response {
-    let store: &dyn Store = &*state.context.store;
-    let rows = match store.admin_status_metrics(INSTANCE_SCAN_CAP) {
-        Ok(rows) => rows,
-        Err(err) => return ApiError::from(err).into_response(),
-    };
-    let mut set: HashSet<&str> = HashSet::new();
-    for row in &rows {
-        if let Some(language) = row.language.as_deref() {
-            set.insert(language);
-        }
-    }
-    let mut codes: Vec<&str> = set.into_iter().collect();
-    codes.sort_unstable();
-    let body: Vec<Value> = codes
+/// `code`/`name`). This serves the same static shape from the bundled
+/// [`LOCALE_CATALOG`] below: every supported code with its autonym, sorted
+/// by code. It is a snapshot, not a live CLDR lookup — unknown codes can
+/// never appear because the set is fixed (no `name` = code fallback rows).
+pub async fn languages_show() -> Response {
+    let body: Vec<Value> = LOCALE_CATALOG
         .iter()
-        .map(|code| json!({ "code": code, "name": code }))
+        .map(|(code, name)| json!({ "code": code, "name": name }))
         .collect();
     Json(body).into_response()
 }
+
+/// Static ISO-639 locale catalog: `(code, localized autonym)` pairs sorted
+/// by code (gaps batch G-A).
+///
+/// Snapshot of upstream's `SUPPORTED_LOCALES` autonyms (rails-i18n): clients
+/// use this for language pickers, so the names are the languages' own names
+/// (`Français`, `Deutsch`, `日本語`), never the bare code.
+const LOCALE_CATALOG: &[(&str, &str)] = &[
+    ("ar", "العربية"),
+    ("ast", "Asturianu"),
+    ("bg", "Български"),
+    ("bn", "বাংলা"),
+    ("br", "Brezhoneg"),
+    ("ca", "Català"),
+    ("ckb", "کوردی"),
+    ("cs", "Čeština"),
+    ("cy", "Cymraeg"),
+    ("da", "Dansk"),
+    ("de", "Deutsch"),
+    ("el", "Ελληνικά"),
+    ("en", "English"),
+    ("eo", "Esperanto"),
+    ("es", "Español"),
+    ("et", "Eesti"),
+    ("eu", "Euskara"),
+    ("fa", "فارسی"),
+    ("fi", "Suomi"),
+    ("fr", "Français"),
+    ("gl", "Galego"),
+    ("he", "עברית"),
+    ("hi", "हिन्दी"),
+    ("hr", "Hrvatski"),
+    ("hu", "Magyar"),
+    ("hy", "Հայերեն"),
+    ("id", "Bahasa Indonesia"),
+    ("ie", "Interlingue"),
+    ("io", "Ido"),
+    ("is", "Íslenska"),
+    ("it", "Italiano"),
+    ("ja", "日本語"),
+    ("ka", "ქართული"),
+    ("kab", "Taqbaylit"),
+    ("kk", "Қазақша"),
+    ("kn", "ಕನ್ನಡ"),
+    ("ko", "한국어"),
+    ("ku", "Kurdî"),
+    ("la", "Latina"),
+    ("lt", "Lietuvių"),
+    ("lv", "Latviešu"),
+    ("ml", "മലയാളം"),
+    ("mr", "मराठी"),
+    ("ms", "Bahasa Melayu"),
+    ("nl", "Nederlands"),
+    ("nn", "Nynorsk"),
+    ("no", "Norsk"),
+    ("oc", "Occitan"),
+    ("pl", "Polski"),
+    ("pt-BR", "Português (Brasil)"),
+    ("pt-PT", "Português (Portugal)"),
+    ("ro", "Română"),
+    ("ru", "Русский"),
+    ("sc", "Sardu"),
+    ("si", "සිංහල"),
+    ("sk", "Slovenčina"),
+    ("sl", "Slovenščina"),
+    ("sq", "Shqip"),
+    ("sr", "Српски"),
+    ("sr-Latn", "Srpski (latinica)"),
+    ("sv", "Svenska"),
+    ("ta", "தமிழ்"),
+    ("te", "తెలుగు"),
+    ("th", "ไทย"),
+    ("tr", "Türkçe"),
+    ("uk", "Українська"),
+    ("ur", "اردو"),
+    ("vi", "Tiếng Việt"),
+    ("zh-CN", "简体中文"),
+    ("zh-HK", "繁體中文（香港）"),
+    ("zh-TW", "繁體中文（台灣）"),
+];
 
 /// Weeks of instance activity, like upstream (`WEEKS_OF_ACTIVITY = 12`,
 /// `app/controllers/api/v1/instances/activity_controller.rb:5`).
@@ -363,17 +459,64 @@ pub async fn activity_show(State(state): State<ApiState>) -> Response {
     Json(out).into_response()
 }
 
+/// Read an operator-authored site text file at serve time (gaps batch G-A;
+/// `Config::validate` deliberately checks shape only, never existence).
+///
+/// Returns the file content plus its modification time. Any failure (no path
+/// configured, unreadable file, unreadable mtime) is `None`: the resource
+/// keeps its honest-absence shape and no filesystem detail ever leaks.
+fn read_site_file(path: Option<&std::path::Path>) -> Option<(String, std::time::SystemTime)> {
+    let content = std::fs::read_to_string(path?);
+    let mtime = std::fs::metadata(path?).and_then(|meta| meta.modified());
+    match (content, mtime) {
+        (Ok(text), Ok(mtime)) => Some((text, mtime)),
+        _ => None,
+    }
+}
+
+/// Format a `SystemTime` as Mastodon's ISO-8601 with milliseconds
+/// (`2025-04-15T12:00:00.000Z`).
+fn rfc3339_ms_time(time: std::time::SystemTime) -> String {
+    let ms: i64 = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().try_into().unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+        .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string())
+}
+
+/// Format a `SystemTime` as a `YYYY-MM-DD` date (terms `effective_date`).
+fn date_only_time(time: std::time::SystemTime) -> String {
+    let ms: i64 = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().try_into().unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+        .map(|dt| dt.date_naive().to_string())
+        .unwrap_or_else(|| "1970-01-01".to_string())
+}
+
 /// `GET /api/v1/instance/extended_description`.
 ///
 /// Upstream (`extended_descriptions_controller.rb:16-19`) renders the
 /// `ExtendedDescription` row with `REST::ExtendedDescriptionSerializer`
-/// (`updated_at`, markdown `content`); when no description is set
+/// (`updated_at`, `content`); when no description is set
 /// (`ExtendedDescription.current`, `app/models/extended_description.rb:5-13`)
 /// the row is empty: `updated_at` renders `null` (`&.` on nil) and blank
-/// text renders `''`. That unset shape is served here (no description store
-/// exists yet).
-pub async fn extended_description_show() -> Response {
-    Json(json!({ "updated_at": Value::Null, "content": "" })).into_response()
+/// text renders `''`. A configured `--site-extended-file=` serves the file
+/// content with the file mtime as `updated_at` (content served verbatim —
+/// the operator authors the text shown on the about page); unconfigured
+/// keeps the unset shape.
+pub async fn extended_description_show(State(state): State<ApiState>) -> Response {
+    match read_site_file(state.server.site_extended_file.as_deref()) {
+        Some((content, mtime)) => Json(json!({
+            "updated_at": rfc3339_ms_time(mtime),
+            "content": content,
+        }))
+        .into_response(),
+        None => Json(json!({ "updated_at": Value::Null, "content": "" })).into_response(),
+    }
 }
 
 /// `GET /api/v1/instance/translation_languages`.
@@ -388,29 +531,65 @@ pub async fn translation_languages_show() -> Response {
 
 /// `GET /api/v1/instance/privacy_policy`.
 ///
-/// Upstream (`privacy_policies_controller.rb:7-10`) always serves a policy:
+/// Upstream (`privacy_policies_controller.rb:7-10`) serves `PrivacyPolicy`
+/// with `REST::PrivacyPolicySerializer` (`updated_at`, `content`);
 /// `PrivacyPolicy.current` falls back to the bundled default template
-/// (`app/models/privacy_policy.rb:3-15`). No policy text is configured or
-/// bundled here, so this answers 404 (recorded divergence until a
-/// `site_terms`-equivalent setting lands) rather than fabricating one.
-pub async fn privacy_policy_show() -> Response {
-    ApiError::not_found().into_response()
+/// (`app/models/privacy_policy.rb:3-15`). A configured
+/// `--site-privacy-file=` serves the file content with the file mtime as
+/// `updated_at` (content verbatim); unconfigured answers 404 rather than
+/// fabricating a policy.
+pub async fn privacy_policy_show(State(state): State<ApiState>) -> Response {
+    match read_site_file(state.server.site_privacy_file.as_deref()) {
+        Some((content, mtime)) => Json(json!({
+            "updated_at": rfc3339_ms_time(mtime),
+            "content": content,
+        }))
+        .into_response(),
+        None => ApiError::not_found().into_response(),
+    }
+}
+
+/// Render the file-backed terms of service (`REST::TermsOfServiceSerializer`:
+/// `effective_date`, `effective`, `content`, `succeeded_by`). The single
+/// configured file is the terms in force: `effective_date` is the file
+/// mtime's date, `effective` is always true, `succeeded_by` is null (one
+/// file holds no version chain). Content is served verbatim.
+fn terms_of_service_json(content: &str, mtime: std::time::SystemTime) -> Value {
+    json!({
+        "effective_date": date_only_time(mtime),
+        "effective": true,
+        "content": content,
+        "succeeded_by": Value::Null,
+    })
 }
 
 /// `GET /api/v1/instance/terms_of_service`.
 ///
 /// Upstream (`terms_of_service_controller.rb:7-10`) raises
-/// `ActiveRecord::RecordNotFound` (404) when no terms are in force. No terms
-/// rows exist here, so this answers 404 — the upstream unconfigured
-/// behavior.
-pub async fn terms_of_service_index() -> Response {
-    ApiError::not_found().into_response()
+/// `ActiveRecord::RecordNotFound` (404) when no terms are in force. A
+/// configured `--site-terms-file=` serves the current terms; unconfigured
+/// answers 404 — the upstream unconfigured behavior.
+pub async fn terms_of_service_index(State(state): State<ApiState>) -> Response {
+    match read_site_file(state.server.site_terms_file.as_deref()) {
+        Some((content, mtime)) => Json(terms_of_service_json(&content, mtime)).into_response(),
+        None => ApiError::not_found().into_response(),
+    }
 }
 
 /// `GET /api/v1/instance/terms_of_service/:date`.
 ///
 /// Upstream (`terms_of_service_controller.rb:12-15`) 404s on an unknown
-/// effective date; with no terms rows every date is unknown.
-pub async fn terms_of_service_show() -> Response {
-    ApiError::not_found().into_response()
+/// effective date. The file-backed store holds one version, so only the
+/// file mtime's date matches; every other date (and the unconfigured case)
+/// 404s.
+pub async fn terms_of_service_show(
+    State(state): State<ApiState>,
+    Path(date): Path<String>,
+) -> Response {
+    match read_site_file(state.server.site_terms_file.as_deref()) {
+        Some((content, mtime)) if date_only_time(mtime) == date => {
+            Json(terms_of_service_json(&content, mtime)).into_response()
+        }
+        _ => ApiError::not_found().into_response(),
+    }
 }

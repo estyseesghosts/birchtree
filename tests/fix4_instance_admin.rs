@@ -299,22 +299,17 @@ async fn instance_rules_serve_stored_rules_in_id_order() {
 
 #[tokio::test]
 async fn instance_languages_serve_distinct_status_languages() {
-    // Upstream shape: `[{code, name}]` (`language_serializer.rb`).
+    // Gaps batch G-A: static ISO-639 autonym catalog (68 entries, sorted),
+    // independent of posted statuses.
     let srv = TestServer::new(false);
     let router = instance_router(&srv);
-    let now = now_ms();
-    let alice = common::mk_account(&srv.store, "alice");
 
     let (status, body) = get_json(&router, "/api/v1/instance/languages").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, serde_json::json!([]));
-
-    post(&srv.store, alice.id, Some("en"), now);
-    post(&srv.store, alice.id, None, now);
-
-    let (status, body) = get_json(&router, "/api/v1/instance/languages").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, serde_json::json!([{"code": "en", "name": "en"}]));
+    let rows = body.as_array().expect("array");
+    assert!(!rows.is_empty(), "catalog is served");
+    assert!(rows.contains(&serde_json::json!({"code": "en", "name": "English"})));
+    assert!(rows.contains(&serde_json::json!({"code": "fr", "name": "Français"})));
 }
 
 #[tokio::test]

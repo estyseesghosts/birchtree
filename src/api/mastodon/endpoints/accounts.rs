@@ -107,13 +107,19 @@ pub async fn register(
 
     let cmd = RegisterAccountCommand {
         username,
-        email,
+        email: email.clone(),
         password,
         agreement,
         locale: field("locale"),
         reason: field("reason"),
         invite_code: field("invite_code"),
         display_name: None,
+        time_zone: field("time_zone"),
+        date_of_birth: field("date_of_birth"),
+    };
+    let profile = accounts::RegistrationProfile {
+        time_zone: field("time_zone"),
+        date_of_birth: field("date_of_birth"),
     };
 
     let store: &dyn Store = &*state.context.store;
@@ -121,16 +127,23 @@ pub async fn register(
     // registrations and attributes the account; unknown/unusable codes are
     // ignored while open. `state.invites` is the durable redb store in
     // production.
-    match accounts::register_account_with_invite(
+    //
+    // Policy-aware path (G-E): `time_zone`/`date_of_birth` capture + min-age
+    // gate, email-domain/canonical-email blocks reconciled with confirmation
+    // state. Delegates to the invite path for everything else.
+    match accounts::register_account_with_profile(
         store,
         store,
         &*state.invites,
+        store,
         &state.server.public_url,
         state.context.now_ms(),
         state.server.registrations_open,
         state.server.registrations_require_approval,
         state.server.invites_enabled,
+        state.server.minimum_age_years,
         &auth.0.app,
+        &profile,
         cmd,
     ) {
         Ok(registered) => {
@@ -235,6 +248,21 @@ pub async fn update_credentials(
         }
     };
 
+    apply_credentials_update(&state, account_id, &pairs, avatar_upload, header_upload).await
+}
+
+/// Shared `update_credentials` / `PATCH /api/v1/profile` core: validate the
+/// flattened params (and any staged avatar/header uploads) and commit the
+/// profile + settings patches, answering with the credential account body.
+/// Both routes carry the same params and semantics (the profile namespace is
+/// the 4.6+ alias of the credentials endpoints).
+async fn apply_credentials_update(
+    state: &ApiState,
+    account_id: crate::domain::Id,
+    pairs: &[(String, String)],
+    avatar_upload: Option<Vec<u8>>,
+    header_upload: Option<Vec<u8>>,
+) -> Response {
     let field = |key: &str| forms::get(&pairs, key);
 
     let display_name = field("display_name").map(str::to_string);
@@ -299,7 +327,7 @@ pub async fn update_credentials(
     // (blob storage cannot join `redb`); a failed commit leaves only a
     // bounded orphan, exactly like media uploads (`birchtree.md` §5).
     let avatar = match profile_image_slot(
-        &state,
+        state,
         "Avatar",
         AVATAR_LIMIT,
         "avatar",
@@ -310,7 +338,7 @@ pub async fn update_credentials(
         Err(err) => return err,
     };
     let header = match profile_image_slot(
-        &state,
+        state,
         "Header",
         HEADER_LIMIT,
         "header",
@@ -440,7 +468,7 @@ pub async fn update_credentials(
         }
     }
 
-    credential_response(&state, account_id)
+    credential_response(state, account_id)
 }
 
 /// `GET /api/v1/accounts/relationships`.
@@ -502,6 +530,155 @@ fn credential_response(state: &ApiState, account_id: crate::domain::Id) -> Respo
         stats.as_ref(),
     ))
     .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Profile namespace (gaps batch G-A; 4.6+ alias of the credentials
+// endpoints). Router wiring is parent-owned; the proposed routes are:
+//   GET    /api/v1/profile          -> profile_show
+//   PATCH  /api/v1/profile          -> profile_update
+//   DELETE /api/v1/profile/avatar   -> profile_avatar_destroy
+//   DELETE /api/v1/profile/header   -> profile_header_destroy
+// ---------------------------------------------------------------------------
+
+/// `GET /api/v1/profile` — the caller's own credential account.
+///
+/// Upstream (`profiles_controller.rb#show`, 4.6+): user token with `profile`
+/// or `read:accounts`; the same `CredentialAccount` body as
+/// `verify_credentials`.
+pub async fn profile_show(State(state): State<ApiState>, auth: Auth) -> Response {
+    if let Err(err) = auth.0.require_scopes(&["profile", "read", "read:accounts"]) {
+        return err.into_response();
+    }
+    let account_id = match auth.0.require_user() {
+        Ok(id) => id,
+        Err(err) => return err.into_response(),
+    };
+    credential_response(&state, account_id)
+}
+
+/// `PATCH /api/v1/profile` — same params and semantics as
+/// `PATCH /api/v1/accounts/update_credentials` (upstream
+/// `profiles_controller.rb#update`, 4.6+; user token + `write:accounts`).
+pub async fn profile_update(
+    State(state): State<ApiState>,
+    auth: Auth,
+    request: Request,
+) -> Response {
+    if let Err(err) = auth.0.require_scopes(WRITE_SCOPES) {
+        return err.into_response();
+    }
+    let account_id = match auth.0.require_user() {
+        Ok(id) => id,
+        Err(err) => return err.into_response(),
+    };
+    let (pairs, avatar_upload, header_upload) = if is_multipart(&request) {
+        match credential_multipart(&state, request).await {
+            Ok(fields) => (fields.pairs, fields.avatar, fields.header),
+            Err(err) => return err.into_response(),
+        }
+    } else {
+        match FormBody::from_request(request, &state).await {
+            Ok(FormBody(pairs)) => (pairs, None, None),
+            Err(rejection) => return rejection,
+        }
+    };
+    apply_credentials_update(&state, account_id, &pairs, avatar_upload, header_upload).await
+}
+
+/// Clear one profile-image slot (`avatar` or `header`) and answer with the
+/// credential account body. Success even when no image is set (upstream
+/// `profiles_controller.rb#delete_avatar/#delete_header`: "If there were no
+/// avatar associated with the profile, the response will still indicate a
+/// successful deletion"). The stale blob is dropped best-effort after the
+/// commit, like the update path.
+async fn clear_profile_image(state: &ApiState, account_id: crate::domain::Id, slot: &str) -> Response {
+    debug_assert!(slot == "avatar" || slot == "header");
+    let store: &dyn Store = &*state.context.store;
+    let previous = store
+        .account_by_id(account_id)
+        .ok()
+        .flatten()
+        .map(|account| (account.avatar_key, account.header_key));
+    let profile = match slot {
+        "avatar" => AccountProfileUpdate {
+            avatar: Some(None),
+            ..Default::default()
+        },
+        _ => AccountProfileUpdate {
+            header: Some(None),
+            ..Default::default()
+        },
+    };
+    if let Err(err) = store.update_account_profile(account_id, profile, state.context.now_ms()) {
+        return ApiError::from(err).into_response();
+    }
+    if let Some((old_avatar, old_header)) = previous
+        && let Ok(Some(account)) = store.account_by_id(account_id)
+    {
+        for (old, new) in [
+            (old_avatar, account.avatar_key),
+            (old_header, account.header_key),
+        ] {
+            if old != new
+                && let Some(key) = old
+                && !key.is_empty()
+                && let Err(err) = state.context.blobs.delete(&key)
+            {
+                tracing::warn!(account = account_id.value(), error = %err, "stale profile image left in place");
+            }
+        }
+    }
+    credential_response(state, account_id)
+}
+
+/// `DELETE /api/v1/profile/avatar` (4.2+; user token + `write:accounts`).
+pub async fn profile_avatar_destroy(State(state): State<ApiState>, auth: Auth) -> Response {
+    if let Err(err) = auth.0.require_scopes(WRITE_SCOPES) {
+        return err.into_response();
+    }
+    let account_id = match auth.0.require_user() {
+        Ok(id) => id,
+        Err(err) => return err.into_response(),
+    };
+    clear_profile_image(&state, account_id, "avatar").await
+}
+
+/// `DELETE /api/v1/profile/header` (4.2+; user token + `write:accounts`).
+pub async fn profile_header_destroy(State(state): State<ApiState>, auth: Auth) -> Response {
+    if let Err(err) = auth.0.require_scopes(WRITE_SCOPES) {
+        return err.into_response();
+    }
+    let account_id = match auth.0.require_user() {
+        Ok(id) => id,
+        Err(err) => return err.into_response(),
+    };
+    clear_profile_image(&state, account_id, "header").await
+}
+
+/// `GET /api/v1/accounts/:id/identity_proofs` — deprecated upstream (3.5.0:
+/// "now returns an empty array"); the only provider was Keybase. This server
+/// stores no identity proofs, so the empty array is the real per-account
+/// state, not a stub. Requires a user token like upstream (no scope gate is
+/// documented); unknown ids 404 like the sibling account reads.
+pub async fn identity_proofs_show(
+    State(state): State<ApiState>,
+    auth: Auth,
+    Path(id): Path<String>,
+) -> Response {
+    let _account_id = match auth.0.require_user() {
+        Ok(id) => id,
+        Err(err) => return err.into_response(),
+    };
+    let Ok(target) = id.parse::<crate::domain::Id>() else {
+        return ApiError::not_found().into_response();
+    };
+    let store: &dyn Store = &*state.context.store;
+    match store.account_by_id(target) {
+        Ok(Some(_)) => axum::Json(json!([])).into_response(),
+        Ok(None) => ApiError::not_found().into_response(),
+        Err(err) => ApiError::from(err).into_response(),
+    }
 }
 
 /// 422 with Mastodon's `ValidationErrorFormatter` shape.
@@ -812,8 +989,9 @@ pub async fn index(
 /// `skip_webfinger: true`): a leading `@` is stripped, the handle resolves
 /// local accounts and already-known remotes, and suspended accounts are
 /// returned (no suspension gate on this route). Remote handles unknown to
-/// this server 404 here — live webfinger resolution is the federation
-/// follow-up (named; the v2 search `resolve=` path already attempts it).
+/// this server resolve live over webfinger when the caller is authenticated
+/// (G-D); 404 only when truly missing, 401 for anonymous remote unknowns.
+/// (The v2 search `resolve=` path already attempts live resolution.)
 pub async fn lookup(
     State(state): State<ApiState>,
     auth: crate::api::mastodon::auth::OptionalAuth,
@@ -849,7 +1027,61 @@ pub async fn lookup(
             ))
             .into_response()
         }
-        Ok(None) => ApiError::not_found().into_response(),
+        Ok(None) => {
+            // G-D live WebFinger: unknown REMOTE handles resolve live over
+            // webfinger when the caller is authenticated; 404 only when
+            // truly missing. Local unknowns still 404.
+            let Some((_, domain)) = crate::activitypub::objects::split_remote_acct(stripped)
+            else {
+                return ApiError::not_found().into_response();
+            };
+            if !crate::activitypub::objects::lookup_should_resolve_live(
+                &domain,
+                &state.server.domain,
+            ) {
+                return ApiError::not_found().into_response();
+            }
+            // Live resolve is an authenticated affordance (never anonymous SSRF).
+            if auth.0.is_none() {
+                return ApiError::new(StatusCode::UNAUTHORIZED, "Authentication required")
+                    .into_response();
+            }
+            match crate::activitypub::resolve::resolve_handle(&state.federation, stripped).await {
+                Ok(Some(account)) => {
+                    let stats = store.account_stats(account.id).ok();
+                    // Federation tail refresh: a freshly resolved remote
+                    // row's counters re-sync from its served collections. An
+                    // enqueue failure never fails the lookup itself.
+                    if !account.local {
+                        let _ = store.enqueue(
+                            crate::domain::JobKind::SyncFollowers,
+                            serde_json::json!({"account_id": account.id.value()}),
+                            state.context.now_ms(),
+                        );
+                    }
+                    axum::Json(dto::account_json_with_stats(
+                        &state.server,
+                        &account,
+                        stats.as_ref(),
+                    ))
+                    .into_response()
+                }
+                Ok(None) => ApiError::not_found().into_response(),
+                Err(err) => {
+                    use crate::activitypub::error::FedError;
+                    match &err {
+                        FedError::Protocol(
+                            activitypub_federation::error::Error::NotFound
+                            | activitypub_federation::error::Error::ObjectDeleted(_)
+                            | activitypub_federation::error::Error::WebfingerResolveFailed(_),
+                        )
+                        | FedError::Domain(crate::domain::Error::NotFound(_))
+                        | FedError::Gone(_) => ApiError::not_found().into_response(),
+                        _ => ApiError::from(crate::domain::Error::from(err)).into_response(),
+                    }
+                }
+            }
+        }
         Err(err) => ApiError::from(err).into_response(),
     }
 }
@@ -1248,6 +1480,182 @@ pub async fn password_reset_create(
         now_ms,
     ) {
         Ok(_) => axum::Json(json!({})).into_response(),
+        Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Password-reset redemption (gaps batch G-A; closes the D12 remainder).
+//
+// The mailed "forgot password" link (`SendPasswordResetEmail` job) lands on
+// `GET /auth/password/edit?reset_password_token=…` (Devise
+// `PasswordsController#edit`, which renders the form without checking the
+// token) and submits to `POST /auth/password` (Devise `#update`, here POST
+// per the frozen shape). Bearer lifetime is
+// `Config::password_reset_ttl_hours` (default 6h); redemption consumes the
+// single-use bearer; unknown/used/expired/wrong-kind tokens answer one
+// indistinguishable 422 page (never an oracle). No new mailer shape.
+// Router wiring is parent-owned; the proposed routes are:
+//   GET  /auth/password/edit -> password_reset_page
+//   POST /auth/password      -> password_reset_update
+// ---------------------------------------------------------------------------
+
+/// Query shape for the mailed link: `?reset_password_token=…`.
+#[derive(Debug, serde::Deserialize)]
+pub struct PasswordResetQuery {
+    pub reset_password_token: Option<String>,
+}
+
+/// Bearer lifetime in ms for `ttl_hours` (`Config::password_reset_ttl_hours`).
+pub fn reset_bearer_ttl_ms(ttl_hours: u64) -> u64 {
+    ttl_hours.saturating_mul(3_600_000)
+}
+
+/// Validate a candidate new password (+ confirmation) BEFORE the bearer is
+/// touched: an invalid password must not consume the single-use token
+/// (upstream Devise clears the reset token only on a valid save, so a typo
+/// never burns the link).
+pub fn validate_reset_password(password: &str, confirmation: &str) -> Result<(), String> {
+    if password != confirmation {
+        return Err("Password confirmation doesn't match".to_string());
+    }
+    if password.chars().count() < accounts::MIN_PASSWORD_LEN {
+        return Err(format!(
+            "Password is too short (minimum is {} characters)",
+            accounts::MIN_PASSWORD_LEN
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a stored reset bearer is still live at `now_ms`.
+pub fn reset_bearer_live(created_at_ms: u64, now_ms: u64, ttl_hours: u64) -> bool {
+    now_ms.saturating_sub(created_at_ms) <= reset_bearer_ttl_ms(ttl_hours)
+}
+
+fn reset_page(status: StatusCode, title: &str, heading: &str, body: &str) -> Response {
+    use crate::api::oauth::consent_page::escape;
+    let html = format!(
+        "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>{}</title></head><body><main><h1>{}</h1><p>{}</p></main></body></html>\n",
+        escape(title),
+        escape(heading),
+        body,
+    );
+    (status, axum::response::Html(html)).into_response()
+}
+
+/// The set-password form. `error` re-renders the form with a message (422)
+/// keeping the token in the hidden field so the user can retry without
+/// burning the link; `None` is the fresh form (200).
+fn reset_form_page(token: &str, error: Option<&str>) -> Response {
+    use crate::api::oauth::consent_page::escape;
+    let status = if error.is_some() {
+        StatusCode::UNPROCESSABLE_ENTITY
+    } else {
+        StatusCode::OK
+    };
+    let error_html = error
+        .map(|message| format!("<p role=\"alert\">{}</p>", escape(message)))
+        .unwrap_or_default();
+    let html = format!(
+        "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>Set a new password</title></head><body><main>\
+         <h1>Set a new password</h1>{error_html}\
+         <form method=\"post\" action=\"/auth/password\">\
+         <input type=\"hidden\" name=\"reset_password_token\" value=\"{}\">\
+         <label>New password <input type=\"password\" name=\"password\" autocomplete=\"new-password\" required minlength=\"8\"></label>\
+         <label>Confirm new password <input type=\"password\" name=\"password_confirmation\" autocomplete=\"new-password\" required minlength=\"8\"></label>\
+         <button type=\"submit\">Change my password</button>\
+         </form></main></body></html>\n",
+        escape(token),
+    );
+    (status, axum::response::Html(html)).into_response()
+}
+
+/// The one indistinguishable invalid/used/expired-token page (422, never an
+/// oracle distinguishing unknown from used).
+fn reset_invalid_page() -> Response {
+    reset_page(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "Password reset failed",
+        "Password reset failed",
+        "This password reset link is invalid or has already been used. \
+         Request a new password reset email and try again.",
+    )
+}
+
+/// Look up a reset param in both the flat shape (`password`) and the Devise
+/// nested shape (`user[password]`).
+fn reset_param<'a>(pairs: &'a [(String, String)], key: &str) -> &'a str {
+    forms::get(pairs, key)
+        .or_else(|| forms::get(pairs, &format!("user[{key}]")))
+        .unwrap_or("")
+}
+
+/// `GET /auth/password/edit?reset_password_token=…` — the server-rendered
+/// set-password form. Like Devise's `#edit`, the token is not checked here;
+/// it rides the hidden field and is validated on submit.
+pub async fn password_reset_page(
+    axum::extract::Query(query): axum::extract::Query<PasswordResetQuery>,
+) -> Response {
+    reset_form_page(query.reset_password_token.as_deref().unwrap_or(""), None)
+}
+
+/// `POST /auth/password` — consume the bearer and set the new password.
+pub async fn password_reset_update(
+    State(state): State<ApiState>,
+    FormBody(pairs): FormBody,
+) -> Response {
+    let token = reset_param(&pairs, "reset_password_token");
+    let password = reset_param(&pairs, "password");
+    let confirmation = reset_param(&pairs, "password_confirmation");
+    if token.is_empty() {
+        return reset_invalid_page();
+    }
+    // Password problems answer before the bearer is touched, so a typo
+    // never burns the single-use link.
+    if let Err(message) = validate_reset_password(password, confirmation) {
+        return reset_form_page(token, Some(&message));
+    }
+    let store: &dyn Store = &*state.context.store;
+    let now_ms = state.context.now_ms();
+    let record = match store.redeem_email_token(token) {
+        Ok(record) => record,
+        Err(err) => return ApiError::from(err).into_response(),
+    };
+    let Some(record) = record else {
+        return reset_invalid_page();
+    };
+    // A confirmation bearer pasted here is refused (wrong flow, never
+    // silently accepted); the bearer is still consumed — single-use
+    // regardless of which endpoint reads it, like `confirm_email`.
+    if record.kind != EmailTokenKind::PasswordReset {
+        return reset_invalid_page();
+    }
+    if !reset_bearer_live(
+        record.created_at_ms,
+        now_ms,
+        state.server.password_reset_ttl_hours,
+    ) {
+        return reset_invalid_page();
+    }
+    let password_hash = match crate::application::crypto::hash_password(password) {
+        Ok(hash) => hash,
+        Err(_) => return ApiError::internal().into_response(),
+    };
+    match store.set_user_password(record.account_id, password_hash) {
+        Ok(_) => reset_page(
+            StatusCode::OK,
+            "Password changed",
+            "Password changed",
+            "Your password has been changed. You can now sign in.",
+        ),
+        // The account vanished after the mail was sent: answer the same
+        // invalid page rather than revealing which half failed.
+        Err(crate::domain::Error::NotFound(_)) => reset_invalid_page(),
         Err(err) => ApiError::from(err).into_response(),
     }
 }

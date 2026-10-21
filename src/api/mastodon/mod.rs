@@ -78,6 +78,18 @@ pub struct ServerInfo {
     pub domain_blocks_public: bool,
     /// Whether invite tokens are honored (mirrors `Config::invites_enabled`).
     pub invites_enabled: bool,
+    /// Bearer lifetime for password-reset tokens in hours (mirrors
+    /// `Config::password_reset_ttl_hours`, default 6; gaps batch G-A).
+    pub password_reset_ttl_hours: u64,
+    /// Minimum registration age in full years (mirrors
+    /// `Config::minimum_age_years`, default 16; gaps finish).
+    pub minimum_age_years: u8,
+    /// Operator-authored site text files, read at serve time (mirrors
+    /// `Config::site_terms_file` / `site_privacy_file` / `site_extended_file`;
+    /// gaps batch G-A). `None` keeps the honest-absence shapes.
+    pub site_terms_file: Option<std::path::PathBuf>,
+    pub site_privacy_file: Option<std::path::PathBuf>,
+    pub site_extended_file: Option<std::path::PathBuf>,
     /// Feed access gates (mirrors the four `Config::*_feed_access` keys,
     /// upstream defaults all `public`). Anything but `public` requires login
     /// on the anonymous-capable timelines; `disabled` serves `[]` to
@@ -206,6 +218,11 @@ impl ServerInfo {
             activity_api_enabled: cfg.activity_api_enabled,
             domain_blocks_public: cfg.domain_blocks_public,
             invites_enabled: cfg.invites_enabled,
+            password_reset_ttl_hours: cfg.password_reset_ttl_hours,
+            minimum_age_years: cfg.minimum_age_years,
+            site_terms_file: cfg.site_terms_file.clone(),
+            site_privacy_file: cfg.site_privacy_file.clone(),
+            site_extended_file: cfg.site_extended_file.clone(),
             local_live_feed_access: cfg.local_live_feed_access.clone(),
             remote_live_feed_access: cfg.remote_live_feed_access.clone(),
             local_topic_feed_access: cfg.local_topic_feed_access.clone(),

@@ -154,6 +154,70 @@ impl NotificationStore for RedbStore {
         Ok(matched)
     }
 
+    fn filtered_notifications_page(
+        &self,
+        recipient_id: Id,
+        limit: usize,
+        max_id: Option<Id>,
+        since_id: Option<Id>,
+        min_id: Option<Id>,
+    ) -> Result<Vec<Notification>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        if max_id.is_some_and(|m| m.value() == 0) {
+            return Ok(Vec::new());
+        }
+        let read = self.begin_read()?;
+        let index = read.open_table(NOTIFICATIONS_BY_RECIPIENT)?;
+        let rows = read.open_table(NOTIFICATIONS)?;
+        // Same cursor mapping as `notifications_page`, filter flipped: only
+        // filtered rows (upstream `browserable` with `include_filtered`).
+        let lower = max_id
+            .map(|m| schema::pair_key(recipient_id.value(), schema::desc_id(m.value()) + 1))
+            .unwrap_or_else(|| schema::pair_key(recipient_id.value(), 0));
+        let upper_exclusive = since_id
+            .or(min_id)
+            .map(|x| schema::desc_id(x.value()));
+        let want_oldest = min_id.is_some() && since_id.is_none();
+        let mut matched: Vec<Notification> = Vec::new();
+        let mut scanned = 0usize;
+        let entries = match upper_exclusive {
+            Some(upper) => {
+                let end = schema::pair_key(recipient_id.value(), upper);
+                index.range(lower.as_slice()..end.as_slice())?
+            }
+            None => {
+                let end = schema::pair_key(recipient_id.value(), u64::MAX);
+                index.range(lower.as_slice()..=end.as_slice())?
+            }
+        };
+        for entry in entries {
+            let (key, value) = entry?;
+            scanned += 1;
+            // Defensive: never leak another recipient's rows.
+            let owner = u64::from_be_bytes(key.value()[..8].try_into().unwrap());
+            if owner != recipient_id.value() {
+                break;
+            }
+            let id = Id::new(value.value());
+            if let Some(guard) = rows.get(id.value())? {
+                let notification: Notification = decode(guard.value())?;
+                if notification.filtered {
+                    matched.push(notification);
+                }
+            }
+            if (!want_oldest && matched.len() >= limit) || scanned >= PAGE_SCAN_CAP {
+                break;
+            }
+        }
+        if want_oldest && matched.len() > limit {
+            matched.drain(..matched.len() - limit);
+        }
+        self.note_scanned(scanned);
+        Ok(matched)
+    }
+
     fn notification_by_id(&self, id: Id) -> Result<Option<Notification>> {
         let read = self.begin_read()?;
         let table = read.open_table(NOTIFICATIONS)?;

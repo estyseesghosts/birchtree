@@ -18,13 +18,14 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
 use crate::api::forms::{self, LenientForm};
-use crate::api::mastodon::auth::{AdminArea, Auth, Authenticated};
+use crate::api::mastodon::auth::{Auth, Authenticated};
 use crate::api::mastodon::dto;
 use crate::api::mastodon::errors::{ApiError, ApiResult};
 use crate::api::mastodon::pagination;
 use crate::api::mastodon::ApiState;
 use crate::application::admin as admin_uc;
 use crate::application::ports::{AccountStore, AdminAccountFilter, AdminAccountPatch, Store};
+use crate::domain::user::AdminAction;
 use crate::domain::{Account, Id, LocalUser, UserRole};
 
 const READ_SCOPES: &[&str] = &["admin:read", "admin:read:accounts"];
@@ -33,13 +34,18 @@ const WRITE_SCOPES: &[&str] = &["admin:write", "admin:write:accounts"];
 /// Role-before-scope gate for every route in this module: app-only tokens
 /// get `422`, role-less users `403 {"error":"Forbidden"}`, and in-scope
 /// failures `403` with the scopes message. Returns the actor and its role.
-fn gate(
+///
+/// D35: the gate is per-action ([`AdminAction`]), checked against the
+/// caller's upstream permission bitmask before the scope check — the same
+/// order as upstream's `PermissionsConcern` → controller `authorize`.
+fn gate_action(
     auth: &Authenticated,
     store: &dyn Store,
+    action: AdminAction,
     scopes: &[&str],
 ) -> ApiResult<(Id, UserRole)> {
     let store: &dyn AccountStore = store;
-    let role = auth.require_admin(store, AdminArea::Accounts, scopes)?;
+    let role = auth.require_admin_action(store, action, scopes)?;
     let viewer = auth.require_user()?;
     Ok((viewer, role))
 }
@@ -58,9 +64,10 @@ fn opt_or_null(value: Option<String>) -> Value {
 /// `REST::Admin::AccountSerializer` (verified field list from
 /// `app/serializers/rest/admin/account_serializer.rb`).
 ///
-/// Gaps (never fabricated rows):
-/// - `role`: birchtree roles have no numeric ids or permission bitmask; the
-///   id is the role name and permissions stay empty.
+/// `role` carries the stable numeric id (`0` = everyone/`User`, `1` =
+/// `Moderator`, `2` = `Admin` — never `-1`) and the upstream permission
+/// bitmask as a decimal string (`0` for non-staff, `1049888` for
+/// moderators, the full set for admins).
 ///
 /// Served since the fix round: `ip` (latest login IP or `null`), `ips`
 /// (`[{ip, used_at}]`, newest first), `locale`, `invite_request`,
@@ -73,10 +80,11 @@ pub fn admin_account_json(
     account: &Account,
     user: Option<&LocalUser>,
 ) -> Value {
-    let (role_id, role_name) = match user.map(|u| u.role).unwrap_or(UserRole::None) {
-        UserRole::Admin => ("admin", "Admin"),
-        UserRole::Moderator => ("moderator", "Moderator"),
-        UserRole::None => ("user", "User"),
+    let role = user.map(|u| u.role).unwrap_or(UserRole::None);
+    let (role_id, role_name) = match role {
+        UserRole::Admin => (2u64, "Admin"),
+        UserRole::Moderator => (1u64, "Moderator"),
+        UserRole::None => (0u64, "User"),
     };
     // Login IPs, newest first (upstream `user.ips`, `IpSerializer`
     // `ip, used_at`); `ip` is the latest entry. Store errors degrade to the
@@ -123,15 +131,28 @@ pub fn admin_account_json(
         "role": {
             "id": role_id,
             "name": role_name,
-            "permissions": "",
+            "permissions": role.permissions().to_string(),
             "color": "",
-            "highlighted": false,
+            "highlighted": role.is_staff(),
         },
     })
 }
 
 fn parse_id(raw: &str) -> ApiResult<Id> {
     raw.parse::<Id>().map_err(|_| ApiError::not_found())
+}
+
+/// Translate one v2 `role_ids` filter token to the role name the store
+/// filter matches: the numeric serializer ids (`0`/`1`/`2`) map to their
+/// names, and legacy name tokens pass through unchanged (compat with
+/// clients that cached the pre-numeric shape).
+fn translate_role_id(raw: &str) -> String {
+    match raw.trim() {
+        "0" => "user".to_string(),
+        "1" => "moderator".to_string(),
+        "2" => "admin".to_string(),
+        other => other.to_string(),
+    }
 }
 
 fn parse_page(uri: &Uri) -> ApiResult<pagination::Page> {
@@ -199,7 +220,7 @@ fn index_response(
 
 /// `GET /api/v1/admin/accounts` — upstream v1 filter flags.
 pub async fn index_v1(State(state): State<ApiState>, auth: Auth, uri: Uri) -> Response {
-    if let Err(err) = gate(&auth.0, &*state.context.store, READ_SCOPES) {
+    if let Err(err) = gate_action(&auth.0, &*state.context.store, AdminAction::ViewAccounts, READ_SCOPES) {
         return err.into_response();
     }
     let page = match parse_page(&uri) {
@@ -245,7 +266,7 @@ pub async fn index_v1(State(state): State<ApiState>, auth: Auth, uri: Uri) -> Re
 
 /// `GET /api/v2/admin/accounts` — upstream v2 filter names.
 pub async fn index_v2(State(state): State<ApiState>, auth: Auth, uri: Uri) -> Response {
-    if let Err(err) = gate(&auth.0, &*state.context.store, READ_SCOPES) {
+    if let Err(err) = gate_action(&auth.0, &*state.context.store, AdminAction::ViewAccounts, READ_SCOPES) {
         return err.into_response();
     }
     let page = match parse_page(&uri) {
@@ -283,7 +304,7 @@ pub async fn index_v2(State(state): State<ApiState>, auth: Auth, uri: Uri) -> Re
         staff_only: forms::get(&pairs, "permissions") == Some("staff"),
         role_names: forms::all(&pairs, "role_ids")
             .into_iter()
-            .map(str::to_string)
+            .map(|raw| translate_role_id(&raw))
             .collect(),
         invited_by,
     };
@@ -319,7 +340,7 @@ pub async fn show(
     auth: Auth,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(err) = gate(&auth.0, &*state.context.store, READ_SCOPES) {
+    if let Err(err) = gate_action(&auth.0, &*state.context.store, AdminAction::ViewAccounts, READ_SCOPES) {
         return err.into_response();
     }
     let store: &dyn Store = &*state.context.store;
@@ -338,7 +359,7 @@ pub async fn destroy(
     auth: Auth,
     Path(id): Path<String>,
 ) -> Response {
-    let (actor, _) = match gate(&auth.0, &*state.context.store, WRITE_SCOPES) {
+    let (actor, _) = match gate_action(&auth.0, &*state.context.store, AdminAction::ModerateAccount, WRITE_SCOPES) {
         Ok(pair) => pair,
         Err(err) => return err.into_response(),
     };
@@ -381,7 +402,7 @@ async fn patch_flag(
     patch: AdminAccountPatch,
     local_only: bool,
 ) -> Response {
-    let (actor, _) = match gate(&auth.0, &*state.context.store, WRITE_SCOPES) {
+    let (actor, _) = match gate_action(&auth.0, &*state.context.store, AdminAction::ModerateAccount, WRITE_SCOPES) {
         Ok(pair) => pair,
         Err(err) => return err.into_response(),
     };
@@ -506,7 +527,7 @@ pub async fn approve(
     auth: Auth,
     Path(id): Path<String>,
 ) -> Response {
-    let (actor, _) = match gate(&auth.0, &*state.context.store, WRITE_SCOPES) {
+    let (actor, _) = match gate_action(&auth.0, &*state.context.store, AdminAction::ModerateAccount, WRITE_SCOPES) {
         Ok(pair) => pair,
         Err(err) => return err.into_response(),
     };
@@ -553,7 +574,7 @@ pub async fn reject(
     auth: Auth,
     Path(id): Path<String>,
 ) -> Response {
-    let (actor, _) = match gate(&auth.0, &*state.context.store, WRITE_SCOPES) {
+    let (actor, _) = match gate_action(&auth.0, &*state.context.store, AdminAction::ModerateAccount, WRITE_SCOPES) {
         Ok(pair) => pair,
         Err(err) => return err.into_response(),
     };
@@ -596,7 +617,7 @@ pub async fn action(
     Path(account_id): Path<String>,
     LenientForm(pairs): LenientForm,
 ) -> Response {
-    let (actor, _) = match gate(&auth.0, &*state.context.store, WRITE_SCOPES) {
+    let (actor, _) = match gate_action(&auth.0, &*state.context.store, AdminAction::ModerateAccount, WRITE_SCOPES) {
         Ok(pair) => pair,
         Err(err) => return err.into_response(),
     };

@@ -30,6 +30,9 @@ struct Args {
     text: Option<String>,
     hint: Option<String>,
     id: Option<String>,
+    name: Option<String>,
+    file: Option<String>,
+    locale: Option<String>,
 }
 
 fn parse_args(cfg: &mut Config) -> Args {
@@ -78,6 +81,12 @@ fn parse_args(cfg: &mut Config) -> Args {
             args.hint = Some(v.to_string());
         } else if let Some(v) = arg.strip_prefix("--id=") {
             args.id = Some(v.to_string());
+        } else if let Some(v) = arg.strip_prefix("--name=") {
+            args.name = Some(v.to_string());
+        } else if let Some(v) = arg.strip_prefix("--file=") {
+            args.file = Some(v.to_string());
+        } else if let Some(v) = arg.strip_prefix("--locale=") {
+            args.locale = Some(v.to_string());
         } else if let Some(v) = arg.strip_prefix("--site-title=") {
             cfg.site_title = v.to_string();
         } else if let Some(v) = arg.strip_prefix("--site-description=") {
@@ -165,6 +174,19 @@ fn parse_args(cfg: &mut Config) -> Args {
             cfg.smtp_url = Some(v.to_string());
         } else if let Some(v) = arg.strip_prefix("--mail-from=") {
             cfg.mail_from = Some(v.to_string());
+        } else if let Some(v) = arg.strip_prefix("--relay-inbox=") {
+            cfg.relay_inboxes.push(v.to_string());
+        } else if let Some(v) = arg.strip_prefix("--password-reset-ttl-hours=") {
+            cfg.password_reset_ttl_hours = v.parse().unwrap_or_else(|_| {
+                eprintln!("invalid --password-reset-ttl-hours (want an integer 1..=72): {v}");
+                std::process::exit(2);
+            });
+        } else if let Some(v) = arg.strip_prefix("--site-terms-file=") {
+            cfg.site_terms_file = Some(std::path::PathBuf::from(v));
+        } else if let Some(v) = arg.strip_prefix("--site-privacy-file=") {
+            cfg.site_privacy_file = Some(std::path::PathBuf::from(v));
+        } else if let Some(v) = arg.strip_prefix("--site-extended-file=") {
+            cfg.site_extended_file = Some(std::path::PathBuf::from(v));
         } else if let Some(v) = arg.strip_prefix("--web-client-dir=") {
             cfg.web_client_dir = Some(std::path::PathBuf::from(v));
         } else if let Some(v) = arg.strip_prefix("--mode=") {
@@ -485,6 +507,7 @@ async fn serve(cfg: Config) {
         lab,
         Some(&instance),
         cfg.federation_authorized_fetch,
+        &cfg.relay_inboxes,
     )
     .await
     .unwrap_or_else(|err| {
@@ -645,6 +668,9 @@ async fn main() {
         Some("create-account") => run_create_account(&cfg, &args),
         Some("grant-role") | Some("set-role") => run_grant_role(&cfg, &args),
         Some("create-rule") => run_create_rule(&cfg, &args),
+        Some("create-text") => run_create_text(&cfg, &args),
+        Some("set-rule-translation") => run_set_rule_translation(&cfg, &args),
+        Some("delete-rule-translation") => run_delete_rule_translation(&cfg, &args),
         Some("delete-rule") => run_delete_rule(&cfg, &args),
         Some("list-rules") => run_list_rules(&cfg, &args),
         Some("crash-harness") => run_crash_harness(&cfg, &args),
@@ -700,6 +726,113 @@ fn run_delete_rule(cfg: &Config, args: &Args) -> ! {
         }
         Err(err) => {
             eprintln!("delete-rule failed: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `create-text --name=terms|privacy|extended [--file=<path>] --text=<text>`:
+/// author one site-text file (G-A; companion to `--site-terms-file` etc.).
+/// `--file` overrides the configured path for that name; otherwise the path
+/// from config is written. Prints bytes written.
+fn run_create_text(cfg: &Config, args: &Args) -> ! {
+    let name = args.name.as_deref().unwrap_or_else(|| {
+        eprintln!("create-text requires --name=terms|privacy|extended");
+        std::process::exit(2);
+    });
+    let configured: Option<&std::path::PathBuf> = match name {
+        "terms" => cfg.site_terms_file.as_ref(),
+        "privacy" => cfg.site_privacy_file.as_ref(),
+        "extended" => cfg.site_extended_file.as_ref(),
+        _ => {
+            eprintln!("create-text: unknown --name={name} (want terms|privacy|extended)");
+            std::process::exit(2);
+        }
+    };
+    let dest = args
+        .file
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .or_else(|| configured.cloned())
+        .unwrap_or_else(|| {
+            eprintln!("create-text: no destination (set --file= or configure --site-{name}-file=)");
+            std::process::exit(2);
+        });
+    let text = args.text.clone().unwrap_or_else(|| {
+        eprintln!("create-text requires --text=<site text>");
+        std::process::exit(2);
+    });
+    match std::fs::write(&dest, &text) {
+        Ok(()) => {
+            println!("wrote {} {} bytes to {}", name, text.len(), dest.display());
+            std::process::exit(0);
+        }
+        Err(err) => {
+            eprintln!("create-text failed: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `set-rule-translation --id=<rule> --locale=<tag> --text=<text> [--hint=<hint>]`: create or replace one rule translation (G-A).
+fn run_set_rule_translation(cfg: &Config, args: &Args) -> ! {
+    use birchtree::application::ports::AdminInfraStore;
+    use birchtree::domain::Id;
+    let id: Id = args.id.as_deref().unwrap_or("").parse().unwrap_or_else(|_| {
+        eprintln!("set-rule-translation requires --id=<rule id>");
+        std::process::exit(2);
+    });
+    let locale = args.locale.clone().unwrap_or_else(|| {
+        eprintln!("set-rule-translation requires --locale=<BCP-47 tag>");
+        std::process::exit(2);
+    });
+    let text = args.text.clone().unwrap_or_else(|| {
+        eprintln!("set-rule-translation requires --text=<translation>");
+        std::process::exit(2);
+    });
+    let (store, clock, _ids) = build_store(cfg);
+    match store.admin_set_rule_translation(
+        id,
+        locale,
+        text,
+        args.hint.clone().unwrap_or_default(),
+        clock.now_ms(),
+    ) {
+        Ok(row) => {
+            println!("translated rule id={} locale={}", row.rule_id, row.locale);
+            std::process::exit(0);
+        }
+        Err(err) => {
+            eprintln!("set-rule-translation failed: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `delete-rule-translation --id=<rule> --locale=<tag>`: delete one rule translation (G-A).
+fn run_delete_rule_translation(cfg: &Config, args: &Args) -> ! {
+    use birchtree::application::ports::AdminInfraStore;
+    use birchtree::domain::Id;
+    let id: Id = args.id.as_deref().unwrap_or("").parse().unwrap_or_else(|_| {
+        eprintln!("delete-rule-translation requires --id=<rule id>");
+        std::process::exit(2);
+    });
+    let locale = args.locale.clone().unwrap_or_else(|| {
+        eprintln!("delete-rule-translation requires --locale=<BCP-47 tag>");
+        std::process::exit(2);
+    });
+    let (store, _clock, _ids) = build_store(cfg);
+    match store.admin_delete_rule_translation(id, &locale) {
+        Ok(true) => {
+            println!("deleted translation rule id={id} locale={locale}");
+            std::process::exit(0);
+        }
+        Ok(false) => {
+            eprintln!("delete-rule-translation: no translation for rule {id} locale {locale}");
+            std::process::exit(1);
+        }
+        Err(err) => {
+            eprintln!("delete-rule-translation failed: {err}");
             std::process::exit(1);
         }
     }

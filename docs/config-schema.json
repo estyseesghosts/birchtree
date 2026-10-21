@@ -15,6 +15,7 @@
     "worker_poll_interval_ms": { "type": "integer", "minimum": 1, "description": "Worker poll interval, milliseconds. No CLI flag; file-only." },
     "registration_open": { "type": "boolean" },
     "registration_requires_approval": { "type": "boolean", "description": "Public registration queues accounts for approval." },
+    "minimum_age_years": { "type": "integer", "minimum": 13, "maximum": 21, "description": "Minimum registration age, full years. Default 16. File-only." },
     "site_title": { "type": "string" },
     "site_description": { "type": "string" },
     "site_contact_email": { "type": "string" },
@@ -64,6 +65,11 @@
       "additionalProperties": false
     },
     "smtp_url": { "type": ["string", "null"], "description": "smtp:// or smtps:// provider URL. Null = mail explicitly disabled (503). Accepts \"env:VAR\" indirection. CLI: --smtp-url." },
-    "mail_from": { "type": ["string", "null"], "description": "Envelope sender. Required when smtp_url is set. CLI: --mail-from." }
+    "mail_from": { "type": ["string", "null"], "description": "Envelope sender. Required when smtp_url is set. CLI: --mail-from." },
+    "relay_inboxes": { "type": "array", "items": { "type": "string" }, "description": "Relay peer inbox URLs public activities forward to. Empty (default) = no relay traffic. CLI: --relay-inbox= (repeatable)." },
+    "password_reset_ttl_hours": { "type": "integer", "minimum": 1, "maximum": 72, "description": "Password-reset bearer lifetime, hours. Default 6. CLI: --password-reset-ttl-hours." },
+    "site_terms_file": { "type": ["string", "null"], "description": "File with the terms-of-service text served by the instance sub-resources. Null = honest-absence 404. CLI: --site-terms-file." },
+    "site_privacy_file": { "type": ["string", "null"], "description": "File with the privacy-policy text. Null = honest-absence 404. CLI: --site-privacy-file." },
+    "site_extended_file": { "type": ["string", "null"], "description": "File with the extended-description text. Null = honest-absence 404. CLI: --site-extended-file." }
   }
 }

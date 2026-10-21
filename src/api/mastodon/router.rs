@@ -50,6 +50,8 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/v2/instance", get(endpoints::instance::v2))
         // Instance sub-resources (fix round; all v1-only upstream).
         .route("/api/v1/instance/peers", get(endpoints::instance::peers_index))
+        // Peer search (gaps G-C): substring-filtered known remote domains.
+        .route("/api/v1/instance/peers/search", get(endpoints::collections::route_peers_search))
         .route("/api/v1/instance/rules", get(endpoints::instance::rules_index))
         .route("/api/v1/instance/domain_blocks", get(endpoints::instance::domain_blocks_index))
         .route("/api/v1/instance/terms_of_service", get(endpoints::instance::terms_of_service_index))
@@ -76,6 +78,34 @@ pub fn build_router(state: ApiState) -> Router {
         .route(
             "/api/v1/accounts/relationships",
             get(endpoints::accounts::relationships),
+        )
+        // Password-reset redemption (D12, G-A): browser link from the mailed
+        // token; the form posts back to set the password. No JS.
+        .route(
+            "/auth/password/edit",
+            get(endpoints::accounts::password_reset_page),
+        )
+        .route(
+            "/auth/password",
+            post(endpoints::accounts::password_reset_update),
+        )
+        // Profile namespace (4.6+ alias of the credentials endpoints, G-A).
+        .route(
+            "/api/v1/profile",
+            get(endpoints::accounts::profile_show).patch(endpoints::accounts::profile_update),
+        )
+        .route(
+            "/api/v1/profile/avatar",
+            delete(endpoints::accounts::profile_avatar_destroy),
+        )
+        .route(
+            "/api/v1/profile/header",
+            delete(endpoints::accounts::profile_header_destroy),
+        )
+        // Identity proofs (deprecated upstream: always `[]` here, G-A).
+        .route(
+            "/api/v1/accounts/:id/identity_proofs",
+            get(endpoints::accounts::identity_proofs_show),
         )
         .route("/api/v1/accounts/:id", get(endpoints::accounts::show))
         // Invites + email. Without a mail provider the mail endpoints
@@ -157,6 +187,15 @@ pub fn build_router(state: ApiState) -> Router {
             "/api/v1/accounts/:id/endorsements",
             get(endpoints::relationships::account_endorsements),
         )
+        // Account collections + lists sub-resources (gaps G-C).
+        .route(
+            "/api/v1/accounts/:id/collections",
+            get(endpoints::collections::route_account_collections),
+        )
+        .route(
+            "/api/v1/accounts/:id/lists",
+            get(endpoints::collections::route_account_lists),
+        )
         .route(
             "/api/v1/endorsements",
             get(endpoints::relationships::endorsements_index),
@@ -180,6 +219,11 @@ pub fn build_router(state: ApiState) -> Router {
             get(endpoints::relationships::domain_blocks_index)
                 .post(endpoints::relationships::domain_blocks_create)
                 .delete(endpoints::relationships::domain_blocks_delete),
+        )
+        // Domain-block preview (gaps G-C): `{domain, accounts_count}`.
+        .route(
+            "/api/v1/domain_blocks/preview",
+            post(endpoints::collections::route_domain_blocks_preview),
         )
         // Preferences.
         .route("/api/v1/preferences", get(endpoints::preferences::index))
@@ -214,6 +258,11 @@ pub fn build_router(state: ApiState) -> Router {
         .route(
             "/api/v1/statuses/:id",
             delete(endpoints::statuses::destroy),
+        )
+        // The viewer's collections containing the status (gaps G-C).
+        .route(
+            "/api/v1/statuses/:id/in_collections",
+            get(endpoints::collections::route_in_collections),
         )
         .route(
             "/api/v1/statuses/:id/source",
@@ -460,6 +509,31 @@ pub fn build_router(state: ApiState) -> Router {
             "/api/v1/notifications/:id/dismiss",
             post(endpoints::notifications::dismiss),
         )
+        // Grouped notifications (gaps G-C): static paths before `:group_key`.
+        .route(
+            "/api/v2/notifications",
+            get(endpoints::collections::route_v2_index),
+        )
+        .route(
+            "/api/v2/notifications/clear",
+            post(endpoints::collections::route_v2_clear),
+        )
+        .route(
+            "/api/v2/notifications/unread_count",
+            get(endpoints::collections::route_v2_unread_count),
+        )
+        .route(
+            "/api/v2/notifications/policy",
+            get(endpoints::collections::route_v2_policy_show),
+        )
+        .route(
+            "/api/v2/notifications/:group_key/dismiss",
+            post(endpoints::collections::route_v2_dismiss),
+        )
+        .route(
+            "/api/v2/notifications/:group_key/accounts",
+            get(endpoints::collections::route_v2_group_accounts),
+        )
         // Markers (Phase 4).
         .route(
             "/api/v1/markers",
@@ -483,6 +557,34 @@ pub fn build_router(state: ApiState) -> Router {
         .route(
             "/api/v1/lists/:id/accounts",
             delete(endpoints::lists::accounts_destroy),
+        )
+        // Collections (gaps G-C): top-level CRUD + items/revoke + the
+        // minimal `v1_alpha` namespace.
+        .route(
+            "/api/v1/collections",
+            get(endpoints::collections::route_collections_index)
+                .post(endpoints::collections::route_collections_create),
+        )
+        .route(
+            "/api/v1/collections/:id",
+            get(endpoints::collections::route_collections_show)
+                .put(endpoints::collections::route_collections_update)
+                .patch(endpoints::collections::route_collections_update)
+                .delete(endpoints::collections::route_collections_destroy),
+        )
+        .route(
+            "/api/v1/collections/:id/items",
+            get(endpoints::collections::route_items_index)
+                .post(endpoints::collections::route_items_add)
+                .delete(endpoints::collections::route_items_remove),
+        )
+        .route(
+            "/api/v1/collections/:id/revoke",
+            post(endpoints::collections::route_collections_revoke),
+        )
+        .route(
+            "/api/v1_alpha/collections",
+            get(endpoints::collections::route_alpha_collections_index),
         )
         // Scheduled statuses (Phase 4).
         .route(

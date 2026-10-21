@@ -487,6 +487,172 @@ pub async fn fetch(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Remote emoji ingest (federation tail, G-D): the tail arm that turns one
+// parsed [`crate::activitypub::objects::RemoteEmoji`] into bytes + a row.
+// ---------------------------------------------------------------------------
+
+/// Largest accepted remote emoji image (Mastodon `CustomEmoji::LIMIT`, the
+/// same 256 KiB as [`crate::domain::CustomEmoji::IMAGE_LIMIT`]).
+pub const MAX_REMOTE_EMOJI_BYTES: u64 = 256 * 1024;
+/// Longest accepted remote emoji source URL (untrusted input bound).
+pub const MAX_REMOTE_EMOJI_URL_LEN: usize = 2048;
+
+/// Storage key for a remote emoji row, namespaced by origin domain so a
+/// remote `:party:` never collides with a local one. Interim shape: the
+/// `CustomEmoji` table is keyed by shortcode only, so remote rows live under
+/// `{shortcode}@{domain}` (a real `(domain, shortcode)` table is the
+/// parent-merge snippet; the payload renderer strips the suffix back).
+pub fn remote_emoji_shortcode(shortcode: &str, domain: &str) -> String {
+    format!("{}@{}", shortcode, domain.to_ascii_lowercase())
+}
+
+/// Split an interim remote-emoji key back into `(shortcode, domain)`.
+pub fn split_remote_emoji_shortcode(stored: &str) -> Option<(&str, &str)> {
+    let (shortcode, domain) = stored.rsplit_once('@')?;
+    if shortcode.is_empty() || domain.is_empty() {
+        return None;
+    }
+    Some((shortcode, domain))
+}
+
+/// Validate one remote emoji reference before any fetch: shortcode shape
+/// (Mastodon `SHORTCODE_RE_FRAGMENT`), a non-empty origin domain, and an
+/// `http(s)` source URL without credentials. Returns the parsed source URL.
+pub fn validate_remote_emoji(shortcode: &str, domain: &str, source_url: &str) -> Result<Url, String> {
+    if !crate::domain::CustomEmoji::shortcode_valid(shortcode) {
+        return Err("remote emoji shortcode is not valid".into());
+    }
+    if domain.is_empty() || domain.len() > 253 {
+        return Err("remote emoji domain is not valid".into());
+    }
+    if source_url.len() > MAX_REMOTE_EMOJI_URL_LEN {
+        return Err("remote emoji url is too long".into());
+    }
+    let url = Url::parse(source_url).map_err(|e| format!("remote emoji url is not a URL: {e}"))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        _ => return Err("remote emoji url is not http(s)".into()),
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("remote emoji url carries credentials".into());
+    }
+    if url.host_str().is_none() {
+        return Err("remote emoji url has no host".into());
+    }
+    Ok(url)
+}
+
+/// Fetch one remote emoji's bytes (the tail arm behind the ingest trigger).
+/// SSRF policy first (`policy::check_url`, same HTTP-allowlist as attachment
+/// fetches), then a bounded `GET`: 5xx/429/408 retry, anything else
+/// non-2xx quarantines (a missing emoji never retries in a loop), the
+/// `Content-Length` pre-check plus a streaming cap enforce
+/// [`MAX_REMOTE_EMOJI_BYTES`], and only PNG/GIF/WebP bytes
+/// (`is_emoji_image`, Mastodon's `CustomEmoji` content types) are returned.
+/// Returns `(bytes, mime_type)`.
+pub async fn fetch_remote_emoji_bytes(
+    client: &reqwest::Client,
+    url: &Url,
+    allow_http: bool,
+    allowlist: &[crate::federation::policy::Cidr],
+) -> std::result::Result<(Vec<u8>, &'static str), DeliveryError> {
+    use futures_util::StreamExt as _;
+    if let Err(e) = policy::check_url(url, allow_http, allowlist) {
+        return Err(DeliveryError::Quarantine(format!("emoji url refused: {e}")));
+    }
+    let response = client
+        .get(url.clone())
+        .header(reqwest::header::ACCEPT, "image/png,image/gif,image/webp,image/*,*/*")
+        .send()
+        .await
+        .map_err(|e| DeliveryError::Retry(e.to_string()))?;
+    let status = response.status();
+    if status.is_server_error()
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+    {
+        return Err(DeliveryError::Retry(format!("emoji server answered {status}")));
+    }
+    if !status.is_success() {
+        return Err(DeliveryError::Quarantine(format!("emoji server answered {status}")));
+    }
+    if let Some(declared) = response.content_length()
+        && declared > MAX_REMOTE_EMOJI_BYTES
+    {
+        return Err(DeliveryError::Quarantine("emoji is larger than the limit".into()));
+    }
+    let mut body: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| DeliveryError::Retry(e.to_string()))?;
+        if body.len() as u64 + chunk.len() as u64 > MAX_REMOTE_EMOJI_BYTES {
+            return Err(DeliveryError::Quarantine("emoji is larger than the limit".into()));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let mime = match ingest::sniff(&body) {
+        Some(sniffed) if ingest::is_emoji_image(&body) => sniffed.mime_type,
+        _ => return Err(DeliveryError::Quarantine("emoji is not a supported image".into())),
+    };
+    Ok((body, mime))
+}
+
+/// Stage fetched remote-emoji bytes: one blob key for the image and one for
+/// the static variant (same bytes; remote originals are served as-is, never
+/// transcoded), then upsert the row under the interim domain-namespaced key.
+/// Remote rows are never picker-visible and never listed (upstream
+/// `CustomEmoji.listed` is local-only); renderers serve them through the
+/// `emojis` arrays only.
+pub fn store_remote_emoji(
+    store: &dyn crate::application::ports::EmojiStore,
+    blobs: &dyn BlobStore,
+    namespaced_shortcode: &str,
+    origin_domain: &str,
+    bytes: &[u8],
+    mime_type: &str,
+    now_ms: u64,
+) -> std::result::Result<crate::domain::CustomEmoji, String> {
+    if bytes.len() as u64 > MAX_REMOTE_EMOJI_BYTES {
+        return Err("emoji is larger than the limit".into());
+    }
+    let sniffed_ok = ingest::sniff(bytes).is_some_and(|s| s.mime_type == mime_type);
+    if !sniffed_ok || !ingest::is_emoji_image(bytes) {
+        return Err("emoji is not a supported image".into());
+    }
+    let (shortcode, _) = split_remote_emoji_shortcode(namespaced_shortcode)
+        .ok_or_else(|| "remote emoji key is not namespaced".to_string())?;
+    let partition = crate::application::emoji::emoji_partition(shortcode);
+    let image_key = format!("custom_emojis/images/{partition}/original/{namespaced_shortcode}.png");
+    let static_key = format!("custom_emojis/images/{partition}/static/{namespaced_shortcode}.png");
+    blobs.put(&image_key, bytes).map_err(|e| e.to_string())?;
+    blobs.put(&static_key, bytes).map_err(|e| e.to_string())?;
+    let _ = (mime_type, now_ms);
+    let row = store
+        .upsert_emoji(crate::domain::CustomEmoji {
+            shortcode: namespaced_shortcode.to_string(),
+            image_key: image_key.clone(),
+            static_image_key: static_key,
+            visible_in_picker: false,
+            disabled: false,
+            category: Some(format!("remote:{origin_domain}")),
+        })
+        .map_err(|e| e.to_string())?;
+    // `REMOTE_EMOJI` render row alongside the interim namespaced row: the
+    // status `emojis` arrays look rows up by bare shortcode (parent merge of
+    // G-D S10) and serve the staged bytes through the same `system/` asset
+    // route as local emoji. The interim row stays for fetch-stage
+    // bookkeeping.
+    store
+        .upsert_remote_emoji(crate::application::ports::RemoteEmojiRow {
+            shortcode: shortcode.to_string(),
+            domain: origin_domain.to_string(),
+            url: format!("system/{image_key}"),
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(row)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,7 +661,6 @@ mod tests {
     fn ceiling_matches_ledger_policy() {
         assert_eq!(MAX_REMOTE_MEDIA_BYTES, remote_cache::PER_FILE_CEILING_BYTES);
     }
-
     #[test]
     fn per_row_keys_have_no_sharing() {
         let a = cache_key_for(Id::new(7));

@@ -82,6 +82,72 @@ pub async fn run(
                         JobKind::ResolveParent => threads::resolve_parent(&federation, &job).await,
                         JobKind::CrawlReplies => threads::crawl_replies(&federation, &job).await,
                         JobKind::FetchRemoteMedia => media::fetch(&federation, &job).await,
+                        JobKind::QuoteReverify => {
+                            threads::run_quote_reverify(&federation, &job).await
+                        }
+                        JobKind::RelayForward => {
+                            delivery::run_relay_forward(&federation, &job).await
+                        }
+                        JobKind::SyncFollowers => {
+                            threads::run_sync_followers(&federation, &job).await
+                        }
+                        JobKind::FetchRemoteEmoji => {
+                            let ctx: &FedContext = &federation;
+                            // Expression-style like the sibling arms (the
+                            // match evaluates to the outcome; `?` cannot be
+                            // used at arm level).
+                            (async {
+                                let shortcode = job
+                                    .payload
+                                    .get("shortcode")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let domain = job
+                                    .payload
+                                    .get("domain")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let source = job
+                                    .payload
+                                    .get("source_url")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let url =
+                                    crate::federation::media::validate_remote_emoji(
+                                        &shortcode,
+                                        &domain,
+                                        &source,
+                                    )
+                                    .map_err(DeliveryError::Quarantine)?;
+                                let (bytes, mime) =
+                                    crate::federation::media::fetch_remote_emoji_bytes(
+                                        &ctx.media_client,
+                                        &url,
+                                        ctx.http.allow_http,
+                                        &ctx.http.allowlist,
+                                    )
+                                    .await?;
+                                let key =
+                                    crate::federation::media::remote_emoji_shortcode(
+                                        &shortcode, &domain,
+                                    );
+                                crate::federation::media::store_remote_emoji(
+                                    &*store,
+                                    &*blobs,
+                                    &key,
+                                    &domain,
+                                    &bytes,
+                                    mime,
+                                    clock.now_ms(),
+                                )
+                                .map_err(DeliveryError::Quarantine)?;
+                                Ok::<(), DeliveryError>(())
+                            })
+                            .await
+                        }
                         JobKind::PreviewCardFetch => {
                             let ctx: &FedContext = &federation;
                             preview::fetch(&*store, &ctx.media_client, &ctx.http, &job).await

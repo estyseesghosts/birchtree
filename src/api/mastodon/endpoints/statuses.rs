@@ -903,7 +903,10 @@ async fn interacted_by(
     }
     let pairs = match which {
         ByWhich::Favourited => store.favourited_by(status_id, page.max_id, page.limit),
-        ByWhich::Reblogged => store.reblogged_by(status_id, page.max_id, page.limit),
+        // D52 distributable-visibility scope (gaps G-C): only public/unlisted
+        // wrappers attribute reblogs; private/direct wrappers never leak
+        // through this read.
+        ByWhich::Reblogged => store.reblogged_by_distributable(status_id, page.max_id, page.limit),
     };
     let pairs = match pairs {
         Ok(pairs) => pairs,

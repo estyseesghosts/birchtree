@@ -28,14 +28,14 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 | GET | `/api/v1/instance` | none | — | implemented (Phase 2) | In | instance discovery, `REST::V1::InstanceSerializer` |
 | GET | `/api/v2/instance` | none | — | implemented (Phase 2) | In | instance discovery v2, `REST::InstanceSerializer` |
 | GET | `/api/v1/instance/peers` | none | — | implemented (fix round) | In | distinct remote domains, sorted; 404 when `peers_api_enabled` is off (default on) |
-| GET | `/api/v1/instance/rules` | none | — | implemented (fix round) | In | server rules id-ordered, `translations:{}` (no translations stored) |
+| GET | `/api/v1/instance/rules` | none | — | implemented (fix round, translations gaps G-A) | In | server rules id-ordered, `translations:{locale:{text,hint}}` from the rule-translation store (`{}` fallback per rule) |
 | GET | `/api/v1/instance/domain_blocks` | none | — | implemented (fix round) | In | 404 while `domain_blocks_public` is off (default, as upstream); serves silence/suspend rows with public digests when on |
-| GET | `/api/v1/instance/languages` | none | — | implemented (fix round) | In | distinct status languages; `name` = code (no locale catalog — recorded divergence) |
+| GET | `/api/v1/instance/languages` | none | — | implemented (fix round, catalog gaps G-A) | In | static ISO-639 autonym catalog (68 entries, `[{code,name}]` sorted; e.g. `fr` → `Français`) |
 | GET | `/api/v1/instance/activity` | none | — | implemented (fix round) | In | 12 trailing 7-day `{week, statuses, logins, registrations}` windows, string values; 404 when `activity_api_enabled` is off (default on) |
-| GET | `/api/v1/instance/extended_description` | none | — | implemented (fix round) | In | unset shape `{updated_at:null,content:""}` (no authoring surface yet) |
+| GET | `/api/v1/instance/extended_description` | none | — | implemented (fix round, file authoring gaps G-A) | In | `{updated_at(mtime),content}` from `--site-extended-file` when configured, else the unset `{updated_at:null,content:""}` shape |
 | GET | `/api/v1/instance/translation_languages` | none | — | implemented (fix round) | In | `{}` (no translation provider configured) |
-| GET | `/api/v1/instance/privacy_policy` | none | — | implemented (fix round) | In | honest 404: no policy text configured or bundled, so nothing is fabricated (`src/api/mastodon/endpoints/instance.rs:396-398`, `src/api/mastodon/router.rs:57`) |
-| GET | `/api/v1/instance/terms_of_service` | none | — | implemented (fix round) | In | honest 404: no terms rows exist, matching upstream's unconfigured behavior (`src/api/mastodon/endpoints/instance.rs:406-408`, `src/api/mastodon/router.rs:55`) |
+| GET | `/api/v1/instance/privacy_policy` | none | — | implemented (fix round, file authoring gaps G-A) | In | `{updated_at(mtime),content}` from `--site-privacy-file` when configured, else honest 404 |
+| GET | `/api/v1/instance/terms_of_service` | none | — | implemented (fix round, file authoring gaps G-A) | In | `{effective_date(mtime),effective:true,content,succeeded_by:null}` from `--site-terms-file` when configured, else honest 404 (upstream unconfigured behavior) |
 | GET | `/api/v1/instance/terms_of_service/:date` | none | — | implemented (fix round) | In | honest 404: every date is unknown with no terms rows (`src/api/mastodon/endpoints/instance.rs:414-416`, `src/api/mastodon/router.rs:56`) |
 | GET | `/api/v1/accounts` | optional | read \| read:accounts | implemented (Phase 7) | In | multi-fetch `id[]` (up to 40; above that `422 Mastodon::ValidationError`); unapproved and pending-deletion accounts omitted (upstream `set_accounts`) |
 | POST | `/api/v1/accounts` | app | write \| write:accounts | implemented (Phase 2) | In | registration; returns a user token |
@@ -47,6 +47,13 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 | GET | `/api/v1/accounts/:id` | none | — | implemented (Phase 2, real counters Phase 3) | In | public profile |
 | GET | `/api/v1/accounts/:id/statuses` | optional | read | implemented (Phase 3) | In | `pinned`/`exclude_replies`/`exclude_reblogs` filters, `Link` cursors |
 | GET | `/invite/:invite_code` | none | — | implemented (round 3, durable round 4) | In | mirrors `Api::V1::InvitesController#show`: 200 `{invite_code, instance_api_url}`, 404 unknown, 401 `{error: "Invalid invitation code"}` for expired/exhausted (checked before the registrations gate); durable `INVITES` table (see D12) |
+| GET | `/api/v1/profile` | user | profile \| read \| read:accounts | implemented (gaps G-A) | In | 4.6+ alias of `verify_credentials` (`CredentialAccount`) |
+| PATCH | `/api/v1/profile` | user | write:accounts | implemented (gaps G-A) | In | `update_credentials` parity (same fields/semantics) |
+| DELETE | `/api/v1/profile/avatar` | user | write:accounts | implemented (gaps G-A) | In | clears the avatar to defaults; 200 `CredentialAccount` even when unset |
+| DELETE | `/api/v1/profile/header` | user | write:accounts | implemented (gaps G-A) | In | clears the header to defaults; 200 `CredentialAccount` even when unset |
+| GET | `/api/v1/accounts/:id/identity_proofs` | user | — | implemented (gaps G-A) | In | always `[]` (deprecated upstream since 3.5.0; no proof model here) |
+| GET | `/auth/password/edit` | none | — | implemented (gaps G-A) | In | server-rendered reset form for `?reset_password_token=`; token unchecked at render (checked on POST) |
+| POST | `/auth/password` | none | — | implemented (gaps G-A) | In | set-password redemption: 6h `PasswordReset` bearers (`password_reset_ttl_hours`), consume-on-write, unknown/used tokens an indistinguishable 422 |
 | POST | `/api/v1/emails/confirmations` | user | write \| write:accounts | implemented (round 3, delivers via job when configured) | In | re-sends the confirmation mail (`200 {}`); 403 when already confirmed or owned by another app (grandfathered pre-attribution rows allow any app); explicit 503 without a mail provider, never fake success; stores a random per-request bearer then enqueues a durable `SendConfirmationEmail` job (worker delivers after commit); redemption at `GET /auth/confirmation` (D12) |
 | GET | `/api/v1/emails/check_confirmation` | user | read \| read:accounts | implemented (round 3) | In | bool; gated on unconfirmed (D12 remainder as above) |
 | POST | `/api/v1/emails/password_reset` | none | — | implemented (round 4, public email flow) | In | no upstream API route (web-only `/auth/password` upstream); public `email`-param flow, always `200 {}` (unknown addresses queue nothing — no enumeration oracle); explicit 503 without a provider; stores a random bearer then enqueues `SendPasswordResetEmail` (6h TTL; redemption flow still open, D12) |
@@ -167,6 +174,30 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 | GET | `/api/v1/lists/:id/accounts` | user | read \| read:lists | implemented (Phase 4) | In | `limit` default 40 (`limit=0` → all), `Link` cursors |
 | POST | `/api/v1/lists/:id/accounts` | user | write \| write:lists | implemented (Phase 4) | In | `account_ids[]`; membership requires the owner's active follow/pending request (422 `Account must be following`), unknown id → 404 |
 | DELETE | `/api/v1/lists/:id/accounts` | user | write \| write:lists | implemented (Phase 4) | In | idempotent `200 {}` |
+
+### Collections + missing REST surface (gaps G-C)
+
+| GET | `/api/v1/collections` | user | read \| read:collections | implemented (gaps G-C) | In | the viewer's collections, id-desc |
+| POST | `/api/v1/collections` | user | write \| write:collections | implemented (gaps G-C) | In | `title` (blank/256-char 422s), `description`, `public` (default false); 50/account cap |
+| GET | `/api/v1/collections/:id` | optional | read \| read:collections | implemented (gaps G-C) | In | owner sees everything; others only public + non-revoked (else 404, never an oracle) |
+| PUT | `/api/v1/collections/:id` | user | write \| write:collections | implemented (gaps G-C) | In | also PATCH; ownership 404s before validation; revoked rows refuse edits |
+| DELETE | `/api/v1/collections/:id` | user | write \| write:collections | implemented (gaps G-C) | In | `200 {}`; enqueues one `CollectionFanout(delete)` in the same txn |
+| GET | `/api/v1/collections/:id/items` | optional | read \| read:collections | implemented (gaps G-C) | In | member statuses newest first (20/40, `Link`); `hide_collections` → `200 []` for non-owners (counts stay); every candidate passes the `show_status` gate |
+| POST | `/api/v1/collections/:id/items` | user | write \| write:collections | implemented (gaps G-C) | In | `status_ids[]` (500/batch 422); members must exist + be owner-visible (404 otherwise); `200 {added:[...]}` |
+| DELETE | `/api/v1/collections/:id/items` | user | write \| write:collections | implemented (gaps G-C) | In | idempotent `200 {removed:[...]}` |
+| POST | `/api/v1/collections/:id/revoke` | user | write \| write:collections | implemented (gaps G-C) | In | empties + marks revoked (terminal for edits/adds); members fan out as `collection_update` |
+| GET | `/api/v1/statuses/:id/in_collections` | user | read \| read:collections | implemented (gaps G-C) | In | the viewer's collections containing the status |
+| GET | `/api/v1/accounts/:id/collections` | optional | read \| read:collections | implemented (gaps G-C) | In | the account's public, non-revoked collections (unknown accounts 404) |
+| GET | `/api/v1/accounts/:id/lists` | user | read \| read:lists | implemented (gaps G-C) | In | the viewer's lists containing the account (unknown accounts 404) |
+| POST | `/api/v1/domain_blocks/preview` | user | follow \| write \| write:blocks | implemented (gaps G-C) | In | `{domain, accounts_count}` over known non-suspended remote accounts; blank domain 422 |
+| GET | `/api/v1/instance/peers/search` | none | — | implemented (gaps G-C) | In | substring `q` over known remote domains, sorted; 404 when `peers_api_enabled` is off (like `peers`) |
+| GET | `/api/v1_alpha/collections` | user | read \| read:collections | implemented (gaps G-C) | In | minimal experimental namespace: same shape as the top-level index |
+| GET | `/api/v2/notifications` | user | read \| read:notifications | implemented (gaps G-C) | In | grouped (`<type>-<anchor>` keys from the newest 2000 rows); groups capped 20/40 with row cursors + `Link` |
+| POST | `/api/v2/notifications/clear` | user | write \| write:notifications | implemented (gaps G-C) | In | `200 {}` |
+| GET | `/api/v2/notifications/unread_count` | user | read \| read:notifications | implemented (gaps G-C) | In | `{"count": N}` against the marker (limit default 100, max 1000) |
+| POST | `/api/v2/notifications/:group_key/dismiss` | user | write \| write:notifications | implemented (gaps G-C) | In | deletes the group's rows (`200 {}`; 404 on empty/unknown keys, never silent success) |
+| GET | `/api/v2/notifications/:group_key/accounts` | user | read \| read:notifications | implemented (gaps G-C) | In | the group's actors (suspended/gone excluded; 404 when empty) |
+| GET | `/api/v2/notifications/policy` | user | read \| read:notifications | implemented (gaps G-C) | In | same shape as the v1 policy singleton + pending summary |
 | GET | `/api/v2/filters` | user | read \| read:filters | implemented (Phase 4) | In | v2 model with `keywords[]` + `statuses[]` |
 | POST | `/api/v2/filters` | user | write \| write:filters | implemented (Phase 4) | In | `title`/`context[]`/`expires_in`/`filter_action`/`keywords_attributes` |
 | GET | `/api/v2/filters/:id` | user | read \| read:filters | implemented (Phase 4) | In | |
@@ -259,7 +290,7 @@ Bullets in the old inventory that are now rows. Upstream sources: `app/controlle
 | GET | `/api/v1/mutes` | user | follow \| read \| read:mutes | implemented (Phase 7) | In | real read over MUTES with `MutedAccountSerializer` (`mute_expires_at`) |
 | GET | `/api/v1/favourites` | user | read \| read:favourites | implemented (Phase 7) | In | real read over FAVOURITES; `min_id` ignored (only `max_id`/`since_id` honored) |
 | GET | `/api/v1/bookmarks` | user | read \| read:bookmarks | implemented (Phase 7) | In | real read over BOOKMARKS; `min_id` ignored (as above) |
-| GET | `/api/v1/accounts/familiar_followers` | user | read \| read:accounts | implemented (Phase 7) | In | computed from real follows; input ids capped at 40 (upstream unbounded); unknown/suspended skipped; no `hide_collections` concept (no collections surface) |
+| GET | `/api/v1/accounts/familiar_followers` | user | read \| read:accounts | implemented (Phase 7, hide gate gaps G-C) | In | computed from real follows; input ids capped at 40 (upstream unbounded); unknown/suspended skipped; `hide_collections` targets yield empty lists and are excluded from the mutual set |
 | GET | `/api/v1/featured_tags` | user | read | implemented (Phase 7) | In | real rows + live usage counts from bounded tag scans |
 | POST | `/api/v1/featured_tags` | user | write | implemented (Phase 7) | In | feature by name |
 | DELETE | `/api/v1/featured_tags/:id` | user | write | implemented (Phase 7) | In | `:id` is the numeric featured-tag row |
@@ -406,10 +437,10 @@ All admin rows: auth `user + role`. The role is `admin` (every admin route) or `
 Rowed since the 2026-10-17 re-scope (each has a row above with its phase): `annual_reports`, `announcements` (+ admin authoring), `conversations` (+ mutes), `donation_campaigns`, `suggestions` (+ directory, userinfo), `POST /api/v1/reports`, `namespace :admin`, v2 admin accounts, `push/*`, `web/*`, `GET /api/v1/accounts` (multi-fetch), `directory`, the instance sub-resources (`peers`, `rules`, `domain_blocks`, `terms_of_service` + `:date`, `privacy_policy`, `extended_description`, `translation_languages`, `languages`, `activity`), `emails/confirmations` + `check_confirmation` + `password_reset` + `GET /auth/confirmation`, domain blocks (index/create/destroy), `tags` follow/unfollow/feature/unfeature + `followed_tags` + featured tags (top-level and per-account), and the notification-requests + `notifications/policy` surface. The entries below remain as bullets because they are not yet rowed or are excluded.
 
 - `GET /api/v1/oembed` — public oEmbed; not in initial profile (record as gap if clients need it). **Out.**
-- `namespace :v1_alpha` — experimental/legacy (`accounts/collections`, `collections/*`); explicitly **Out**.
+- `namespace :v1_alpha` — experimental/legacy; only `GET /api/v1_alpha/collections` is rowed (minimal, gaps G-C). The rest stays **Out**.
 - `GET /api/v1/custom_emojis` — rowed above (was listed here for historical reasons).
 - `GET /api/v1/blocks`, `GET /api/v1/mutes`, `GET /api/v1/favourites`, `GET /api/v1/bookmarks` — relation collection reads; **implemented (Phase 7)** (rows above).
-- `accounts/familiar_followers`, `featured_tags`, `tags` follow/feature, `followed_tags` — **implemented (Phase 7)** (rows above). Still out: `identity_proofs` (needs cryptographic proof verification), `email_subscriptions`, `collections` (experimental `v1_alpha`).
+- `accounts/familiar_followers`, `featured_tags`, `tags` follow/feature, `followed_tags` — **implemented (Phase 7)** (rows above). Still out: `email_subscriptions` (no source-audited shape found in the public API; stays 404 out-of-profile — gaps finish decision). Top-level + account `collections` rowed in the new gaps-G-C section. `identity_proofs` rowed above (always `[]`, gaps G-A).
 - `translate` (statuses) — **Out** unless a translation provider is configured (row above).
 
 ## Non-route contract items tracked separately
@@ -494,12 +525,12 @@ Implemented 2026-10-17 (D10a, D10b, D11). Evidence: `tests/phase4_1_json_parity.
 Recorded, not fixed. Each needs a decision or a contract-review pass.
 
 1. **Domain-block route shape: resolved 2026-10-17.** The Phase 3 rows now match the pinned tag: `GET`, `POST` and `DELETE /api/v1/domain_blocks`, with numeric row-id paging and the domain as a parameter. The correction is recorded in `birchtree.md` §7 Phase 3 item 6 and in `docs/logs/2026-10-17-domain-blocks-correction.md`.
-2. **Pinned routes not yet rowed (narrowed fix round, 2026-10-20).** `directory`, the instance sub-resources, `emails/*`, domain blocks, `tags`/`followed_tags`/`featured_tags`, and the notification-requests + `policy` surface are rowed above and removed from this list. Each remaining item needs a row in Phase 7 or later:
-   - `profile` (`GET`/`PATCH /api/v1/profile`, `DELETE` of avatar and header);
-   - `peers/search` (instance peer search; `peers` itself is rowed above);
-   - `domain_blocks/preview`;
-   - accounts sub-resources: `lists`, `identity_proofs`, `email_subscriptions`, `collections`, `in_collections` still to row; `familiar_followers` already rowed above (Phase 7); top-level `collections` (`GET`/`POST`/`PUT`/`DELETE`, and `items`/`revoke`) still to row;
-   - `GET /api/v2/notifications` and its `clear`, `unread_count`, `dismiss`, `:group_key/accounts`, and `policy` sub-routes.
+2. **Pinned routes not yet rowed (narrowed fix round, 2026-10-20; closed gaps finish).** `directory`, the instance sub-resources, `emails/*`, domain blocks, `tags`/`followed_tags`/`featured_tags`, and the notification-requests + `policy` surface are rowed above and removed from this list. Gaps finish rowed the rest (see the gaps-G-C section above):
+   - `profile` — **rowed (gaps G-A):** `GET`/`PATCH /api/v1/profile` + avatar/header `DELETE` rows above;
+   - `peers/search` (rowed gaps G-C);
+   - `domain_blocks/preview` (rowed gaps G-C);
+   - accounts sub-resources: `lists`, `collections`, `in_collections` (rowed gaps G-C; `identity_proofs` gaps G-A; `email_subscriptions` stays out — no pinned shape); `familiar_followers` already rowed above (Phase 7); top-level `collections` (`GET`/`POST`/`PUT`/`DELETE`, and `items`/`revoke`) rowed (gaps G-C);
+   - `GET /api/v2/notifications` and its `clear`, `unread_count`, `dismiss`, `:group_key/accounts`, and `policy` sub-routes (rowed gaps G-C).
 3. **`GET /api/v1/accounts` (index) had no row.** Resolved in the 2026-10-17 follow-up: the row is in profile at Phase 7, as the account multi-fetch (`id[]`, up to 40).
 4. **`namespace :web` and `/api/web/*` auth.** Resolved as a design decision in the 2026-10-17 follow-up: these routes serve keystodon's first-party mode and use the browser session plus CSRF (Phase 7). Still open: whether first-party `/api/v1/*` calls use OAuth tokens (proposed) or the session.
 5. **Scope registry comment: resolved (fix round).** `KNOWN_SCOPES` lists the `admin:*` families (`src/api/oauth/scopes.rs:48-63`), so admin scopes validate and are grantable through the normal scope check; the old "accepted for storage but never granted / rejected today" wording no longer applies.

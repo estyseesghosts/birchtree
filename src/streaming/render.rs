@@ -75,6 +75,8 @@ pub fn notification(
         now_ms,
         recipient,
         vec![notification.clone()],
+        // Stream payloads carry no fallback, like upstream.
+        None,
     )?;
     Ok(rows.into_iter().next())
 }

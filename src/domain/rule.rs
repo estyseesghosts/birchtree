@@ -19,6 +19,27 @@ use crate::domain::Id;
 /// Maximum rule text length (upstream `Rule::TEXT_SIZE_LIMIT`).
 pub const RULE_TEXT_LIMIT: usize = 300;
 
+/// Maximum locale tag length (BCP-47 tags like `pt-BR`/`zh-Hant` stay far
+/// below this; the bound keeps the translation key small).
+pub const RULE_LOCALE_LIMIT: usize = 32;
+
+/// One server-rule translation (gaps batch G-A).
+///
+/// Upstream (`rule_translations` table, 4.4+): each rule carries zero or more
+/// `(locale, text, hint)` rows rendered as
+/// `translations: {locale: {text, hint}}`; a rule with no rows renders
+/// `translations: {}` and clients fall back to the base `text`/`hint`.
+/// Locales are bare BCP-47 tags (`fr`, `pt-BR`, `zh-CN`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleTranslation {
+    pub rule_id: Id,
+    pub locale: String,
+    pub text: String,
+    #[serde(default)]
+    pub hint: String,
+    pub updated_at_ms: u64,
+}
+
 /// One server rule moderators can attach to reports.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rule {

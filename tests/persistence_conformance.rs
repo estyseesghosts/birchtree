@@ -374,6 +374,8 @@ fn registration_commits_confirmation_mail_job_atomically() {
             reason: None,
             invite_code: None,
             display_name: None,
+            time_zone: None,
+            date_of_birth: None,
         },
     )
     .unwrap();

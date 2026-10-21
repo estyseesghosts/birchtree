@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::application::notifications::fan_out_payload;
 use crate::application::ports::{
-    AccountStatusesQuery, CreatedStatus, DeletedStatus, NewStatus, StatusStore, StatusUpdate,
-    StatusViewFlags,
+    AccountStatusesQuery, CreatedStatus, DeletedStatus, NewStatus, RelationshipStore, StatusStore,
+    StatusUpdate, StatusViewFlags,
 };
 use crate::domain::bookmark::Bookmark;
 use crate::domain::favourite::Favourite;
@@ -424,6 +424,40 @@ impl StatusStore for RedbStore {
                     Some(input.account_id),
                     Some(status_id),
                     now_ms,
+                )?;
+            }
+        }
+
+        // -- D51 `status`: followers with `notify` set are fanned out in
+        // this same transaction (G-B producer). Non-Direct only: followers
+        // cannot see direct posts (upstream's exact visibility gate is
+        // unverified — revisit against `fan_out_on_write_service.rb`).
+        if input.visibility != Visibility::Direct {
+            use crate::application::notifications::emit_status_for_followers;
+            let mut notify: Vec<Id> = Vec::new();
+            let mut cursor: Option<Id> = None;
+            for _ in 0..20 {
+                let batch = self.followers(input.account_id, cursor, 500)?;
+                if batch.is_empty() {
+                    break;
+                }
+                for follower in &batch {
+                    cursor = Some(*follower);
+                    if self
+                        .follow_of(*follower, input.account_id)?
+                        .is_some_and(|f| f.notify)
+                    {
+                        notify.push(*follower);
+                    }
+                }
+                if batch.len() < 500 {
+                    break;
+                }
+            }
+            for job in emit_status_for_followers(input.account_id, status_id, &notify, now_ms) {
+                super::jobs::insert_job(
+                    &write,
+                    &Job::new(self.next_id(), job.kind, job.payload, now_ms, now_ms),
                 )?;
             }
         }
@@ -856,6 +890,66 @@ impl StatusStore for RedbStore {
 
         write_status_txn(&write, &status)?;
         super::federation_content::federation_event_txn(&write, self.next_id(), account_id, serde_json::json!({"event": "update", "status_id": id.value()}), now_ms)?;
+        // -- D51 `update` (live rebloggers) + `quoted_update` (accepted
+        // quoters' authors), same transaction (G-B producers).
+        {
+            use crate::application::notifications::{
+                emit_quoted_update_for_quoters, emit_update_for_rebloggers,
+            };
+            let rebloggers: Vec<Id> = self
+                .reblogged_by(id, None, 5000)?
+                .into_iter()
+                .map(|(account, _)| account)
+                .collect();
+            for job in emit_update_for_rebloggers(account_id, id, &rebloggers, now_ms) {
+                super::jobs::insert_job(
+                    &write,
+                    &Job::new(self.next_id(), job.kind, job.payload, now_ms, now_ms),
+                )?;
+            }
+            // Accepted quoters' authors, scanned inline on the held write
+            // txn (`quotes_of_status` opens its own write txn and cannot
+            // nest inside this one).
+            let mut quoter_ids: Vec<Id> = Vec::new();
+            {
+                let by_quoted = write.open_table(QUOTES_BY_QUOTED)?;
+                let lower = schema::pair_key(id.value(), 0);
+                let upper = schema::pair_key(id.value(), u64::MAX);
+                for entry in by_quoted.range(lower.as_slice()..=upper.as_slice())? {
+                    let (key, value) = entry?;
+                    let bytes = key.value();
+                    let quote_id = u64::from_be_bytes(bytes[8..].try_into().map_err(|_| {
+                        Error::Storage("quote key is not 16 bytes".into())
+                    })?);
+                    let quoting_status_id = Id::new(value.value());
+                    let Some(quote) =
+                        super::quotes::read_quote_txn(&write, Id::new(quote_id))?
+                    else {
+                        continue;
+                    };
+                    if !quote.is_accepted() {
+                        continue;
+                    }
+                    let Some(quoting) = read_status_txn(&write, quoting_status_id)? else {
+                        continue;
+                    };
+                    if quoting.is_deleted() {
+                        continue;
+                    }
+                    quoter_ids.push(quoting.account_id);
+                    if quoter_ids.len() >= 1000 {
+                        break;
+                    }
+                }
+            }
+            for job in emit_quoted_update_for_quoters(status.account_id, id, &quoter_ids, now_ms)
+            {
+                super::jobs::insert_job(
+                    &write,
+                    &Job::new(self.next_id(), job.kind, job.payload, now_ms, now_ms),
+                )?;
+            }
+        }
         // Phase 7.2: incremental search indexing rides the same commit.
         super::jobs::insert_job(&write, &Job::new(self.next_id(), JobKind::SearchIndexStatus, crate::jobs::search_index::index_payload(id), now_ms, now_ms))?;
         write.commit()?;

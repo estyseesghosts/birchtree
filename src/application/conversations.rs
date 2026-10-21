@@ -574,6 +574,17 @@ pub fn known_alert_types() -> &'static [&'static str] {
         "poll",
         "follow_request",
         "quote",
+        // D51 producers (gaps G-B): pushable once their features emit.
+        "status",
+        "update",
+        "severed_relationships",
+        "moderation_warning",
+        "annual_report",
+        "admin.sign_up",
+        "admin.report",
+        "quoted_update",
+        "added_to_collection",
+        "collection_update",
     ]
 }
 

@@ -144,6 +144,15 @@ pub async fn show(State(state): State<ApiState>, auth: Auth) -> Response {
         Err(err) => return err.into_response(),
     };
     let store: &dyn Store = &*state.context.store;
+    // Pre-token backfill (gaps G-B): heal the row's bearer token + absolute
+    // `Unsubscribe-URL` once a token exists (send-or-mark, never fabricated).
+    // A backfill failure never fails the read: the row is still served.
+    let _ = crate::application::notifications::backfill_push_unsubscribe(
+        store,
+        actor.token_id,
+        &state.server.public_url,
+        state.context.now_ms(),
+    );
     match store.push_subscription_by_token(actor.token_id) {
         Ok(Some(subscription)) => {
             axum::Json(push::subscription_json(&subscription, &state.server.vapid_public_key))
@@ -167,6 +176,14 @@ pub async fn update(
     };
     let (policy, alerts) = data_params(&pairs);
     let store: &dyn Store = &*state.context.store;
+    // Pre-token backfill (gaps G-B): same send-or-mark healing as `show`
+    // before the data update is applied.
+    let _ = crate::application::notifications::backfill_push_unsubscribe(
+        store,
+        actor.token_id,
+        &state.server.public_url,
+        state.context.now_ms(),
+    );
     match store.update_push_subscription_data(
         actor.token_id,
         policy,

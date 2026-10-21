@@ -343,6 +343,8 @@ fn confirmation_ownership_grandfather_and_mismatch() {
             reason: None,
             invite_code: None,
             display_name: None,
+            time_zone: None,
+            date_of_birth: None,
         },
     )
     .expect("register");
@@ -525,6 +527,8 @@ async fn resend_enforces_signup_app_ownership() {
             reason: None,
             invite_code: None,
             display_name: None,
+            time_zone: None,
+            date_of_birth: None,
         },
     )
     .expect("register");

@@ -41,7 +41,16 @@ pub use admin_infra::{
     InteractionEventKind,
 };
 pub use oauth::{AccessToken, AuthorizationCode, OAuthApplication};
-pub use user::{EmailToken, EmailTokenKind, LocalUser, LoginSession, SignInEvent, UserRole};
+pub use user::{
+    AdminAction, EmailToken, EmailTokenKind, LocalUser, LoginSession, SignInEvent, TotpRecord,
+    UserRole, WebauthnChallenge, WebauthnCredential, WebauthnPurpose,
+    ADMIN_PERMISSIONS, MODERATOR_PERMISSIONS,
+    PERM_DELETE_USER_DATA, PERM_MANAGE_ANNOUNCEMENTS, PERM_MANAGE_APPEALS, PERM_MANAGE_BLOCKS,
+    PERM_MANAGE_CUSTOM_EMOJIS, PERM_MANAGE_FEDERATION, PERM_MANAGE_INVITES, PERM_MANAGE_ROLES,
+    PERM_MANAGE_REPORTS, PERM_MANAGE_RULES, PERM_MANAGE_SETTINGS, PERM_MANAGE_TAXONOMIES,
+    PERM_MANAGE_USER_ACCESS, PERM_MANAGE_USERS, PERM_MANAGE_WEBHOOKS, PERM_VIEW_AUDIT_LOG,
+    PERM_VIEW_DASHBOARD, PERM_VIEW_FEEDS,
+};
 pub use job::{Job, JobKind, JobState};
 pub use follow::{Follow, FollowState};
 pub use relationship::{
@@ -65,4 +74,4 @@ pub use conversation::{ConversationState, PushPolicy, WebPushSubscription};
 pub use federation::ActorKeys;
 pub use federation::DeliveryDestState;
 pub use report::Report;
-pub use rule::{AccountWarning, Rule, RULE_TEXT_LIMIT};
+pub use rule::{AccountWarning, Rule, RuleTranslation, RULE_LOCALE_LIMIT, RULE_TEXT_LIMIT};

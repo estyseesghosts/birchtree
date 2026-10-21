@@ -21,7 +21,8 @@ use crate::domain::{
     LoginSession, Marker, MediaAttachment, Mute, NewAnnualReport, Notification, NotificationPolicy,
     NotificationRequest, NotificationType,
     OAuthApplication,
-    Poll, QuotePolicy, QuoteRecord, RepliesPolicy, Report, Result, Rule, ScheduledStatus, Status,
+    Poll, QuotePolicy, QuoteRecord, RepliesPolicy, Report, Result, Rule, RuleTranslation,
+    ScheduledStatus, Status,
     StatusApplication, StatusVersion, TagUsage, TrendLink, TrendPublisher, TrendStatusFlag,
     TrendTagFlag, UserRole, Visibility,
 };
@@ -62,6 +63,10 @@ pub struct NewLocalAccount {
     /// supplied). Recorded in `INVITE_USES` in the same transaction as the
     /// account (backs `invited_by_account_id` + the `invited_by` filter).
     pub invite_code: Option<String>,
+    /// IANA time-zone name captured at registration (upstream `user.time_zone`).
+    pub time_zone: Option<String>,
+    /// Date of birth (`YYYY-MM-DD`, upstream `user.date_of_birth`).
+    pub date_of_birth: Option<String>,
 }
 
 /// Input for registering an OAuth application.
@@ -214,6 +219,22 @@ pub trait AccountStore: Send + Sync {
     /// no local user exists for `account_id` (wrong id or remote account).
     fn set_user_role(&self, account_id: Id, role: UserRole) -> Result<LocalUser>;
 
+    /// Record the account this one moved to (federation `Move`, G-D). Remote
+    /// rows included. ONE transaction; `None` clears.
+    fn set_moved_to(&self, account_id: Id, moved_to: Option<Id>, now_ms: u64) -> Result<Account>;
+
+    /// Overwrite a REMOTE account's counters from validated collection
+    /// totals (federation tail refresh). `None` fields keep their row.
+    /// Callers gate on remote rows (local counters are authoritative); the
+    /// port itself is a plain upsert.
+    fn set_remote_stats(
+        &self,
+        account_id: Id,
+        followers: Option<u64>,
+        following: Option<u64>,
+        statuses: Option<u64>,
+    ) -> Result<AccountStats>;
+
     /// Record one password sign-in event for the admin `active_users`
     /// telemetry (D39). Called once when a local user completes the browser
     /// password login; API calls on an existing token are not sign-ins.
@@ -269,6 +290,13 @@ pub trait AccountStore: Send + Sync {
     /// loudly; RedbStore overrides.
     fn redeem_email_token(&self, _token: &str) -> Result<Option<EmailToken>> {
         Err(Error::Internal("redeem_email_token is not implemented".into()))
+    }
+
+    /// Set a local user's password hash in ONE transaction (D12
+    /// password-reset redemption). `NotFound` when no local user exists for
+    /// `account_id`. Scaffold default refuses loudly; RedbStore overrides.
+    fn set_user_password(&self, _account_id: Id, _password_hash: String) -> Result<LocalUser> {
+        Err(Error::Internal("set_user_password is not implemented".into()))
     }
 }
 
@@ -1085,7 +1113,13 @@ pub trait AdminInfraStore: Send + Sync {
         min_id: Option<Id>,
         limit: usize,
     ) -> Result<Vec<AdminEmailDomainBlock>>;
-    fn admin_delete_email_domain_block(&self, id: Id) -> Result<Option<AdminEmailDomainBlock>>;
+    /// The email-domain block for one normalized domain, if any (targeted
+    /// signup lookup; domains are unique at creation, so at most one row).
+    /// `None` for blank/unknown domains — never an error.
+    fn email_domain_block_for_domain(
+        &self,
+        domain: &str,
+    ) -> Result<Option<AdminEmailDomainBlock>>;    fn admin_delete_email_domain_block(&self, id: Id) -> Result<Option<AdminEmailDomainBlock>>;
 
     // -- IP blocks --
     fn admin_create_ip_block(
@@ -1212,6 +1246,31 @@ pub trait AdminInfraStore: Send + Sync {
     fn admin_rules(&self) -> Result<Vec<Rule>>;
     /// The rules for `ids`, in `ids` order, skipping unknown ids.
     fn admin_rules_by_ids(&self, ids: &[Id]) -> Result<Vec<Rule>>;
+    /// Every rule translation row, rule-then-locale ordered (gaps batch G-A;
+    /// backs the instance rules `translations` map). Empty when none are
+    /// stored (the serializer renders `{}` per rule then).
+    fn admin_rule_translations(&self) -> Result<Vec<RuleTranslation>> {
+        Ok(Vec::new())
+    }
+    /// Create or replace the `(rule, locale)` translation in ONE
+    /// transaction. `NotFound` when the rule is gone; `InvalidInput` on a
+    /// malformed locale or over-long text.
+    fn admin_set_rule_translation(
+        &self,
+        _rule_id: Id,
+        _locale: String,
+        _text: String,
+        _hint: String,
+        _now_ms: u64,
+    ) -> Result<RuleTranslation> {
+        Err(Error::Internal("admin_set_rule_translation is not implemented".into()))
+    }
+    /// Delete one `(rule, locale)` translation; `true` when a row existed.
+    fn admin_delete_rule_translation(&self, _rule_id: Id, _locale: &str) -> Result<bool> {
+        Err(Error::Internal(
+            "admin_delete_rule_translation is not implemented".into(),
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1464,6 +1523,18 @@ pub trait NotificationStore: Send + Sync {
     /// Filtered rows are excluded (upstream's default notification scope):
     /// they surface only through notification requests until accepted.
     fn notifications_page(
+        &self,
+        recipient_id: Id,
+        limit: usize,
+        max_id: Option<Id>,
+        since_id: Option<Id>,
+        min_id: Option<Id>,
+    ) -> Result<Vec<Notification>>;
+
+    /// Filtered rows for `include_filtered=true`, newest first with the same
+    /// exclusive cursors (upstream `browserable` serves them when the flag is
+    /// set). Bounded scan like `notifications_page`.
+    fn filtered_notifications_page(
         &self,
         recipient_id: Id,
         limit: usize,
@@ -1891,6 +1962,21 @@ pub trait EmojiStore: Send + Sync {
     fn listed_emojis(&self, cap: usize) -> Result<Vec<CustomEmoji>>;
     /// Emoji whose shortcode is in `shortcodes` (status/account payloads).
     fn emojis_by_shortcodes(&self, shortcodes: &[String]) -> Result<Vec<CustomEmoji>>;
+    /// Upsert one remote emoji row (federation tail, G-D ingest).
+    fn upsert_remote_emoji(&self, row: RemoteEmojiRow) -> Result<RemoteEmojiRow>;
+    /// Remote emoji rows by shortcode (federation tail, G-D): backs the
+    /// `emojis` arrays for shortcodes with no local row. Empty when none.
+    fn remote_emojis_by_shortcodes(&self, shortcodes: &[String]) -> Result<Vec<RemoteEmojiRow>>;
+}
+
+/// One remote custom emoji row (federation tail, G-D): the origin domain +
+/// shortcode key the render path, with the source URL served in `emojis`
+/// arrays (never picker-visible, never listed).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RemoteEmojiRow {
+    pub shortcode: String,
+    pub domain: String,
+    pub url: String,
 }
 
 /// Bounded local search scans backing `GET /api/v2/search`.
@@ -2195,6 +2281,158 @@ pub trait InteractionLog: Send + Sync {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Collections (gaps batch G-C; port moved here at the parent merge so the
+// REST adapters can join it to `Store`).
+// ---------------------------------------------------------------------------
+
+/// A curated collection of statuses owned by one account.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CollectionRecord {
+    pub id: Id,
+    pub account_id: Id,
+    pub title: String,
+    pub description: String,
+    pub public: bool,
+    #[serde(default)]
+    pub revoked: bool,
+    /// Denormalized membership count. Stays rendered even when the owner's
+    /// `hide_collections` hides the members (D30/D52: members hidden, counts
+    /// stay).
+    pub items_count: u64,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+/// What changed in a collection (fan-out job payload + handler dispatch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectionChange {
+    Add,
+    Remove,
+    Revoke,
+    Delete,
+}
+
+impl CollectionChange {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            CollectionChange::Add => "add",
+            CollectionChange::Remove => "remove",
+            CollectionChange::Revoke => "revoke",
+            CollectionChange::Delete => "delete",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        Some(match raw {
+            "add" => CollectionChange::Add,
+            "remove" => CollectionChange::Remove,
+            "revoke" => CollectionChange::Revoke,
+            "delete" => CollectionChange::Delete,
+            _ => return None,
+        })
+    }
+}
+
+/// Narrow port over the `COLLECTIONS` / `COLLECTION_ITEMS` tables.
+///
+/// `account_id` arguments are the claimed owner: trait methods return
+/// `NotFound("Record not found")` for missing *or* foreign collections (never
+/// an ownership oracle). Use-case wrappers add validation and policy.
+pub trait CollectionStore: Send + Sync {
+    fn create_collection(
+        &self,
+        account_id: Id,
+        title: &str,
+        description: &str,
+        public: bool,
+        now_ms: u64,
+    ) -> Result<CollectionRecord>;
+
+    fn collection_by_id(&self, id: Id) -> Result<Option<CollectionRecord>>;
+
+    /// The owner's collections, newest first.
+    fn collections_by_account(&self, account_id: Id) -> Result<Vec<CollectionRecord>>;
+
+    /// Patch an owned collection; `None` when missing/foreign.
+    fn update_collection(
+        &self,
+        account_id: Id,
+        id: Id,
+        title: Option<String>,
+        description: Option<String>,
+        public: Option<bool>,
+        now_ms: u64,
+    ) -> Result<Option<CollectionRecord>>;
+
+    /// Delete an owned collection and all its memberships; `false` when
+    /// missing/foreign. Enqueues one `CollectionFanout` (`delete`) in the
+    /// same transaction.
+    fn delete_collection(&self, account_id: Id, id: Id, now_ms: u64) -> Result<bool>;
+
+    /// Member status ids, newest first; cursors exclusive (`id < max_id`),
+    /// bounded scan.
+    fn collection_items(
+        &self,
+        collection_id: Id,
+        max_id: Option<Id>,
+        limit: usize,
+    ) -> Result<Vec<Id>>;
+
+    /// The owner's collections containing `status_id`, newest first.
+    fn collections_containing_status(
+        &self,
+        account_id: Id,
+        status_id: Id,
+    ) -> Result<Vec<CollectionRecord>>;
+
+    /// Add members (idempotent; existing members skipped). Returns the newly
+    /// added ids. Enqueues one `CollectionFanout` (`add`, batch ≤ 500) in
+    /// the same transaction. `NotFound` when missing/foreign; `InvalidInput`
+    /// when revoked, over the batch bound, or over the item cap.
+    fn add_collection_items(
+        &self,
+        account_id: Id,
+        collection_id: Id,
+        status_ids: &[Id],
+        now_ms: u64,
+    ) -> Result<Vec<Id>>;
+
+    /// Remove members (idempotent). Returns the removed ids. Enqueues one
+    /// `CollectionFanout` (`remove`) in the same transaction when anything
+    /// was removed.
+    fn remove_collection_items(
+        &self,
+        account_id: Id,
+        collection_id: Id,
+        status_ids: &[Id],
+        now_ms: u64,
+    ) -> Result<Vec<Id>>;
+
+    /// Revoke an owned collection: every membership is dropped,
+    /// `revoked = true`, and one `CollectionFanout` (`revoke`) is enqueued
+    /// in the same transaction. `None` when missing/foreign.
+    fn revoke_collection(
+        &self,
+        account_id: Id,
+        id: Id,
+        now_ms: u64,
+    ) -> Result<Option<CollectionRecord>>;
+
+    /// `(account_id, reblog_id)` pairs for `status_id`, newest first, scoped
+    /// to distributable reblogs: the reblog wrapper must exist, must not be
+    /// a tombstone, and its visibility must be `distributable` (public or
+    /// unlisted — `Visibility::is_distributable`). This is the D52 scope the
+    /// plain `reblogged_by` scan lacks.
+    fn reblogged_by_distributable(
+        &self,
+        status_id: Id,
+        max_id: Option<Id>,
+        limit: usize,
+    ) -> Result<Vec<(Id, Id)>>;
+}
+
 /// Bundled persistence surface assembled into a `Context`.
 ///
 /// Implemented once by the `redb` adapter; application code depends on the
@@ -2231,6 +2469,8 @@ pub trait Store:
     + crate::application::push::PushSubscriptionStore
     + WebStore
     + CacheStore
+    + crate::application::accounts::SecondFactorStore
+    + CollectionStore
 {
 }
 impl<T> Store for T where
@@ -2265,6 +2505,8 @@ impl<T> Store for T where
     + crate::application::push::PushSubscriptionStore
     + WebStore
     + CacheStore
+    + crate::application::accounts::SecondFactorStore
+    + CollectionStore
 {
 }
 

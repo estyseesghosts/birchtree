@@ -14,19 +14,11 @@ Conventions: `D##` = row in `docs/compatibility-profile.md`;
 
 ## Needs an operator decision
 
-- **Password-reset redemption flow.** The "forgot password" mail sends a
-  real link, but the link target (`/auth/password/edit`-equivalent) has no
-  page and no set-password port. Shape of the redemption HTTP flow is
-  undecided.
 - **Suggestion ranking source.** Suggestions rank honest local signals only
   (friends-of-friends, then most-followed fill). Confirm this is enough, or
   name a richer source (staff picks, similar-profiles, FASP, remote
   signals). Related: the profile directory is always on (upstream has a
   kill switch we did not build).
-- **Site text settings.** Terms of service, privacy policy and extended
-  description answer 404 — there is no authoring surface for the texts.
-  Decide the settings/authoring shape (then the instance sub-resources serve
-  them instead of 404ing).
 
 ## Media / profile follow-ups
 
@@ -37,66 +29,52 @@ Conventions: `D##` = row in `docs/compatibility-profile.md`;
   `update_account_profile` transaction; actor documents serve
   `icon`/`image` and a `profile_update` event fans out. Evidence
   `tests/avatar_upload.rs`.
-- **Rule translations.** Server rules render `translations: {}` — no
-  translation store exists.
-- **Locale catalog for languages.** `GET /api/v1/instance/languages`
-  renders `name` = code (e.g. `"fr"` instead of `"Français"`); upstream
-  serves localized names from its ISO-639 catalog.
 
 ## Notifications / streaming follow-ups
 
-- **Unproduced notification types (D51).** Ten types parse but are never
-  emitted (poll updates, post updates, severed relationships, moderation
-  warnings, annual reports, admin sign-ups/reports, quote updates,
-  added-to-collection, collection updates). One register row per producer as
-  the underlying features land.
-- **Streaming announcement events.** Upstream emits `announcement`,
-  `announcement.reaction` and `announcement.delete` on streams; we emit
-  none (reads/dismissals/reactions are REST-only so far).
+- **Producers landed (gaps G-B + G-D + G-C, D51).** All types except
+  `severed_relationships` (no sever cascade exists — gaps-finish gap record)
+  emit from real features; `added_to_collection`/`collection_update` flow
+  from the `CollectionFanout` worker; announcement streaming events ride
+  `user` streams. Evidence `tests/gaps_notifications.rs`,
+  `tests/gaps_federation_tail.rs`, `tests/gaps_collections.rs`.
 - **Store push-down for notification paging (deferred, not a bug).** The
   `account_id` fill loop is correct and cursor-stable; pushing the actor
   filter into the store page is a bounded perf optimization. Revisit only
   with measured scan pressure.
-- **`Unsubscribe-URL` on pre-token push rows.** Subscriptions created
-  before the fix round carry no token/URL and send no header (never
-  fabricated). New subscriptions are complete.
-- **`include_filtered` / `supported_types` honored in name only.** Both
-  params parse, but filtered rows are never served into the v1 index and the
-  `supported_types` fallback rendering is unbuilt — same observable result
-  as upstream with no filtered content, but the knobs don't turn yet.
 
-## Federation tail (own phase — D32 refuse-position stands)
+## Federation tail (landed gaps G-D; D32 refuse-position narrowed to truly-unknown)
 
-- Account Move (migrated follows need an individual register row).
-- Remote emoji ingest (`emojis` arrays omit remote emoji).
-- Relays / inbox forwarding (delivery reachability claims).
-- Follower sync and remote counters.
-- Note / featured collections.
-- Quote re-verify workers, remote counts, note collections.
-- Poll `collection_update` notifications.
-- Report forwarding as Flag to remote servers (Phase 6; local reports and
-  the moderator queue are done).
-- Live interop proofs (no live services in this environment — recorded,
-  not chased).
+- Account Move + migrated follows (D32a/D32b; `alsoKnownAs` link-back check open).
+- Remote emoji ingest + status-array rendering (D32c; account payloads open).
+- Relays / inbox forwarding (D32d).
+- Follower sync and remote counters as untrusted hints (D32e).
+- Note / featured collections (D32f).
+- Quote re-verify workers, remote counts, note collections (D32g).
+- Poll `collection_update` notifications (D32h; collection-side rows wait on G-C).
+- Report forwarding as Flag to remote servers (D34; local queue → event → delivery verified).
+- Live WebFinger resolve (D32j) and web embeds remote fetch/sanitize (D32k).
+- Remaining: live interop proofs (no live services in this environment — recorded, not chased).
 
-## Collections surface
+## Collections surface (landed gaps G-C)
 
-- `hide_collections` round-trips on the account row but there are no
-  collections to hide (D52).
-- Unbuilt endpoints (in manifest "not yet rowed" list): account `lists`
-  sub-resource, `identity_proofs`, `email_subscriptions`, `in_collections`,
-  top-level `collections` CRUD + items/revoke, `v1_alpha` namespace,
-  `domain_blocks/preview`, `GET/PATCH /api/v1/profile`, instance
-  `peers/search`, `GET /api/v2/notifications` family.
-- `reblogged_by` lacks upstream's `distributable_visibility` scope (D52).
+- Top-level `collections` CRUD + `items` + `revoke`, `in_collections`,
+  account `lists` sub-resource, `v1_alpha` namespace (minimal),
+  `domain_blocks/preview`, `peers/search`, `GET /api/v2/notifications`
+  family — all rowed in the manifest. `hide_collections` enforced
+  everywhere (D52); `reblogged_by` carries the `distributable_visibility`
+  scope. Evidence `tests/gaps_collections.rs`.
 
 ## Permissions / admin follow-ups
 
-- **D35 roadmap:** fine-grained per-action permission flags on the upstream
-  `Admin::BasePolicy` model (shipped: two-role split, moderator covers
-  accounts+reports only).
-- **Role serializer:** role ids are names (no numeric ids). Permissions are
-  a real bitmask since the fix round.
+- **D35 landed (gaps G-E):** fine-grained per-action permission flags on
+  the upstream `Admin::BasePolicy` model; moderator scope widens per flag
+  as the remaining admin modules adopt `require_admin_action`; audit per
+  write kept. Evidence `tests/gaps_auth_moderation.rs`.
+- **Role serializer numeric ids + real bitmask (gaps G-E):** role ids are
+  `0`/`1`/`2`, permissions the upstream bitmask string (`-1` gone; the
+  `1049888` comment arithmetic corrected to `1049884`, verified against
+  `user_role.rb` at `8ff11c2b`).
 
 ## Deliberately out of profile (not TODO, listed so nobody re-files them)
 
@@ -110,26 +88,31 @@ Conventions: `D##` = row in `docs/compatibility-profile.md`;
 - Donation campaigns as real campaigns (honest 404 absence by decision).
 - `GET /api/v1/oembed` (explicitly out of the initial profile).
 
-## Accounts, auth, and moderation open items
+## Accounts, auth, and moderation open items (landed gaps G-E unless noted)
 
-- **MFA login unsupported.** No TOTP/WebAuthn second factor; password +
-  (optional) approval only.
-- **Registration `time_zone` / `date_of_birth` ignored; no min-age policy.**
-  `locale` and invite text are captured; the other two fields are accepted
-  and dropped.
+- **MFA login (landed):** TOTP (+ hashed single-use backup codes) and
+  WebAuthn (ES256, `none` + `packed` self-attestation) second factors;
+  staged browser login gate (`otp_attempt`) with uniform refusals.
+  Evidence `tests/gaps_auth_moderation.rs`. Follow-ups: TOTP envelope
+  encryption at rest (no operator key exists yet); durable WebAuthn
+  challenges (memory-scoped; `WEBAUTHN_CHALLENGES` table open);
+  RS256/EdDSA authenticators + attestation chains (refused 422).
+- **Registration `time_zone` / `date_of_birth` + min-age gate (landed):**
+  captured on the credential row, validated (`validate_time_zone`,
+  `check_date_of_birth`, min 16y), under-age refused 422. `minimum_age_years`
+  config key landed (13–21); enforcement plumbing to the constant is open.
+- **IP-block client-IP verification (landed):** true-client-IP matrix
+  across proxy shapes pinned in `tests/gaps_auth_moderation.rs`.
+- **Email-domain / canonical-email block enforcement vs confirmation
+  state (landed):** signup-time matrix + confirmation reconciliation pinned
+  in `tests/gaps_auth_moderation.rs`. Open: targeted
+  `email_domain_block_for_domain` lookup (signup page is capped at 1000).
 - **First-party token-vs-session question (still open).** Whether
   first-party `/api/v1/*` calls use OAuth tokens (proposed default) or the
   browser session (endpoint-manifest web section).
 - **Media caps policy.** Status length decided (500 default,
   `--max-status-chars` to 3000); the operator-facing media caps story
   beyond the upload size limit is unsettled.
-- **IP-block client-IP verification.** Enforcement reads the trusted-proxy
-  client IP; verify it sees the true client IP in all deployment shapes
-  (no-access blocks depend on it).
-- **Email-domain / canonical-email block enforcement vs confirmation
-  state.** Registration-time enforcement is documented as needing email
-  confirmation; confirm it works now that confirmation redemption is live,
-  or record the remaining gap.
 
 ## Federation / remote-media fidelity
 

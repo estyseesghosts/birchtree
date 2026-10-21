@@ -584,11 +584,67 @@ pub fn remote_cache_key(source_url: &str, variant: &str) -> Vec<u8> {
     key
 }
 
+// ---------------------------------------------------------------------------
+// Gaps batch (schema v18, `docs/gaps.md` Step 0): collections + second-factor
+// credential rows. Skeletons only — names + key helpers; G-C owns the
+// collections port functions, G-E owns the TOTP/WebAuthn port functions.
+// ---------------------------------------------------------------------------
+
+/// Collections by numeric collection ID -> JSON `CollectionRecord`.
+pub const COLLECTIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("collections");
+
+/// Collection membership: 16-byte `(collection_id_be || item_id_be)` -> JSON
+/// `CollectionItem`.
+pub const COLLECTION_ITEMS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("collection_items");
+
+/// TOTP second-factor secrets by account ID -> JSON `TotpSecret`
+/// (encrypted-at-rest envelope; never logged).
+pub const TOTP_SECRETS: TableDefinition<u64, &[u8]> = TableDefinition::new("totp_secrets");
+
+/// WebAuthn credentials by raw credential ID bytes -> JSON `WebauthnCredential`.
+pub const WEBAUTHN_CREDS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("webauthn_creds");
+
+/// WebAuthn single-use challenges by `challenge_b64` -> JSON
+/// `WebauthnChallenge` (gaps finish; 5 min TTL enforced by callers via
+/// `live_at`, removed on take either way).
+pub const WEBAUTHN_CHALLENGES: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("webauthn_challenges");
+
+/// Fixed 16-byte membership key `(collection_id_be || item_id_be)`.
+pub fn collection_item_key(collection_id: u64, item_id: u64) -> [u8; 16] {
+    pair_key(collection_id, item_id)
+}
+
+/// Rule translations: `{rule_id}:{locale}` -> JSON `RuleTranslation`
+/// (locales never contain `:`, enforced at the write port).
+pub const RULE_TRANSLATIONS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("rule_translations");
+
+/// Remote custom emoji: `(domain_utf8 || 0xFF || shortcode_utf8)` -> JSON
+/// `RemoteEmojiRow` (federation tail, G-D; backs the `emojis` arrays for
+/// shortcodes with no local row; never picker-visible, never listed).
+pub const REMOTE_EMOJI: TableDefinition<&[u8], &[u8]> = TableDefinition::new("remote_emoji");
+
+/// Storage key for one `(domain, shortcode)` remote-emoji row.
+pub fn remote_emoji_key(domain: &str, shortcode: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(domain.len() + shortcode.len() + 1);
+    key.extend_from_slice(domain.as_bytes());
+    key.push(0xFF);
+    key.extend_from_slice(shortcode.as_bytes());
+    key
+}
+
+/// Storage key for one `(rule, locale)` translation row.
+pub fn rule_translation_key(rule_id: u64, locale: &str) -> String {
+    format!("{rule_id}:{locale}")
+}
+
 /// Key under `META` holding the applied schema version (big-endian `u64`).
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// Current schema version. Bump with a new migration step.
-pub const SCHEMA_VERSION: u64 = 17;
+pub const SCHEMA_VERSION: u64 = 21;
 
 /// All table names, for diagnostics and migration verification.
 pub const TABLE_NAMES: &[&str] = &[
@@ -609,6 +665,8 @@ pub const TABLE_NAMES: &[&str] = &[
     "delivery_dest",
     "reports",
     "rules",
+    "rule_translations",
+    "remote_emoji",
     "account_warnings",
     "sign_ins",
     "admin_audit",
@@ -694,6 +752,11 @@ pub const TABLE_NAMES: &[&str] = &[
     "interaction_events",
     "remote_cache",
     "cache_accounting",
+    "collections",
+    "collection_items",
+    "totp_secrets",
+    "webauthn_creds",
+    "webauthn_challenges",
 ];
 
 /// Build the fixed 16-byte scheduling key used by [`JOBS_INDEX`].

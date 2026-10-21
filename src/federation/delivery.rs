@@ -261,3 +261,146 @@ fn classify(err: ProtocolError) -> DeliveryError {
         other => DeliveryError::Retry(other.to_string()),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Relays + inbox forwarding (federation tail, G-D).
+// ---------------------------------------------------------------------------
+
+/// Largest relayed/inbound-forwarded activity body (matches the 1 MB inbound
+/// activity bound, D27): federation input is untrusted on every path.
+pub const RELAY_MAX_BODY_BYTES: u64 = 1_048_576;
+/// Destinations cap per inbox-forwarding plan (bounded fan-out per job).
+pub const FORWARD_MAX_DESTINATIONS: usize = 1_000;
+
+/// Parse operator-configured relay inbox URLs (proposed `relays` config keys,
+/// parent-merged): only `http(s)` URLs without credentials survive. Anything
+/// else is dropped, never quarantined (operator config, not remote input).
+pub fn relay_inboxes(configured: &[String]) -> Vec<Url> {
+    configured
+        .iter()
+        .filter_map(|raw| Url::parse(raw).ok())
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .filter(|url| url.username().is_empty() && url.password().is_none())
+        .filter(|url| url.host_str().is_some())
+        .collect()
+}
+
+/// Whether an inbound activity type is forwarded to local followers' remote
+/// followers (Mastodon inbox-forwarding shape): public boosts and public
+/// creations travel on; anything else (likes, flags, private addressing)
+/// never forwards. Audience checks stay with the caller, which knows the
+/// activity's `to`/`cc`.
+pub fn should_forward_inbound(activity_type: &str) -> bool {
+    matches!(activity_type, "Announce" | "Create")
+}
+
+/// Plan inbox forwarding for an activity authored by `author_id`: one
+/// `DeliverActivity` job per distinct remote follower inbox (shared inboxes
+/// deduped by [`crate::activitypub::outgoing::follower_inboxes`]), excluding
+/// `exclude_inbox` (the inbox the activity arrived from, so a relay loop
+/// cannot bounce it straight back). Returns the planned destination count.
+///
+/// The payload is fixed at plan time, so retries send the same bytes; each
+/// destination settles under the same per-host budget/cooldown as ordinary
+/// delivery (reachability claim D49 stands for forwarded traffic too).
+pub fn plan_inbox_forward(
+    store: &dyn crate::application::ports::Store,
+    author_id: Id,
+    activity_uri: &str,
+    body: &serde_json::Value,
+    exclude_inbox: Option<&str>,
+    now_ms: u64,
+) -> Result<usize, String> {
+    let body_bytes = serde_json::to_vec(body).map_err(|e| e.to_string())?;
+    if body_bytes.len() as u64 > RELAY_MAX_BODY_BYTES {
+        return Err("forwarded activity is larger than the limit".into());
+    }
+    let author = store
+        .account_by_id(author_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "forwarding author is missing".to_string())?;
+    let mut inboxes = crate::activitypub::outgoing::follower_inboxes(store, author.id)
+        .map_err(|e| e.to_string())?;
+    if let Some(exclude) = exclude_inbox {
+        inboxes.retain(|inbox| inbox != exclude);
+    }
+    inboxes.truncate(FORWARD_MAX_DESTINATIONS);
+    for inbox in &inboxes {
+        store
+            .enqueue(
+                JobKind::DeliverActivity,
+                serde_json::json!({
+                    "sender_id": author.id.value(),
+                    "inbox": inbox,
+                    "activity_uri": activity_uri,
+                    "body": body,
+                }),
+                now_ms,
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(inboxes.len())
+}
+
+/// Run one `RelayForward` job (payload `{sender_id, relay_inbox|inbox, body,
+/// activity_uri?}`): forward a fixed activity to one relay peer. The send
+/// reuses [`run`], so relay traffic carries the same signatures, per-host
+/// failure budget/cooldown and quarantine behavior as ordinary delivery —
+/// that is the reachability claim. Oversize bodies and unparseable payloads
+/// quarantine without touching any host budget.
+pub async fn run_relay_forward(
+    config: &FederationConfig<FedContext>,
+    job: &Job,
+) -> Result<(), DeliveryError> {
+    let payload = &job.payload;
+    let sender = payload
+        .get("sender_id")
+        .and_then(Value::as_u64)
+        .map(Id::new)
+        .ok_or_else(|| DeliveryError::Quarantine("relay forward has no sender".into()))?;
+    let relay = payload
+        .get("relay_inbox")
+        .or_else(|| payload.get("inbox"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| DeliveryError::Quarantine("relay forward has no relay inbox".into()))?;
+    let relay_url = Url::parse(relay).map_err(|_| DeliveryError::Quarantine("relay inbox is not a URL".into()))?;
+    if !matches!(relay_url.scheme(), "http" | "https") || relay_url.host_str().is_none() {
+        return Err(DeliveryError::Quarantine("relay inbox is not an http(s) URL".into()));
+    }
+    let body = payload
+        .get("body")
+        .cloned()
+        .ok_or_else(|| DeliveryError::Quarantine("relay forward has no body".into()))?;
+    let body_bytes = serde_json::to_vec(&body)
+        .map_err(|e| DeliveryError::Quarantine(format!("relay body is not JSON: {e}")))?;
+    if body_bytes.len() as u64 > RELAY_MAX_BODY_BYTES {
+        return Err(DeliveryError::Quarantine("relay body is larger than the limit".into()));
+    }
+    // The activity must be sendable (an id + actor to sign with); anything
+    // else quarantines before any host state is touched.
+    OutboundActivity::from_body(body.clone())
+        .map_err(|e| DeliveryError::Quarantine(format!("relay body is not an activity: {e}")))?;
+    let activity_uri = payload
+        .get("activity_uri")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let forwarded = Job {
+        id: job.id,
+        kind: JobKind::DeliverActivity,
+        payload: serde_json::json!({
+            "sender_id": sender.value(),
+            "inbox": relay,
+            "activity_uri": activity_uri,
+            "body": body,
+        }),
+        state: job.state,
+        due_at_ms: job.due_at_ms,
+        lease_until_ms: job.lease_until_ms,
+        attempts: job.attempts,
+        max_attempts: job.max_attempts,
+        last_error: job.last_error.clone(),
+        created_at_ms: job.created_at_ms,
+    };
+    run(config, &forwarded).await
+}

@@ -48,10 +48,22 @@ pub struct RemoteNote {
     pub mention_uris: Vec<String>,
     pub tags: Vec<String>,
     pub attachments: Vec<RemoteAttachment>,
+    /// Remote custom emoji carried in the Note's `Emoji` tags (federation
+    /// tail, G-D): fetched through `FetchRemoteEmoji` at ingest.
+    pub emojis: Vec<RemoteEmojiRef>,
     /// The quoted status URI (`quote`), if any.
     pub quote_uri: Option<String>,
     /// A poll to attach, when the received object is a `Question`.
     pub poll: Option<RemotePoll>,
+}
+
+/// One remote custom emoji carried in a Note's `Emoji` tags: shortcode +
+/// source URL (federation tail, G-D). Fetched through `FetchRemoteEmoji` at
+/// ingest; invalid refs skip, never a refusal.
+#[derive(Debug, Clone)]
+pub struct RemoteEmojiRef {
+    pub shortcode: String,
+    pub url: String,
 }
 
 /// A received `Question`'s poll: option titles with their tallies, the
@@ -196,6 +208,36 @@ pub fn ingest_note(store: &dyn Store, note: RemoteNote, poll: Option<RemotePoll>
             serde_json::json!({ "media_id": media_id.value() }),
             now_ms,
         )?;
+    }
+    // Remote emoji ingest (federation tail, G-D): `Emoji` tags fetch through
+    // `FetchRemoteEmoji` (SSRF/size/type rules enforced in the worker arm).
+    // Invalid refs skip, never a refusal; the author's domain scopes the
+    // shortcode check.
+    if !note.emojis.is_empty() {
+        let domain = store
+            .account_by_id(note.author_id)?
+            .map(|author| author.domain)
+            .unwrap_or_default();
+        for emoji in &note.emojis {
+            if crate::federation::media::validate_remote_emoji(
+                &emoji.shortcode,
+                &domain,
+                &emoji.url,
+            )
+            .is_err()
+            {
+                continue;
+            }
+            store.enqueue(
+                JobKind::FetchRemoteEmoji,
+                serde_json::json!({
+                    "shortcode": emoji.shortcode,
+                    "domain": domain,
+                    "source_url": emoji.url,
+                }),
+                now_ms,
+            )?;
+        }
     }
     // A quote of a local status is pending until the QuoteRequest is decided.
     if let Some(quoted_uri) = &note.quote_uri {
@@ -452,6 +494,22 @@ pub fn sync_question(
         serde_json::json!({"event": "question_update", "status_id": status.id.value()}),
         now_ms,
     )?;
+    // G-D poll `collection_update`: the author's LOCAL followers learn the
+    // new totals (deduped downstream by the FanOut job; self-skips inside).
+    for follower in store.followers(poll.account_id, None, 1_000)? {
+        if store
+            .account_by_id(follower)?
+            .is_some_and(|account| account.local)
+        {
+            crate::federation::threads::enqueue_collection_update(
+                store,
+                follower,
+                Some(author_id),
+                Some(status.id),
+                now_ms,
+            )?;
+        }
+    }
     Ok(Applied::Applied)
 }
 

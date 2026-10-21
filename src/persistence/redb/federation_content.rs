@@ -6,6 +6,7 @@
 use redb::{ReadableTable, ReadableTableMetadata, WriteTransaction};
 
 use crate::application::federation_ports::{FederationContentStore, NewQuote, NewReport};
+use crate::application::ports::{AdminAccountFilter, AdminStore};
 use crate::domain::federation::RefreshRecord;
 use crate::domain::{
     Account, Error, Id, Job, JobKind, MediaAttachment, QuoteRecord, QuoteState, Report, Result, Status,
@@ -440,6 +441,29 @@ impl FederationContentStore for RedbStore {
                 serde_json::json!({"event": "flag", "report_id": report.id.value()}),
                 now_ms,
             )?;
+        }
+        // D51 `admin.report` to staff (admins + moderators = reviewers here),
+        // same transaction (G-B producer).
+        {
+            use crate::application::notifications::emit_admin_report;
+            let staff = self.admin_accounts_page(
+                &AdminAccountFilter {
+                    staff_only: true,
+                    ..Default::default()
+                },
+                None,
+                None,
+                None,
+                false,
+                5000,
+            )?;
+            let staff_ids: Vec<Id> = staff.into_iter().map(|(account, _)| account.id).collect();
+            for job in emit_admin_report(report.reporter_id, &staff_ids, now_ms) {
+                super::jobs::insert_job(
+                    &write,
+                    &Job::new(self.next_id(), job.kind, job.payload, now_ms, now_ms),
+                )?;
+            }
         }
         write.commit()?;
         Ok(report)

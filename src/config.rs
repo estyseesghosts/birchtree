@@ -108,6 +108,15 @@ pub struct Config {
     /// filter, and their tokens are refused by user-token endpoints until
     /// an admin approves them. Off by default (upstream default `open`).
     pub registration_requires_approval: bool,
+    /// Minimum registration age in full years (upstream age assurance).
+    /// Default 16 (matches `domain::user::MINIMUM_AGE_YEARS`); enforced by
+    /// the registration use case once plumbed (follow-up: the constant
+    /// governs until then). File-only.
+    pub minimum_age_years: u8,
+    /// Relay peers public activities are forwarded to (federation tail,
+    /// G-D). Empty (default) = no relay traffic. `--relay-inbox=` repeatable;
+    /// file shape `relay_inboxes: [...]`.
+    pub relay_inboxes: Vec<String>,
     /// Instance title shown by `/api/v1/instance` and `/api/v2/instance`.
     pub site_title: String,
     /// Instance description.
@@ -224,6 +233,18 @@ pub struct Config {
     pub cache_dir: Option<PathBuf>,
     /// Remote-media cache budgets + lifecycle (`docs/database.md` Step 0).
     pub remote_cache: RemoteCacheConfig,
+    /// Password-reset bearer lifetime in hours (gaps batch, frozen decision:
+    /// server-rendered reset page + set-password port; 6h bearers,
+    /// consume-on-write). File-only; `--password-reset-ttl-hours=` overrides.
+    pub password_reset_ttl_hours: u64,
+    /// Operator-authored site texts, served by the instance sub-resources
+    /// instead of 404 (gaps batch, frozen decision: CLI + file authoring).
+    /// Each is a file path; `None` (default) keeps the honest-absence 404.
+    /// `--site-terms-file=` / `--site-privacy-file=` / `--site-extended-file=`
+    /// override.
+    pub site_terms_file: Option<PathBuf>,
+    pub site_privacy_file: Option<PathBuf>,
+    pub site_extended_file: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -239,6 +260,8 @@ impl Default for Config {
             worker_poll_interval: Duration::from_millis(250),
             registration_open: false,
             registration_requires_approval: false,
+            minimum_age_years: 16,
+            relay_inboxes: Vec::new(),
             site_title: "Birchtree".to_string(),
             site_description: "A Mastodon-compatible server".to_string(),
             site_contact_email: "admin@localhost".to_string(),
@@ -276,6 +299,10 @@ impl Default for Config {
             durable_dir: None,
             cache_dir: None,
             remote_cache: RemoteCacheConfig::default(),
+            password_reset_ttl_hours: 6,
+            site_terms_file: None,
+            site_privacy_file: None,
+            site_extended_file: None,
         }
     }
 }
@@ -424,6 +451,37 @@ impl Config {
         }
         if self.cache_dir_resolved() == self.durable_dir_resolved() {
             return Err("cache_dir and durable_dir must be different directories".to_string());
+        }
+        // Gaps batch (`docs/gaps.md` Step 0): reset bearer lifetime + site
+        // text file authoring. All optional; file paths are read at serve
+        // time (G-A), so existence is not checked here — only shape.
+        if self.password_reset_ttl_hours == 0 || self.password_reset_ttl_hours > 72 {
+            return Err("password_reset_ttl_hours must be between 1 and 72".to_string());
+        }
+        if self.minimum_age_years < 13 || self.minimum_age_years > 21 {
+            return Err("minimum_age_years must be between 13 and 21".to_string());
+        }
+        // Federation tail (G-D): relay inboxes must be http(s) inbox URLs
+        // without credentials; empty (default) disables relay traffic.
+        for relay in &self.relay_inboxes {
+            let parsed = url::Url::parse(relay)
+                .map_err(|_| "relay_inboxes entries must be http(s) inbox URLs".to_string())?;
+            if !matches!(parsed.scheme(), "http" | "https")
+                || parsed.host_str().is_none()
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+            {
+                return Err("relay_inboxes entries must be http(s) inbox URLs".to_string());
+            }
+        }
+        for (key, path) in [
+            ("site_terms_file", &self.site_terms_file),
+            ("site_privacy_file", &self.site_privacy_file),
+            ("site_extended_file", &self.site_extended_file),
+        ] {
+            if path.as_ref().is_some_and(|p| p.as_os_str().is_empty()) {
+                return Err(format!("{key} must not be empty"));
+            }
         }
         Ok(())
     }
@@ -654,5 +712,83 @@ mod tests {
         };
         cfg.cache_dir = Some(cfg.durable_dir_resolved());
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn gaps_step0_reset_site_text_defaults_round_trip_and_rejects() {
+        // Frozen decisions (`docs/gaps.md`): 6h reset bearers, CLI + file
+        // authoring for the site texts. All optional; `deny_unknown_fields`
+        // stays.
+        let cfg = Config {
+            transcoding_enabled: false,
+            ..Config::default()
+        };
+        assert_eq!(cfg.password_reset_ttl_hours, 6);
+        assert!(cfg.site_terms_file.is_none());
+        assert!(cfg.site_privacy_file.is_none());
+        assert!(cfg.site_extended_file.is_none());
+        assert!(cfg.validate().is_ok());
+        // Round-trip through JSON (file shape), including set values.
+        let mut set = cfg.clone();
+        set.password_reset_ttl_hours = 12;
+        set.site_terms_file = Some("terms.md".into());
+        set.site_privacy_file = Some("privacy.md".into());
+        set.site_extended_file = Some("extended.md".into());
+        let json = serde_json::to_value(&set).expect("serializes");
+        let back: Config = serde_json::from_value(json).expect("round-trips");
+        assert_eq!(back.password_reset_ttl_hours, 12);
+        assert_eq!(back.site_terms_file, set.site_terms_file);
+        assert_eq!(back.site_privacy_file, set.site_privacy_file);
+        assert_eq!(back.site_extended_file, set.site_extended_file);
+        assert!(back.validate().is_ok());
+        // Bounds: TTL 0 and > 72 are refused; empty paths are refused.
+        for ttl in [0, 73] {
+            let mut bad = Config {
+                transcoding_enabled: false,
+                ..Config::default()
+            };
+            bad.password_reset_ttl_hours = ttl;
+            assert!(bad.validate().is_err());
+        }
+        let mut bad = Config {
+            transcoding_enabled: false,
+            ..Config::default()
+        };
+        bad.site_terms_file = Some("".into());
+        assert!(bad.validate().is_err());
+        // Unknown keys are still rejected.
+        let unknown = serde_json::json!({"site_terms_file_typo": "x"});
+        assert!(serde_json::from_value::<Config>(unknown).is_err());
+    }
+
+    #[test]
+    fn gaps_relay_inboxes_default_empty_and_validate_url_shape() {
+        let cfg = Config {
+            transcoding_enabled: false,
+            ..Config::default()
+        };
+        assert!(cfg.relay_inboxes.is_empty());
+        assert!(cfg.validate().is_ok());
+        // Good relay inbox URLs pass.
+        let mut good = Config {
+            transcoding_enabled: false,
+            ..Config::default()
+        };
+        good.relay_inboxes = vec!["https://relay.example/inbox".to_string()];
+        assert!(good.validate().is_ok());
+        // Non-URL, non-http(s), host-less and credentialed entries fail.
+        for bad in [
+            "not a url",
+            "ftp://relay.example/inbox",
+            "https://",
+            "https://user:pass@relay.example/inbox",
+        ] {
+            let mut cfg = Config {
+                transcoding_enabled: false,
+                ..Config::default()
+            };
+            cfg.relay_inboxes = vec![bad.to_string()];
+            assert!(cfg.validate().is_err(), "relay {bad:?} must be refused");
+        }
     }
 }

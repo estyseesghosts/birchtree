@@ -57,6 +57,9 @@ pub enum JobKind {
     CrawlReplies,
     /// Fetch a remote attachment's bytes and stage them for processing (Phase 6).
     FetchRemoteMedia,
+    /// Fetch one remote custom emoji's bytes and stage them (federation tail,
+    /// G-D). Payload `{shortcode, domain, source_url}`; no blobs in the txn.
+    FetchRemoteEmoji,
     /// Generate an annual report for one account and year (Phase 7.3). The
     /// handler computes real stats from local records and inserts the row
     /// idempotently; a retry after commit is a no-op.
@@ -98,6 +101,21 @@ pub enum JobKind {
     /// orphans, missing blobs, stale metadata, unfinished deletions.
     /// Bounded batch (<= 500 rows); payload < 64 KiB.
     ReconcileStorage,
+    /// Re-verify one quote's authorization state (gaps batch, `docs/gaps.md`
+    /// Step 0). Payload `{quote_id}`; bounded batch (<= 500 rows);
+    /// payload < 64 KiB; no blobs in the transaction.
+    QuoteReverify,
+    /// Fan out one collection change (Add/Remove) to members/followers
+    /// (gaps batch, Step 0). Payload `{collection_id, item_id?, change}`;
+    /// bounded batch (<= 500 rows); payload < 64 KiB.
+    CollectionFanout,
+    /// Forward one activity to relay peers (gaps batch, Step 0). Payload
+    /// `{activity_id}`; bounded batch (<= 500 rows); payload < 64 KiB.
+    RelayForward,
+    /// Refresh one remote account's counters from its served collections
+    /// (parent finish, federation tail). Payload `{account_id}`; bounded to
+    /// three small fetches; no blobs in the transaction.
+    SyncFollowers,
 }
 
 impl JobKind {
@@ -116,6 +134,7 @@ impl JobKind {
             JobKind::ResolveParent => "resolve_parent",
             JobKind::CrawlReplies => "crawl_replies",
             JobKind::FetchRemoteMedia => "fetch_remote_media",
+            JobKind::FetchRemoteEmoji => "fetch_remote_emoji",
             JobKind::GenerateAnnualReport => "generate_annual_report",
             JobKind::SearchIndexStatus => "search_index_status",
             JobKind::SearchBackfill => "search_backfill",
@@ -126,6 +145,10 @@ impl JobKind {
             JobKind::PreviewCardFetch => "preview_card_fetch",
             JobKind::CacheEvict => "cache_evict",
             JobKind::ReconcileStorage => "reconcile_storage",
+            JobKind::QuoteReverify => "quote_reverify",
+            JobKind::CollectionFanout => "collection_fanout",
+            JobKind::RelayForward => "relay_forward",
+            JobKind::SyncFollowers => "sync_followers",
         }
     }
 }

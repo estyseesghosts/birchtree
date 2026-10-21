@@ -364,10 +364,8 @@ pub fn reject_request(
 /// Mirrors upstream's `hide_results?`
 /// (`app/controllers/api/v1/accounts/follower_accounts_controller.rb` at pin
 /// `8ff11c2b`): a suspended target yields `[]`, as does any non-self viewer
-/// the target blocks. Upstream also hides when the target enables
-/// `hide_collections?`; that setting is accepted but not yet persisted (see
-/// `persistence/redb/accounts.rs`), so the hides branch is recorded as a gap
-/// in the fix-round report rather than enforced here.
+/// the target blocks, as does any viewer when the target enables
+/// `hide_collections` (members hidden, counts stay — gaps G-C/D52).
 pub fn followers_of(
     store: &dyn Store,
     viewer: Option<Id>,
@@ -399,10 +397,11 @@ pub fn following_of(
     store.following(account_id, max_id, limit)
 }
 
-/// Upstream `hide_results?` minus the unpersisted `hide_collections?`
-/// setting: unavailable (suspended) targets hide from everyone, and a target
-/// that blocks the viewer hides from that viewer (anonymous viewers are
-/// never blocked). The target always sees their own lists.
+/// Upstream `hide_results?` (gaps G-C/D52): unavailable (suspended) targets
+/// hide from everyone; a target that blocks the viewer hides from that
+/// viewer (anonymous viewers are never blocked); a target with
+/// `hide_collections` hides its edge lists from everyone but itself
+/// (members hidden, counts stay). The target always sees their own lists.
 fn hidden_edge_list(
     store: &dyn Store,
     viewer: Option<Id>,
@@ -420,6 +419,11 @@ fn hidden_edge_list(
     };
     if viewer == account_id {
         return Ok(false);
+    }
+    // Upstream `hide_collections?` (gaps G-C/D52): members hidden, counts
+    // stay (counts render from the account row, never from this list).
+    if target.hide_collections == Some(true) {
+        return Ok(true);
     }
     // `pair_state(target, viewer).blocking` = the target blocks the viewer.
     Ok(store.pair_state(account_id, viewer, now_ms)?.blocking)

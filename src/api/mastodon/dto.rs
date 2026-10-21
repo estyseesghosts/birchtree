@@ -193,61 +193,19 @@ pub fn credential_account_json_with_stats(
 /// `permissions` is the OR of the upstream flag bits that role carries there
 /// (`user_role.rb:20-44` — e.g. moderator = `view_dashboard | view_audit_log
 /// | view_feeds | manage_users | manage_reports | manage_taxonomies` =
-/// `1049888`). Ids are synthetic slugs (`moderator`/`admin`): birchtree
-/// collapses roles to an enum with no row ids (same convention as the admin
-/// account serializer), so upstream numeric row ids cannot round-trip.
+/// `1049884`, the OR of the positions below; the previous comment's `1049888`
+/// was an arithmetic slip, flagged by G-E and corrected here). Ids are
+/// upstream-style numerics (`0` user / `1` moderator / `2` admin): birchtree
+/// collapses roles to an enum with no row ids, so the ids are these canonical
+/// ordinals, never `-1`.
 pub fn role_json(user: Option<&LocalUser>) -> Value {
-    // Upstream `UserRole::FLAGS` bit positions (`user_role.rb:20-44`).
-    const VIEW_DASHBOARD: u64 = 1 << 3;
-    const VIEW_AUDIT_LOG: u64 = 1 << 2;
-    const VIEW_FEEDS: u64 = 1 << 20;
-    const MANAGE_USERS: u64 = 1 << 10;
-    const MANAGE_REPORTS: u64 = 1 << 4;
-    const MANAGE_TAXONOMIES: u64 = 1 << 8;
-    const MANAGE_FEDERATION: u64 = 1 << 5;
-    const MANAGE_SETTINGS: u64 = 1 << 6;
-    const MANAGE_BLOCKS: u64 = 1 << 7;
-    const MANAGE_APPEALS: u64 = 1 << 9;
-    const MANAGE_INVITES: u64 = 1 << 11;
-    const MANAGE_RULES: u64 = 1 << 12;
-    const MANAGE_ANNOUNCEMENTS: u64 = 1 << 13;
-    const MANAGE_CUSTOM_EMOJIS: u64 = 1 << 14;
-    const MANAGE_WEBHOOKS: u64 = 1 << 15;
-    const MANAGE_USER_ACCESS: u64 = 1 << 18;
-    const DELETE_USER_DATA: u64 = 1 << 19;
-    const MANAGE_ROLES: u64 = 1 << 17;
-    const MODERATOR_PERMISSIONS: u64 = VIEW_DASHBOARD
-        | VIEW_AUDIT_LOG
-        | VIEW_FEEDS
-        | MANAGE_USERS
-        | MANAGE_REPORTS
-        | MANAGE_TAXONOMIES;
-    const ADMIN_PERMISSIONS: u64 = MODERATOR_PERMISSIONS
-        | MANAGE_FEDERATION
-        | MANAGE_SETTINGS
-        | MANAGE_BLOCKS
-        | MANAGE_APPEALS
-        | MANAGE_INVITES
-        | MANAGE_RULES
-        | MANAGE_ANNOUNCEMENTS
-        | MANAGE_CUSTOM_EMOJIS
-        | MANAGE_WEBHOOKS
-        | MANAGE_USER_ACCESS
-        | DELETE_USER_DATA
-        | MANAGE_ROLES;
+    use crate::domain::user::{
+        ADMIN_PERMISSIONS, MODERATOR_PERMISSIONS, UserRole as DomainRole,
+    };
     let (id, name, permissions, highlighted) = match user.map(|u| u.role).unwrap_or_default() {
-        crate::domain::UserRole::Admin => ("admin", "Admin", ADMIN_PERMISSIONS, true),
-        crate::domain::UserRole::Moderator => {
-            ("moderator", "Moderator", MODERATOR_PERMISSIONS, true)
-        }
-        crate::domain::UserRole::None => return json!({
-            "id": "-1",
-            "name": "User",
-            "permissions": "0",
-            "color": "",
-            "highlighted": false,
-            "collection_limit": 0,
-        }),
+        DomainRole::Admin => (2u64, "Admin", ADMIN_PERMISSIONS, true),
+        DomainRole::Moderator => (1u64, "Moderator", MODERATOR_PERMISSIONS, true),
+        DomainRole::None => (0u64, "User", 0u64, false),
     };
     json!({
         "id": id,

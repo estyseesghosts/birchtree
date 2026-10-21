@@ -94,6 +94,14 @@ impl Note {
             .collect()
     }
 
+    /// Remote emoji refs from `Emoji` tags (G-D): parsed through
+    /// objects::parse_remote_emojis over this Note's own JSON.
+    pub fn emoji_refs(&self) -> Vec<crate::activitypub::objects::RemoteEmoji> {
+        serde_json::to_value(self)
+            .map(|v| crate::activitypub::objects::parse_remote_emojis(&v))
+            .unwrap_or_default()
+    }
+
     /// The hashtag names, without the `#`, normalized the way birchtree
     /// stores them (D25: NFKC-subset + lowercase + ASCII folding, so a
     /// remote `#café` lands on the same `cafe` tag as a local one),
@@ -177,6 +185,11 @@ pub struct Tag {
     pub href: Option<Url>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// `Emoji` icon payload (`{"url": ..., "static_url": ...}`): kept raw so
+    /// the remote-emoji tail arm can parse it from the Note's own JSON
+    /// without re-fetching (federation tail, G-D).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<serde_json::Value>,
 }
 
 /// An attachment: a `Document` with its `mediaType` and `url`.
