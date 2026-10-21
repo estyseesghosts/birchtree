@@ -16,6 +16,7 @@ use url::Url;
 
 use crate::activitypub::actor::Person;
 use crate::activitypub::error::FedError;
+use crate::activitypub::key_generation;
 use crate::activitypub::FedContext;
 use crate::application::ports::Store;
 use crate::domain::federation::main_key_id;
@@ -35,18 +36,14 @@ pub struct InstanceActor {
 /// Load the instance actor's keys, generating them on first start.
 pub async fn ensure(store: &dyn Store, public_url: &str) -> Result<InstanceActor, String> {
     let id = Url::parse(&format!("{}/actor", public_url.trim_end_matches('/'))).map_err(|e| e.to_string())?;
-    let keys = match store.actor_keys(Id::new(INSTANCE_KEY_ID)).map_err(|e| e.to_string())? {
-        Some(keys) if keys.private_key_pem.is_some() => keys,
-        _ => {
-            let pair = tokio::task::spawn_blocking(generate_actor_keypair)
-                .await
-                .map_err(|e| e.to_string())?
-                .map_err(|e| e.to_string())?;
-            store
-                .store_local_keys(Id::new(INSTANCE_KEY_ID), &main_key_id(id.as_str()), &pair.public_key, &pair.private_key)
-                .map_err(|e| e.to_string())?
-        }
-    };
+    let keys = key_generation::ensure_keys(
+        store,
+        Id::new(INSTANCE_KEY_ID),
+        &main_key_id(id.as_str()),
+        generate_actor_keypair,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(InstanceActor {
         id,
         public_key_pem: keys.public_key_pem,

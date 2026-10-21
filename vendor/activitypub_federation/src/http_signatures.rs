@@ -22,12 +22,7 @@ use http_signature_normalization_reqwest::{
 use once_cell::sync::Lazy;
 use reqwest::Request;
 use reqwest_middleware::RequestBuilder;
-use rsa::{
-    pkcs8::{DecodePublicKey, EncodePrivateKey, EncodePublicKey, LineEnding},
-    Pkcs1v15Sign,
-    RsaPrivateKey,
-    RsaPublicKey,
-};
+use crate::rsa_provider::{self, SigningKey};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fmt::Debug, time::Duration};
@@ -44,29 +39,21 @@ pub struct Keypair {
 }
 
 impl Keypair {
-    /// Helper method to turn this into an openssl private key
+    /// Helper method to import the private key (tests only).
     #[cfg(test)]
-    pub(crate) fn private_key(&self) -> Result<RsaPrivateKey, anyhow::Error> {
-        use rsa::pkcs8::DecodePrivateKey;
-
-        Ok(RsaPrivateKey::from_pkcs8_pem(&self.private_key)?)
+    pub(crate) fn private_key(&self) -> Result<SigningKey, Error> {
+        SigningKey::from_pkcs8_pem(&self.private_key)
     }
 }
 
-/// Generate a random asymmetric keypair for ActivityPub HTTP signatures.
+/// Generate a random 2048-bit RSA keypair for ActivityPub HTTP signatures.
 ///
-/// Note that this method is very slow in debug mode. To make it faster, follow
-/// instructions in the RSA crate's readme.
-/// <https://github.com/RustCrypto/RSA/blob/master/README.md>
+/// The private key is PKCS#8 PEM and the public key is SubjectPublicKeyInfo PEM.
 pub fn generate_actor_keypair() -> Result<Keypair, Error> {
-    let mut rng = rand::thread_rng();
-    let rsa = RsaPrivateKey::new(&mut rng, 2048)?;
-    let pkey = RsaPublicKey::from(&rsa);
-    let public_key = pkey.to_public_key_pem(LineEnding::default())?;
-    let private_key = rsa.to_pkcs8_pem(LineEnding::default())?.to_string();
+    let pems = rsa_provider::generate_pems()?;
     Ok(Keypair {
-        private_key,
-        public_key,
+        private_key: pems.private_key,
+        public_key: pems.public_key,
     })
 }
 
@@ -83,7 +70,7 @@ pub(crate) async fn sign_request(
     request_builder: RequestBuilder,
     actor_id: &Url,
     activity: Bytes,
-    private_key: RsaPrivateKey,
+    private_key: SigningKey,
     http_signature_compat: bool,
 ) -> Result<Request, Error> {
     static CONFIG: Lazy<Config<DefaultSpawner>> =
@@ -106,10 +93,9 @@ pub(crate) async fn sign_request(
             Sha256::new(),
             activity,
             move |signing_string| {
-                Ok(Base64.encode(private_key.sign(
-                    Pkcs1v15Sign::new::<Sha256>(),
-                    &Sha256::digest(signing_string.as_bytes()),
-                )?)) as Result<_, Error>
+                // The whole signing string is passed: AWS-LC hashes it inside the operation.
+                Ok(Base64.encode(private_key.sign_legacy_rsa_sha256(signing_string.as_bytes())?))
+                    as Result<_, Error>
             },
         )
         .await
@@ -206,29 +192,22 @@ fn verify_signature_inner(
                 "Verifying with key {}, message {}",
                 &public_key, &signing_string
             );
-            // Some servers (Akkoma) publish the PEM with a trailing blank line, which the strict
-            // RFC 7468 parser rejects; normalise the line ending. A key that still does not parse
-            // is a failed signature check (401), not a server error.
-            let normalized = format!("{}\n", public_key.trim());
-            let public_key = match RsaPublicKey::from_public_key_pem(&normalized) {
-                Ok(key) => key,
-                Err(err) => {
-                    debug!("unusable public key: {err}");
-                    return Ok(false);
-                }
-            };
-
             let base64_decoded = Base64
                 .decode(signature)
                 .map_err(|err| Error::Other(err.to_string()))?;
 
-            Ok(public_key
-                .verify(
-                    Pkcs1v15Sign::new::<Sha256>(),
-                    &Sha256::digest(signing_string.as_bytes()),
-                    &base64_decoded,
-                )
-                .is_ok())
+            // A key that does not parse is a failed signature check (401), not a server error.
+            match rsa_provider::verify_legacy_rsa_sha256(
+                public_key,
+                signing_string.as_bytes(),
+                &base64_decoded,
+            ) {
+                Ok(valid) => Ok(valid),
+                Err(err) => {
+                    debug!("unusable public key: {err}");
+                    Ok(false)
+                }
+            }
         })?;
 
     if verified {
@@ -300,7 +279,6 @@ pub mod test {
     use crate::activity_sending::generate_request_headers;
     use reqwest::Client;
     use reqwest_middleware::ClientWithMiddleware;
-    use rsa::{pkcs1::DecodeRsaPrivateKey, pkcs8::DecodePrivateKey};
     use std::str::FromStr;
 
     static ACTOR_ID: Lazy<Url> = Lazy::new(|| Url::parse("https://example.com/u/alice").unwrap());
@@ -323,7 +301,7 @@ pub mod test {
             request_builder,
             &ACTOR_ID,
             "my activity".into(),
-            RsaPrivateKey::from_pkcs8_pem(&test_keypair().private_key).unwrap(),
+            test_keypair().private_key().unwrap(),
             // set this to prevent created/expires headers to be generated and inserted
             // automatically from current time
             true,
@@ -359,7 +337,7 @@ pub mod test {
             request_builder,
             &ACTOR_ID,
             "my activity".to_string().into(),
-            RsaPrivateKey::from_pkcs8_pem(&test_keypair().private_key).unwrap(),
+            test_keypair().private_key().unwrap(),
             false,
         )
         .await
@@ -396,13 +374,11 @@ pub mod test {
 
     /// Internal only, return hardcoded keypair for testing
     pub fn test_keypair() -> Keypair {
-        let rsa = RsaPrivateKey::from_pkcs1_pem(PRIVATE_KEY).unwrap();
-        let pkey = RsaPublicKey::from(&rsa);
-        let public_key = pkey.to_public_key_pem(LineEnding::default()).unwrap();
-        let private_key = rsa.to_pkcs8_pem(LineEnding::default()).unwrap().to_string();
+        let (_, der) = spki::der::pem::decode_vec(PRIVATE_KEY.as_bytes()).unwrap();
+        let key = SigningKey::from_pkcs1_der(&der).unwrap();
         Keypair {
-            private_key,
-            public_key,
+            private_key: key.private_key_pem().unwrap(),
+            public_key: key.public_key_pem().unwrap(),
         }
     }
 

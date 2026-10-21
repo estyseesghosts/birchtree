@@ -30,7 +30,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::{redirect::Policy, Client, Request};
 use reqwest_middleware::{ClientWithMiddleware, RequestBuilder};
-use rsa::{pkcs8::DecodePrivateKey, RsaPrivateKey};
+use crate::rsa_provider::SigningKey;
 use serde::de::DeserializeOwned;
 use std::{
     net::IpAddr,
@@ -92,12 +92,12 @@ pub struct FederationConfig<T: Clone> {
     /// This can be used to implement secure mode federation.
     /// <https://docs.joinmastodon.org/spec/activitypub/#secure-mode>
     #[builder(default = "None", setter(custom))]
-    pub(crate) signed_fetch_actor: Option<Arc<(Url, RsaPrivateKey)>>,
+    pub(crate) signed_fetch_actor: Option<Arc<(Url, SigningKey)>>,
     #[builder(
         default = "Cache::builder().max_capacity(10000).build()",
         setter(custom)
     )]
-    pub(crate) actor_pkey_cache: Cache<Url, RsaPrivateKey>,
+    pub(crate) actor_pkey_cache: Cache<Url, SigningKey>,
     /// Queue for sending outgoing activities. Only optional to make builder work, its always
     /// present once constructed.
     #[builder(setter(skip))]
@@ -260,7 +260,7 @@ impl<T: Clone> FederationConfigBuilder<T> {
             .expect("actor does not have a private key to sign with");
 
         let private_key =
-            RsaPrivateKey::from_pkcs8_pem(&private_key_pem).expect("Could not decode PEM data");
+            SigningKey::from_pkcs8_pem(&private_key_pem).expect("Could not decode PEM data");
         self.signed_fetch_actor = Some(Some(Arc::new((actor.id(), private_key))));
         self
     }
@@ -385,6 +385,11 @@ impl<T: Clone> Data<T> {
     /// Total number of outgoing HTTP requests made with this data.
     pub fn request_count(&self) -> u32 {
         self.request_counter.load(Ordering::Relaxed)
+    }
+
+    /// Whether a signed-fetch actor is configured, so [`Data::sign_request`] can succeed.
+    pub fn can_sign_requests(&self) -> bool {
+        self.config.signed_fetch_actor.is_some()
     }
 
     /// Add HTTP signature to arbitrary request

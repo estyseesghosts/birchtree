@@ -170,8 +170,12 @@ default-features = false
 [dependencies.reqwest-middleware]
 version = "0.3.2"
 
-[dependencies.rsa]
-version = "0.9.6"
+[dependencies.aws-lc-rs]
+version = "1.18.2"
+
+[dependencies.spki]
+version = "0.7"
+features = ["pem", "alloc"]
 
 [dependencies.serde]
 version = "1.0.204"
@@ -252,6 +256,3 @@ warnings = "deny"
 [profile.dev]
 debug = 0
 strip = "symbols"
-
-[profile.dev.package.num-bigint-dig]
-opt-level = 3

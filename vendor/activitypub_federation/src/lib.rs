@@ -20,6 +20,7 @@ pub mod config;
 pub mod error;
 pub mod fetch;
 pub mod http_signatures;
+pub mod rsa_provider;
 pub mod protocol;
 pub(crate) mod reqwest_shim;
 pub mod traits;

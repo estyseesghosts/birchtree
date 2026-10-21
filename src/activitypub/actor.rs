@@ -22,6 +22,7 @@ use url::Url;
 
 use crate::activitypub::error::FedError;
 use crate::activitypub::FedContext;
+use crate::activitypub::key_generation;
 use crate::application::accounts::host_from_url;
 use crate::application::federation_ports::RemoteAccountUpsert;
 use crate::application::ports::Store;
@@ -112,20 +113,12 @@ pub async fn ensure_local_keys_for_account(config: &FederationConfig<FedContext>
     Ok(())
 }
 
-/// The keys of a local account. Missing keys are generated on a blocking thread
-/// (2048-bit RSA is CPU work) and stored; the first stored pair wins.
+/// The keys of a local account. Missing keys are generated once (single-flight per
+/// account, on a blocking thread: 2048-bit RSA is CPU work) and stored; the stored pair wins.
 pub async fn keys_for_local(data: &Data<FedContext>, account: &Account) -> Result<ActorKeys, FedError> {
     let store: &dyn Store = &*data.app.store;
-    if let Some(keys) = store.actor_keys(account.id)? {
-        if keys.private_key_pem.is_some() {
-            return Ok(keys);
-        }
-    }
-    let pair = tokio::task::spawn_blocking(generate_actor_keypair)
-        .await
-        .map_err(|e| FedError::Refused(format!("key generation task failed: {e}")))??;
     let key_id = main_key_id(&account.actor_uri);
-    Ok(store.store_local_keys(account.id, &key_id, &pair.public_key, &pair.private_key)?)
+    key_generation::ensure_keys(store, account.id, &key_id, generate_actor_keypair).await
 }
 
 #[async_trait]

@@ -20,7 +20,7 @@ use reqwest::{
     Response,
 };
 use reqwest_middleware::ClientWithMiddleware;
-use rsa::{pkcs8::DecodePrivateKey, RsaPrivateKey};
+use crate::rsa_provider::SigningKey;
 use serde::Serialize;
 use std::{
     fmt::{Debug, Display},
@@ -37,7 +37,7 @@ pub struct SendActivityTask {
     pub(crate) activity_id: Url,
     pub(crate) activity: Bytes,
     pub(crate) inbox: Url,
-    pub(crate) private_key: RsaPrivateKey,
+    pub(crate) private_key: SigningKey,
     pub(crate) http_signature_compat: bool,
 }
 
@@ -182,7 +182,7 @@ where
 pub(crate) async fn get_pkey_cached<ActorType>(
     data: &Data<impl Clone>,
     actor: &ActorType,
-) -> Result<RsaPrivateKey, Error>
+) -> Result<SigningKey, Error>
 where
     ActorType: Actor,
 {
@@ -199,13 +199,13 @@ where
 
             // This is a mostly expensive blocking call, we don't want to tie up other tasks while this is happening
             let pkey = tokio::task::spawn_blocking(move || {
-                RsaPrivateKey::from_pkcs8_pem(&private_key_pem).map_err(|err| {
+                SigningKey::from_pkcs8_pem(&private_key_pem).map_err(|err| {
                     Error::Other(format!("Could not create private key from PEM data:{err}"))
                 })
             })
             .await
             .map_err(|err| Error::Other(format!("Error joining: {err}")))??;
-            std::result::Result::<RsaPrivateKey, Error>::Ok(pkey)
+            std::result::Result::<SigningKey, Error>::Ok(pkey)
         })
         .await
         .map_err(|e| Error::Other(format!("cloned error: {e}")))
