@@ -9,11 +9,12 @@ use crate::application::ports::{
     AccountProfileUpdate, AccountStore, AdminAccountFilter, AdminStore, NewLocalAccount,
     UserSettingsUpdate,
 };
-use crate::domain::user::{EmailToken, Invite};
+use crate::domain::user::{EmailToken, EmailTokenKind, Invite};
 use crate::domain::{Account, AccountStats, Error, Id, LocalUser, Result, SignInEvent, UserRole};
 
 use super::schema::{
-    ACCOUNTS, ACCOUNT_STATS, EMAIL_INDEX, EMAIL_TOKENS, HANDLE_INDEX, INVITES, LOCAL_USERS,
+    self, ACCOUNTS, ACCOUNT_STATS, EMAIL_INDEX, EMAIL_TOKENS, HANDLE_INDEX, INVITES, LOCAL_USERS,
+    META,
 };
 use super::{decode, encode, RedbStore, StoreResult};
 
@@ -39,6 +40,96 @@ fn read_local_user(store: &RedbStore, account_id: Id) -> StoreResult<Option<Loca
     match table.get(account_id.value())? {
         Some(guard) => Ok(Some(decode(guard.value())?)),
         None => Ok(None),
+    }
+}
+
+
+/// Re-key legacy `EMAIL_TOKENS` rows (keyed by the plaintext bearer) by
+/// digest, once. Idempotent: the marker row short-circuits later calls, and
+/// digest keys carry [`schema::EMAIL_TOKEN_KEY_PREFIX`], which no hex bearer
+/// can match, so a half-applied pass can never be mistaken for legacy data.
+pub(super) fn ensure_email_tokens_keyed(write: &redb::WriteTransaction) -> StoreResult<()> {
+    {
+        let meta = write.open_table(META)?;
+        if meta.get(schema::EMAIL_TOKEN_DIGEST_MARKER_KEY)?.is_some() {
+            return Ok(());
+        }
+    }
+    let mut legacy: Vec<(String, Vec<u8>)> = Vec::new();
+    {
+        let tokens = write.open_table(EMAIL_TOKENS)?;
+        for row in tokens.iter()? {
+            let (key, value) = row?;
+            if !key.value().starts_with(schema::EMAIL_TOKEN_KEY_PREFIX) {
+                legacy.push((key.value().to_string(), value.value().to_vec()));
+            }
+        }
+    }
+    {
+        let mut tokens = write.open_table(EMAIL_TOKENS)?;
+        for (plaintext, value) in &legacy {
+            tokens.remove(plaintext.as_str())?;
+            tokens.insert(schema::email_token_key(plaintext).as_str(), value.as_slice())?;
+        }
+    }
+    let mut meta = write.open_table(META)?;
+    meta.insert(schema::EMAIL_TOKEN_DIGEST_MARKER_KEY, [1u8].as_slice())?;
+    Ok(())
+}
+
+/// Persist a bearer's digest (never the bearer) inside `write`.
+pub(super) fn insert_email_token(
+    write: &redb::WriteTransaction,
+    token: &str,
+    record: &EmailToken,
+) -> StoreResult<()> {
+    let mut tokens = write.open_table(EMAIL_TOKENS)?;
+    tokens.insert(schema::email_token_key(token).as_str(), encode(record)?.as_slice())?;
+    Ok(())
+}
+
+/// Remove and return a bearer's record inside `write` (single use).
+pub(super) fn take_email_token(
+    write: &redb::WriteTransaction,
+    token: &str,
+) -> StoreResult<Option<EmailToken>> {
+    let mut tokens = write.open_table(EMAIL_TOKENS)?;
+    let removed = tokens.remove(schema::email_token_key(token).as_str())?;
+    match removed {
+        Some(guard) => Ok(Some(decode(guard.value())?)),
+        None => Ok(None),
+    }
+}
+
+/// Which mail job a bearer kind queues.
+pub(super) fn mail_job_kind(kind: EmailTokenKind) -> crate::domain::JobKind {
+    match kind {
+        EmailTokenKind::Confirmation => crate::domain::JobKind::SendConfirmationEmail,
+        EmailTokenKind::PasswordReset => crate::domain::JobKind::SendPasswordResetEmail,
+    }
+}
+
+impl RedbStore {
+    /// Context string binding a sealed mail bearer to its account.
+    fn mail_token_context(account_id: Id) -> Vec<u8> {
+        format!("mail-token:{}", account_id.value()).into_bytes()
+    }
+
+    /// The value stored in a mail job's `token` field: sealed under the
+    /// installed key, or the bare bearer when no key is configured.
+    pub(super) fn protect_mail_token(&self, account_id: Id, token: &str) -> Result<String> {
+        Ok(self
+            .secret_box()
+            .seal_text_if_enabled(&Self::mail_token_context(account_id), token)?)
+    }
+
+    /// Inverse of [`Self::protect_mail_token`]; fails closed when the value
+    /// is sealed and the key is missing or wrong.
+    pub(super) fn recover_mail_token(&self, account_id: Id, stored: &str) -> Result<String> {
+        Ok(self
+            .secret_box()
+            .open_text(&Self::mail_token_context(account_id), stored)?
+            .text)
     }
 }
 
@@ -189,6 +280,18 @@ impl AccountStore for RedbStore {
         // committed account can never lose its verification message.
         if input.send_confirmation_email {
             if let Some(email) = input.email.as_deref() {
+                // Random bearer minted before the job exists: only its digest
+                // is persisted; the job carries it sealed for delivery retries.
+                let token: String = crate::application::crypto::random_token_hex(32);
+                insert_email_token(
+                    &write,
+                    &token,
+                    &EmailToken {
+                        account_id,
+                        kind: EmailTokenKind::Confirmation,
+                        created_at_ms: input.now_ms,
+                    },
+                )?;
                 let mail_job = crate::domain::Job::new(
                     self.next_id(),
                     crate::domain::JobKind::SendConfirmationEmail,
@@ -196,6 +299,7 @@ impl AccountStore for RedbStore {
                         "account_id": account_id.value(),
                         "user_id": user_id.value(),
                         "email": email,
+                        "token": self.protect_mail_token(account_id, &token)?,
                     }),
                     input.now_ms,
                     input.now_ms,
@@ -696,29 +800,17 @@ impl AccountStore for RedbStore {
             return Err(Error::InvalidInput("email token is empty".into()));
         }
         let write = self.begin_write()?;
-        {
-            let mut tokens = write.open_table(EMAIL_TOKENS)?;
-            // Overwrite = idempotent: a retried registration job re-stores
-            // the same deterministic token without error.
-            tokens.insert(token, encode(&record)?.as_slice())?;
-        }
+        ensure_email_tokens_keyed(&write)?;
+        // Overwrite = idempotent for a re-stored bearer.
+        insert_email_token(&write, token, &record)?;
         write.commit()?;
         Ok(())
     }
 
     fn redeem_email_token(&self, token: &str) -> Result<Option<EmailToken>> {
         let write = self.begin_write()?;
-        let record: Option<EmailToken> = {
-            let tokens = write.open_table(EMAIL_TOKENS)?;
-            match tokens.get(token)? {
-                Some(guard) => Some(decode(guard.value())?),
-                None => None,
-            }
-        };
-        if record.is_some() {
-            let mut tokens = write.open_table(EMAIL_TOKENS)?;
-            tokens.remove(token)?;
-        }
+        ensure_email_tokens_keyed(&write)?;
+        let record: Option<EmailToken> = take_email_token(&write, token)?;
         write.commit()?;
         Ok(record)
     }

@@ -223,6 +223,41 @@ impl Job {
     }
 }
 
+impl JobKind {
+    /// Payload fields that hold a bearer or recipient address and must not
+    /// outlive delivery (`None` for kinds with nothing sensitive).
+    pub const fn sensitive_payload_fields(self) -> Option<&'static [&'static str]> {
+        match self {
+            JobKind::SendConfirmationEmail | JobKind::SendPasswordResetEmail => {
+                Some(&["token", "email"])
+            }
+            _ => None,
+        }
+    }
+}
+
+impl Job {
+    /// Drop bearer and recipient fields from the payload once the job can no
+    /// longer send (succeeded or quarantined), keeping the non-sensitive
+    /// diagnostics (`account_id`, ...). Returns whether anything was removed.
+    pub fn redact_sensitive_payload(&mut self) -> bool {
+        let Some(fields) = self.kind.sensitive_payload_fields() else {
+            return false;
+        };
+        let Some(object) = self.payload.as_object_mut() else {
+            return false;
+        };
+        let mut removed = false;
+        for field in fields {
+            removed |= object.remove(*field).is_some();
+        }
+        if removed {
+            object.insert("redacted".to_string(), serde_json::Value::Bool(true));
+        }
+        removed
+    }
+}
+
 /// How long a worker may hold a claim before the job is reclaimable.
 pub const LEASE_MS: u64 = 30_000;
 /// Base retry backoff.

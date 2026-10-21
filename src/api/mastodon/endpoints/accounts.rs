@@ -24,7 +24,7 @@ use crate::application::ports::{
 };
 use crate::application::relationships;
 use crate::domain::Error as DomainError;
-use crate::domain::{EmailToken, EmailTokenKind};
+use crate::domain::EmailTokenKind;
 use crate::mailer::{MailEnv, MailError};
 
 /// Scope alternatives accepted by the write endpoints.
@@ -1350,30 +1350,11 @@ pub async fn email_confirmation_create(
     if let Err(err) = crate::mailer::validate_address(&email) {
         return mail_error_response(err);
     }
-    // Random per request (unguessable, unlike the deterministic registration
-    // token); the job payload carries it to the worker.
-    let token = crate::application::crypto::random_token_hex(32);
+    // The store mints the random bearer, persists only its digest and queues
+    // the mail job in one transaction (no orphan token, no plaintext at rest).
     let now_ms = state.context.now_ms();
-    if let Err(err) = store.store_email_token(
-        &token,
-        EmailToken {
-            account_id,
-            kind: EmailTokenKind::Confirmation,
-            created_at_ms: now_ms,
-        },
-    ) {
-        return ApiError::from(err).into_response();
-    }
-    match store.enqueue(
-        crate::domain::JobKind::SendConfirmationEmail,
-        json!({
-            "account_id": account_id.value(),
-            "email": email,
-            "token": token,
-        }),
-        now_ms,
-    ) {
-        Ok(_) => axum::Json(json!({})).into_response(),
+    match store.issue_email_token(account_id, &email, EmailTokenKind::Confirmation, now_ms) {
+        Ok(()) => axum::Json(json!({})).into_response(),
         Err(err) => ApiError::from(err).into_response(),
     }
 }
@@ -1457,29 +1438,8 @@ pub async fn password_reset_create(
     if crate::mailer::validate_address(&address).is_err() {
         return axum::Json(json!({})).into_response();
     }
-    let token = crate::application::crypto::random_token_hex(32);
-    // Durable first, as on the confirmation resend: a crash between the two
-    // leaves a harmless orphan token, never a mailed link with no backing row.
-    if let Err(err) = store.store_email_token(
-        &token,
-        EmailToken {
-            account_id: account.id,
-            kind: EmailTokenKind::PasswordReset,
-            created_at_ms: now_ms,
-        },
-    ) {
-        return ApiError::from(err).into_response();
-    }
-    match store.enqueue(
-        crate::domain::JobKind::SendPasswordResetEmail,
-        json!({
-            "account_id": account.id.value(),
-            "email": address,
-            "token": token,
-        }),
-        now_ms,
-    ) {
-        Ok(_) => axum::Json(json!({})).into_response(),
+    match store.issue_email_token(account.id, &address, EmailTokenKind::PasswordReset, now_ms) {
+        Ok(()) => axum::Json(json!({})).into_response(),
         Err(err) => ApiError::from(err).into_response(),
     }
 }
@@ -1622,40 +1582,25 @@ pub async fn password_reset_update(
     }
     let store: &dyn Store = &*state.context.store;
     let now_ms = state.context.now_ms();
-    let record = match store.redeem_email_token(token) {
-        Ok(record) => record,
-        Err(err) => return ApiError::from(err).into_response(),
-    };
-    let Some(record) = record else {
-        return reset_invalid_page();
-    };
-    // A confirmation bearer pasted here is refused (wrong flow, never
-    // silently accepted); the bearer is still consumed — single-use
-    // regardless of which endpoint reads it, like `confirm_email`.
-    if record.kind != EmailTokenKind::PasswordReset {
-        return reset_invalid_page();
-    }
-    if !reset_bearer_live(
-        record.created_at_ms,
-        now_ms,
-        state.server.password_reset_ttl_hours,
-    ) {
-        return reset_invalid_page();
-    }
     let password_hash = match crate::application::crypto::hash_password(password) {
         Ok(hash) => hash,
         Err(_) => return ApiError::internal().into_response(),
     };
-    match store.set_user_password(record.account_id, password_hash) {
+    // One transaction validates kind and lifetime, burns the bearer and sets
+    // the password: a failure cannot consume the link without the change.
+    let ttl_ms = reset_bearer_ttl_ms(state.server.password_reset_ttl_hours);
+    match accounts::reset_password(store, token, password_hash, now_ms, ttl_ms) {
         Ok(_) => reset_page(
             StatusCode::OK,
             "Password changed",
             "Password changed",
             "Your password has been changed. You can now sign in.",
         ),
-        // The account vanished after the mail was sent: answer the same
-        // invalid page rather than revealing which half failed.
-        Err(crate::domain::Error::NotFound(_)) => reset_invalid_page(),
+        // Unknown, used, expired, wrong-kind or vanished account: one page,
+        // so the answer never says which case occurred.
+        Err(crate::domain::Error::NotFound(_) | crate::domain::Error::InvalidInput(_)) => {
+            reset_invalid_page()
+        }
         Err(err) => ApiError::from(err).into_response(),
     }
 }

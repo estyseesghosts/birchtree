@@ -905,6 +905,11 @@ impl WebauthnChallenge {
     }
 }
 
+/// Most WebAuthn credentials (security keys) one account may register.
+/// Enforced atomically by the storage port; registration beyond it is a
+/// `Conflict`, not a silent truncation of the login-time listing.
+pub const MAX_WEBAUTHN_CREDENTIALS_PER_ACCOUNT: usize = 20;
+
 /// A registered WebAuthn credential (the `WEBAUTHN_CREDS` table row, keyed
 /// by raw credential-id bytes; JSON shape).
 ///

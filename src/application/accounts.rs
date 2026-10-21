@@ -37,7 +37,7 @@ use crate::application::ports::{
 use crate::domain::account::{normalize_username, validate_username};
 use crate::domain::admin_infra::AdminEmailDomainBlock;
 use crate::domain::user::{
-    BACKUP_CODE_BYTES, BACKUP_CODE_COUNT, INVITE_COMMENT_LIMIT, TOTP_SECRET_LEN, EmailTokenKind,
+    BACKUP_CODE_BYTES, BACKUP_CODE_COUNT, MAX_WEBAUTHN_CREDENTIALS_PER_ACCOUNT, INVITE_COMMENT_LIMIT, TOTP_SECRET_LEN, EmailTokenKind,
     Invite, InviteRefusal, TotpRecord, WebauthnChallenge, WebauthnCredential, WebauthnPurpose,
     base32_decode, base32_encode, check_date_of_birth_with_min_age, consume_backup_code_hash,
     invite_code_from_seed, validate_time_zone, verify_totp_at, verify_webauthn_assertion,
@@ -381,21 +381,28 @@ pub fn redeem_invite(store: &dyn InviteStore, code: &str, now_ms: u64) -> Result
 pub const PASSWORD_RESET_TTL_MS: u64 = 6 * 3_600_000;
 
 pub fn confirm_email(
-    store: &dyn AccountStore,
+    store: &dyn SecondFactorStore,
     token: &str,
-    // Confirmation bearers never expire (Devise default); the clock stays
-    // in the signature for symmetry with the reset flow (`email_token_live`).
-    _now_ms: u64,
+    // Confirmation bearers never expire (Devise default); the clock is
+    // passed through for symmetry with the reset flow.
+    now_ms: u64,
 ) -> Result<LocalUser> {
-    let record = store
-        .redeem_email_token(token)?
-        .ok_or_else(|| Error::NotFound("confirmation token is invalid or has already been used".into()))?;
-    if record.kind != EmailTokenKind::Confirmation {
-        return Err(Error::InvalidInput(
-            "this token is for password reset, not email confirmation".into(),
-        ));
-    }
-    store.set_email_verified(record.account_id, true)
+    // One storage transaction consumes the bearer and flips the flag.
+    store.confirm_email_token(token, now_ms)
+}
+
+/// Redeem a password-reset bearer and set the new password hash atomically.
+/// Unknown, used, expired and wrong-kind bearers all answer `NotFound` /
+/// `InvalidInput` without revealing which case occurred to HTTP callers
+/// (the endpoint maps every failure to one page).
+pub fn reset_password(
+    store: &dyn SecondFactorStore,
+    token: &str,
+    password_hash: String,
+    now_ms: u64,
+    ttl_ms: u64,
+) -> Result<LocalUser> {
+    store.reset_password_with_token(token, password_hash, now_ms, ttl_ms)
 }
 
 /// Whether a stored token is still live at `now_ms`.
@@ -598,6 +605,59 @@ pub trait SecondFactorStore: Send + Sync {
         &self,
         challenge_b64: &str,
     ) -> Result<Option<WebauthnChallenge>>;
+
+    // -- Email-token and mail-outbox secrets (work package 1) -------------
+    //
+    // Hosted on this trait because it is already a `Store` supertrait that
+    // the storage adapter implements next to the secret-sealing code.
+    // Defaults refuse loudly (like the scaffold `AccountStore` methods);
+    // `RedbStore` overrides every one.
+
+    /// Mint a random bearer, persist only its digest, and queue the mail job
+    /// (`SendConfirmationEmail` or `SendPasswordResetEmail` by `kind`) in ONE
+    /// transaction. The job payload carries the bearer sealed under the
+    /// store's secret key (plaintext only when no key is configured).
+    fn issue_email_token(
+        &self,
+        _account_id: Id,
+        _email: &str,
+        _kind: EmailTokenKind,
+        _now_ms: u64,
+    ) -> Result<()> {
+        Err(Error::Internal("issue_email_token is not implemented".into()))
+    }
+
+    /// Recover the bearer from a mail job's stored `token` field. The default
+    /// is the identity (stores that never seal).
+    fn reveal_mail_token(&self, _account_id: Id, stored: &str) -> Result<String> {
+        Ok(stored.to_string())
+    }
+
+    /// Atomically consume a confirmation bearer and mark the owner's email
+    /// verified (one transaction: a failed update leaves the bearer intact).
+    fn confirm_email_token(&self, _token: &str, _now_ms: u64) -> Result<LocalUser> {
+        Err(Error::Internal("confirm_email_token is not implemented".into()))
+    }
+
+    /// Atomically validate kind and lifetime, consume a reset bearer and set
+    /// the new password hash (one transaction).
+    fn reset_password_with_token(
+        &self,
+        _token: &str,
+        _password_hash: String,
+        _now_ms: u64,
+        _ttl_ms: u64,
+    ) -> Result<LocalUser> {
+        Err(Error::Internal("reset_password_with_token is not implemented".into()))
+    }
+
+    /// Bounded maintenance: delete up to `limit` stale email-token rows
+    /// (expired resets, bearers of accounts that no longer exist, and
+    /// confirmation bearers of already-verified accounts) and redact finished
+    /// mail jobs that still carry a bearer. Returns rows changed.
+    fn prune_email_secrets(&self, _now_ms: u64, _reset_ttl_ms: u64, _limit: usize) -> Result<usize> {
+        Err(Error::Internal("prune_email_secrets is not implemented".into()))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -679,6 +739,19 @@ impl SecondFactorStore for MemorySecondFactorStore {
 
     fn put_webauthn(&self, credential: WebauthnCredential) -> Result<WebauthnCredential> {
         let mut inner = self.inner.lock().expect("second-factor store");
+        let already_owned: bool = inner
+            .webauthn_by_id
+            .get(&credential.credential_id)
+            .is_some_and(|old| old.account_id == credential.account_id);
+        let owned_count: usize = inner
+            .webauthn_by_account
+            .get(&credential.account_id.value())
+            .map_or(0, Vec::len);
+        if !already_owned && owned_count >= MAX_WEBAUTHN_CREDENTIALS_PER_ACCOUNT {
+            return Err(Error::Conflict(format!(
+                "an account may register at most {MAX_WEBAUTHN_CREDENTIALS_PER_ACCOUNT} security keys"
+            )));
+        }
         if let Some(old) = inner.webauthn_by_id.get(&credential.credential_id).cloned()
             && old.account_id != credential.account_id
             && let Some(ids) = inner.webauthn_by_account.get_mut(&old.account_id.value())
