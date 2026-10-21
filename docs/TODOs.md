@@ -2,12 +2,10 @@
 
 Status: Draft
 
-Remaining work after the 2026-10-20 fix round (P0 privacy, P1 builds, P2
-confirmed rows — all green, see `docs/fix-plan.md` and
-`docs/logs/2026-10-20-fix-plan-verification.md`). Each item is honest
-absence or a recorded gap — never a success-shaped stub. Items marked
-**operator** need an operator decision before build; items marked
-**phase** belong to a named future phase.
+Remaining work post fix round + storage overhaul (2026-10-21, `docs/database.md`)
++ gaps batch (`docs/gaps.md`, commit `722b024`). Database and gaps items
+below are marked landed; what is left is verification debt, post-parity
+programs, and deliberate exclusions.
 
 Conventions: `D##` = row in `docs/compatibility-profile.md`;
 "manifest" = `docs/endpoint-manifest.md`.

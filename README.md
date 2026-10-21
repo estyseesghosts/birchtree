@@ -15,14 +15,19 @@ at it — see [keystone](https://github.com/estyseesghosts/keystone) (in
 development). The official Mastodon frontend has not been tested against it
 yet. YMMV.
 
-> **Status (2026-10-20):** local-usable and federating in the lab
-> (`cargo test --release`: 349 passed / 0 failed). Accounts, statuses,
-> relationships, media, timelines, notifications/markers/lists/filters,
-> streaming (SSE + WebSocket), and core federation are implemented and
-> lab-verified against real Mastodon 4.7.3. Conversations, Web Push, admin
-> API, `/api/web/*`, transcoding, full-text search, and multi-node are
-> planned, not built. Tested in simulated environments and a private lab
-> only — never against the live fediverse.
+> **Status (2026-10-21):** local-usable and federating in the lab,
+> post storage overhaul (`docs/database.md`) + gaps batch (`docs/gaps.md`).
+> Accounts, statuses, relationships, media (two-pool store + on-demand
+> remote cache + transcode), timelines, notifications/markers/lists/filters,
+> streaming (SSE + WebSocket, announcement events), conversations,
+> suggestions, announcements, Web Push, admin/moderation/trends/reports,
+> `/api/web/*`, search (embedded index), collections + `v2/notifications`,
+> federation tail (Move/emoji/relays/follower hints/quote re-verify/Flag
+> forward/live WebFinger/embeds), and MFA/TOTP/WebAuthn are implemented and
+> covered by executed tests. Remaining honest gaps: `email_subscriptions`
+> (404 out-of-profile), `severed_relationships` producer (no sever cascade),
+> follower-count sync (hints only). Tested in simulated environments and a
+> private lab only — never against the live fediverse.
 
 ---
 
@@ -208,9 +213,9 @@ Things that work but with documented limits you may trip over:
 | 3 | Local statuses, relationships, quotes, idempotency | Done |
 | 4 | Media, timelines, notifications, lists/filters/search | Done |
 | 4.1 | Parity gap closure (JSON bodies D11, exclusive lists D10b, home cap D10a) | Done |
-| 5 | Streaming (SSE + WebSocket, envelopes, bounds) | Current — largely built, exit review open |
-| 6 | ActivityPub federation (inboxes, delivery, thread completion) | Core landed + lab-verified; hardening open |
-| 7 | Transcoding (7.1), search (7.2), admin/moderation (7.3), push, `/api/web/*` | Planned — only multi-fetch/reports/stubs landed |
+| 5 | Streaming (SSE + WebSocket, envelopes, bounds, announcement events) | Done |
+| 6 | ActivityPub federation (inboxes, delivery, thread completion, Move/emoji/relays/quote re-verify/Flag forward) | Done (follower-count sync hints only) |
+| 7 | Transcoding (7.1), search (7.2), admin/moderation (7.3), push, `/api/web/*`, conversations/suggestions/announcements, collections + `v2/notifications`, MFA, storage overhaul | Done |
 | 8 | Declared API compatibility (98% parity suite) | Planned |
 
 The single-node server is **local-usable today**. Declared v4.7.3

@@ -2,7 +2,7 @@
 
 This page is the plain-words map of where birchtree has been and where it is going. Each phase adds a working slice; nothing is marked done without a passing test run behind it. No dates are promised for anything still open.
 
-Status: everything through Phase 7.3 is built and green, including the October fix round. Next is Phase 8.
+Status: everything through Phase 7.3 is built and green, including the October fix round, the 2026-10-21 storage overhaul, and the gaps batch. Next is Phase 8.
 
 <!-- docs/logs/2026-10-20-fix-plan-verification.md:1-13; docs/logs/2026-10-20-phase-7-3-verification.md:36-52 -->
 
@@ -15,8 +15,8 @@ Status: everything through Phase 7.3 is built and green, including the October f
 | 4 | Everyday use: uploads, timelines, notifications, lists, filters, search-over-local-posts, markers, scheduled posts | done |
 | 4.1 | Gap closure: JSON request bodies, private lists hidden from home, home reads up to 1000 followed accounts | done |
 | 5 | Live updates: one-way and two-way streams with shared visibility rules, heartbeats, and limits | done |
-| 6 | Talking to other servers: discovery, profiles, follows, posts, edits, deletes, likes, boosts, polls, quote decisions, retries | done (content flows; thread-completion and the long tail below are a separate future phase) |
-| 7 | Wider app compatibility: multi-account lookup, conversations, suggestions, announcements, donation placeholder, push notifications, companion-app endpoints | done |
+| 6 | Talking to other servers: discovery, profiles, follows, posts, edits, deletes, likes, boosts, polls, quote decisions, Move/emoji/relays/quote re-verify/Flag forward, retries | done (follower-count sync hints only) |
+| 7 | Wider app compatibility: multi-account lookup, conversations, suggestions, announcements, donation placeholder, push notifications, companion-app endpoints, collections, MFA | done |
 | 7.1 | Media conversion: pictures to WebP, moving pictures to WebM, with startup checks and limits | done |
 | 7.2 | Search engine: built-in index on by default, switchable to simple scan or off; private posts never indexed | done |
 | 7.3 | Moderation and statistics: staff roles, reports, domain/email/IP rules, trend approvals, yearly summaries, usage measures | done |

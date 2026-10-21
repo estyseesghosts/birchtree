@@ -2,7 +2,7 @@
 
 This page says what the server does today. It is written for a smart reader with no programming background: what works, what is deliberately left out, and what is still planned. Short code pointers sit in hidden comments for the engineers; they are not needed to understand the page.
 
-Status: late October 2026. Everything planned through Phase 7.3 is built and green. The October fix round (privacy, builds, confirmed rows) is finished and merged — it is history, not in-flight work. Next is Phase 8: measuring speed and robustness under load.
+Status: late October 2026. Everything planned through Phase 7.3 is built and green, plus the 2026-10-21 storage overhaul (`docs/database.md`: two-pool store, on-demand remote cache, stream-to-disk, reconciler) and gaps batch (`docs/gaps.md`: operator/profile surfaces, D51 producers, collections + `v2/notifications`, federation tail, MFA/D35). The October fix round is history. Next is Phase 8: measuring speed and robustness under load.
 
 <!-- docs/logs/2026-10-20-fix-plan-verification.md:1-13; docs/logs/2026-10-20-phase-7-3-verification.md:36-52 -->
 
