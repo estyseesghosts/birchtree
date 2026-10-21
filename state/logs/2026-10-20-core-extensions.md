@@ -101,3 +101,23 @@ in `e63b39a` via `rm --cached`; disk copies intact).
   contention), 6, 7, 7.1, 7.2, 7.3 — all `*_OK`.
 - C_CORE = `ed21657` (feature/core-extensions tip, incl. session-log
   commit). `feature/aperture-mode` cut from C_CORE.
+
+## Stage 2: MERGED + PUSHED (per operator: commit+push prioritized over testing)
+- `feature/aperture-mode` = `7e8d3ec` on top of skeleton `4356672` on top
+  of C_CORE `ed21657`. Both branches pushed to
+  github.com/estyseesghosts/birchtree (nothing on main/master).
+- Aperture suites green at merge time: a1 5/5, a2 11/11, b1 6/6, b2 4/4,
+  e1 7/7, zero ignored. Full `cargo check --all-targets` green at merge;
+  full `cargo test` / smoke-all NOT re-run on the final tree per operator
+  instruction ( Stage 1 gate was green; Stage 2 needs a full gate +
+  two-instance interop + Pixelfed fixture run before being called done).
+- Parent decisions: A2 Q1 message `Status must have media attachments`;
+  Q2 strip-only edits (grandfathered text editable); Q3 publish-time-only
+  scheduled enforcement. B1 replies leave timelines (store-level
+  has_media); link+list forced, untested. B2 Q1 exact-URL exempt; Q2
+  application-level filter; D53 assigned. E1 Q1 audio doesn't satisfy;
+  Q2 NoteRef needs no gate (read-only); Q3 known-status Updates ungated;
+  Q4 log-line counter only. `preferredLicense` actor federation deferred
+  (external Person type).
+- Open: full gate on final tree, interop evidence, worktree cleanup
+  (wt-core-*, wt-ap-*, wt/core-*, wt/ap-* branches).
