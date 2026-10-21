@@ -93,17 +93,65 @@ impl ReconReport {
     }
 }
 
-/// Run one bounded, idempotent sweep.
+/// Resume point of a multi-job sweep: the last key seen in each listing.
+///
+/// A sweep that stops at the batch cap hands this back so the next job
+/// continues where it ended instead of re-reading the same first page
+/// forever (healthy keys stay in the first page, so a sweep without a cursor
+/// would never reach the rest of a large tree). Serialized into the job
+/// payload; a handful of short keys, far under the payload budget.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReconCursor {
+    /// Last blob key scanned (`None` starts from the beginning).
+    pub blob_after: Option<String>,
+    /// Last metadata key scanned.
+    pub meta_after: Option<String>,
+    /// The blob listing reached its end in an earlier page of this pass.
+    pub blobs_done: bool,
+    /// The metadata listing reached its end in an earlier page of this pass.
+    pub metas_done: bool,
+}
+
+/// One page of a resumable sweep.
+#[derive(Debug, Clone)]
+pub struct ReconPage {
+    /// What this page found and fixed.
+    pub report: ReconReport,
+    /// Where the next page continues; `None` when this page reached the end
+    /// of both listings (a full pass is complete).
+    pub next: Option<ReconCursor>,
+}
+
+/// Run one bounded, idempotent sweep from the beginning of the listings.
 ///
 /// Every category is page-capped at `batch` (clamped to
 /// `1..=RECONCILE_BATCH_LIMIT`), so a single sweep never scans without
-/// bound; repeat sweeps converge the backlog to zero.
+/// bound; repeat sweeps converge the backlog to zero. Use
+/// [`reconcile_page`] to walk the whole keyspace across jobs.
 pub fn reconcile(store: &dyn ReconStore, now_ms: u64, batch: usize) -> Result<ReconReport> {
+    Ok(reconcile_page(store, now_ms, batch, &ReconCursor::default())?.report)
+}
+
+/// Run one bounded sweep page starting at `cursor`.
+pub fn reconcile_page(
+    store: &dyn ReconStore,
+    now_ms: u64,
+    batch: usize,
+    cursor: &ReconCursor,
+) -> Result<ReconPage> {
     let cap = batch.clamp(1, RECONCILE_BATCH_LIMIT);
     let mut report = ReconReport::default();
 
-    let blobs = store.list_blob_keys(None, cap)?;
-    let metas = store.list_meta_keys(None, cap)?;
+    let blobs = if cursor.blobs_done {
+        Vec::new()
+    } else {
+        store.list_blob_keys(cursor.blob_after.as_deref(), cap)?
+    };
+    let metas = if cursor.metas_done {
+        Vec::new()
+    } else {
+        store.list_meta_keys(cursor.meta_after.as_deref(), cap)?
+    };
     let pending = store.list_pending_deletes(None, cap)?;
     report.scanned_blobs = blobs.len();
     report.scanned_meta = metas.len();
@@ -145,7 +193,19 @@ pub fn reconcile(store: &dyn ReconStore, now_ms: u64, batch: usize) -> Result<Re
         report.deletes_completed += 1;
     }
 
-    Ok(report)
+    let blobs_done: bool = cursor.blobs_done || blobs.len() < cap;
+    let metas_done: bool = cursor.metas_done || metas.len() < cap;
+    let next = if blobs_done && metas_done {
+        None
+    } else {
+        Some(ReconCursor {
+            blob_after: blobs.last().cloned().or_else(|| cursor.blob_after.clone()),
+            meta_after: metas.last().cloned().or_else(|| cursor.meta_after.clone()),
+            blobs_done,
+            metas_done,
+        })
+    };
+    Ok(ReconPage { report, next })
 }
 
 #[cfg(test)]

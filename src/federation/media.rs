@@ -9,16 +9,20 @@
 //! deletes the row's own `remote/{media_id}` key (per-row keys retained, no
 //! sharing, no refcount; durable local media is never touched).
 //!
+//! The fetch is instance-actor-signed on every hop ([`get_signed`]): when an
+//! instance actor is configured each `GET` (initial URL and each redirect
+//! target) carries its HTTP signature, so authorized-fetch peers accept the
+//! dereference; without a configured actor the fetch is an unsigned `GET`
+//! with `Accept: */*`. Every hop is revalidated against the SSRF URL policy
+//! before it is requested.
+//!
 //! The enforcement shape is unchanged: SSRF URL policy, the resolver's
 //! connect checks, `redirect(Policy::none)` with 5s/10s timeouts
 //! (`federation::net`), `Content-Length` advisory check, streaming byte-count
 //! abort, `ingest::sniff` + `validate`. `MAX_REMOTE_MEDIA_BYTES` stays the
 //! per-file ceiling inside the class/global budgets.
-//!
-//! Open gap (carried, not absorbed): this fetch sends an unsigned `GET` with
-//! `Accept: */*` while `federation-contract.md` requires instance-actor-signed
-//! dereferences — see `docs/database.md` §"Open gap".
 
+use axum::body::Bytes;
 use futures_util::StreamExt;
 use url::Url;
 
@@ -38,6 +42,53 @@ pub const MAX_REMOTE_MEDIA_BYTES: u64 = 40 * 1024 * 1024;
 
 /// Attachments are fetched as full originals (`variant "original"`).
 const ATTACHMENT_VARIANT: &str = "original";
+
+/// Redirect hops followed for one attachment (each hop is revalidated).
+pub const MAX_REDIRECT_HOPS: usize = 5;
+
+/// `GET` a remote attachment, signed with the instance actor when one is
+/// configured, following redirects manually under the URL policy.
+async fn get_signed(
+    config: &activitypub_federation::config::FederationConfig<FedContext>,
+    first_url: Url,
+) -> std::result::Result<reqwest::Response, DeliveryError> {
+    let ctx: &FedContext = config;
+    let data = config.to_request_data();
+    let mut url = first_url;
+    for _hop in 0..=MAX_REDIRECT_HOPS {
+        policy::check_url(&url, ctx.http.allow_http, &ctx.http.allowlist)
+            .map_err(|e| DeliveryError::Quarantine(format!("attachment url refused: {e}")))?;
+        let response = if data.can_sign_requests() {
+            let builder = reqwest_middleware::ClientWithMiddleware::from(ctx.media_client.clone())
+                .get(url.as_str())
+                .header(reqwest::header::ACCEPT, "*/*");
+            let request = data
+                .sign_request(builder, Bytes::new())
+                .await
+                .map_err(|e| DeliveryError::Retry(format!("signing the attachment fetch failed: {e}")))?;
+            ctx.media_client.execute(request).await
+        } else {
+            ctx.media_client
+                .get(url.clone())
+                .header(reqwest::header::ACCEPT, "*/*")
+                .send()
+                .await
+        };
+        let response = response.map_err(|e| DeliveryError::Retry(e.to_string()))?;
+        if !response.status().is_redirection() {
+            return Ok(response);
+        }
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| DeliveryError::Quarantine("attachment redirect has no location".into()))?;
+        url = url
+            .join(location)
+            .map_err(|e| DeliveryError::Quarantine(format!("attachment redirect is invalid: {e}")))?;
+    }
+    Err(DeliveryError::Quarantine("attachment redirected too many times".into()))
+}
 
 /// Per-row blob key for a remote attachment (retained v1 decision: no
 /// content-addressed sharing, no refcount; safe eviction deletes this key).
@@ -236,18 +287,12 @@ pub async fn fetch(
         ledger.release(MediaClass::Full, amount);
     };
 
-    let response = ctx
-        .media_client
-        .get(url.clone())
-        .header(reqwest::header::ACCEPT, "*/*")
-        .send()
-        .await
-        .map_err(|e| {
-            if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
-                release(&mut ledger, reserved);
-            }
-            DeliveryError::Retry(e.to_string())
-        })?;
+    let response = get_signed(config, url.clone()).await.map_err(|e| {
+        if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
+            release(&mut ledger, reserved);
+        }
+        e
+    })?;
     let status = response.status();
     if status.is_server_error() || status == reqwest::StatusCode::REQUEST_TIMEOUT || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         if let Ok(mut ledger) = remote_cache::process_ledger().lock() {

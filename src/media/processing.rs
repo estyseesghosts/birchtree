@@ -127,7 +127,10 @@ fn process_image(mime_type: &str, bytes: &[u8]) -> Result<Processed, ProcessErro
     let format = image_format(mime_type).ok_or_else(|| {
         ProcessError::Unidentifiable(format!("unsupported media type {mime_type}"))
     })?;
-    let img = image::load_from_memory_with_format(bytes, format).map_err(|err| {
+    check_decode_limits(format, bytes)?;
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+    reader.limits(decode_limits());
+    let img = reader.decode().map_err(|err| {
         ProcessError::Unidentifiable(format!("could not decode {mime_type}: {err}"))
     })?;
     let (width, height) = img.dimensions();
@@ -177,6 +180,54 @@ fn process_image(mime_type: &str, bytes: &[u8]) -> Result<Processed, ProcessErro
         }),
         duration_ms: None,
     })
+}
+
+/// Most pixels an accepted still image may have (Mastodon's
+/// `MAX_IMAGE_PIXELS`, about an 8K frame). A compressed byte cap alone does
+/// not bound the decoded size: a small PNG can declare billions of pixels.
+pub const MAX_IMAGE_PIXELS: u64 = 33_177_600;
+
+/// Longest accepted image side. Bounds degenerate `1 x 100_000_000` frames
+/// that pass the pixel product on a 32-bit multiplication.
+pub const MAX_IMAGE_SIDE: u32 = 20_000;
+
+/// Decoder allocation ceiling: one RGBA frame at the pixel cap (4 bytes per
+/// pixel) plus headroom for the decoder's working buffers.
+const MAX_DECODE_ALLOC_BYTES: u64 = MAX_IMAGE_PIXELS * 4 + 64 * 1024 * 1024;
+
+/// Decoder limits applied to every untrusted decode.
+fn decode_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_SIDE);
+    limits.max_image_height = Some(MAX_IMAGE_SIDE);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC_BYTES);
+    limits
+}
+
+/// Read the declared dimensions from the container header only (no pixel
+/// decode) and refuse oversized images before any allocation.
+fn check_decode_limits(format: ImageFormat, bytes: &[u8]) -> Result<(), ProcessError> {
+    let reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+    let (width, height) = reader.into_dimensions().map_err(|err| {
+        ProcessError::Unidentifiable(format!("could not read image header: {err}"))
+    })?;
+    let pixels: u64 = u64::from(width) * u64::from(height);
+    if width > MAX_IMAGE_SIDE || height > MAX_IMAGE_SIDE || pixels > MAX_IMAGE_PIXELS {
+        return Err(ProcessError::Unidentifiable(format!(
+            "image dimensions {width}x{height} exceed the limit"
+        )));
+    }
+    Ok(())
+}
+
+/// Header-only dimension check for a sniffed still image, shared with the
+/// transcode path so ffmpeg is never started on a decompression bomb.
+/// Formats the pure-Rust decoders cannot read (HEIC, TIFF) pass through.
+pub fn check_image_limits(mime_type: &str, bytes: &[u8]) -> Result<(), ProcessError> {
+    match image_format(mime_type) {
+        Some(format) => check_decode_limits(format, bytes),
+        None => Ok(()),
+    }
 }
 
 /// Map a sniffed content type onto an `image`-crate format.

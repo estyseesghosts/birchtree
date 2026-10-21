@@ -417,8 +417,9 @@ pub const INVITES: TableDefinition<&str, &[u8]> = TableDefinition::new("invites"
 /// duplicate checks; backfilled from existing credential rows in v12).
 pub const EMAIL_INDEX: TableDefinition<&str, u64> = TableDefinition::new("email_index");
 
-/// Pending email tokens by token -> JSON `EmailToken` (D12 redemption;
-/// consumed on use, single-use).
+/// Pending email tokens by [`email_token_key`] (`h1:` + SHA-256 hex of the
+/// bearer; the plaintext bearer is never a key) -> JSON `EmailToken` (D12
+/// redemption; consumed on use, single-use).
 pub const EMAIL_TOKENS: TableDefinition<&str, &[u8]> = TableDefinition::new("email_tokens");
 
 /// Interaction events by event id -> JSON `InteractionEvent` (D39
@@ -605,6 +606,40 @@ pub const TOTP_SECRETS: TableDefinition<u64, &[u8]> = TableDefinition::new("totp
 /// WebAuthn credentials by raw credential ID bytes -> JSON `WebauthnCredential`.
 pub const WEBAUTHN_CREDS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("webauthn_creds");
 
+/// WebAuthn credentials by owning account: `(account_id_be || credential_id)`
+/// -> unit. Maintained in the same transaction as `WEBAUTHN_CREDS`; a prefix
+/// range scan lists one account's credentials without touching other rows.
+/// Created and backfilled lazily by `second_factor` (marker row
+/// [`WEBAUTHN_INDEX_MARKER_KEY`] under `META`).
+pub const WEBAUTHN_BY_ACCOUNT: TableDefinition<&[u8], ()> =
+    TableDefinition::new("webauthn_by_account");
+
+/// `META` key set once `WEBAUTHN_BY_ACCOUNT` has been backfilled.
+pub const WEBAUTHN_INDEX_MARKER_KEY: &str = "webauthn_by_account_built";
+
+/// `META` key set once `EMAIL_TOKENS` rows have been re-keyed by digest.
+pub const EMAIL_TOKEN_DIGEST_MARKER_KEY: &str = "email_tokens_digest_keyed";
+
+/// Key prefix marking a digest-keyed `EMAIL_TOKENS` row (legacy rows were
+/// keyed by the 64-hex plaintext bearer, which this prefix cannot collide with).
+pub const EMAIL_TOKEN_KEY_PREFIX: &str = "h1:";
+
+/// `EMAIL_TOKENS` key for a bearer: one-way digest, not recoverable.
+pub fn email_token_key(token: &str) -> String {
+    format!(
+        "{EMAIL_TOKEN_KEY_PREFIX}{}",
+        crate::application::crypto::sha256_hex(token.as_bytes())
+    )
+}
+
+/// Storage key for one `WEBAUTHN_BY_ACCOUNT` entry.
+pub fn webauthn_account_key(account_id: u64, credential_id: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(8 + credential_id.len());
+    key.extend_from_slice(&account_id.to_be_bytes());
+    key.extend_from_slice(credential_id);
+    key
+}
+
 /// WebAuthn single-use challenges by `challenge_b64` -> JSON
 /// `WebauthnChallenge` (gaps finish; 5 min TTL enforced by callers via
 /// `live_at`, removed on take either way).
@@ -756,6 +791,7 @@ pub const TABLE_NAMES: &[&str] = &[
     "collection_items",
     "totp_secrets",
     "webauthn_creds",
+    "webauthn_by_account",
     "webauthn_challenges",
 ];
 

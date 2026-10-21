@@ -56,26 +56,11 @@ pub fn check_content_length(declared: Option<u64>, limit: u64) -> Result<()> {
     Ok(())
 }
 
-/// Resolve `key` under `root`, rejecting the same shapes the blob store
-/// rejects (empty, absolute, parent-dir escapes). Mirrors
-/// `FsBlobStore::resolve` without importing Agent A's type, so the streaming
-/// writes land in the same tree while the two agents work in parallel.
+/// Resolve `key` under `root` with the blob store's key validation (empty,
+/// absolute, parent-dir, dot-prefixed and reserved components are refused).
 fn resolve_key(root: &Path, key: &str) -> Result<PathBuf> {
-    if key.is_empty() {
-        return Err(Error::InvalidInput("empty blob key".into()));
-    }
-    let path = Path::new(key);
-    if path.is_absolute()
-        || path.components().any(|c| {
-            matches!(
-                c,
-                std::path::Component::ParentDir | std::path::Component::RootDir
-            )
-        })
-    {
-        return Err(Error::InvalidInput(format!("invalid blob key: {key}")));
-    }
-    Ok(root.join(path))
+    crate::media::blob_store::validate_key(key)?;
+    Ok(root.join(key))
 }
 
 /// Allocate a fresh tmp path for a download staged under `root`.
@@ -86,8 +71,7 @@ fn resolve_key(root: &Path, key: &str) -> Result<PathBuf> {
 /// listing ever mistake it for a committed blob.
 pub fn tmp_path_for(root: &Path) -> Result<PathBuf> {
     let dir = root.join(TMP_DIR_NAME);
-    std::fs::create_dir_all(&dir)
-        .map_err(|err| Error::Storage(format!("create tmp dir {}: {err}", dir.display())))?;
+    crate::media::blob_store::create_private_dirs(&dir)?;
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let rand: u128 = rand::random();
     Ok(dir.join(format!(
@@ -98,23 +82,21 @@ pub fn tmp_path_for(root: &Path) -> Result<PathBuf> {
 
 /// Atomically publish a staged tmp file onto `dest`.
 ///
-/// `rename` overwrites atomically on POSIX; on Windows the target is removed
-/// first and the rename retried once. A failed publish removes the tmp file.
+/// One `rename` replaces the destination; the destination is never removed
+/// first, so a failed publish leaves the previous bytes in place. A failed
+/// publish removes the tmp file.
 pub fn publish_tmp(tmp: &Path, dest: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| {
-            Error::Storage(format!("create blob dir {}: {err}", parent.display()))
-        })?;
+        crate::media::blob_store::create_private_dirs(parent)?;
     }
-    if std::fs::rename(tmp, dest).is_err() {
-        let _ = std::fs::remove_file(dest);
-        if let Err(err) = std::fs::rename(tmp, dest) {
-            let _ = std::fs::remove_file(tmp);
-            return Err(Error::Storage(format!(
-                "rename tmp blob {}: {err}",
-                dest.display()
-            )));
-        }
+    let published: std::io::Result<()> = crate::media::blob_store::replace_file(tmp, dest)
+        .and_then(|()| crate::media::blob_store::sync_parent_dir(dest));
+    if let Err(err) = published {
+        let _ = std::fs::remove_file(tmp);
+        return Err(Error::Storage(format!(
+            "rename tmp blob {}: {err}",
+            dest.display()
+        )));
     }
     Ok(())
 }
@@ -140,7 +122,7 @@ pub fn stage_slices_capped(
     let abort = |tmp: &Path| {
         let _ = std::fs::remove_file(tmp);
     };
-    let mut file = std::fs::File::create(&tmp)
+    let mut file = crate::media::blob_store::open_new_private(&tmp)
         .map_err(|err| Error::Storage(format!("create tmp blob {}: {err}", tmp.display())))?;
     for chunk in chunks {
         if written.saturating_add(chunk.len() as u64) > limit {
@@ -221,6 +203,69 @@ pub fn sweep_tmp(root: &Path) -> Result<usize> {
     Ok(removed)
 }
 
+/// Maximum directory entries one [`sweep_stale_residue`] pass inspects.
+pub const RESIDUE_SWEEP_VISIT_CAP: usize = 200_000;
+
+/// Remove staging residue older than `min_age` under `root`: `tmp/*.part`
+/// downloads and dot-prefixed `.name.part-*` atomic-write siblings anywhere
+/// in the tree. The age gate keeps a live writer's file safe, unlike
+/// [`sweep_tmp`] (which is for startup, before any writer exists). At most
+/// `cap` files are removed and [`RESIDUE_SWEEP_VISIT_CAP`] entries visited
+/// per call; returns the number removed.
+pub fn sweep_stale_residue(
+    root: &Path,
+    min_age: std::time::Duration,
+    cap: usize,
+) -> Result<usize> {
+    let now = std::time::SystemTime::now();
+    let mut removed = 0usize;
+    let mut visited = 0usize;
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(Error::Storage(format!(
+                    "list residue dir {}: {err}",
+                    dir.display()
+                )));
+            }
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > RESIDUE_SWEEP_VISIT_CAP || removed >= cap {
+                return Ok(removed);
+            }
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let in_tmp = dir.file_name().is_some_and(|n| n == TMP_DIR_NAME)
+                && dir.parent() == Some(root);
+            let is_residue = (in_tmp && name.ends_with(TMP_SUFFIX))
+                || (name.starts_with('.') && name.contains(".part-"));
+            if !is_residue || !meta.is_file() {
+                continue;
+            }
+            let old_enough = meta
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age >= min_age);
+            if old_enough && std::fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
+}
+
 /// Copy an async byte stream (e.g. `reqwest::Response::bytes_stream`) to an
 /// already-allocated `tmp` path, counting bytes and aborting mid-body when
 /// `limit` is exceeded.
@@ -242,9 +287,9 @@ where
     use tokio::io::AsyncWriteExt as _;
 
     let mut stream = stream;
-    let mut file = tokio::fs::File::create(tmp).await.map_err(|err| {
-        Error::Storage(format!("create tmp blob {}: {err}", tmp.display()))
-    })?;
+    let mut file = crate::media::blob_store::open_new_private(tmp)
+        .map(tokio::fs::File::from_std)
+        .map_err(|err| Error::Storage(format!("create tmp blob {}: {err}", tmp.display())))?;
     let mut written: u64 = 0;
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk {

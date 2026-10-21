@@ -13,6 +13,8 @@ use crate::api::mastodon::errors::ApiError;
 use crate::api::mastodon::ApiState;
 use crate::application::emoji;
 use crate::application::ports::Store;
+use crate::domain::Error as DomainError;
+use crate::media::public_media;
 
 /// `GET /api/v1/custom_emojis`.
 pub async fn index(State(state): State<ApiState>) -> Response {
@@ -35,11 +37,18 @@ pub async fn index(State(state): State<ApiState>) -> Response {
 }
 
 /// `GET /system/custom_emojis/images/{*path}` — serve an emoji image.
+///
+/// Only published emoji key shapes are served
+/// (`public_media::emoji_blob_key`): guessed names, traversal, backslashes,
+/// symlink paths, staging siblings and other namespaces are all a plain 404
+/// before the filesystem is consulted, exactly like the attachment route.
 pub async fn serve_image(
     State(state): State<ApiState>,
     Path(path): Path<String>,
 ) -> Response {
-    let key = format!("custom_emojis/images/{path}");
+    let Some(key) = public_media::emoji_blob_key(&path) else {
+        return ApiError::new(StatusCode::NOT_FOUND, "Not Found").into_response();
+    };
     let blobs = &*state.context.blobs;
     match blobs.get(&key) {
         Ok(Some(bytes)) => {
@@ -55,12 +64,19 @@ pub async fn serve_image(
                         header::CACHE_CONTROL,
                         "max-age=86400, public".to_string(),
                     ),
+                    (
+                        header::X_CONTENT_TYPE_OPTIONS,
+                        "nosniff".to_string(),
+                    ),
                 ],
                 bytes,
             )
                 .into_response()
         }
         Ok(None) => ApiError::new(StatusCode::NOT_FOUND, "Not Found").into_response(),
+        Err(DomainError::InvalidInput(_)) => {
+            ApiError::new(StatusCode::NOT_FOUND, "Not Found").into_response()
+        }
         Err(err) => ApiError::from(err).into_response(),
     }
 }

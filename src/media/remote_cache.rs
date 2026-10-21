@@ -264,12 +264,14 @@ pub fn is_cache_key(key: &str) -> bool {
     key.starts_with("remote/")
 }
 
-/// Warming reuses `FetchRemoteMedia` behind the config flag and never covers
+/// Warming reuses `FetchRemoteMedia` behind scoped opt-in and never covers
 /// relay-originated media (there is no relay path yet; the exclusion is
 /// enforced at the call site signature so it cannot be added later without
-/// passing through here).
+/// passing through here). Opt-in is either `mode = warm` or the `warming`
+/// flag; both mean the same capped per-status warming
+/// ([`crate::media::cache_maintenance::WARM_FETCH_CAP_PER_STATUS`]).
 pub fn should_warm(cfg: &RemoteCacheConfig, is_relay: bool) -> bool {
-    cfg.warming && !is_relay
+    (cfg.warming || cfg.mode == crate::config::RemoteCacheMode::Warm) && !is_relay
 }
 
 /// Point-in-time usage snapshot.
@@ -623,6 +625,55 @@ impl CacheLedger {
                 shell.size = 0;
                 self.entries.insert(key, shell);
             }
+        }
+    }
+
+    /// Re-insert a durable ledger row after a restart, without a prior
+    /// reservation: byte-holding rows count as stored bytes. Refuses rows
+    /// outside the cache namespace so durable media can never enter the
+    /// ledger. A row already present is replaced (no double count).
+    pub fn restore_entry(&mut self, entry: RemoteCacheEntry) -> Result<(), CacheError> {
+        if !is_cache_key(&entry.blob_key) {
+            return Err(CacheError::Unsupported(format!(
+                "refusing non-cache key in the remote ledger: {}",
+                entry.blob_key
+            )));
+        }
+        let key = entry.cache_key();
+        if let Some(old) = self.entries.get(&key) {
+            if old.has_bytes {
+                let idx = class_index(old.class);
+                self.stored[idx] = self.stored[idx].saturating_sub(old.size);
+            }
+        }
+        if entry.has_bytes {
+            let idx = class_index(entry.class);
+            self.stored[idx] = self.stored[idx].saturating_add(entry.size);
+        }
+        self.entries.insert(key, entry);
+        Ok(())
+    }
+
+    /// Forget every row and stored-byte counter while keeping in-flight
+    /// reservations (running downloads still hold their budget). Used to
+    /// rebuild the ledger from the durable rows.
+    pub fn clear_entries(&mut self) {
+        self.entries.clear();
+        self.stored = [0; 4];
+    }
+
+    /// Drop the byte mapping of the row that owns `blob_key` (the durable
+    /// eviction already happened). Returns whether a byte-holding row was
+    /// found.
+    pub fn evict_by_blob_key(&mut self, blob_key: &str) -> bool {
+        let found: Option<Vec<u8>> = self
+            .entries
+            .iter()
+            .find(|(_, entry)| entry.has_bytes && entry.blob_key == blob_key)
+            .map(|(key, _)| key.clone());
+        match found {
+            Some(key) => self.evict_one(&key).is_some(),
+            None => false,
         }
     }
 

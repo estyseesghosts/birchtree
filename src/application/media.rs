@@ -12,6 +12,8 @@ use crate::application::ports::{
 };
 use crate::domain::{Error, FocusPoint, Id, MediaAttachment, MediaState, Result};
 use crate::media::ingest::{self, Sniffed};
+use crate::media::staging::StagingGuard;
+use crate::media::upload_spool::{SNIFF_PREFIX_BYTES, UploadSpool};
 
 /// Mastodon's `file_type_error`: the attachment cannot be decoded.
 pub const FILE_TYPE_ERROR: &str = "File type of uploaded media could not be verified";
@@ -69,11 +71,7 @@ fn shard_key(shard: &str, style: &str, ext: &str) -> String {
 /// A sibling key in the same shard as `file_key` (`.../{style}.{ext}`), or
 /// `None` when the key carries no shard (e.g. an empty placeholder).
 fn sibling_key(file_key: &str, style: &str, ext: &str) -> Option<String> {
-    let (dir, _) = file_key.rsplit_once('/')?;
-    if dir.is_empty() {
-        return None;
-    }
-    Some(format!("{dir}/{style}.{ext}"))
+    crate::media::public_media::sibling_key(file_key, style, ext)
 }
 
 // ---------------------------------------------------------------------------
@@ -109,7 +107,7 @@ pub fn human_size(bytes: u64) -> String {
 }
 
 /// Mastodon's file-size 422 body for a `limit` that was exceeded.
-fn file_too_large_error(limit: u64) -> Error {
+pub fn file_too_large_error(limit: u64) -> Error {
     let human = human_size(limit);
     Error::InvalidInput(format!(
         "Validation failed: File must be less than {human}, File file size must be less than {human}"
@@ -169,7 +167,7 @@ pub fn upload_media(
         blobs,
         now_ms,
         account_id,
-        file_bytes,
+        UploadFile::Bytes(file_bytes),
         thumbnail_bytes,
         description,
         focus,
@@ -201,7 +199,63 @@ pub fn upload_media_with_config(
         blobs,
         now_ms,
         account_id,
-        file_bytes,
+        UploadFile::Bytes(file_bytes),
+        thumbnail_bytes,
+        description,
+        focus,
+        delay,
+        max_file_size,
+        config,
+    )
+}
+
+/// The uploaded file: resident bytes, or a capped spool file the HTTP layer
+/// already wrote to disk (published onto its blob key with one rename).
+pub enum UploadFile<'upload> {
+    Bytes(&'upload [u8]),
+    Spooled(&'upload mut UploadSpool),
+}
+
+impl UploadFile<'_> {
+    fn len(&self) -> u64 {
+        match self {
+            UploadFile::Bytes(bytes) => bytes.len() as u64,
+            UploadFile::Spooled(spool) => spool.len(),
+        }
+    }
+
+    /// Leading bytes used for content sniffing.
+    fn prefix(&self) -> &[u8] {
+        match self {
+            UploadFile::Bytes(bytes) => &bytes[..bytes.len().min(SNIFF_PREFIX_BYTES)],
+            UploadFile::Spooled(spool) => spool.prefix(),
+        }
+    }
+}
+
+/// Upload with the file already spooled to disk (the streaming HTTP path):
+/// identical rules to [`upload_media_with_config`], but the original is
+/// moved onto its blob key by rename instead of being held in memory.
+#[allow(clippy::too_many_arguments)]
+pub fn upload_media_spooled(
+    store: &dyn Store,
+    blobs: &dyn BlobStore,
+    now_ms: u64,
+    account_id: Id,
+    file: &mut UploadSpool,
+    thumbnail_bytes: Option<&[u8]>,
+    description: &str,
+    focus: Option<&str>,
+    delay: bool,
+    max_file_size: u64,
+    config: Option<&crate::media::transcode::TranscodeConfig>,
+) -> Result<MediaAttachment> {
+    stage_and_finish_upload(
+        store,
+        blobs,
+        now_ms,
+        account_id,
+        UploadFile::Spooled(file),
         thumbnail_bytes,
         description,
         focus,
@@ -215,12 +269,9 @@ pub fn upload_media_with_config(
 fn stage_and_finish_upload(
     store: &dyn Store,
     blobs: &dyn BlobStore,
-    // Kept for signature symmetry with the other media use cases: attachment
-    // URLs are rendered by `dto::media_file_url` from the committed
-    // `file_key`, so the base URL is not needed while staging.
     now_ms: u64,
     account_id: Id,
-    file_bytes: &[u8],
+    mut file: UploadFile<'_>,
     thumbnail_bytes: Option<&[u8]>,
     description: &str,
     focus: Option<&str>,
@@ -228,16 +279,17 @@ fn stage_and_finish_upload(
     max_file_size: u64,
     config: Option<&crate::media::transcode::TranscodeConfig>,
 ) -> Result<MediaAttachment> {
+    let file_len: u64 = file.len();
     // 1. A missing/blank file param.
-    if file_bytes.is_empty() {
+    if file_len == 0 {
         return Err(Error::InvalidInput(ERR_BLANK_FILE.into()));
     }
-    // 2. Content sniffed from bytes (never the declared type).
-    let sniffed = sniff_accepted(file_bytes).ok_or_else(|| {
+    // 2. Content sniffed from a bounded prefix (never the declared type).
+    let sniffed = sniff_accepted(file.prefix()).ok_or_else(|| {
         Error::InvalidInput(ERR_CONTENT_TYPE.into())
     })?;
     // 3. Size limit.
-    if file_bytes.len() as u64 > max_file_size {
+    if file_len > max_file_size {
         return Err(file_too_large_error(max_file_size));
     }
     // 4. Description length.
@@ -265,13 +317,25 @@ fn stage_and_finish_upload(
     };
 
     // Stage bytes FIRST (blob storage cannot join the `redb` transaction).
+    // The guard removes everything staged here if any later step fails.
+    let mut staging = StagingGuard::new(blobs);
     let shard = new_shard();
     let file_key = shard_key(&shard, "original", sniffed.extension);
-    blobs.put(&file_key, file_bytes)?;
+    match &mut file {
+        UploadFile::Bytes(bytes) => staging.put(&file_key, bytes)?,
+        UploadFile::Spooled(spool) => {
+            let tmp = spool.disarm();
+            if let Err(err) = staging.publish_file(&tmp, &file_key) {
+                // Stores without `publish_tmp` leave the spool file behind.
+                let _ = std::fs::remove_file(&tmp);
+                return Err(err);
+            }
+        }
+    }
     let thumbnail_key = match &thumbnail {
         Some((bytes, thumb)) => {
             let key = shard_key(&shard, "thumbnail", thumb.extension);
-            blobs.put(&key, bytes)?;
+            staging.put(&key, bytes)?;
             Some(key)
         }
         None => None,
@@ -284,7 +348,7 @@ fn stage_and_finish_upload(
             r#type: sniffed.r#type.to_string(),
             mime_type: sniffed.mime_type.to_string(),
             description: description.to_string(),
-            file_size: file_bytes.len() as u64,
+            file_size: file_len,
             file_key,
             thumbnail_key,
             focus,
@@ -297,6 +361,7 @@ fn stage_and_finish_upload(
         },
         now_ms,
     )?;
+    staging.commit();
 
     // Inline processing (v1 always; v2 only when the format needs no
     // deferred work). The committed job stays queued and is a no-op when a
@@ -409,14 +474,16 @@ fn process_media_job_legacy(
     };
     match crate::media::processing::process(&media.mime_type, &bytes) {
         Ok(processed) => {
-            // Stage the preview BEFORE committing the row that points at it.
+            // Stage the preview BEFORE committing the row that points at it;
+            // the guard removes it again if the commit fails.
+            let mut staging = StagingGuard::new(blobs);
             let mut preview_key = None;
             let mut preview_width = None;
             let mut preview_height = None;
             if let Some(preview) = processed.preview {
                 let key = sibling_key(&media.file_key, "small", preview.extension)
                     .ok_or_else(|| Error::Internal("media key carries no shard".into()))?;
-                blobs.put(&key, &preview.bytes)?;
+                staging.put(&key, &preview.bytes)?;
                 preview_key = Some(key);
                 preview_width = Some(preview.width);
                 preview_height = Some(preview.height);
@@ -442,6 +509,7 @@ fn process_media_job_legacy(
                 },
                 now_ms,
             )?;
+            staging.commit();
         }
         Err(err) => {
             tracing::warn!(media = media_id.value(), error = %err, "media processing failed");
@@ -455,6 +523,38 @@ fn process_media_job_legacy(
         }
     }
     Ok(())
+}
+
+/// Rebuild the `small` preview of cached remote media after its bytes were
+/// evicted or reconciled away. Only the row's own committed `preview_key`
+/// is rewritten (so nothing outside the row's key set is ever created), from
+/// the cached original. Returns whether the preview exists afterwards;
+/// `false` when the original is not cached (the caller refetches it first).
+pub fn regenerate_remote_preview(
+    store: &dyn Store,
+    blobs: &dyn BlobStore,
+    media_id: Id,
+    preview_key: &str,
+) -> Result<bool> {
+    let Some(media) = store.media_by_id(media_id)? else {
+        return Ok(false);
+    };
+    if media.preview_key.as_deref() != Some(preview_key) || media.state != MediaState::Ready {
+        return Ok(false);
+    }
+    let Some(original) = blobs.get(&media.file_key)? else {
+        return Ok(false);
+    };
+    let Ok(processed) = crate::media::processing::process(&media.mime_type, &original) else {
+        return Ok(false);
+    };
+    let Some(preview) = processed.preview else {
+        return Ok(false);
+    };
+    let mut staging = StagingGuard::new(blobs);
+    staging.put(preview_key, &preview.bytes)?;
+    staging.commit();
+    Ok(true)
 }
 
 /// Commit a `Failed` state for `media` (job still completes).
@@ -534,6 +634,7 @@ pub fn update_media(
         patch.focus = Some(parse_focus(focus)?);
     }
     let mut replaced_thumbnail: Option<String> = None;
+    let mut staging = StagingGuard::new(blobs);
     if let Some(thumbnail) = thumbnail {
         if thumbnail.is_empty() {
             patch.thumbnail_key = Some(None);
@@ -548,7 +649,7 @@ pub fn update_media(
             // (if any) is deleted after it.
             let key = sibling_key(&media.file_key, "thumbnail", thumb.extension)
                 .ok_or_else(|| Error::InvalidInput(ERR_THUMBNAIL_INVALID.into()))?;
-            blobs.put(&key, thumbnail)?;
+            staging.put(&key, thumbnail)?;
             replaced_thumbnail = media.thumbnail_key.clone();
             patch.thumbnail_key = Some(Some(key));
         }
@@ -557,6 +658,7 @@ pub fn update_media(
     let updated = store
         .update_media(account_id, id, patch, now_ms)?
         .ok_or_else(|| Error::NotFound("media".into()))?;
+    staging.commit();
     // When the cover was replaced and the new key differs, drop the old blob
     // (best-effort: a failure leaves an orphan blob, never a broken row — the
     // row already committed).

@@ -62,6 +62,8 @@ use crate::application::media::{THUMBNAIL_ERROR, UNSUPPORTED_REASON};
 use crate::application::ports::{BlobStore, MediaProcessingResult, Store};
 use crate::domain::{Error, Id, MediaState, Result};
 use crate::media::processing;
+use crate::media::staging::StagingGuard;
+use crate::media::upload_gate;
 
 // ---------------------------------------------------------------------------
 // Configuration.
@@ -531,6 +533,10 @@ pub fn parse_duration_ms(field: &str) -> Option<u64> {
 /// passthrough" → transcode. The input is always a local temp file, so the
 /// probe cannot block on the network.
 pub fn probe_file(ffmpeg_path: &str, input: &Path) -> std::result::Result<Probe, String> {
+    // Probes are FFmpeg processes too: they share the concurrency cap.
+    let _slot = upload_gate::ffmpeg_gate()
+        .acquire()
+        .map_err(|err| format!("probe slot unavailable: {err}"))?;
     let out = Command::new(ffmpeg_path)
         .arg("-hide_banner")
         .arg("-i")
@@ -722,6 +728,11 @@ fn run_bounded(
     if argv.is_empty() {
         return Err(TranscodeError::Spawn("empty argv".to_string()));
     }
+    // At most `ffmpeg_gate()` FFmpeg processes run at once; extra jobs wait
+    // here (on a blocking-pool thread) instead of oversubscribing the host.
+    let _slot = upload_gate::ffmpeg_gate()
+        .acquire()
+        .map_err(|err| TranscodeError::Io(format!("ffmpeg slot unavailable: {err}")))?;
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
         .stdout(Stdio::null())
@@ -876,11 +887,7 @@ impl Drop for TempGuard {
 /// The key is stable per attachment, so a crashed attempt's orphan is
 /// overwritten by the retry, never accumulated; it is deleted after commit.
 pub fn staging_key_for(file_key: &str, ext: &str) -> Option<String> {
-    let (dir, _) = file_key.rsplit_once('/')?;
-    if dir.is_empty() {
-        return None;
-    }
-    Some(format!("{dir}/derived.{ext}"))
+    crate::media::public_media::sibling_key(file_key, "derived", ext)
 }
 
 /// Maximum `/tmp` orphans removed by one [`sweep_tmp_files`] pass: the sweep
@@ -1114,6 +1121,7 @@ fn commit_legacy(
 ) -> Result<()> {
     match processing::process(&media.mime_type, bytes) {
         Ok(processed) => {
+            let mut staging = StagingGuard::new(blobs);
             let mut preview_key = None;
             let mut preview_width = None;
             let mut preview_height = None;
@@ -1121,7 +1129,7 @@ fn commit_legacy(
                 let key = sibling_key(&media.file_key, "small", preview.extension).ok_or_else(
                     || Error::Internal("media key carries no shard".into()),
                 )?;
-                blobs.put(&key, &preview.bytes)?;
+                staging.put(&key, &preview.bytes)?;
                 preview_key = Some(key);
                 preview_width = Some(preview.width);
                 preview_height = Some(preview.height);
@@ -1144,6 +1152,7 @@ fn commit_legacy(
                 },
                 now_ms,
             )?;
+            staging.commit();
         }
         Err(err) => {
             tracing::warn!(media = media.id.value(), error = %err, "media processing failed");
@@ -1169,6 +1178,19 @@ fn run_transcode_plan(
     now_ms: u64,
     config: &TranscodeConfig,
 ) -> Result<()> {
+    // A compressed byte cap does not bound decoded size: refuse oversized
+    // stills from their header before FFmpeg allocates anything.
+    if plan == TranscodePlan::ImageToWebp
+        && let Err(err) = processing::check_image_limits(&media.mime_type, bytes)
+    {
+        mark_failed(
+            store,
+            media,
+            &format!("{}: {err}", UNSUPPORTED_REASON),
+            now_ms,
+        )?;
+        return Ok(());
+    }
     // Video probes the original first: VP9 + Opus-or-silent within the size
     // limit keeps its codecs (D3) — byte-identical when already WebM,
     // stream-copied into WebM otherwise.
@@ -1359,7 +1381,8 @@ fn commit_derived(
     //    read-back before it can ever be served.
     let staging_key = staging_key_for(&media.file_key, derived_extension(plan))
         .ok_or_else(|| Error::Internal("media key carries no shard".into()))?;
-    blobs.put(&staging_key, derived)?;
+    let mut staging = StagingGuard::new(blobs);
+    staging.put(&staging_key, derived)?;
     let staged = blobs.get(&staging_key)?.ok_or_else(|| {
         Error::Storage(format!("media {}: staged derived missing", media.id.value()))
     })?;
@@ -1388,7 +1411,7 @@ fn commit_derived(
     if let Some(preview) = preview {
         let key = sibling_key(&media.file_key, "small", preview.extension)
             .ok_or_else(|| Error::Internal("media key carries no shard".into()))?;
-        blobs.put(&key, &preview.bytes)?;
+        staging.put(&key, &preview.bytes)?;
         preview_key = Some(key);
         preview_width = Some(preview.width);
         preview_height = Some(preview.height);
@@ -1417,6 +1440,7 @@ fn commit_derived(
         },
         now_ms,
     )?;
+    staging.commit();
     // 6. Best-effort staging cleanup (a crash before this leaves a
     //    deterministic orphan the next run overwrites).
     if let Err(err) = blobs.delete(&staging_key) {
@@ -1474,11 +1498,7 @@ fn mark_failed(
 
 /// A sibling key in the same shard as `file_key` (`{dir}/{style}.{ext}`).
 fn sibling_key(file_key: &str, style: &str, ext: &str) -> Option<String> {
-    let (dir, _) = file_key.rsplit_once('/')?;
-    if dir.is_empty() {
-        return None;
-    }
-    Some(format!("{dir}/{style}.{ext}"))
+    crate::media::public_media::sibling_key(file_key, style, ext)
 }
 
 #[cfg(test)]

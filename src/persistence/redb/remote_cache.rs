@@ -16,9 +16,12 @@
 
 use redb::ReadableTable;
 
-use crate::application::ports::CacheStore;
-use crate::domain::Result;
-use crate::media::remote_cache::{CacheUsage, MediaClass, RemoteCacheEntry};
+use crate::application::federation_ports::FederationContentStore;
+use crate::application::ports::{BlobStore, CacheStore, MediaStore};
+use crate::domain::{Error, Id, Result};
+use crate::media::blob_store::FsBlobStore;
+use crate::media::reconciler::ReconStore;
+use crate::media::remote_cache::{self, CacheUsage, MediaClass, RemoteCacheEntry};
 
 use super::schema::{self, CACHE_ACCOUNTING, REMOTE_CACHE};
 use super::RedbStore;
@@ -93,6 +96,12 @@ impl CacheStore for RedbStore {
         etag: Option<String>,
         now_ms: u64,
     ) -> Result<()> {
+        // Durable local media must never enter the evictable ledger.
+        if !remote_cache::is_cache_key(blob_key) {
+            return Err(Error::InvalidInput(format!(
+                "refusing non-cache key in the remote cache: {blob_key}"
+            )));
+        }
         let write = self.begin_write()?;
         {
             let mut cache = write.open_table(REMOTE_CACHE)?;
@@ -227,19 +236,20 @@ impl CacheStore for RedbStore {
             }
             classes.push(class);
         }
-        // Bounded forward scan (one read txn): at most `cap` byte-holding rows.
+        // One read transaction over the byte-holding rows. The batch that is
+        // *written* below is bounded by `cap`. Rows that are not cache keys
+        // are never victims, so durable media cannot be reached from here.
         let candidates: Vec<(Vec<u8>, RemoteCacheEntry)> = {
             let read = self.begin_read()?;
             let table = read.open_table(REMOTE_CACHE)?;
             let mut out = Vec::new();
             for entry in table.iter()? {
                 let (key, value) = entry?;
-                let row: RemoteCacheEntry = super::decode(value.value())?;
-                if row.has_bytes {
+                let Some(row) = decode_row(value.value()) else {
+                    continue;
+                };
+                if row.has_bytes && remote_cache::is_cache_key(&row.blob_key) {
                     out.push((key.value().to_vec(), row));
-                }
-                if out.len() >= cap {
-                    break;
                 }
             }
             out
@@ -264,6 +274,7 @@ impl CacheStore for RedbStore {
                 break;
             }
         }
+        victims.truncate(cap);
         if victims.is_empty() {
             return Ok(Vec::new());
         }
@@ -321,5 +332,351 @@ impl CacheStore for RedbStore {
         }
         write.commit()?;
         Ok(blob_keys)
+    }
+}
+
+
+/// Decode one stored row; a corrupted row is `None` (callers skip it, and
+/// [`RedbStore::cache_accounting_rebuild`] removes it).
+fn decode_row(bytes: &[u8]) -> Option<RemoteCacheEntry> {
+    super::decode::<RemoteCacheEntry>(bytes).ok()
+}
+
+/// Class index into the four-slot counter array.
+fn class_slot(class: MediaClass) -> usize {
+    match class {
+        MediaClass::AvatarEmoji => 0,
+        MediaClass::Preview => 1,
+        MediaClass::Full => 2,
+        MediaClass::Stream => 3,
+    }
+}
+
+/// What a [`RedbStore::cache_accounting_rebuild`] pass changed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AccountingRepair {
+    /// Stored bytes the counters claimed before the rebuild (zero when the
+    /// counters were unreadable).
+    pub before_total: u64,
+    /// Stored bytes after the rebuild (the sum of the byte-holding rows).
+    pub after_total: u64,
+    /// Rows that could not be decoded and were removed.
+    pub corrupt_rows_removed: usize,
+    /// Byte-holding rows that point outside the cache namespace and were
+    /// detached from the ledger.
+    pub foreign_rows_detached: usize,
+}
+
+impl RedbStore {
+    /// One page of ledger rows in table order, strictly after `after`.
+    /// Corrupted rows are skipped. The cursor is the raw table key, so a
+    /// caller can resume a scan across batches (startup restore).
+    pub fn cache_rows_page(
+        &self,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, RemoteCacheEntry)>> {
+        let limit = limit.clamp(1, 500);
+        let read = self.begin_read()?;
+        let table = read.open_table(REMOTE_CACHE)?;
+        let mut out = Vec::new();
+        let range = match after {
+            Some(cursor) => table.range::<&[u8]>((
+                std::ops::Bound::Excluded(cursor),
+                std::ops::Bound::Unbounded,
+            ))?,
+            None => table.range::<&[u8]>(..)?,
+        };
+        for entry in range {
+            let (key, value) = entry?;
+            if let Some(row) = decode_row(value.value()) {
+                out.push((key.value().to_vec(), row));
+            }
+            if out.len() >= limit {
+                break;
+            }
+        }
+        self.note_scanned(out.len());
+        Ok(out)
+    }
+
+    /// Evict byte-holding rows past their TTL, oldest first, at most `cap`
+    /// per call (one write transaction: mappings and counters together).
+    /// Returns the blob keys the caller must now delete from the cache pool.
+    pub fn cache_expire_batch(&self, now_ms: u64, cap: usize) -> Result<Vec<String>> {
+        let cap = cap.clamp(1, 500);
+        let mut expired: Vec<(u64, Vec<u8>)> = Vec::new();
+        {
+            let read = self.begin_read()?;
+            let table = read.open_table(REMOTE_CACHE)?;
+            for entry in table.iter()? {
+                let (key, value) = entry?;
+                let Some(row) = decode_row(value.value()) else {
+                    continue;
+                };
+                if row.is_expired(now_ms) && remote_cache::is_cache_key(&row.blob_key) {
+                    expired.push((row.expiry_ms, key.value().to_vec()));
+                }
+            }
+        }
+        expired.sort();
+        expired.truncate(cap);
+        if expired.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys: Vec<Vec<u8>> = expired.into_iter().map(|(_, key)| key).collect();
+        self.evict_rows(&keys)
+    }
+
+    /// Clear the byte mapping of the given ledger rows in one transaction,
+    /// moving the counters with them. Returns the blob keys to delete.
+    fn evict_rows(&self, keys: &[Vec<u8>]) -> Result<Vec<String>> {
+        let write = self.begin_write()?;
+        let mut blob_keys = Vec::new();
+        {
+            let mut cache = write.open_table(REMOTE_CACHE)?;
+            let mut counters = write.open_table(CACHE_ACCOUNTING)?;
+            let mut total = decode_counter(counters.get(TOTAL_KEY).ok().flatten()).unwrap_or(0);
+            let mut per_class: [u64; 4] = [0; 4];
+            for class in MediaClass::all() {
+                per_class[class_slot(class)] =
+                    decode_counter(counters.get(class_key(class)).ok().flatten()).unwrap_or(0);
+            }
+            for key in keys {
+                let existing: Option<RemoteCacheEntry> = match cache.get(key.as_slice())? {
+                    Some(guard) => decode_row(guard.value()),
+                    None => None,
+                };
+                let Some(mut entry) = existing else {
+                    continue;
+                };
+                if !entry.has_bytes {
+                    continue;
+                }
+                total = total.saturating_sub(entry.size);
+                let slot = class_slot(entry.class);
+                per_class[slot] = per_class[slot].saturating_sub(entry.size);
+                blob_keys.push(entry.blob_key.clone());
+                entry.has_bytes = false;
+                entry.size = 0;
+                cache.insert(key.as_slice(), super::encode(&entry)?.as_slice())?;
+            }
+            counters.insert(TOTAL_KEY, super::encode(&total)?.as_slice())?;
+            for class in [MediaClass::AvatarEmoji, MediaClass::Preview, MediaClass::Full] {
+                counters.insert(
+                    class_key(class),
+                    super::encode(&per_class[class_slot(class)])?.as_slice(),
+                )?;
+            }
+        }
+        write.commit()?;
+        Ok(blob_keys)
+    }
+
+    /// Recompute the stored-byte counters from the ledger rows themselves
+    /// (the rows are the source of truth; the counters are a cache of their
+    /// sum). Corrupted rows are removed and rows pointing outside the cache
+    /// namespace are detached first. Idempotent; one write transaction.
+    pub fn cache_accounting_rebuild(&self) -> Result<AccountingRepair> {
+        let mut repair = AccountingRepair {
+            before_total: self.cache_accounting().map(|usage| usage.stored_total).unwrap_or(0),
+            ..AccountingRepair::default()
+        };
+        let write = self.begin_write()?;
+        {
+            let mut cache = write.open_table(REMOTE_CACHE)?;
+            let mut counters = write.open_table(CACHE_ACCOUNTING)?;
+            let mut total = 0u64;
+            let mut per_class: [u64; 4] = [0; 4];
+            let mut corrupt: Vec<Vec<u8>> = Vec::new();
+            let mut detach: Vec<(Vec<u8>, RemoteCacheEntry)> = Vec::new();
+            for entry in cache.iter()? {
+                let (key, value) = entry?;
+                match decode_row(value.value()) {
+                    None => corrupt.push(key.value().to_vec()),
+                    Some(row) if row.has_bytes && !remote_cache::is_cache_key(&row.blob_key) => {
+                        detach.push((key.value().to_vec(), row));
+                    }
+                    Some(row) if row.has_bytes => {
+                        total = total.saturating_add(row.size);
+                        let slot = class_slot(row.class);
+                        per_class[slot] = per_class[slot].saturating_add(row.size);
+                    }
+                    Some(_) => {}
+                }
+            }
+            for key in &corrupt {
+                cache.remove(key.as_slice())?;
+            }
+            repair.corrupt_rows_removed = corrupt.len();
+            repair.foreign_rows_detached = detach.len();
+            for (key, mut row) in detach {
+                row.has_bytes = false;
+                row.size = 0;
+                cache.insert(key.as_slice(), super::encode(&row)?.as_slice())?;
+            }
+            counters.insert(TOTAL_KEY, super::encode(&total)?.as_slice())?;
+            for class in [MediaClass::AvatarEmoji, MediaClass::Preview, MediaClass::Full] {
+                counters.insert(
+                    class_key(class),
+                    super::encode(&per_class[class_slot(class)])?.as_slice(),
+                )?;
+            }
+            repair.after_total = total;
+        }
+        write.commit()?;
+        Ok(repair)
+    }
+
+    /// The ledger row that claims `blob_key`, with its table key.
+    ///
+    /// Attachment bytes use the deterministic key `remote/<media id>`, so the
+    /// fast path is two point lookups (media id -> source URL -> row); any
+    /// other key falls back to a scan of the ledger.
+    pub fn cache_row_by_blob_key(
+        &self,
+        blob_key: &str,
+    ) -> Result<Option<(Vec<u8>, RemoteCacheEntry)>> {
+        if let Some(id) = blob_key
+            .strip_prefix("remote/")
+            .and_then(|digits| digits.parse::<u64>().ok())
+            && let Some(source) = self.remote_media_source(Id::new(id))?
+            && let Some(row) = self.cache_get(&source, "original")?
+            && row.blob_key == blob_key
+        {
+            return Ok(Some((row.cache_key(), row)));
+        }
+        let read = self.begin_read()?;
+        let table = read.open_table(REMOTE_CACHE)?;
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            if let Some(row) = decode_row(value.value())
+                && row.blob_key == blob_key
+            {
+                return Ok(Some((key.value().to_vec(), row)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The attachment row that references `blob_key` (as its file, preview
+    /// or cover), with the ledger variant that key is accounted under: bytes
+    /// that are in use even when the ledger lost track of them.
+    pub fn media_references_blob(&self, blob_key: &str) -> Result<Option<(Id, &'static str)>> {
+        let Some(rest) = blob_key.strip_prefix("remote/") else {
+            return Ok(None);
+        };
+        let digits: &str = rest.split('.').next().unwrap_or_default();
+        let Ok(id) = digits.parse::<u64>() else {
+            return Ok(None);
+        };
+        let Some(media) = self.media_by_id(Id::new(id))? else {
+            return Ok(None);
+        };
+        let variant: Option<&'static str> = if media.file_key == blob_key {
+            Some("original")
+        } else if media.preview_key.as_deref() == Some(blob_key) {
+            Some("preview")
+        } else if media.thumbnail_key.as_deref() == Some(blob_key) {
+            Some("thumbnail")
+        } else {
+            None
+        };
+        Ok(variant.map(|variant| (media.id, variant)))
+    }
+
+    fn recon_pool(&self) -> Result<&FsBlobStore> {
+        self.cache_pool()
+            .ok_or_else(|| Error::Internal("cache pool is not attached to the store".into()))
+    }
+}
+
+/// The reconciler's view of the remote cache: ledger rows (`REMOTE_CACHE`)
+/// against the bytes in the **cache** pool. The durable pool is never
+/// visible here, so an orphan sweep can only ever delete cache bytes.
+///
+/// A blob counts as claimed when a byte-holding ledger row names it, or when
+/// a committed attachment row references it (in-use bytes the ledger lost
+/// track of are adopted by the maintenance pass, never deleted). Blobs
+/// younger than the store's orphan grace period are not listed at all.
+impl ReconStore for RedbStore {
+    fn list_blob_keys(&self, after: Option<&str>, limit: usize) -> Result<Vec<String>> {
+        self.recon_pool()?.list_keys(after, limit, self.orphan_grace())
+    }
+
+    fn list_meta_keys(&self, after: Option<&str>, limit: usize) -> Result<Vec<String>> {
+        let read = self.begin_read()?;
+        let table = read.open_table(REMOTE_CACHE)?;
+        let mut keys: Vec<String> = Vec::new();
+        for entry in table.iter()? {
+            let (_, value) = entry?;
+            let Some(row) = decode_row(value.value()) else {
+                continue;
+            };
+            if row.has_bytes && after.is_none_or(|cursor| row.blob_key.as_str() > cursor) {
+                keys.push(row.blob_key);
+            }
+        }
+        keys.sort();
+        keys.truncate(limit);
+        Ok(keys)
+    }
+
+    fn meta_has(&self, key: &str) -> Result<bool> {
+        if let Some((_, row)) = self.cache_row_by_blob_key(key)?
+            && row.has_bytes
+        {
+            return Ok(true);
+        }
+        Ok(self.media_references_blob(key)?.is_some())
+    }
+
+    fn blob_exists(&self, key: &str) -> Result<bool> {
+        self.recon_pool()?.exists(key)
+    }
+
+    fn meta_is_stale(&self, key: &str, now_ms: u64) -> Result<Option<bool>> {
+        Ok(self
+            .cache_row_by_blob_key(key)?
+            .map(|(_, row)| row.is_expired(now_ms)))
+    }
+
+    fn meta_is_flagged_missing(&self, key: &str) -> Result<Option<bool>> {
+        Ok(self
+            .cache_row_by_blob_key(key)?
+            .map(|(_, row)| !row.has_bytes))
+    }
+
+    fn remove_blob(&self, key: &str) -> Result<()> {
+        if !remote_cache::is_cache_key(key) {
+            return Err(Error::InvalidInput(format!(
+                "refusing to delete a non-cache key: {key}"
+            )));
+        }
+        self.recon_pool()?.delete(key)
+    }
+
+    fn remove_meta(&self, key: &str) -> Result<()> {
+        if let Some((table_key, _)) = self.cache_row_by_blob_key(key)? {
+            self.evict_rows(&[table_key])?;
+        }
+        Ok(())
+    }
+
+    fn flag_missing(&self, key: &str, _now_ms: u64) -> Result<()> {
+        // Bytes are gone: drop the byte mapping (the shell with the source
+        // URL stays, so the next request refetches) and fix the counters.
+        self.remove_meta(key)
+    }
+
+    fn list_pending_deletes(&self, _after: Option<&str>, _limit: usize) -> Result<Vec<String>> {
+        // Eviction commits the mapping change first and deletes the blob
+        // second, so an interrupted delete leaves an orphan blob (found by
+        // the orphan scan), not a marker row.
+        Ok(Vec::new())
+    }
+
+    fn clear_pending_delete(&self, _key: &str) -> Result<()> {
+        Ok(())
     }
 }

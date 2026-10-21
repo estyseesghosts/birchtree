@@ -1,12 +1,17 @@
-pub mod ingest;
 pub mod blob_store;
-pub mod processing;
-pub mod remote_cache;
-pub mod transcode;
+pub mod cache_maintenance;
 pub mod fetch_stream;
+pub mod ingest;
+pub mod pooled_blob_stores;
+pub mod processing;
+pub mod public_media;
 pub mod reconciler;
+pub mod remote_cache;
+pub mod staging;
+pub mod storage_roots;
+pub mod transcode;
+pub mod upload_gate;
+pub mod upload_spool;
 
-// Agent A: single canonical re-export for the two-pool handles. Agents B/C
-// add `fetch_stream` / `reconciler` as their own `pub mod` lines in their
-// files; nothing is pre-declared here so this list always compiles.
+// Single canonical re-export for the filesystem handle.
 pub use blob_store::FsBlobStore;
