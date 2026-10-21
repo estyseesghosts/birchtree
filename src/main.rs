@@ -618,6 +618,7 @@ async fn serve(cfg: Config) {
         cfg.federation_authorized_fetch,
         &cfg.license_policy,
         &cfg.place_policy,
+        cfg.aperture_mode,
     )
     .await
     .unwrap_or_else(|err| {

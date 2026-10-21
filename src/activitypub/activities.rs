@@ -865,7 +865,7 @@ impl ActivityHandler for Create {
             CreateObject::Question(question) => {
                 verify_object_author(&question.id, &question.attributed_to, self.actor.inner())?;
                 let (note, poll) = question_input_for(&question, author.account.id, author.account.sensitized, now);
-                let applied = match tombstone::ingest_checked(store, note, Some(poll), now)? {
+                let applied = match tombstone::ingest_checked(store, note, Some(poll), now, data.aperture_mode)? {
                     CheckedIngest::Live(ingested) => {
                         if let Some(parent_uri) = &ingested.parent_unknown {
                             crate::federation::threads::schedule_parent(store, ingested.status.id, parent_uri, now)?;
@@ -874,6 +874,13 @@ impl ActivityHandler for Create {
                     }
                     // The Delete won the race: the note stays gone.
                     CheckedIngest::Tombstoned => Applied::Duplicate,
+                    // Aperture: accepted transport, no store, no record.
+                    CheckedIngest::Dropped => {
+                        let dropped =
+                            Applied::Ignored("aperture: text-only top-level dropped".into());
+                        log_outcome("Create", &self.id, self.actor.inner(), &dropped);
+                        return Ok(());
+                    }
                 };
                 log_outcome("Create", &self.id, self.actor.inner(), &applied);
                 record(store, &self.id, &applied, now)?;
@@ -893,13 +900,20 @@ impl ActivityHandler for Create {
                         inbound::VoteDisposition::NotAVote => {}
                     }
                 }
-                let ingested = match tombstone::ingest_checked(store, note_input_for(&note, author.account.id, &author.account.domain, author.account.sensitized), None, now)? {
+                let ingested = match tombstone::ingest_checked(store, note_input_for(&note, author.account.id, &author.account.domain, author.account.sensitized), None, now, data.aperture_mode)? {
                     CheckedIngest::Live(ingested) => ingested,
                     // The Delete won the race: the note stays gone.
                     CheckedIngest::Tombstoned => {
                         let tombstoned = Applied::Duplicate;
                         log_outcome("Create", &self.id, self.actor.inner(), &tombstoned);
                         record(store, &self.id, &tombstoned, now)?;
+                        return Ok(());
+                    }
+                    // Aperture: accepted transport, no store, no record.
+                    CheckedIngest::Dropped => {
+                        let dropped =
+                            Applied::Ignored("aperture: text-only top-level dropped".into());
+                        log_outcome("Create", &self.id, self.actor.inner(), &dropped);
                         return Ok(());
                     }
                 };
@@ -971,7 +985,7 @@ impl ActivityHandler for Update {
                 // Delete arrived first (then it stays gone).
                 let applied = match store.status_by_uri(&note.uri)? {
                     Some(_) => inbound::sync_question(store, author.account.id, &note.uri, &poll, now)?,
-                    None => match tombstone::ingest_checked(store, note, Some(poll), now)? {
+                    None => match tombstone::ingest_checked(store, note, Some(poll), now, data.aperture_mode)? {
                         CheckedIngest::Live(ingested) => {
                             if let Some(parent_uri) = &ingested.parent_unknown {
                                 crate::federation::threads::schedule_parent(store, ingested.status.id, parent_uri, now)?;
@@ -979,6 +993,13 @@ impl ActivityHandler for Update {
                             if ingested.created { Applied::Applied } else { Applied::Duplicate }
                         }
                         CheckedIngest::Tombstoned => Applied::Duplicate,
+                        // Aperture: accepted transport, no store, no record.
+                        CheckedIngest::Dropped => {
+                            let dropped =
+                                Applied::Ignored("aperture: text-only top-level dropped".into());
+                            log_outcome("Update", &self.id, self.actor.inner(), &dropped);
+                            return Ok(());
+                        }
                     },
                 };
                 log_outcome("Update", &self.id, self.actor.inner(), &applied);
@@ -1212,11 +1233,18 @@ impl ActivityHandler for QuoteRequest {
         let quoting = match &self.instrument {
             crate::activitypub::wire::Instrument::Note(note) => {
                 verify_note_author(note, &self.actor)?;
-                match tombstone::ingest_checked(store, note_input_for(note, author.account.id, &author.account.domain, author.account.sensitized), None, now)? {
+                match tombstone::ingest_checked(store, note_input_for(note, author.account.id, &author.account.domain, author.account.sensitized), None, now, data.aperture_mode)? {
                     CheckedIngest::Live(ingested) => ingested.status.id,
                     CheckedIngest::Tombstoned => {
                         let tombstoned = Applied::Ignored("quoting status was deleted before it arrived".into());
                         log_outcome("QuoteRequest", &self.id, &self.actor, &tombstoned);
+                        return Ok(());
+                    }
+                    // Aperture: quoting status dropped — nothing to decide.
+                    CheckedIngest::Dropped => {
+                        let dropped =
+                            Applied::Ignored("aperture: quoting status dropped".into());
+                        log_outcome("QuoteRequest", &self.id, &self.actor, &dropped);
                         return Ok(());
                     }
                 }
@@ -1224,11 +1252,18 @@ impl ActivityHandler for QuoteRequest {
             crate::activitypub::wire::Instrument::Question(question) => {
                 verify_object_author(&question.id, &question.attributed_to, &self.actor)?;
                 let (note, poll) = question_input_for(question, author.account.id, author.account.sensitized, now);
-                match tombstone::ingest_checked(store, note, Some(poll), now)? {
+                match tombstone::ingest_checked(store, note, Some(poll), now, data.aperture_mode)? {
                     CheckedIngest::Live(ingested) => ingested.status.id,
                     CheckedIngest::Tombstoned => {
                         let tombstoned = Applied::Ignored("quoting status was deleted before it arrived".into());
                         log_outcome("QuoteRequest", &self.id, &self.actor, &tombstoned);
+                        return Ok(());
+                    }
+                    // Aperture: quoting status dropped — nothing to decide.
+                    CheckedIngest::Dropped => {
+                        let dropped =
+                            Applied::Ignored("aperture: quoting status dropped".into());
+                        log_outcome("QuoteRequest", &self.id, &self.actor, &dropped);
                         return Ok(());
                     }
                 }

@@ -26,6 +26,7 @@ pub mod media;
 pub mod license_policy;
 pub mod place_policy;
 pub mod alt_text_policy;
+pub mod aperture;
 pub mod search;
 pub mod lists;
 pub mod filters;

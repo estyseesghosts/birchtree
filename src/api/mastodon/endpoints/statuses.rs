@@ -524,6 +524,7 @@ pub async fn create(
             &state.server.place_policy,
             place_id,
             &state.server.alt_text_policy,
+            state.server.aperture_mode,
         ) {
             Ok(row) => {
                 let media = store
@@ -544,7 +545,7 @@ pub async fn create(
         };
     }
 
-    match statuses::create_status(store, &state.server.public_url, state.context.now_ms(), cmd, state.server.max_status_chars, &state.server.license_policy, &state.server.place_policy, place_id, &state.server.alt_text_policy) {
+    match statuses::create_status(store, &state.server.public_url, state.context.now_ms(), cmd, state.server.max_status_chars, &state.server.license_policy, &state.server.place_policy, place_id, &state.server.alt_text_policy, state.server.aperture_mode) {
         Ok(created) => {
             // An idempotent replay committed nothing new, so nothing streams.
             if !created.replayed {
@@ -670,7 +671,7 @@ pub async fn update(
         quote_approval_policy: field("quote_approval_policy"),
     };
     let store: &dyn Store = &*state.context.store;
-    match statuses::update_status(store, state.context.now_ms(), cmd, &state.server.license_policy, &state.server.place_policy, place_id, &state.server.alt_text_policy) {
+    match statuses::update_status(store, state.context.now_ms(), cmd, &state.server.license_policy, &state.server.place_policy, place_id, &state.server.alt_text_policy, state.server.aperture_mode) {
         Ok(maybe_status) => {
             // No changes: reload and answer 200 with the unchanged status.
             let status = match maybe_status {

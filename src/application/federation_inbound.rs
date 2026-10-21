@@ -115,6 +115,29 @@ pub struct NoteIngest {
 
 /// Store a received Note (or Question) as a status of its remote author.
 /// Idempotent by URI. A usable attached poll is stored with the status and
+/// Aperture gate (Stage 2 AP-E1): does this received Note drop under
+/// aperture mode? DMs and anything with an `inReplyTo` (replies park and
+/// resolve through the existing thread-completion path) pass; top-level
+/// non-DM Notes need at least one image/video attachment. Polls never
+/// satisfy the gate (a poll-only top-level drops — documented deviation);
+/// audio does not satisfy it (photo-first).
+pub fn aperture_drops_note(note: &RemoteNote) -> bool {
+    if note.visibility == Visibility::Direct {
+        return false;
+    }
+    if note.in_reply_to_uri.is_some() {
+        return false;
+    }
+    if note
+        .attachments
+        .iter()
+        .any(|a| matches!(media_kind(&a.media_type), "image" | "video"))
+    {
+        return false;
+    }
+    true
+}
+
 /// seeded with the origin's tallies; an unusable one is dropped (poll-less
 /// status), never a refusal.
 pub fn ingest_note(store: &dyn Store, note: RemoteNote, poll: Option<RemotePoll>, now_ms: u64) -> Result<NoteIngest> {

@@ -327,6 +327,12 @@ impl TimelineStore for RedbStore {
             let Some(status) = status_at(&read, id)? else {
                 continue;
             };
+            // Aperture (Stage 2) rides the existing `only_media` predicate:
+            // home/list force it at the endpoint when the flag is on.
+            // Mirrors the public/tag scans above.
+            if query.only_media && status.media_ids.is_empty() {
+                continue;
+            }
             if filter.include(&status) {
                 matched.push(status);
             }

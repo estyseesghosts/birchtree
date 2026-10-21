@@ -209,10 +209,13 @@ pub async fn home(State(state): State<ApiState>, auth: Auth, uri: Uri) -> Respon
         Ok(id) => id,
         Err(err) => return err.into_response(),
     };
-    let query = match timeline_query(&uri) {
+    let mut query = match timeline_query(&uri) {
         Ok(query) => query,
         Err(err) => return err.into_response(),
     };
+    // Aperture (Stage 2): flag on forces photo-only timelines regardless of
+    // the client's `only_media`. No cursor/`Link` change.
+    query.only_media |= state.server.aperture_mode;
     let store: &dyn Store = &*state.context.store;
     match timelines::home(store, viewer, query, state.context.now_ms()) {
         Ok(page) => timeline_response(&state, Some(viewer), &uri, PRIVATE_CACHE, page, true),
@@ -270,10 +273,13 @@ pub async fn public(State(state): State<ApiState>, auth: OptionalAuth, uri: Uri)
         return err.into_response();
     }
     let viewer = viewer_of(&auth);
-    let query = match timeline_query(&uri) {
+    let mut query = match timeline_query(&uri) {
         Ok(query) => query,
         Err(err) => return err.into_response(),
     };
+    // Aperture (Stage 2): flag on forces photo-only timelines regardless of
+    // the client's `only_media`. No cursor/`Link` change.
+    query.only_media |= state.server.aperture_mode;
     let modes: Vec<&str> = if query.local_only {
         vec![state.server.local_live_feed_access.as_str()]
     } else if query.remote_only {
@@ -307,10 +313,13 @@ pub async fn tag(
         return err.into_response();
     }
     let viewer = viewer_of(&auth);
-    let query = match timeline_query(&uri) {
+    let mut query = match timeline_query(&uri) {
         Ok(query) => query,
         Err(err) => return err.into_response(),
     };
+    // Aperture (Stage 2): flag on forces photo-only timelines regardless of
+    // the client's `only_media`. No cursor/`Link` change.
+    query.only_media |= state.server.aperture_mode;
     // Upstream `TagFeed` modes: `any[]` widens, `all[]` narrows, `none[]`
     // excludes (each capped in `timelines::tag_filtered`).
     let pairs = forms::parse(uri.query().unwrap_or("").as_bytes());
@@ -358,10 +367,13 @@ pub async fn list(
     let Ok(id) = raw.parse::<Id>() else {
         return ApiError::not_found().into_response();
     };
-    let query = match timeline_query(&uri) {
+    let mut query = match timeline_query(&uri) {
         Ok(query) => query,
         Err(err) => return err.into_response(),
     };
+    // Aperture (Stage 2): flag on forces photo-only timelines regardless of
+    // the client's `only_media`. No cursor/`Link` change.
+    query.only_media |= state.server.aperture_mode;
     let store: &dyn Store = &*state.context.store;
     match timelines::list(store, viewer, id, query, state.context.now_ms()) {
         Ok(page) => timeline_response(&state, Some(viewer), &uri, PRIVATE_CACHE, page, false),

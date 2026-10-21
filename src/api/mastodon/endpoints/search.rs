@@ -168,6 +168,10 @@ pub async fn index(State(state): State<ApiState>, auth: OptionalAuth, uri: Uri) 
         account_id,
         max_id,
         min_id,
+        // Aperture (Stage 2): flag on filters `statuses` to `has_media`.
+        // Exact-URL resolution above stays exempt (direct navigation, like
+        // direct GET of grandfathered text).
+        state.server.aperture_mode,
     ) {
         Ok(results) => {
             let mut found = results.accounts;

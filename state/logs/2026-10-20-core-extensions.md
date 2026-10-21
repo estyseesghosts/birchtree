@@ -94,3 +94,10 @@ in `e63b39a` via `rm --cached`; disk copies intact).
 
 ## Stage 1 gate
 - `scripts/smoke-all.sh` running in background (-> C_CORE on green).
+
+## Stage 1 gate: GREEN
+- `cargo check --all-targets` + full `cargo test` (762 ok) + live smokes
+  phase 1-4, 5 (rerun; first attempt flaked on server boot under run9
+  contention), 6, 7, 7.1, 7.2, 7.3 — all `*_OK`.
+- C_CORE = `ed21657` (feature/core-extensions tip, incl. session-log
+  commit). `feature/aperture-mode` cut from C_CORE.

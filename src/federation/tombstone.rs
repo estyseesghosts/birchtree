@@ -37,6 +37,9 @@ pub enum CheckedIngest {
     Live(NoteIngest),
     /// The URI was deleted before it arrived: nothing was stored.
     Tombstoned,
+    /// Aperture (Stage 2): the Note was dropped by the photo-first ingest
+    /// gate — accepted transport, no stored status, no error, no record.
+    Dropped,
 }
 
 /// File a tombstone for an object URI whose `Delete` found no status row.
@@ -75,14 +78,25 @@ pub fn file_remote_tombstone(
 ///
 /// A tombstoned URI reports `Tombstoned` (the caller logs it as a duplicate:
 /// the delete already won); every other URI ingests as before.
+///
+/// When `aperture` is true, a top-level non-DM Note/Question with no valid
+/// image/video attachment is `Dropped` instead (log + no store + no error +
+/// no record, so redeliveries re-evaluate). Replies (any `inReplyTo`), DMs,
+/// and media-carrying top-levels ingest as before; poll-only top-levels
+/// drop (documented deviation).
 pub fn ingest_checked(
     store: &dyn Store,
     note: inbound::RemoteNote,
     poll: Option<RemotePoll>,
     now_ms: u64,
+    aperture: bool,
 ) -> Result<CheckedIngest> {
     if store.remote_tombstone(&note.uri)?.is_some() {
         return Ok(CheckedIngest::Tombstoned);
+    }
+    if aperture && inbound::aperture_drops_note(&note) {
+        tracing::info!(target: "birchtree::federation", direction = "inbound", uri = %note.uri, outcome = "ignored: aperture text-only top-level dropped", "activity handled");
+        return Ok(CheckedIngest::Dropped);
     }
     Ok(CheckedIngest::Live(inbound::ingest_note(store, note, poll, now_ms)?))
 }

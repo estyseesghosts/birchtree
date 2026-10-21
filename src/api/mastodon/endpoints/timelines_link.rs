@@ -66,7 +66,7 @@ pub async fn link(State(state): State<ApiState>, auth: OptionalAuth, uri: Uri) -
         Err(err) => return err.into_response(),
     };
     let flag = |key: &str| forms::get(&pairs, key).is_some_and(bool_cast);
-    let query = TimelineQuery {
+    let mut query = TimelineQuery {
         max_id: cursors.max_id,
         since_id: cursors.since_id,
         min_id: cursors.min_id,
@@ -75,6 +75,9 @@ pub async fn link(State(state): State<ApiState>, auth: OptionalAuth, uri: Uri) -
         local_only: flag("local"),
         remote_only: flag("remote"),
     };
+    // Aperture (Stage 2): flag on forces photo-only timelines regardless of
+    // the client's `only_media`. No cursor/`Link` change.
+    query.only_media |= state.server.aperture_mode;
     let viewer = viewer_of(&auth);
     let store: &dyn Store = &*state.context.store;
     let now = state.context.now_ms();

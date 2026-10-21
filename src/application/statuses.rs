@@ -176,6 +176,7 @@ pub fn create_status(
     place_policy: &str,
     place_id: Option<Id>,
     alt_text_policy: &str,
+    aperture_mode: bool,
 ) -> Result<CreateStatusResult> {
     let CreateStatusCommand {
         account_id,
@@ -276,6 +277,17 @@ pub fn create_status(
         in_reply_to = Some(parent.id);
         in_reply_to_account = Some(parent.account_id);
     }
+
+    // Core extension APERTURE (Stage 2): under aperture mode, a
+    // top-level non-DM write with no attachments is a 422. Replies
+    // (resolvable parent; unresolvable keeps the 404 above) and DMs are
+    // exempt. Placed after reply resolution so the 404 wins.
+    crate::application::aperture::check_aperture_write(
+        aperture_mode,
+        visibility == Visibility::Direct,
+        in_reply_to.is_some(),
+        !media_ids.is_empty(),
+    )?;
 
     // Pre-resolved mentions and tags. The quoted author's silent mention is
     // added by the store via `NewQuoteSpec.quoted_account_id`, not here.
@@ -727,6 +739,7 @@ pub fn update_status(
     place_policy: &str,
     place_id: Option<Option<Id>>,
     alt_text_policy: &str,
+    aperture_mode: bool,
 ) -> Result<Option<Status>> {
     let status = store
         .status_by_id(cmd.status_id)?
@@ -836,6 +849,18 @@ pub fn update_status(
                 crate::application::alt_text_policy::check_block(alt_text_policy, &pairs)?;
             }
         }
+    }
+    // Core extension APERTURE: a top-level non-DM edit may not strip the
+    // last attachment under aperture mode. Replies/DMs exempt; text-only
+    // edits of grandfathered text-only rows pass (only Some(empty) over a
+    // non-empty stored set fires).
+    if aperture_mode
+        && status.in_reply_to_id.is_none()
+        && status.visibility != Visibility::Direct
+        && !status.media_ids.is_empty()
+        && update.media_ids.as_ref().is_some_and(|ids| ids.is_empty())
+    {
+        crate::application::aperture::check_aperture_write(aperture_mode, false, false, false)?;
     }
     // Tags are re-derived on every edit (steady-state write path): the
     // effective text is the edited text, or the stored text when the edit

@@ -388,6 +388,7 @@ fn block_gate_applies_at_status_write_regardless_of_upload_policy() {
         "off",
         None,
         "block",
+        false,
     )
     .expect_err("must block");
     assert!(matches!(err, birchtree::domain::Error::InvalidInput(msg) if msg == BLOCK_MESSAGE));
@@ -418,6 +419,7 @@ fn block_gate_applies_at_status_write_regardless_of_upload_policy() {
         "off",
         None,
         "off",
+        false,
     )
     .expect("create while off")
     .status;
@@ -439,6 +441,7 @@ fn block_gate_applies_at_status_write_regardless_of_upload_policy() {
         "off",
         None,
         "block",
+        false,
     )
     .expect_err("edit leaving undescribed image must block");
     assert!(matches!(err, birchtree::domain::Error::InvalidInput(msg) if msg == BLOCK_MESSAGE));

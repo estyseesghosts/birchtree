@@ -54,6 +54,12 @@ Upstream files a `Tombstone` row when a `Delete` arrives, even for an object nev
 
 Evidence: `tests/phase6_gaps_round2_e.rs` (Delete-before-Create both directions, cross-host poisoning refused, edits of tombstoned URIs ignored).
 
+### Aperture ingest gate (Stage 2, flag `aperture_mode`, default off)
+
+When on, every `Create`-shaped ingest path (`Create` Note/Question, `Update`-as-`Create`, quote instruments) checks the photo-first gate after the tombstone check: a top-level (no `inReplyTo`) non-DM Note/Question with no valid image/video attachment is `Dropped` — accepted transport (202), log line (`outcome = "ignored: aperture text-only top-level dropped"`), no stored status, no error, no dedup record (redeliveries re-evaluate). Replies (any `inReplyTo`, resolvable or reply-parked), DMs, votes/likes/follows, and media-carrying top-levels ingest as before. Poll-only top-levels drop (documented deviation: a poll is not media). `Update` of a known status stays ungated (edits carry no media changes on this path). Off = Mastodon parity.
+
+Evidence: `tests/aperture_e1_ingest.rs` (7 green: drop + no-store, flag-off parity, reply/DM/photo kept, poll-only drop).
+
 ### Remote document limits (dereference path through the safe client)
 
 Document fetches (actor/object/collection dereference) go through the crate's client built in `federation::net` (SSRF resolver, no reqwest redirects, connect + total timeouts, URL policy) with the `FailClientErrors` rule. The crate enforces the wire limits; birchtree pins and tests them:

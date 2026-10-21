@@ -40,6 +40,9 @@ pub struct FedContext {
     /// Core extension CORE-P policy (`off`/`unenforced`/`enforced`): gates
     /// `location` emission on outgoing Notes (omitted when `off`).
     pub place_policy: Arc<str>,
+    /// Aperture mode (Stage 2): when true, federation ingest drops
+    /// text-only top-level Notes (mirrors `Config::aperture_mode`).
+    pub aperture_mode: bool,
     /// Instance title/description (advertised in NodeInfo `metadata`;
     /// upstream `NodeInfo::Serializer#metadata`).
     pub site_title: Arc<str>,
@@ -70,6 +73,7 @@ pub async fn build_config(
     authorized_fetch: bool,
     license_policy: &str,
     place_policy: &str,
+    aperture_mode: bool,
 ) -> Result<FederationConfig<FedContext>, String> {
     let domain = host_of(public_url).ok_or_else(|| format!("public url has no host: {public_url}"))?;
     let client = net::middleware_client(http)?;
@@ -89,6 +93,7 @@ pub async fn build_config(
             site_description: Arc::from(site_description),
             license_policy: Arc::from(license_policy),
             place_policy: Arc::from(place_policy),
+            aperture_mode,
             http: Arc::new(http.clone()),
             media_client,
             authorized_fetch,

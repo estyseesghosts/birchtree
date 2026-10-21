@@ -68,7 +68,8 @@ pub fn search(
         // Mastodon only serves status search to authenticated callers (with
         // Elasticsearch enabled upstream). Anonymous callers get `[]`.
         if let Some(viewer) = viewer {
-            results.statuses = search_statuses(store, viewer, query, limit, account_id, max_id, min_id)?;
+            results.statuses =
+                search_statuses(store, viewer, query, limit, account_id, max_id, min_id, false)?;
         }
     }
     Ok(results)
@@ -139,6 +140,7 @@ fn search_statuses(
     account_id: Option<Id>,
     max_id: Option<Id>,
     min_id: Option<Id>,
+    aperture: bool,
 ) -> Result<Vec<Status>> {
     let needle = query.to_ascii_lowercase();
     let candidates = store.recent_statuses(account_id, max_id, min_id, 2_000)?;
@@ -155,6 +157,10 @@ fn search_statuses(
         // Visibility: only statuses the viewer may fetch.
         let pair = store.pair_state(status.account_id, viewer, 0)?;
         if !crate::application::policy::can_fetch(Some(viewer), &status, pair) {
+            continue;
+        }
+        // Aperture (Stage 2): statuses without media leave search.
+        if aperture && status.media_ids.is_empty() {
             continue;
         }
         out.push(status);
@@ -215,6 +221,7 @@ pub fn search_with_mode(
     account_id: Option<Id>,
     max_id: Option<Id>,
     min_id: Option<Id>,
+    aperture: bool,
 ) -> Result<SearchResults> {
     let query = query.trim();
     let wants_accounts = kind.is_none_or(|k| k == "accounts");
@@ -243,17 +250,19 @@ pub fn search_with_mode(
             results.statuses = match mode {
                 SearchMode::Off => Vec::new(),
                 SearchMode::Database => {
-                    search_statuses(store, viewer, query, limit, account_id, max_id, min_id)?
+                    search_statuses(store, viewer, query, limit, account_id, max_id, min_id, aperture)?
                 }
                 SearchMode::Embedded => match index {
                     Some(index) if !index.is_empty() => search_statuses_embedded(
-                        store, index, viewer, query, limit, account_id, max_id, min_id,
+                        store, index, viewer, query, limit, account_id, max_id, min_id, aperture,
                     )?,
                     // No (or cold) index: degrade to the database scan
                     // rather than failing the search. A cold index and a
                     // fresh server both read empty here; once the backfill
                     // chain fills the index this arm stops triggering.
-                    _ => search_statuses(store, viewer, query, limit, account_id, max_id, min_id)?,
+                    _ => {
+                        search_statuses(store, viewer, query, limit, account_id, max_id, min_id, aperture)?
+                    }
                 },
             };
         }
@@ -277,6 +286,7 @@ fn search_statuses_embedded(
     account_id: Option<Id>,
     max_id: Option<Id>,
     min_id: Option<Id>,
+    aperture: bool,
 ) -> Result<Vec<Status>> {
     let candidates = index.search_ids(query, EMBEDDED_CANDIDATE_CAP);
     let mut ids: Vec<Id> = Vec::new();
@@ -300,6 +310,10 @@ fn search_statuses_embedded(
         // serve time, since the index stores text, not permissions).
         let pair = store.pair_state(status.account_id, viewer, 0)?;
         if !crate::application::policy::can_fetch(Some(viewer), &status, pair) {
+            continue;
+        }
+        // Aperture (Stage 2): statuses without media leave search.
+        if aperture && status.media_ids.is_empty() {
             continue;
         }
         out.push(status);

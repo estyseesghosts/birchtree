@@ -137,6 +137,7 @@ fn search_statuses(
         None,
         None,
         None,
+        false,
     )
     .expect("search");
     // The mode dispatch must not disturb the account/hashtag paths; statuses
@@ -204,6 +205,7 @@ async fn accounts_path_is_mode_independent() {
             None,
             None,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(results.accounts.len(), 1, "accounts in {mode:?}");
@@ -237,6 +239,7 @@ async fn hashtags_stay_on_the_database_path() {
             None,
             None,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(results.hashtags, vec!["rustaceans".to_string()], "hashtags in {mode:?}");
@@ -264,6 +267,7 @@ async fn unknown_type_is_empty_in_every_mode() {
             None,
             None,
             None,
+            false,
         )
         .unwrap();
         assert!(results.accounts.is_empty(), "accounts in {mode:?}");
@@ -306,7 +310,7 @@ async fn edit_delete_visibility_change_converge() {
             poll: None,
             quote_approval_policy: None,
         },
-        "off", "off", None, "off",
+        "off", "off", None, "off", false,
     )
     .unwrap();
     index_now(&srv, &index, id);

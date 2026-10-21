@@ -78,6 +78,7 @@ pub fn schedule_status(
     place_policy: &str,
     place_id: Option<Id>,
     alt_text_policy: &str,
+    aperture_mode: bool,
 ) -> Result<ScheduledStatus> {
     let account_id = cmd.account_id;
     validate_time(scheduled_at_ms, now_ms)?;
@@ -126,7 +127,9 @@ pub fn schedule_status(
         }
     }
 
-    let params = command_params(&cmd, max_chars, license_policy, place_policy, place_id, alt_text_policy);
+    let params = command_params(
+        &cmd, max_chars, license_policy, place_policy, place_id, alt_text_policy, aperture_mode,
+    );
     store.create_scheduled(
         NewScheduledStatus {
             account_id,
@@ -196,6 +199,7 @@ pub fn publish_scheduled_job(
         &publish_place_policy(&row.params),
         publish_place_id(&row.params),
         &publish_alt_text_policy(&row.params),
+        publish_aperture_mode(&row.params),
     ) {
         Ok(created) => Ok(Some(created.status.id)),
         Err(err) => {
@@ -219,6 +223,7 @@ fn command_params(
     place_policy: &str,
     place_id: Option<Id>,
     alt_text_policy: &str,
+    aperture_mode: bool,
 ) -> serde_json::Value {
     let mut params = serde_json::Map::new();
     params.insert("max_status_chars".into(), serde_json::json!(max_chars));
@@ -233,6 +238,7 @@ fn command_params(
     }
     // Core extension CORE-T: same replay rule as the other policies.
     params.insert("alt_text_policy".into(), serde_json::json!(alt_text_policy));
+    params.insert("aperture_mode".into(), serde_json::json!(aperture_mode));
     if let Some(text) = &cmd.text {
         params.insert("text".into(), serde_json::json!(text));
     }
@@ -303,6 +309,14 @@ fn publish_place_id(params: &serde_json::Value) -> Option<Id> {
 }
 
 /// Alt-text policy stored alongside; old rows replay as `off`.
+/// Aperture flag stored alongside; old rows replay with it off.
+fn publish_aperture_mode(params: &serde_json::Value) -> bool {
+    params
+        .get("aperture_mode")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 fn publish_alt_text_policy(params: &serde_json::Value) -> String {
     params
         .get("alt_text_policy")
