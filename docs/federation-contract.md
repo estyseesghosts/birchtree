@@ -57,6 +57,14 @@ Upstream: `DeleteAccountService` removes the account's statuses in batches (`Bat
 - Local account deletion (`DELETE /api/v1/admin/accounts/:id`, `reject`): suspend + disable immediately, plus — in the same transaction — the first `AccountDeletionBatch {account_id, after}` job and a `FederationEvent {event: "delete_actor"}`. The batch chain tombstones 50 statuses per job (each with its own `Delete` event) and ends on a short page; the actor event goes to follower inboxes as `Delete {object: {id, type: Tombstone, formerType: Person}}`.
 - Tombstone rule (outbound side): rows are tombstoned, never hard-removed — status rows keep `deleted_at_ms`, the account row stays suspended — so deleted URIs keep resolving (as tombstones) instead of dangling, and a retried batch can never resurrect or duplicate a status. Delivery is at-least-once per destination under the job retry budget, then quarantine; duplicates are idempotent downstream (activity-ID dedup).
 
+### Profile update distribution, local side (2026-10-21)
+
+Upstream: any profile write enqueues `UpdateDistributionWorker` (debounced ~5 s), which sends an `Update` of the actor (`ActivityPub::UpdateActorSerializer`, the full actor document) to the account's remote followers (via `AccountReachFinder`: followers plus reporters, recent mentions/follows). Birchtree matches that shape without the debounce:
+
+- `AccountStore::update_account_profile` commits one `FederationEvent {event: "profile_update"}` in the same transaction as the account row (a no-op for remote rows, which never reach this path).
+- The event worker rebuilds the actor document through the same `into_json` the served `Person` endpoint uses (so refetch and fan-out can never disagree) and sends `Update {object: <full actor document>}` (`src/activitypub/outgoing.rs::profile_update`, `src/federation/events.rs`) to the account's remote follower inboxes. The served document carries `icon`/`image` only while the account references a staged avatar/header blob.
+- Intended divergence: immediate enqueue (no 5 s debounce) and follower-only recipients (no reporters/mentions expansion). Evidence: `tests/avatar_upload.rs` (`multipart_avatar_and_header_upload_round_trip`, `profile_update_event_carries_the_new_actor_document`).
+
 ## Initial activity set (Phase 6)
 
 Create/Note, Update, Delete, Follow/Accept/Reject/Undo, Like/Undo, Announce/Undo, Block, quote Request/Accept/Reject/Revoke, and Flag (send and receive). Flag is required by reports (Phase 7.3); local report creation does not depend on it.

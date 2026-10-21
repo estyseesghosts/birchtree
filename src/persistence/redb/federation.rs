@@ -132,6 +132,12 @@ fn upsert_remote_txn(
                 hide_collections: None,
                 fields: Vec::new(),
                 attribution_domains: Vec::new(),
+                avatar_key: None,
+                avatar_content_type: None,
+                avatar_description: String::new(),
+                header_key: None,
+                header_content_type: None,
+                header_description: String::new(),
                 created_at_ms: now_ms,
             }
         }

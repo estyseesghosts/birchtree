@@ -30,6 +30,35 @@ fn date_only(ms: u64) -> String {
         .unwrap_or_else(|| "1970-01-01".to_string())
 }
 
+/// Avatar URL for an account: the staged blob when one is referenced, else
+/// the conventional missing-avatar asset.
+pub fn avatar_url(server: &ServerInfo, account: &Account) -> String {
+    match account.avatar_key.as_deref().filter(|key| !key.is_empty()) {
+        Some(key) => media_file_url(server, key),
+        None => server.asset_url(MISSING_AVATAR),
+    }
+}
+
+/// Avatar-static URL: birchtree serves the same bytes for both styles (no
+/// Paperclip static-variant transcode — documented in the endpoint
+/// manifest), so this mirrors [`avatar_url`].
+pub fn avatar_static_url(server: &ServerInfo, account: &Account) -> String {
+    avatar_url(server, account)
+}
+
+/// Header URL for an account, same fallback rule as [`avatar_url`].
+pub fn header_url(server: &ServerInfo, account: &Account) -> String {
+    match account.header_key.as_deref().filter(|key| !key.is_empty()) {
+        Some(key) => media_file_url(server, key),
+        None => server.asset_url(MISSING_HEADER),
+    }
+}
+
+/// Header-static URL: same bytes as [`header_url`] (no static variant).
+pub fn header_static_url(server: &ServerInfo, account: &Account) -> String {
+    header_url(server, account)
+}
+
 /// Format a millisecond timestamp as Mastodon's ISO-8601 with milliseconds.
 fn rfc3339_ms(ms: u64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64)
@@ -68,12 +97,12 @@ pub fn account_json_with_stats(
     object.insert("note".into(), json!(account.note));
     object.insert("url".into(), json!(account.actor_uri));
     object.insert("uri".into(), json!(account.actor_uri));
-    object.insert("avatar".into(), json!(server.asset_url(MISSING_AVATAR)));
-    object.insert("avatar_static".into(), json!(server.asset_url(MISSING_AVATAR)));
-    object.insert("avatar_description".into(), json!(String::new()));
-    object.insert("header".into(), json!(server.asset_url(MISSING_HEADER)));
-    object.insert("header_static".into(), json!(server.asset_url(MISSING_HEADER)));
-    object.insert("header_description".into(), json!(String::new()));
+    object.insert("avatar".into(), json!(avatar_url(server, account)));
+    object.insert("avatar_static".into(), json!(avatar_static_url(server, account)));
+    object.insert("avatar_description".into(), json!(account.avatar_description.clone()));
+    object.insert("header".into(), json!(header_url(server, account)));
+    object.insert("header_static".into(), json!(header_static_url(server, account)));
+    object.insert("header_description".into(), json!(account.header_description.clone()));
     object.insert("followers_count".into(), json!(stats.map_or(0, |s| s.followers_count)));
     object.insert("following_count".into(), json!(stats.map_or(0, |s| s.following_count)));
     object.insert("statuses_count".into(), json!(stats.map_or(0, |s| s.statuses_count)));
@@ -397,10 +426,10 @@ pub fn instance_v1_json(
             "note": a.note,
             "url": a.actor_uri,
             "uri": a.actor_uri,
-            "avatar": server.asset_url(MISSING_AVATAR),
-            "avatar_static": server.asset_url(MISSING_AVATAR),
-            "header": server.asset_url(MISSING_HEADER),
-            "header_static": server.asset_url(MISSING_HEADER),
+            "avatar": avatar_url(server, a),
+            "avatar_static": avatar_static_url(server, a),
+            "header": header_url(server, a),
+            "header_static": header_static_url(server, a),
             "followers_count": 0,
             "following_count": 0,
             "statuses_count": 0,

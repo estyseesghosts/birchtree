@@ -12,9 +12,10 @@
 //!   `name` the display name, `profile` the short profile URL and `picture`
 //!   the avatar URL.
 //!
-//! This build stores no avatar blobs, so `picture` is the conventional
-//! missing-avatar asset URL — the same placeholder `dto::account_json`
-//! already emits (not a fabricated upload). Compiled via a `#[path]` shim in
+//! This build stages avatar blobs under the blob store, so `picture` is the
+//! account's staged avatar URL when one is referenced, else the conventional
+//! missing-avatar asset URL (the same placeholder `dto::account_json`
+//! already emits when no avatar is set). Compiled via a `#[path]` shim in
 //! `endpoints::suggestions` until the parent wires `pub mod userinfo;` here +
 //! the route.
 
@@ -26,10 +27,6 @@ use crate::api::mastodon::auth::Auth;
 use crate::api::mastodon::errors::ApiError;
 use crate::api::mastodon::ApiState;
 use crate::application::ports::Store;
-
-/// The missing-avatar asset path (`dto.rs` `MISSING_AVATAR`; inlined so this
-/// module does not depend on the Mastodon DTO packers).
-const MISSING_AVATAR: &str = "avatars/original/missing.png";
 
 /// `GET|POST /oauth/userinfo`. One handler serves both methods (upstream
 /// `via: [:get, :post]`, OpenID Connect Core §5.3.1); the request body is
@@ -63,7 +60,7 @@ pub async fn show(State(state): State<ApiState>, auth: Auth) -> Response {
         "name": account.display_name,
         "preferred_username": account.username,
         "profile": profile,
-        "picture": state.server.asset_url(MISSING_AVATAR),
+        "picture": crate::api::mastodon::dto::avatar_url(&state.server, &account),
     }))
     .into_response()
 }

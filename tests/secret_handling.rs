@@ -50,6 +50,11 @@ fn database_never_contains_plaintext_secrets() {
     .unwrap();
     let (session_plaintext, _session) = auth::create_login_session(&*store, account.id, T0).unwrap();
 
+    // Release the store before reading the database file back: redb holds a
+    // file lock while open, which Windows (unlike Linux) refuses to read
+    // through. All writes above are committed, so the bytes are stable.
+    drop(store);
+
     let bytes = db_bytes(dir.path());
 
     // The password used to create the account is "password123" (see common);

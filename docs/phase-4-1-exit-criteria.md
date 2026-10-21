@@ -89,7 +89,9 @@ not yet cover.
 - Malformed JSON to an unknown `/api/` path: 400 where upstream gives 404.
 - JSON above 1 MiB: 413.
 - `Vary: Authorization` not replicated on the malformed-JSON answer.
-- `PATCH /api/v1/accounts/update_credentials` takes form bodies only, so
-  multipart avatar and header uploads get 415 (pre-existing; upstream accepts).
+- `PATCH /api/v1/accounts/update_credentials` accepts multipart bodies
+  (avatar/header file parts; shipped 2026-10-21, evidence
+  `tests/avatar_upload.rs`). Urlencoded/JSON bodies keep the exact
+  pre-multipart behavior (including the `415` for other content types).
 - Invalid `replies_policy` on list create answers 422; upstream's answer for an
   invalid enum is not verified.

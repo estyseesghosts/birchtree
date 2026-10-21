@@ -83,6 +83,12 @@ impl AccountStore for RedbStore {
             hide_collections: None,
             fields: Vec::new(),
             attribution_domains: Vec::new(),
+            avatar_key: None,
+            avatar_content_type: None,
+            avatar_description: String::new(),
+            header_key: None,
+            header_content_type: None,
+            header_description: String::new(),
             created_at_ms: input.now_ms,
         };
         let user = LocalUser {
@@ -267,6 +273,7 @@ impl AccountStore for RedbStore {
         &self,
         account_id: Id,
         update: AccountProfileUpdate,
+        now_ms: u64,
     ) -> Result<Account> {
         let write = self.begin_write()?;
         let mut account: Account = {
@@ -303,10 +310,54 @@ impl AccountStore for RedbStore {
         if let Some(v) = update.bot {
             account.bot = v;
         }
+        // Avatar/header slots share the rest's transaction: the bytes were
+        // staged before this call (blob storage cannot join `redb`), so only
+        // the references commit here.
+        if let Some(slot) = update.avatar {
+            match slot {
+                Some(data) => {
+                    account.avatar_key = Some(data.key);
+                    account.avatar_content_type = Some(data.content_type);
+                }
+                None => {
+                    account.avatar_key = None;
+                    account.avatar_content_type = None;
+                }
+            }
+        }
+        if let Some(description) = update.avatar_description {
+            account.avatar_description = description;
+        }
+        if let Some(slot) = update.header {
+            match slot {
+                Some(data) => {
+                    account.header_key = Some(data.key);
+                    account.header_content_type = Some(data.content_type);
+                }
+                None => {
+                    account.header_key = None;
+                    account.header_content_type = None;
+                }
+            }
+        }
+        if let Some(description) = update.header_description {
+            account.header_description = description;
+        }
         {
             let mut accounts = write.open_table(ACCOUNTS)?;
             accounts.insert(account_id.value(), encode(&account)?.as_slice())?;
         }
+        // Every profile write fans a profile `Update` to the account's
+        // followers (upstream `UpdateDistributionWorker`, debounced there;
+        // immediate here — documented in the federation contract). The no-op
+        // guard inside keeps remote rows silent.
+        super::federation_content::federation_event_txn(
+            &write,
+            self.next_id(),
+            account_id,
+            serde_json::json!({"event": "profile_update"}),
+            now_ms,
+        )?;
         write.commit()?;
         Ok(account)
     }

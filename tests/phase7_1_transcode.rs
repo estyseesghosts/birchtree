@@ -10,6 +10,13 @@
 //!
 //! Recorded environment fact (2026-10-20): `ffmpeg` is absent here, so
 //! `TranscodeConfig::default().validate()` must be `Err` on this machine.
+//!
+//! Unix-only (`#![cfg(unix)]` below): the fake-ffmpeg harness shells out to
+//! POSIX `sh` scripts with `chmod +x` bits, which have no Windows equivalent.
+//! Gating the whole file keeps `cargo check --all-targets` green on Windows
+//! with zero behavior change on Linux.
+
+#![cfg(unix)]
 
 mod common;
 

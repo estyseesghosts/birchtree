@@ -24,6 +24,13 @@
 //! in-test with the `image` crate) served by the fake toolchain. A job whose
 //! ffmpeg cannot decode the input commits `Failed` (quarantined, surfaced as
 //! 422) — never a silent success, never zero-filled bytes.
+//!
+//! Unix-only (`#![cfg(unix)]` below): the fake-ffmpeg harness shells out to
+//! POSIX `sh` scripts with `chmod +x` bits, which have no Windows equivalent.
+//! Gating the whole file keeps `cargo check --all-targets` green on Windows
+//! with zero behavior change on Linux.
+
+#![cfg(unix)]
 
 mod common;
 

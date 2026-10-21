@@ -7,8 +7,11 @@
 //! the parent of a reply; the target of a like, boost, block, flag or quote request.
 
 use activitypub_federation::config::FederationConfig;
+use activitypub_federation::fetch::object_id::ObjectId;
+use activitypub_federation::traits::Object;
 use serde_json::Value;
 
+use crate::activitypub::actor::ActorRecord;
 use crate::activitypub::outgoing;
 use crate::activitypub::FedContext;
 use crate::application::ports::Store;
@@ -132,6 +135,28 @@ pub async fn run(config: &FederationConfig<FedContext>, job: &crate::domain::Job
                 outgoing::undo_block(&author, &target)
             };
             (vec![body], outgoing::inboxes_of(store, &[target.id]).map_err(retry)?)
+        }
+        // Profile write (display name, avatar/header, fields, ...): the
+        // actor's own `Update`, carrying the full actor document the crate
+        // serves (same `into_json` as the `Person` endpoint, so refetch and
+        // fan-out can never disagree). Recipients are the account's remote
+        // followers (upstream `AccountReachFinder` is broader — reporters,
+        // recent mentions/follows — documented in the federation contract).
+        "profile_update" => {
+            let actor_url = url::Url::parse(&author.actor_uri)
+                .map_err(|e| quarantine(format!("profile update of an actor without a URL: {e}")))?;
+            let data = config.to_request_data();
+            let record = ObjectId::<ActorRecord>::from(actor_url)
+                .dereference(&data)
+                .await
+                .map_err(|e| DeliveryError::Retry(e.to_string()))?;
+            let person = record
+                .into_json(&data)
+                .await
+                .map_err(|e| DeliveryError::Retry(e.to_string()))?;
+            let person = serde_json::to_value(&person).map_err(|e| quarantine(e.to_string()))?;
+            let body = outgoing::profile_update(&author, person, now);
+            (vec![body], outgoing::follower_inboxes(store, author.id).map_err(retry)?)
         }
         // Account deletion (D38, upstream `DeleteAccountService#delete_actor!`):
         // the actor becomes a `Tombstone` for every follower inbox. Only

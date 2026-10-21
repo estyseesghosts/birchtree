@@ -131,6 +131,16 @@ pub struct UserSettingsUpdate {
     pub web_auto_play_gifs: Option<bool>,
 }
 
+/// A staged avatar/header image waiting to be referenced by an account row.
+///
+/// The bytes were already staged under `key` (blob store, outside the
+/// transaction); the profile commit only records the reference.
+#[derive(Debug, Clone)]
+pub struct ProfileImageData {
+    pub key: String,
+    pub content_type: String,
+}
+
 /// Mutable subset of an account profile (`PATCH update_credentials`).
 ///
 /// `None` fields are left unchanged.
@@ -148,6 +158,16 @@ pub struct AccountProfileUpdate {
     pub attribution_domains: Option<Vec<String>>,
     /// Automated account flag (`update_credentials[bot]`).
     pub bot: Option<bool>,
+    /// Avatar slot: `None` = unchanged, `Some(None)` = clear back to the
+    /// default, `Some(Some(data))` = reference the staged blob.
+    pub avatar: Option<Option<ProfileImageData>>,
+    /// Avatar alt text (upstream `avatar_description`, max 150 chars;
+    /// length is enforced at the endpoint).
+    pub avatar_description: Option<String>,
+    /// Header slot, same presence semantics as `avatar`.
+    pub header: Option<Option<ProfileImageData>>,
+    /// Header alt text (upstream `header_description`, max 150 chars).
+    pub header_description: Option<String>,
 }
 
 /// Accounts, local users, and the unique handle index.
@@ -175,10 +195,15 @@ pub trait AccountStore: Send + Sync {
     fn accounts_by_ids(&self, ids: &[Id]) -> Result<HashMap<Id, Account>>;
 
     /// Apply a profile patch, returning the updated account.
+    ///
+    /// The commit also enqueues one `FederationEvent` (`profile_update`) so
+    /// followers refetch the actor; the event is a no-op for remote rows
+    /// (which never reach this path — they sync through `upsert_remote`).
     fn update_account_profile(
         &self,
         account_id: Id,
         update: AccountProfileUpdate,
+        now_ms: u64,
     ) -> Result<Account>;
 
     /// Apply a preferences patch, returning the updated credential record.

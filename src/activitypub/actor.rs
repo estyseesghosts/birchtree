@@ -165,6 +165,37 @@ impl Object for ActorRecord {
         } else {
             self.account.shared_inbox_uri.as_deref().and_then(|u| Url::parse(u).ok())
         };
+        // Avatar/header attachments resolve against this server's file route
+        // (the same URLs the REST serializers emit). A missing blob reference
+        // omits the attachment rather than serving a dead link.
+        let icon = self.account.avatar_key.as_deref().filter(|key| !key.is_empty()).and_then(|key| {
+            Url::parse(&format!(
+                "{}/system/media_attachments/files/{key}",
+                data.public_url.trim_end_matches('/')
+            ))
+            .ok()
+            .map(|url| {
+                PersonImage::new(
+                    url,
+                    self.account.avatar_content_type.clone().unwrap_or_else(|| "application/octet-stream".to_string()),
+                    &self.account.avatar_description,
+                )
+            })
+        });
+        let image = self.account.header_key.as_deref().filter(|key| !key.is_empty()).and_then(|key| {
+            Url::parse(&format!(
+                "{}/system/media_attachments/files/{key}",
+                data.public_url.trim_end_matches('/')
+            ))
+            .ok()
+            .map(|url| {
+                PersonImage::new(
+                    url,
+                    self.account.header_content_type.clone().unwrap_or_else(|| "application/octet-stream".to_string()),
+                    &self.account.header_description,
+                )
+            })
+        });
         Ok(Person {
             kind: Default::default(),
             id: self.url.clone().into(),
@@ -178,6 +209,8 @@ impl Object for ActorRecord {
             followers: self.account.local.then(|| Url::parse(&format!("{}/followers", self.account.actor_uri)).ok()).flatten(),
             following: self.account.local.then(|| Url::parse(&format!("{}/following", self.account.actor_uri)).ok()).flatten(),
             outbox: self.account.local.then(|| Url::parse(&format!("{}/outbox", self.account.actor_uri)).ok()).flatten(),
+            icon,
+            image,
         })
     }
 
@@ -192,6 +225,11 @@ impl Object for ActorRecord {
     }
 
     /// Upsert a fetched remote actor, with its key, in one store transaction.
+    ///
+    /// The document's `icon`/`image` attachments are intentionally not
+    /// ingested (remote avatar caching is out of profile — see the
+    /// remote-media-cache plan); the refetch still updates every other
+    /// profile field and the key.
     async fn from_json(json: Person, data: &Data<FedContext>) -> Result<Self, FedError> {
         let actor_url = json.id.inner().clone();
         let domain = super::host_of(actor_url.as_str())
@@ -268,6 +306,49 @@ pub struct Person {
     pub following: Option<Url>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outbox: Option<Url>,
+    /// Avatar (`icon`) and header (`image`) attachments, present only while
+    /// the account references a staged blob (upstream `avatar_exists?` /
+    /// `header_exists?`). Remote avatar caching is out of profile: remote
+    /// rows carry no keys, so their documents omit both, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<PersonImage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<PersonImage>,
+}
+
+/// An `icon`/`image` attachment on a served actor document (upstream
+/// `ActivityPub::ImageSerializer`: `type`/`mediaType`/`url`, plus `summary`
+/// when the account carries an image description).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersonImage {
+    #[serde(rename = "type", default = "image_kind")]
+    pub kind: String,
+    #[serde(default = "octet_stream")]
+    pub media_type: String,
+    pub url: Url,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+fn image_kind() -> String {
+    "Image".to_string()
+}
+
+fn octet_stream() -> String {
+    "application/octet-stream".to_string()
+}
+
+impl PersonImage {
+    fn new(url: Url, media_type: String, description: &str) -> Self {
+        let summary = (!description.is_empty()).then(|| description.to_string());
+        Self {
+            kind: "Image".to_string(),
+            media_type,
+            url,
+            summary,
+        }
+    }
 }
 
 /// The `endpoints` object: the shared inbox.

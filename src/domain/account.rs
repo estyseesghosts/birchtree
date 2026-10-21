@@ -107,6 +107,27 @@ pub struct Account {
     /// Domains attributed to this account (upstream `attribution_domains`).
     #[serde(default)]
     pub attribution_domains: Vec<String>,
+    /// Local blob key of the staged avatar original (`None` = the default
+    /// `missing.png`; remote accounts never carry a key — remote avatar
+    /// caching is out of profile). Served under
+    /// `/system/media_attachments/files/` like any other staged blob.
+    #[serde(default)]
+    pub avatar_key: Option<String>,
+    /// Sniffed content type of the staged avatar (mirrors the upload bytes).
+    #[serde(default)]
+    pub avatar_content_type: Option<String>,
+    /// Avatar alt text (upstream `avatar_description`, max 150 chars).
+    #[serde(default)]
+    pub avatar_description: String,
+    /// Local blob key of the staged header original (`None` = default).
+    #[serde(default)]
+    pub header_key: Option<String>,
+    /// Sniffed content type of the staged header.
+    #[serde(default)]
+    pub header_content_type: Option<String>,
+    /// Header alt text (upstream `header_description`, max 150 chars).
+    #[serde(default)]
+    pub header_description: String,
     pub created_at_ms: u64,
 }
 
@@ -175,6 +196,12 @@ mod tests {
             hide_collections: None,
             fields: Vec::new(),
             attribution_domains: Vec::new(),
+            avatar_key: None,
+            avatar_content_type: None,
+            avatar_description: String::new(),
+            header_key: None,
+            header_content_type: None,
+            header_description: String::new(),
             created_at_ms: 0,
         };
         assert_eq!(a.acct(), "alice");

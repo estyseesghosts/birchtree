@@ -48,6 +48,11 @@ Phase 2 additions to the narrow ports:
   `SendConfirmationEmail` job in the account transaction.
 - `UserSettingsUpdate` / `AccountProfileUpdate` carry `PATCH
   update_credentials` patches; `None` fields are left unchanged.
+  `AccountProfileUpdate` also carries the avatar/header slots (`None` =
+  unchanged, `Some(None)` = clear to the default, `Some(Some(..))` =
+  reference the staged blob) plus the image descriptions; the redb commit
+  enqueues one `FederationEvent {event: "profile_update"}` in the same
+  transaction (no-op for remote rows).
 
 ## Implementation status (Phase 3)
 

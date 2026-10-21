@@ -30,10 +30,13 @@ Conventions: `D##` = row in `docs/compatibility-profile.md`;
 
 ## Media / profile follow-ups
 
-- **Avatar/header upload in `update_credentials`.** `bot`, profile fields
-  and attribution domains persist; `avatar`/`header` (+ descriptions) need
-  the media pipeline (Phase 7.1 transcode + attachment ownership checks).
-  Manifest notes it as a named follow-up.
+- **Avatar/header upload in `update_credentials` (shipped 2026-10-21).**
+  Multipart `avatar`/`header` file parts validate through the media path
+  (still-image allowlist, 8 MB caps, decode check), stage under the blob
+  store, and persist references on the account row in the same
+  `update_account_profile` transaction; actor documents serve
+  `icon`/`image` and a `profile_update` event fans out. Evidence
+  `tests/avatar_upload.rs`.
 - **Rule translations.** Server rules render `translations: {}` — no
   translation store exists.
 - **Locale catalog for languages.** `GET /api/v1/instance/languages`

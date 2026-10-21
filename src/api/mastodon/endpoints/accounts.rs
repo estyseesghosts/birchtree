@@ -6,7 +6,7 @@
 //! endpoints accept `read`/`read:accounts`; `verify_credentials` and
 //! `update_credentials` require a user token.
 
-use axum::extract::{ConnectInfo, Extension, Path, RawQuery, State};
+use axum::extract::{ConnectInfo, Extension, FromRequest, Multipart, Path, RawQuery, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
@@ -15,11 +15,12 @@ use std::sync::Arc;
 use crate::api::forms::{self, FormBody};
 use crate::api::mastodon::auth::Auth;
 use crate::api::mastodon::dto;
-use crate::api::mastodon::errors::ApiError;
+use crate::api::mastodon::errors::{ApiError, ApiResult};
 use crate::api::mastodon::ApiState;
 use crate::application::accounts::{self, RegisterAccountCommand};
+use crate::application::media::human_size;
 use crate::application::ports::{
-    AccountProfileUpdate, Store, UserSettingsUpdate,
+    AccountProfileUpdate, ProfileImageData, Store, UserSettingsUpdate,
 };
 use crate::application::relationships;
 use crate::domain::Error as DomainError;
@@ -28,6 +29,17 @@ use crate::mailer::{MailEnv, MailError};
 
 /// Scope alternatives accepted by the write endpoints.
 const WRITE_SCOPES: &[&str] = &["write", "write:accounts"];
+
+/// Upstream avatar/header image constraints
+/// (`Account::Avatar::AVATAR_IMAGE_MIME_TYPES` /
+/// `Account::Header::HEADER_IMAGE_MIME_TYPES` at the pin): still images only
+/// (the probed still-image decoders minus the birchtree D4 extensions —
+/// BMP/TIFF/HEIC/HEIF need the ffmpeg toolchain and upstream avatars reject
+/// them), 8 MB each, descriptions capped at 150 chars.
+const PROFILE_IMAGE_MIME_TYPES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
+const AVATAR_LIMIT: u64 = 8 * 1024 * 1024;
+const HEADER_LIMIT: u64 = 8 * 1024 * 1024;
+const MAX_IMAGE_DESCRIPTION_LEN: usize = 150;
 
 /// Attach the caching headers Mastodon uses for token responses.
 fn with_no_store(mut response: Response) -> Response {
@@ -188,10 +200,18 @@ pub async fn verify_credentials(State(state): State<ApiState>, auth: Auth) -> Re
 }
 
 /// `PATCH /api/v1/accounts/update_credentials`.
+///
+/// Mastodon clients send this endpoint as `multipart/form-data` when an
+/// avatar/header file is attached and as `application/x-www-form-urlencoded`
+/// (or JSON) otherwise; every encoding carries the same text params. The body
+/// is therefore branched on content type: multipart text parts flatten into
+/// the same pairs the form path parses, while `avatar`/`header` file parts
+/// run the media pipeline below. Urlencoded and JSON bodies keep the exact
+/// pre-multipart behavior (including the `415` for other content types).
 pub async fn update_credentials(
     State(state): State<ApiState>,
     auth: Auth,
-    FormBody(pairs): FormBody,
+    request: Request,
 ) -> Response {
     if let Err(err) = auth.0.require_scopes(WRITE_SCOPES) {
         return err.into_response();
@@ -199,6 +219,20 @@ pub async fn update_credentials(
     let account_id = match auth.0.require_user() {
         Ok(id) => id,
         Err(err) => return err.into_response(),
+    };
+
+    // Multipart carries files; every other content type keeps the
+    // form-or-JSON extractor (and its rejections) untouched.
+    let (pairs, avatar_upload, header_upload) = if is_multipart(&request) {
+        match credential_multipart(&state, request).await {
+            Ok(fields) => (fields.pairs, fields.avatar, fields.header),
+            Err(err) => return err.into_response(),
+        }
+    } else {
+        match FormBody::from_request(request, &state).await {
+            Ok(FormBody(pairs)) => (pairs, None, None),
+            Err(rejection) => return rejection,
+        }
     };
 
     let field = |key: &str| forms::get(&pairs, key);
@@ -219,9 +253,9 @@ pub async fn update_credentials(
     }
     // Upstream `credentials_controller.rb#account_params`: `bot`,
     // `fields_attributes[][name|value]` and `attribution_domains[]` are
-    // accepted alongside the profile fields above (`avatar`/`header` need
-    // the media pipeline — named follow-up). They persist on the account row
-    // in the same `update_account_profile` transaction as the rest.
+    // accepted alongside the profile fields above. `avatar`/`header` file
+    // parts run the media pipeline below and persist on the account row in
+    // the same `update_account_profile` transaction as the rest.
     let bot = field("bot").map(bool_cast);
     // `fields_attributes` absent → leave stored fields unchanged (upstream
     // nested-attributes semantics); present → replace the whole list.
@@ -260,6 +294,51 @@ pub async fn update_credentials(
         });
 
     let store: &dyn Store = &*state.context.store;
+    // Avatar/header images: multipart file parts and present urlencoded/JSON
+    // fields share one pipeline. Staging happens BEFORE the profile commit
+    // (blob storage cannot join `redb`); a failed commit leaves only a
+    // bounded orphan, exactly like media uploads (`birchtree.md` §5).
+    let avatar = match profile_image_slot(
+        &state,
+        "Avatar",
+        AVATAR_LIMIT,
+        "avatar",
+        avatar_upload,
+        field("avatar"),
+    ) {
+        Ok(slot) => slot,
+        Err(err) => return err,
+    };
+    let header = match profile_image_slot(
+        &state,
+        "Header",
+        HEADER_LIMIT,
+        "header",
+        header_upload,
+        field("header"),
+    ) {
+        Ok(slot) => slot,
+        Err(err) => return err,
+    };
+    for (key, label) in [
+        ("avatar_description", "Avatar"),
+        ("header_description", "Header"),
+    ] {
+        if field(key).is_some_and(|v| v.chars().count() > MAX_IMAGE_DESCRIPTION_LEN) {
+            return validation_error(
+                format!("Validation failed: {label} description is too long (maximum is {MAX_IMAGE_DESCRIPTION_LEN} characters)"),
+                json!({}),
+            );
+        }
+    }
+    // Previous blob keys, for best-effort cleanup of replaced images after
+    // the commit (mirrors the media thumbnail swap: the row commits first,
+    // stale bytes are dropped after, never before).
+    let previous = store
+        .account_by_id(account_id)
+        .ok()
+        .flatten()
+        .map(|account| (account.avatar_key, account.header_key));
     let profile = AccountProfileUpdate {
         display_name,
         note,
@@ -270,9 +349,30 @@ pub async fn update_credentials(
         fields: profile_fields,
         attribution_domains,
         bot,
+        avatar,
+        avatar_description: field("avatar_description").map(str::to_string),
+        header,
+        header_description: field("header_description").map(str::to_string),
+        ..Default::default()
     };
-    if let Err(err) = store.update_account_profile(account_id, profile) {
+    if let Err(err) = store.update_account_profile(account_id, profile, state.context.now_ms()) {
         return ApiError::from(err).into_response();
+    }
+    if let Some((old_avatar, old_header)) = previous
+        && let Ok(Some(account)) = store.account_by_id(account_id)
+    {
+        for (old, new) in [
+            (old_avatar, account.avatar_key),
+            (old_header, account.header_key),
+        ] {
+            if old != new
+                && let Some(key) = old
+                && !key.is_empty()
+                && let Err(err) = state.context.blobs.delete(&key)
+            {
+                tracing::warn!(account = account_id.value(), error = %err, "stale profile image left in place");
+            }
+        }
     }
 
     // `source[...]` carries posting preferences.
@@ -405,12 +505,166 @@ fn credential_response(state: &ApiState, account_id: crate::domain::Id) -> Respo
 }
 
 /// 422 with Mastodon's `ValidationErrorFormatter` shape.
-fn validation_error(message: &str, details: Value) -> Response {
+fn validation_error(message: impl Into<String>, details: Value) -> Response {
     (
         StatusCode::UNPROCESSABLE_ENTITY,
-        axum::Json(json!({ "error": message, "details": details })),
+        axum::Json(json!({ "error": message.into(), "details": details })),
     )
         .into_response()
+}
+
+/// Multipart fields of an `update_credentials` body: every text part flattens
+/// into the same pairs the urlencoded path parses (order preserved, so the
+/// `fields_attributes[][name]` sequencing keeps working); `avatar`/`header`
+/// file parts are captured as bytes (`Some(vec![])` when the part is present
+/// but empty — the clearing signal).
+struct CredentialMultipart {
+    pairs: Vec<(String, String)>,
+    avatar: Option<Vec<u8>>,
+    header: Option<Vec<u8>>,
+}
+
+/// Parse a `multipart/form-data` credentials body. A malformed frame is a
+/// `400` (like the media upload path); content problems inside a well-formed
+/// part are `422`s from the image pipeline below, never here.
+async fn credential_multipart(
+    state: &ApiState,
+    request: Request,
+) -> ApiResult<CredentialMultipart> {
+    let mut multipart = Multipart::from_request(request, state)
+        .await
+        .map_err(|err| ApiError::bad_request(format!("Invalid multipart body: {err}")))?;
+    let mut fields = CredentialMultipart {
+        pairs: Vec::new(),
+        avatar: None,
+        header: None,
+    };
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|err| ApiError::bad_request(format!("Invalid multipart body: {err}")))?
+    {
+        let name = field.name().map(str::to_string);
+        let bytes = field
+            .bytes()
+            .await
+            .map_err(|err| ApiError::bad_request(format!("Invalid multipart body: {err}")))?
+            .to_vec();
+        match name.as_deref() {
+            Some("avatar") => fields.avatar = Some(bytes),
+            Some("header") => fields.header = Some(bytes),
+            Some(name) => {
+                fields
+                    .pairs
+                    .push((name.to_string(), String::from_utf8_lossy(&bytes).into_owned()));
+            }
+            None => {}
+        }
+    }
+    Ok(fields)
+}
+
+fn is_multipart(request: &Request) -> bool {
+    request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("multipart/form-data"))
+}
+
+/// Resolve one profile-image slot to its `AccountProfileUpdate` presence:
+/// `None` = absent (leave stored), `Some(None)` = present-but-empty (clear to
+/// the default), `Some(Some(..))` = a staged upload (validate + stage now).
+///
+/// A present-but-non-empty urlencoded/JSON value carries no bytes and can
+/// never become an image, so it 422s instead of silently ignoring the intent
+/// (upstream Paperclip likewise refuses a string where a file belongs).
+#[allow(clippy::too_many_arguments)]
+fn profile_image_slot(
+    state: &ApiState,
+    label: &str,
+    limit: u64,
+    kind: &str,
+    upload: Option<Vec<u8>>,
+    field: Option<&str>,
+) -> Result<Option<Option<ProfileImageData>>, Response> {
+    match upload {
+        Some(bytes) if !bytes.is_empty() => {
+            let (mime_type, extension) = validate_profile_image(bytes.len(), &bytes, label, limit, state.server.max_file_size)?;
+            let key = stage_profile_image(&*state.context.blobs, kind, &bytes, extension)?;
+            Ok(Some(Some(ProfileImageData {
+                key,
+                content_type: mime_type.to_string(),
+            })))
+        }
+        Some(_) => Ok(Some(None)),
+        None => match field {
+            None => Ok(None),
+            Some(raw) if raw.is_empty() => Ok(Some(None)),
+            Some(_) => Err(validation_error(
+                format!("Validation failed: {label} content type is invalid"),
+                json!({}),
+            )),
+        },
+    }
+}
+
+/// Sniff, cap and decode-check one avatar/header upload: the declared content
+/// type is never trusted (magic bytes decide, exactly like media uploads).
+/// Failures are the file's existing 422 shape, never 415/500.
+fn validate_profile_image(
+    len: usize,
+    bytes: &[u8],
+    label: &str,
+    limit: u64,
+    max_file_size: u64,
+) -> Result<(&'static str, &'static str), Response> {
+    let sniffed = crate::media::ingest::sniff(bytes).filter(|sniffed| {
+        PROFILE_IMAGE_MIME_TYPES.contains(&sniffed.mime_type) && sniffed.r#type == "image"
+    });
+    let Some(sniffed) = sniffed else {
+        return Err(validation_error(
+            format!("Validation failed: {label} content type is invalid"),
+            json!({}),
+        ));
+    };
+    // Both caps apply: the operator's `max_file_size` and the upstream
+    // per-image limit, whichever is smaller.
+    let cap = max_file_size.min(limit);
+    if len as u64 > cap {
+        let human = human_size(cap);
+        return Err(validation_error(
+            format!("Validation failed: {label} file size must be less than {human}"),
+            json!({}),
+        ));
+    }
+    // Decode-check through the media path (undecodable bytes are an invalid
+    // upload, not a server fault). GIF/BMP previews are PNG; only the
+    // verdict matters here — avatars serve the staged original.
+    match crate::media::processing::process(sniffed.mime_type, bytes) {
+        Ok(_) => Ok((sniffed.mime_type, sniffed.extension)),
+        Err(crate::media::processing::ProcessError::Unidentifiable(_)) => Err(validation_error(
+            format!("Validation failed: {label} is invalid"),
+            json!({}),
+        )),
+        Err(_) => Err(ApiError::internal().into_response()),
+    }
+}
+
+/// Stage validated bytes under the blob store (`{aa}/{bb}/{rand}/{kind}.{ext}`,
+/// the media shard layout) and return the key the account row references.
+fn stage_profile_image(
+    blobs: &dyn crate::application::ports::BlobStore,
+    kind: &str,
+    bytes: &[u8],
+    extension: &str,
+) -> Result<String, Response> {
+    let hex = crate::application::crypto::random_token_hex(8);
+    let key = format!("{}/{}/{}/{}.{extension}", &hex[0..2], &hex[2..4], hex, kind);
+    match blobs.put(&key, bytes) {
+        Ok(()) => Ok(key),
+        Err(err) => Err(ApiError::from(err).into_response()),
+    }
 }
 
 /// Parse `fields_attributes` profile fields from flattened params.

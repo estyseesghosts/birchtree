@@ -41,7 +41,11 @@ fn document(title: &str, body: &str) -> String {
 
 /// Login form. `fields` are the OAuth parameters that must survive the login
 /// round-trip.
-pub fn login_page(fields: &[(String, String)], error: Option<&str>) -> String {
+///
+/// Returns [`Html`] so the authorize endpoints serve `text/html`: a plain
+/// `String` body would make axum answer `text/plain` and browsers would show
+/// the form as source instead of rendering it.
+pub fn login_page(fields: &[(String, String)], error: Option<&str>) -> axum::response::Html<String> {
     let error_html = error
         .map(|e| format!("<p class=\"error\">{}</p>", escape(e)))
         .unwrap_or_default();
@@ -56,7 +60,7 @@ pub fn login_page(fields: &[(String, String)], error: Option<&str>) -> String {
         error_html = error_html,
         hidden = hidden_fields(fields),
     );
-    document("Sign in", &body)
+    axum::response::Html(document("Sign in", &body))
 }
 
 /// Consent page: the user is authenticated and approves or denies the app.
@@ -65,7 +69,7 @@ pub fn consent_page(
     username: &str,
     app_name: &str,
     scopes: &[String],
-) -> String {
+) -> axum::response::Html<String> {
     let scope_list = scopes
         .iter()
         .map(|s| format!("<li>{}</li>", escape(s)))
@@ -91,13 +95,13 @@ pub fn consent_page(
         hidden = hidden_fields(fields),
         hidden_deny = hidden_fields(fields),
     );
-    document(&format!("Authorize {app_name}"), &body)
+    axum::response::Html(document(&format!("Authorize {app_name}"), &body))
 }
 
 /// A simple error page for invalid authorize requests.
-pub fn error_page(message: &str) -> String {
-    document(
+pub fn error_page(message: &str) -> axum::response::Html<String> {
+    axum::response::Html(document(
         "Authorization error",
         &format!("<main><h1>Authorization error</h1><p>{}</p></main>", escape(message)),
-    )
+    ))
 }

@@ -254,6 +254,23 @@ pub fn question_update(store: &dyn Store, public_url: &str, status: &Status, now
     }))
 }
 
+/// `Update` of a local actor's profile (upstream
+/// `ActivityPub::UpdateActorSerializer` as sent by
+/// `UpdateDistributionWorker`): the full actor document is the object, so a
+/// remote refetch picks up display name, avatar (`icon`) and header
+/// (`image`) alike. Debounce is upstream's (5 s `perform_in`); here the
+/// event enqueues immediately (documented in the federation contract).
+pub fn profile_update(author: &Account, person: serde_json::Value, now_ms: u64) -> Value {
+    json!({
+        "@context": context(),
+        "id": format!("{}#updates/{}", author.actor_uri, now_ms),
+        "type": "Update",
+        "actor": author.actor_uri,
+        "to": [PUBLIC],
+        "object": person,
+    })
+}
+
 /// `Delete` of a local status: the Note becomes a `Tombstone` with its URI.
 pub fn delete(author: &Account, status: &Status) -> Value {
     json!({
