@@ -19,6 +19,72 @@ Every key is optional in the file; absent keys take compiled defaults.
 Unknown keys are rejected (typo safety). A minimal file is at
 `config.example.json` in the repo root.
 
+## Deployment mode
+
+`mode` is `production` (default) or `lab` (CLI: `--lab`). Production
+refuses to start with weakened settings — `federation_allow_http`,
+`federation_allowlist`, `federation_extra_ca`, or
+`rate_limit_multiplier > 1` — unless the exact override phrase is set
+(CLI: `--unsafe-production-override=I-ACCEPT-WEAKENED-SECURITY-IN-PRODUCTION`).
+The refusal names the offending keys and exits 2; the override is logged at
+warn level. `check_runtime_mode()` runs after `validate()`; the secret-free
+startup summary (`Config::startup_summary`) is logged on every boot and
+never contains credentials, tokens, keys or seeds.
+
+## Client IP and trusted proxies
+
+Rate limiting and IP blocks resolve the client IP from the TCP peer plus
+`X-Forwarded-For` only when the peer is a configured `--trusted-proxy`
+(repeatable). The chain rule is rightmost-untrusted: starting from the
+peer, the resolver walks the forwarded chain back through trusted proxies
+and takes the first untrusted address (see
+`rate_limits::resolve_client_ip`). An untrusted peer's `X-Forwarded-For`
+is ignored entirely, so it cannot spoof its rate-limit identity. The
+limiter is bounded with expiry/eviction (no clear-all), with independent
+thresholds on login, token issuance, registration, password-reset and
+confirmation-resend flows, plus per-account/address controls on reset that
+do not reveal whether an account exists.
+
+## Secret keyring
+
+TOTP seeds, local ActivityPub signing keys and mail-outbox bearers are
+sealed with AES-256-GCM under an operator-managed keyring that lives
+outside the database (file or environment variable, never the config
+file's inline values):
+
+```json
+{ "secret_keyring_file": "/etc/birchtree/keyring" }
+```
+
+or `{ "secret_keyring_env": "BIRCHTREE_KEYRING" }` (CLI:
+`--secret-keyring-file=` / `--secret-keyring-env=`). The format is one
+`<key id>:<64 hex chars>` per line; blank lines and `#` comments are
+ignored; the first key seals, the rest only open older values (rotation =
+add the new key first, re-seal, then retire the old one). Keyring files
+must not be group/other-readable on Unix. Production refuses to start
+when no key loads; lab starts with a warning and plaintext secrets.
+Losing every key that sealed a row makes that row **unrecoverable** — it
+is not a migration problem: MFA enrollments cannot be decrypted, actor
+keys cannot be recovered (fail closed, never silently re-generated), and
+sealed outbox bearers cannot be mailed. Back the keyring up separately
+from the database.
+
+## Cache and media policy keys
+
+`remote_cache` budgets the remote-media cache (`mode`: `on_demand`
+default, `warm`, or `disabled`; per-class caps plus a global cap;
+`avatar_retention_days`; scoped `warming` reuse of `FetchRemoteMedia`,
+relay-excluded). On demand is the effective policy: ingest records
+metadata only and enqueues no fetch unless the policy opts into warming;
+bytes arrive on the first cache miss through a deduplicated
+single-flight job. `durable_dir` (default `<data_dir>/media`) and
+`cache_dir` (default `<data_dir>/media_cache`) must be disjoint trees
+that exclude the database file (resolved through symlinks; startup
+refuses overlaps). `max_file_size` is enforced per file independently of
+`max_body_size`; uploads stream to disk, responses stream with byte
+ranges, and decode/ffmpeg work runs off the async runtime under bounded
+concurrency.
+
 ## Secrets
 
 `smtp_url` and `vapid_private_key` accept an `env:VAR_NAME`
@@ -73,7 +139,8 @@ Every other key has both a file key and a CLI flag (`src/main.rs:42-169`):
 `--opus-bitrate-kbps`, `--transcode-wall-time-secs`,
 `--transcode-max-output-bytes`, `--transcode-max-memory-bytes`,
 `--vapid-public-key`, `--vapid-private-key`, `--smtp-url`, `--mail-from`,
-`--web-client-dir`.
+`--web-client-dir`, `--lab`, `--unsafe-production-override`,
+`--secret-keyring-file`, `--secret-keyring-env`.
 
 ## Reloading
 

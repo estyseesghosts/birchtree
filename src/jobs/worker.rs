@@ -16,22 +16,49 @@ use crate::application::ports::{BlobStore, MailSender, Store, StreamingSink};
 use crate::domain::{Clock, JobKind};
 use crate::federation::delivery::{self, DeliveryError};
 use crate::federation::{events, media, preview, threads};
+use crate::media::cache_maintenance::CacheMaintenance;
 
 use super::handlers;
 
 /// How many jobs a worker claims per poll.
 pub const DEFAULT_BATCH: usize = 32;
 
+/// Latency of the most recently finished media job (`ProcessMedia` /
+/// `TranscodeMedia`) in milliseconds, for the `/metrics`
+/// `birchtree_media_job_latency_ms` gauge. Zero when no media job has run
+/// yet in this process.
+static LAST_MEDIA_JOB_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The media-processing latency gauge value (see [`LAST_MEDIA_JOB_MS`]).
+pub fn last_media_job_latency_ms() -> u64 {
+    LAST_MEDIA_JOB_MS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn note_media_job_latency(started: std::time::Instant) {
+    LAST_MEDIA_JOB_MS.store(
+        started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// Worker-threaded resources for the async job kinds (Phase 7): the push
 /// delivery client + VAPID identity, and the ffmpeg toolchain config.
 /// Built once in `main.rs` from `Config`.
-#[derive(Debug, Clone)]
+/// (`CacheMaintenance` holds pool handles without a `Debug` impl, so this
+/// struct is `Clone` but not `Debug`.)
+#[derive(Clone)]
 pub struct WorkerExtra {
     pub push_client: reqwest::Client,
     pub vapid: crate::application::push::VapidKeys,
     /// VAPID `sub` claim (contact URI of the instance).
     pub push_subject: String,
     pub transcode: crate::media::transcode::TranscodeConfig,
+    /// Cache lifecycle service (`CacheEvict` / `ReconcileStorage` jobs).
+    pub maintenance: Arc<CacheMaintenance>,
+    /// Password-reset bearer TTL in ms, for the maintenance email-token prune.
+    pub reset_token_ttl_ms: u64,
+    /// Liveness stamp beaten every loop iteration for `/ready`.
+    pub heartbeat: Arc<crate::api::mastodon::router::readiness::WorkerHeartbeat>,
 }
 
 /// Create the signing key of the account a `user_created` job names, in a detached task.
@@ -68,6 +95,7 @@ pub async fn run(
         return;
     }
     loop {
+        extra.heartbeat.beat();
         match store.claim_due(clock.now_ms(), batch) {
             Ok(jobs) if jobs.is_empty() => {}
             Ok(jobs) => {
@@ -174,6 +202,7 @@ pub async fn run(
                             // ffmpeg blocks: run it off the async runtime.
                             // The job is self-describing (`{media_id}`); the
                             // toolchain comes from the worker context.
+                            let started = std::time::Instant::now();
                             let store = Arc::clone(&store);
                             let blobs = Arc::clone(&blobs);
                             let job = job.clone();
@@ -191,27 +220,90 @@ pub async fn run(
                             .unwrap_or_else(|err| {
                                 Err(DeliveryError::Retry(format!("transcode join: {err}")))
                             });
+                            note_media_job_latency(started);
                             // `ProcessMedia` also funnels here on rows that
                             // need a transcode, so keep the arm total.
                             sync
                         }
                         _ => {
-                            let sync = handlers::handle_with_transcode(
-                                &job,
-                                &*store,
-                                &*mailer,
-                                &*blobs,
-                                &*streaming,
-                                Some(&extra.transcode),
-                            )
-                            .map_err(|err| DeliveryError::Retry(err.to_string()));
-                            if job.kind == JobKind::UserCreated && sync.is_ok() {
-                                // The local signing key is made ahead of the first remote request.
-                                // It takes seconds in a debug build, so it runs detached: the
-                                // worker must not wait on it. A failure leaves the lazy path in place.
-                                spawn_user_keys(federation.clone(), &job);
+                            // Cache lifecycle jobs run through the
+                            // `CacheMaintenance` service on a blocking
+                            // thread (redb writes must not block the
+                            // async runtime). Any failure retries under
+                            // the normal policy; the chain re-seeds its
+                            // follow-up on success.
+                            if matches!(
+                                job.kind,
+                                JobKind::CacheEvict | JobKind::ReconcileStorage
+                            ) {
+                                let maint = Arc::clone(&extra.maintenance);
+                                let store = Arc::clone(&store);
+                                let job = job.clone();
+                                let due_at_ms = clock.now_ms();
+                                let reset_ttl_ms = extra.reset_token_ttl_ms;
+                                tokio::task::spawn_blocking(move || {
+                                    maint
+                                        .handle_job(&job, &*store, due_at_ms)
+                                        .map_err(|err| {
+                                            DeliveryError::Retry(err.to_string())
+                                        })?;
+                                    // Expired email-token rows are pruned with
+                                    // the maintenance chain (bounded batch),
+                                    // so confirmation/reset bearers never
+                                    // accumulate as never-cleaned rows.
+                                    {
+                                        match store.prune_email_secrets(
+                                            due_at_ms,
+                                            reset_ttl_ms,
+                                            500,
+                                        ) {
+                                            Ok(removed) if removed > 0 => {
+                                                tracing::info!(
+                                                    removed,
+                                                    "pruned expired email tokens"
+                                                );
+                                            }
+                                            Ok(_) => {}
+                                            Err(err) => {
+                                                tracing::warn!(
+                                                    error = %err,
+                                                    "email token prune failed"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Ok(())
+                                })
+                                .await
+                                .unwrap_or_else(|err| {
+                                    Err(DeliveryError::Retry(format!(
+                                        "maintenance join: {err}"
+                                    )))
+                                })
+                            } else {
+                                let is_media_job =
+                                    matches!(job.kind, JobKind::ProcessMedia);
+                                let started = std::time::Instant::now();
+                                let sync = handlers::handle_with_transcode(
+                                    &job,
+                                    &*store,
+                                    &*mailer,
+                                    &*blobs,
+                                    &*streaming,
+                                    Some(&extra.transcode),
+                                )
+                                .map_err(|err| DeliveryError::Retry(err.to_string()));
+                                if is_media_job {
+                                    note_media_job_latency(started);
+                                }
+                                if job.kind == JobKind::UserCreated && sync.is_ok() {
+                                    // The local signing key is made ahead of the first remote request.
+                                    // It takes seconds in a debug build, so it runs detached: the
+                                    // worker must not wait on it. A failure leaves the lazy path in place.
+                                    spawn_user_keys(federation.clone(), &job);
+                                }
+                                sync
                             }
-                            sync
                         }
                     };
                     let outcome = outcome.map_err(|e| match e {

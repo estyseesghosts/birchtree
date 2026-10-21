@@ -36,6 +36,60 @@ impl Default for RemoteCacheMode {
     }
 }
 
+/// Exact phrase that lets a production-mode node start with lab-only or
+/// weakened settings (`unsafe_production_override`). Deliberately long so it
+/// cannot be set by accident.
+pub const UNSAFE_PRODUCTION_OVERRIDE_PHRASE: &str = "I-ACCEPT-WEAKENED-SECURITY-IN-PRODUCTION";
+
+/// Deployment mode. Production (default) refuses lab-only federation
+/// allowances and weakened rate limits; lab permits them with a warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeMode {
+    #[default]
+    Production,
+    Lab,
+}
+
+impl RuntimeMode {
+    /// Stable lowercase name used in logs and the config file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Production => "production",
+            Self::Lab => "lab",
+        }
+    }
+}
+
+/// Secret-free, structured view of the effective configuration for the
+/// startup log. Secrets appear only as `configured` booleans.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StartupSummary {
+    pub mode: &'static str,
+    pub public_url: String,
+    pub listen: String,
+    pub data_dir: String,
+    pub trusted_proxy_count: usize,
+    pub registration_open: bool,
+    pub registration_requires_approval: bool,
+    pub max_file_size: u64,
+    pub max_body_size: usize,
+    pub rate_limit_multiplier: u32,
+    pub federation_allow_http: bool,
+    pub federation_allowlist_entries: usize,
+    pub federation_extra_ca: bool,
+    pub federation_authorized_fetch: bool,
+    pub transcoding_enabled: bool,
+    pub mail_enabled: bool,
+    /// Scheme and host only; credentials and path are never included.
+    pub smtp_endpoint: Option<String>,
+    pub vapid_public_key_configured: bool,
+    pub vapid_private_key_configured: bool,
+    pub unsafe_production_override_active: bool,
+    /// Human-readable list of weakened settings in force.
+    pub warnings: Vec<String>,
+}
+
 /// Byte budgets + lifecycle for the remote-media cache (Step 0 skeleton:
 /// config surface only; enforcement lands with agents B/C).
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -81,6 +135,14 @@ impl Default for RemoteCacheConfig {
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    /// Deployment mode (`production` default, or `lab`). Production refuses
+    /// lab federation allowances and `rate_limit_multiplier > 1`; see
+    /// [`Config::check_runtime_mode`]. CLI: `--lab`.
+    pub mode: RuntimeMode,
+    /// Set to [`UNSAFE_PRODUCTION_OVERRIDE_PHRASE`] to start a production-mode
+    /// node despite weakened settings. Any other value is ignored. Startup
+    /// logs the override at warn level.
+    pub unsafe_production_override: Option<String>,
     /// Public base URL used for actor/object URIs (must be http/https).
     pub public_url: String,
     pub data_dir: PathBuf,
@@ -233,6 +295,18 @@ pub struct Config {
     pub cache_dir: Option<PathBuf>,
     /// Remote-media cache budgets + lifecycle (`docs/database.md` Step 0).
     pub remote_cache: RemoteCacheConfig,
+    /// Path to the secret-encryption keyring file (one `<id>:<64 hex>`
+    /// line each; the first line is the active sealing key, the rest only
+    /// open older values). The key seals TOTP seeds, local signing keys and
+    /// mail-outbox bearers; it lives outside the database and is never
+    /// logged. Required in production (startup refuses without a loadable
+    /// key); lab runs without one keep long-lived secrets in plaintext.
+    /// `--secret-keyring-file=` overrides.
+    pub secret_keyring_file: Option<PathBuf>,
+    /// Name of an environment variable holding the same keyring text; used
+    /// only when `secret_keyring_file` is unset. `--secret-keyring-env=`
+    /// overrides.
+    pub secret_keyring_env: Option<String>,
     /// Password-reset bearer lifetime in hours (gaps batch, frozen decision:
     /// server-rendered reset page + set-password port; 6h bearers,
     /// consume-on-write). File-only; `--password-reset-ttl-hours=` overrides.
@@ -250,6 +324,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            mode: RuntimeMode::Production,
+            unsafe_production_override: None,
             public_url: "http://localhost:3000".to_string(),
             data_dir: PathBuf::from("./data"),
             listen: "0.0.0.0:3000".parse().unwrap(),
@@ -299,6 +375,8 @@ impl Default for Config {
             durable_dir: None,
             cache_dir: None,
             remote_cache: RemoteCacheConfig::default(),
+            secret_keyring_file: None,
+            secret_keyring_env: None,
             password_reset_ttl_hours: 6,
             site_terms_file: None,
             site_privacy_file: None,
@@ -483,7 +561,112 @@ impl Config {
                 return Err(format!("{key} must not be empty"));
             }
         }
+        // At most one keyring source; an empty file path or variable name is
+        // a typo, and the keyring itself must stay out of the config file.
+        if self.secret_keyring_file.is_some() && self.secret_keyring_env.is_some() {
+            return Err(
+                "secret_keyring_file and secret_keyring_env are mutually exclusive".to_string(),
+            );
+        }
+        if self
+            .secret_keyring_file
+            .as_ref()
+            .is_some_and(|p| p.as_os_str().is_empty())
+        {
+            return Err("secret_keyring_file must not be empty".to_string());
+        }
+        if self
+            .secret_keyring_env
+            .as_deref()
+            .is_some_and(str::is_empty)
+        {
+            return Err("secret_keyring_env must not be empty".to_string());
+        }
         Ok(())
+    }
+
+    /// Lab-only or weakened settings currently enabled, as operator-readable
+    /// names (empty for a hardened configuration).
+    pub fn weakened_settings(&self) -> Vec<String> {
+        let mut found: Vec<String> = Vec::new();
+        if self.federation_allow_http {
+            found.push("federation_allow_http (plain-HTTP federation targets)".to_string());
+        }
+        if !self.federation_allowlist.is_empty() {
+            found.push("federation_allowlist (private-network federation targets)".to_string());
+        }
+        if self.federation_extra_ca.is_some() {
+            found.push("federation_extra_ca (extra TLS trust roots)".to_string());
+        }
+        if self.rate_limit_multiplier > 1 {
+            found.push(format!(
+                "rate_limit_multiplier={} (weakened rate limits)",
+                self.rate_limit_multiplier
+            ));
+        }
+        found
+    }
+
+    /// Whether the explicit unsafe-production override is set correctly.
+    pub fn unsafe_production_override_active(&self) -> bool {
+        self.unsafe_production_override.as_deref() == Some(UNSAFE_PRODUCTION_OVERRIDE_PHRASE)
+    }
+
+    /// Refuse dangerous settings in production mode. Lab mode and an exact
+    /// override phrase pass. Call once at startup after [`Config::validate`];
+    /// the error names the offending keys and the way out, never any value
+    /// that could be a secret.
+    pub fn check_runtime_mode(&self) -> Result<(), String> {
+        if self.mode == RuntimeMode::Lab || self.unsafe_production_override_active() {
+            return Ok(());
+        }
+        let weakened: Vec<String> = self.weakened_settings();
+        if weakened.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "refusing to start in production mode with weakened settings: {}. \
+             Run with --lab for a lab network, or set unsafe_production_override \
+             to the documented phrase to accept the risk",
+            weakened.join("; ")
+        ))
+    }
+
+    /// Build the secret-free startup summary (see [`StartupSummary`]).
+    pub fn startup_summary(&self) -> StartupSummary {
+        let mut warnings: Vec<String> = self.weakened_settings();
+        if self.mode == RuntimeMode::Lab {
+            warnings.push("lab mode: not for production".to_string());
+        }
+        if self.unsafe_production_override_active() {
+            warnings.push("unsafe_production_override is active".to_string());
+        }
+        if self.public_url.starts_with("http://") {
+            warnings.push("public_url is plain http".to_string());
+        }
+        StartupSummary {
+            mode: self.mode.as_str(),
+            public_url: self.normalized_public_url(),
+            listen: self.listen.to_string(),
+            data_dir: self.data_dir.display().to_string(),
+            trusted_proxy_count: self.trusted_proxies.len(),
+            registration_open: self.registration_open,
+            registration_requires_approval: self.registration_requires_approval,
+            max_file_size: self.max_file_size,
+            max_body_size: self.max_body_size,
+            rate_limit_multiplier: self.rate_limit_multiplier,
+            federation_allow_http: self.federation_allow_http,
+            federation_allowlist_entries: self.federation_allowlist.len(),
+            federation_extra_ca: self.federation_extra_ca.is_some(),
+            federation_authorized_fetch: self.federation_authorized_fetch,
+            transcoding_enabled: self.transcoding_enabled,
+            mail_enabled: self.mail_enabled(),
+            smtp_endpoint: self.smtp_url.as_deref().and_then(redacted_smtp_endpoint),
+            vapid_public_key_configured: !self.vapid_public_key.is_empty(),
+            vapid_private_key_configured: !self.vapid_private_key.is_empty(),
+            unsafe_production_override_active: self.unsafe_production_override_active(),
+            warnings,
+        }
     }
 
     /// Whether outbound mail has a configured provider.
@@ -580,9 +763,100 @@ impl Config {
     }
 }
 
+/// `scheme://host[:port]` of an SMTP URL with userinfo, path and query
+/// dropped; `None` for unparsable values (including `env:` indirections).
+fn redacted_smtp_endpoint(raw: &str) -> Option<String> {
+    let parsed = url::Url::parse(raw).ok()?;
+    let host = parsed.host_str()?;
+    Some(match parsed.port() {
+        Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
+        None => format!("{}://{host}", parsed.scheme()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_mode_refuses_weakened_settings() {
+        let base = Config {
+            transcoding_enabled: false,
+            ..Config::default()
+        };
+        assert!(base.check_runtime_mode().is_ok());
+        let http = Config {
+            federation_allow_http: true,
+            ..base.clone()
+        };
+        let slow = Config {
+            rate_limit_multiplier: 10,
+            ..base.clone()
+        };
+        let private = Config {
+            federation_allowlist: crate::federation::policy::parse_allowlist("10.0.0.0/8").expect("cidr"),
+            ..base.clone()
+        };
+        for cfg in [http, slow, private] {
+            let err = cfg.check_runtime_mode().expect_err("production must refuse");
+            assert!(err.contains("production"), "{err}");
+        }
+    }
+
+    #[test]
+    fn lab_mode_and_exact_override_permit_weakened_settings() {
+        let weak = Config {
+            rate_limit_multiplier: 10,
+            federation_allow_http: true,
+            transcoding_enabled: false,
+            ..Config::default()
+        };
+        let lab = Config {
+            mode: RuntimeMode::Lab,
+            ..weak.clone()
+        };
+        assert!(lab.check_runtime_mode().is_ok());
+        let wrong = Config {
+            unsafe_production_override: Some("yes".to_string()),
+            ..weak.clone()
+        };
+        assert!(wrong.check_runtime_mode().is_err());
+        let exact = Config {
+            unsafe_production_override: Some(UNSAFE_PRODUCTION_OVERRIDE_PHRASE.to_string()),
+            ..weak
+        };
+        assert!(exact.check_runtime_mode().is_ok());
+        assert!(exact.startup_summary().unsafe_production_override_active);
+    }
+
+    #[test]
+    fn startup_summary_never_contains_secrets() {
+        let cfg = Config {
+            smtp_url: Some("smtps://mailuser:hunter2@mail.example:465/path?x=1".to_string()),
+            mail_from: Some("noreply@example.social".to_string()),
+            vapid_private_key: "PRIVATE-SCALAR-MATERIAL".to_string(),
+            vapid_public_key: "PUBLIC".to_string(),
+            transcoding_enabled: false,
+            ..Config::default()
+        };
+        let summary = cfg.startup_summary();
+        let json = serde_json::to_string(&summary).expect("summary serializes");
+        for secret in ["hunter2", "mailuser", "PRIVATE-SCALAR-MATERIAL", "x=1"] {
+            assert!(!json.contains(secret), "{secret} leaked into {json}");
+        }
+        assert_eq!(summary.smtp_endpoint.as_deref(), Some("smtps://mail.example:465"));
+        assert!(summary.vapid_private_key_configured);
+        assert!(summary.mail_enabled);
+    }
+
+    #[test]
+    fn mode_defaults_to_production_and_round_trips() {
+        assert_eq!(Config::default().mode, RuntimeMode::Production);
+        let cfg: Config =
+            serde_json::from_value(serde_json::json!({"mode": "lab"})).expect("lab mode parses");
+        assert_eq!(cfg.mode, RuntimeMode::Lab);
+        assert!(serde_json::from_value::<Config>(serde_json::json!({"mode": "staging"})).is_err());
+    }
 
     #[test]
     fn default_config_is_valid() {

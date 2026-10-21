@@ -12,6 +12,7 @@ pub mod activities;
 pub mod error;
 pub mod http;
 pub mod instance;
+pub mod key_generation;
 pub mod objects;
 pub mod outbound;
 pub mod outgoing;
@@ -23,6 +24,7 @@ use std::sync::Arc;
 use activitypub_federation::config::FederationConfig;
 
 use crate::application::context::Context;
+use crate::config::RemoteCacheConfig;
 use crate::federation::net::{self, SafeHttpConfig};
 
 /// The app data the crate hands to every federation callback (`Data<FedContext>`).
@@ -47,6 +49,10 @@ pub struct FedContext {
     /// Relay peers public activities forward to (federation tail, G-D).
     /// Empty = no relay traffic.
     pub relays: Arc<Vec<String>>,
+    /// Remote-media fetch policy (on demand by default): ingest enqueues
+    /// `FetchRemoteMedia` only when
+    /// [`crate::media::cache_maintenance::fetch_at_ingest`] says so.
+    pub remote_cache: RemoteCacheConfig,
 }
 
 /// The crate's configuration for this server.
@@ -66,6 +72,39 @@ pub async fn build_config(
     instance: Option<&instance::InstanceActor>,
     authorized_fetch: bool,
     relays: &[String],
+) -> Result<FederationConfig<FedContext>, String> {
+    build_config_with_remote_cache(
+        context,
+        public_url,
+        registrations_open,
+        site_title,
+        site_description,
+        http,
+        debug,
+        instance,
+        authorized_fetch,
+        relays,
+        &RemoteCacheConfig::default(),
+    )
+    .await
+}
+
+/// As [`build_config`], with the operator's remote-media cache policy: the
+/// ingest path enqueues `FetchRemoteMedia` eagerly only when the policy
+/// allows it (otherwise fetches happen on demand at the first cache miss).
+#[allow(clippy::too_many_arguments)]
+pub async fn build_config_with_remote_cache(
+    context: Arc<Context>,
+    public_url: &str,
+    registrations_open: bool,
+    site_title: &str,
+    site_description: &str,
+    http: &SafeHttpConfig,
+    debug: bool,
+    instance: Option<&instance::InstanceActor>,
+    authorized_fetch: bool,
+    relays: &[String],
+    remote_cache: &RemoteCacheConfig,
 ) -> Result<FederationConfig<FedContext>, String> {
     let domain = host_of(public_url).ok_or_else(|| format!("public url has no host: {public_url}"))?;
     let client = net::middleware_client(http)?;
@@ -87,6 +126,7 @@ pub async fn build_config(
             media_client,
             authorized_fetch,
             relays: Arc::new(relays.to_vec()),
+            remote_cache: remote_cache.clone(),
         })
         .client(client)
         .url_verifier(Box::new(net::PolicyVerifier::new(http)))

@@ -178,17 +178,118 @@ fn upsert_remote_txn(
     Ok(account)
 }
 
+/// Context string binding a sealed actor key to its account row: a
+/// ciphertext copied to another row fails authentication.
+fn actor_key_context(account_id: Id) -> Vec<u8> {
+    format!("actor-key:{}", account_id.value()).into_bytes()
+}
+
+impl RedbStore {
+    /// Rewrite one actor-key row with `plaintext_pem` sealed under the
+    /// active key (legacy-plaintext or retired-key migration after a
+    /// successful open). Row metadata is preserved.
+    fn rewrite_actor_key(
+        &self,
+        account_id: Id,
+        stored: &StoredKeys,
+        plaintext_pem: &str,
+    ) -> Result<()> {
+        let sealed: String = self
+            .secret_box()
+            .seal_text(&actor_key_context(account_id), plaintext_pem)?;
+        let write = self.begin_write()?;
+        {
+            let mut keys = write.open_table(ACTOR_KEYS)?;
+            let fresh = StoredKeys {
+                key_id: stored.key_id.clone(),
+                public_key_pem: stored.public_key_pem.clone(),
+                private_key_pem: Some(sealed),
+                refreshed_at_ms: stored.refreshed_at_ms,
+            };
+            keys.insert(account_id.value(), encode(&fresh)?.as_slice())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Seal every legacy-plaintext or retired-key `ACTOR_KEYS` row under the
+    /// active keyring key (bounded only by table size; actor rows are few).
+    /// Returns how many rows were rewritten. Fails closed when no keyring is
+    /// installed: losing the encryption key makes sealed rows unrecoverable,
+    /// which is an operator recovery matter, not a migration.
+    pub fn seal_legacy_actor_keys(&self) -> Result<usize> {
+        let secrets = self.secret_box();
+        if !secrets.is_enabled() {
+            return Err(crate::domain::Error::Internal(
+                "secret encryption key is not configured".into(),
+            ));
+        }
+        let write = self.begin_write()?;
+        let mut rewritten: Vec<(Id, StoredKeys, String)> = Vec::new();
+        {
+            let keys = write.open_table(ACTOR_KEYS)?;
+            for entry in keys.iter()? {
+                let (key, value) = entry?;
+                let account_id = Id::new(key.value());
+                let stored: StoredKeys = decode(value.value())?;
+                let Some(sealed_pem) = stored.private_key_pem.as_deref() else {
+                    continue;
+                };
+                let opened = secrets.open_text(&actor_key_context(account_id), sealed_pem)?;
+                if opened.needs_reseal {
+                    rewritten.push((account_id, stored, opened.text));
+                }
+            }
+        }
+        for (account_id, stored, plaintext_pem) in &rewritten {
+            let sealed: String =
+                secrets.seal_text(&actor_key_context(*account_id), plaintext_pem)?;
+            let mut keys = write.open_table(ACTOR_KEYS)?;
+            let fresh = StoredKeys {
+                key_id: stored.key_id.clone(),
+                public_key_pem: stored.public_key_pem.clone(),
+                private_key_pem: Some(sealed),
+                refreshed_at_ms: stored.refreshed_at_ms,
+            };
+            keys.insert(account_id.value(), encode(&fresh)?.as_slice())?;
+        }
+        write.commit()?;
+        Ok(rewritten.len())
+    }
+}
+
 impl FederationStore for RedbStore {
     fn actor_keys(&self, account_id: Id) -> Result<Option<ActorKeys>> {
-        let read = self.begin_read()?;
-        let table = read.open_table(ACTOR_KEYS)?;
-        match table.get(account_id.value())? {
-            Some(guard) => {
-                let stored: StoredKeys = decode(guard.value())?;
-                Ok(Some(stored.into_domain(account_id)))
+        let context: Vec<u8> = actor_key_context(account_id);
+        let stored: Option<StoredKeys> = {
+            let read = self.begin_read()?;
+            let table = read.open_table(ACTOR_KEYS)?;
+            match table.get(account_id.value())? {
+                Some(guard) => Some(decode(guard.value())?),
+                None => None,
             }
-            None => Ok(None),
+        };
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        let Some(sealed_pem) = stored.private_key_pem.as_deref() else {
+            return Ok(Some(stored.into_domain(account_id)));
+        };
+        // Fail closed: a missing key, an unknown key id or tampering is an
+        // error, never a reason to generate a replacement key.
+        let opened = self
+            .secret_box()
+            .open_text(&context, sealed_pem)?;
+        if opened.needs_reseal {
+            self.rewrite_actor_key(account_id, &stored, &opened.text)?;
         }
+        Ok(Some(ActorKeys {
+            account_id,
+            key_id: stored.key_id,
+            public_key_pem: stored.public_key_pem,
+            private_key_pem: Some(opened.text),
+            refreshed_at_ms: stored.refreshed_at_ms,
+        }))
     }
 
     fn store_local_keys(
@@ -208,10 +309,18 @@ impl FederationStore for RedbStore {
             match existing {
                 Some(existing) => existing,
                 None => {
+                    // The private key is sealed under the operator keyring
+                    // (plaintext only when no keyring is configured, so
+                    // development rows keep working). The first stored key
+                    // wins: concurrent first fetches never fork the identity.
+                    let sealed: String = self.secret_box().seal_text_if_enabled(
+                        &actor_key_context(account_id),
+                        private_key_pem,
+                    )?;
                     let fresh = StoredKeys {
                         key_id: key_id.to_string(),
                         public_key_pem: public_key_pem.to_string(),
-                        private_key_pem: Some(private_key_pem.to_string()),
+                        private_key_pem: Some(sealed),
                         refreshed_at_ms: None,
                     };
                     keys.insert(account_id.value(), encode(&fresh)?.as_slice())?;
@@ -220,7 +329,19 @@ impl FederationStore for RedbStore {
             }
         };
         write.commit()?;
-        Ok(stored.into_domain(account_id))
+        // Return the opened key, not the envelope: callers sign with it.
+        let context: Vec<u8> = actor_key_context(account_id);
+        let private_key_pem = match stored.private_key_pem.as_deref() {
+            Some(sealed_pem) => Some(self.secret_box().open_text(&context, sealed_pem)?.text),
+            None => None,
+        };
+        Ok(ActorKeys {
+            account_id,
+            key_id: stored.key_id,
+            public_key_pem: stored.public_key_pem,
+            private_key_pem,
+            refreshed_at_ms: stored.refreshed_at_ms,
+        })
     }
 
     fn account_by_actor_uri(&self, actor_uri: &str) -> Result<Option<Account>> {

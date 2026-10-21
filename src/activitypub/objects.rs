@@ -16,7 +16,7 @@ use crate::activitypub::error::FedError;
 use crate::activitypub::outgoing;
 use crate::activitypub::wire::NoteOrQuestion;
 use crate::activitypub::FedContext;
-use crate::application::federation_inbound::ingest_note;
+use crate::application::federation_inbound::ingest_note_with_config;
 use crate::domain::Status;
 
 /// A status known here (local or remote), as the crate's object.
@@ -89,7 +89,7 @@ impl Object for NoteRef {
                     .account_by_id(author)?
                     .is_some_and(|account| account.sensitized);
                 let input = note_input_for(&note, author, sensitized);
-                let ingested = ingest_note(&*data.app.store, input, None, now)?;
+                let ingested = ingest_note_with_config(&*data.app.store, input, None, now, &data.remote_cache)?;
                 Ok(NoteRef { status: ingested.status })
             }
             NoteOrQuestion::Question(question) => {
@@ -105,7 +105,7 @@ impl Object for NoteRef {
                     .account_by_id(author)?
                     .is_some_and(|account| account.sensitized);
                 let (input, poll) = question_input_for(&question, author, sensitized, now);
-                let ingested = ingest_note(&*data.app.store, input, Some(poll), now)?;
+                let ingested = ingest_note_with_config(&*data.app.store, input, Some(poll), now, &data.remote_cache)?;
                 Ok(NoteRef { status: ingested.status })
             }
         }

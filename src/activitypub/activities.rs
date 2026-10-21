@@ -836,7 +836,7 @@ impl ActivityHandler for Create {
             CreateObject::Question(question) => {
                 verify_object_author(&question.id, &question.attributed_to, self.actor.inner())?;
                 let (note, poll) = question_input_for(&question, author.account.id, author.account.sensitized, now);
-                let applied = match tombstone::ingest_checked(store, note, Some(poll), now)? {
+                let applied = match tombstone::ingest_checked_with_config(store, note, Some(poll), now, &data.remote_cache)? {
                     CheckedIngest::Live(ingested) => {
                         if let Some(parent_uri) = &ingested.parent_unknown {
                             crate::federation::threads::schedule_parent(store, ingested.status.id, parent_uri, now)?;
@@ -864,7 +864,7 @@ impl ActivityHandler for Create {
                         inbound::VoteDisposition::NotAVote => {}
                     }
                 }
-                let ingested = match tombstone::ingest_checked(store, note_input_for(&note, author.account.id, author.account.sensitized), None, now)? {
+                let ingested = match tombstone::ingest_checked_with_config(store, note_input_for(&note, author.account.id, author.account.sensitized), None, now, &data.remote_cache)? {
                     CheckedIngest::Live(ingested) => ingested,
                     // The Delete won the race: the note stays gone.
                     CheckedIngest::Tombstoned => {
@@ -942,7 +942,7 @@ impl ActivityHandler for Update {
                 // Delete arrived first (then it stays gone).
                 let applied = match store.status_by_uri(&note.uri)? {
                     Some(_) => inbound::sync_question(store, author.account.id, &note.uri, &poll, now)?,
-                    None => match tombstone::ingest_checked(store, note, Some(poll), now)? {
+                    None => match tombstone::ingest_checked_with_config(store, note, Some(poll), now, &data.remote_cache)? {
                         CheckedIngest::Live(ingested) => {
                             if let Some(parent_uri) = &ingested.parent_unknown {
                                 crate::federation::threads::schedule_parent(store, ingested.status.id, parent_uri, now)?;
@@ -1183,7 +1183,7 @@ impl ActivityHandler for QuoteRequest {
         let quoting = match &self.instrument {
             crate::activitypub::wire::Instrument::Note(note) => {
                 verify_note_author(note, &self.actor)?;
-                match tombstone::ingest_checked(store, note_input_for(note, author.account.id, author.account.sensitized), None, now)? {
+                match tombstone::ingest_checked_with_config(store, note_input_for(note, author.account.id, author.account.sensitized), None, now, &data.remote_cache)? {
                     CheckedIngest::Live(ingested) => ingested.status.id,
                     CheckedIngest::Tombstoned => {
                         let tombstoned = Applied::Ignored("quoting status was deleted before it arrived".into());
@@ -1195,7 +1195,7 @@ impl ActivityHandler for QuoteRequest {
             crate::activitypub::wire::Instrument::Question(question) => {
                 verify_object_author(&question.id, &question.attributed_to, &self.actor)?;
                 let (note, poll) = question_input_for(question, author.account.id, author.account.sensitized, now);
-                match tombstone::ingest_checked(store, note, Some(poll), now)? {
+                match tombstone::ingest_checked_with_config(store, note, Some(poll), now, &data.remote_cache)? {
                     CheckedIngest::Live(ingested) => ingested.status.id,
                     CheckedIngest::Tombstoned => {
                         let tombstoned = Applied::Ignored("quoting status was deleted before it arrived".into());

@@ -76,6 +76,32 @@ impl RedbStore {
         Ok(out)
     }
 
+    /// Redact bearer and recipient fields from up to `limit` finished
+    /// (succeeded or quarantined) mail jobs that still carry them, such as
+    /// rows written before redaction existed. Returns how many were changed.
+    pub fn redact_finished_job_payloads(&self, limit: usize) -> Result<usize> {
+        let write = self.begin_write()?;
+        let mut changed: Vec<Job> = Vec::new();
+        {
+            let jobs = write.open_table(JOBS)?;
+            for entry in jobs.iter()? {
+                let (_key, value) = entry?;
+                let mut job: Job = decode(value.value())?;
+                if job.state.is_terminal() && job.redact_sensitive_payload() {
+                    changed.push(job);
+                    if changed.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        for job in &changed {
+            store_job(&write, job)?;
+        }
+        write.commit()?;
+        Ok(changed.len())
+    }
+
     /// Number of entries in the scheduling index (diagnostics and tests).
     pub fn schedule_index_len(&self) -> Result<u64> {
         use redb::ReadableTableMetadata;
@@ -165,6 +191,8 @@ impl JobQueue for RedbStore {
         remove_index(&write, job.due_at_ms, id)?;
         job.state = JobState::Succeeded;
         job.lease_until_ms = None;
+        // A delivered mail job keeps no bearer or recipient (WP1 1.2).
+        job.redact_sensitive_payload();
         store_job(&write, &job)?;
         write.commit()?;
         Ok(())
@@ -181,6 +209,7 @@ impl JobQueue for RedbStore {
 
         if job.attempts >= job.max_attempts {
             job.state = JobState::Quarantined;
+            job.redact_sensitive_payload();
         } else {
             job.state = JobState::Pending;
             job.due_at_ms = now_ms + backoff_ms(job.attempts);
@@ -200,6 +229,7 @@ impl JobQueue for RedbStore {
         job.state = JobState::Quarantined;
         job.lease_until_ms = None;
         job.last_error = Some(error.to_string());
+        job.redact_sensitive_payload();
         store_job(&write, &job)?;
         write.commit()?;
         Ok(())

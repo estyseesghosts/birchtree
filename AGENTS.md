@@ -44,9 +44,11 @@ confirmed rows, all gated and committed).
 - Mastodon-compatible decimal IDs: 64-bit timestamp-oriented IDs, serialized as decimal strings. Keep comparisons numeric internally; never order decimal IDs lexicographically.
 - Contract first: pin endpoints, methods, encodings, scopes, response fields/nullability, status codes, headers, cursor semantics, streaming events, and unsupported behavior in a manifest backed by tests. No "success-shaped stubs": an unimplemented endpoint is explicitly out of profile and returns an appropriate error, not fabricated data.
 - Federation input is untrusted: enforce size limits, timeouts, redirect limits, SSRF protections, signature verification.
+- All new code must follow the style preferences as specified in rust_style_guide.md. 
 
 ## Verification
 
+- On a Windows host, always prefer native Windows tools (PowerShell, native `cargo`) and never WSL: WSL is slow.
 - Verify by execution: run tests/prototypes and paste or reference real output in the state log. Do not mark work done on reasoning alone.
 - Compatibility claims require tests against real Mastodon v4.7.3 fixtures or target clients, not internal mocks.
 - Both `cargo check --all-targets` and `cargo test` must pass on the release-relevant baseline before a phase exit is claimed.

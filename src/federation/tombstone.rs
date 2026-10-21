@@ -81,8 +81,27 @@ pub fn ingest_checked(
     poll: Option<RemotePoll>,
     now_ms: u64,
 ) -> Result<CheckedIngest> {
+    ingest_checked_with_config(store, note, poll, now_ms, &crate::config::RemoteCacheConfig::default())
+}
+
+/// As [`ingest_checked`], with the operator's remote-media cache policy
+/// threaded through to the ingest (see
+/// [`inbound::ingest_note_with_config`]).
+pub fn ingest_checked_with_config(
+    store: &dyn Store,
+    note: inbound::RemoteNote,
+    poll: Option<RemotePoll>,
+    now_ms: u64,
+    remote_cache: &crate::config::RemoteCacheConfig,
+) -> Result<CheckedIngest> {
     if store.remote_tombstone(&note.uri)?.is_some() {
         return Ok(CheckedIngest::Tombstoned);
     }
-    Ok(CheckedIngest::Live(inbound::ingest_note(store, note, poll, now_ms)?))
+    Ok(CheckedIngest::Live(inbound::ingest_note_with_config(
+        store,
+        note,
+        poll,
+        now_ms,
+        remote_cache,
+    )?))
 }

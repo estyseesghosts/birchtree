@@ -5,7 +5,6 @@
 //! completion. Only kinds produced by the current phase are expected; the
 //! remaining kinds become reachable as their phases land.
 
-use crate::application::crypto;
 use crate::application::notifications;
 use crate::application::ports::{BlobStore, MailSender, Store, StreamingSink};
 use crate::application::streaming::StreamEvent;
@@ -45,60 +44,14 @@ pub fn handle_with_transcode(
             Ok(())
         }
         JobKind::SendConfirmationEmail => {
-            let account_id = job
-                .payload
-                .get("account_id")
-                .and_then(|v| v.as_u64())
-                .map(Id::new)
-                .ok_or_else(|| Error::Internal("send_confirmation_email: missing account_id".into()))?;
-            let email = job
-                .payload
-                .get("email")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| Error::Internal("send_confirmation_email: missing email".into()))?;
-            // The resend endpoint puts an explicit random token in the
-            // payload; registration jobs carry none, so fall back to the
-            // job-id derivation (a retried job never mints a different
-            // value). The bearer is persisted before sending so the mailed
-            // link is redeemable; overwrite = idempotent across retries.
-            let token;
-            let token = match job.payload.get("token").and_then(|v| v.as_str()) {
-                Some(explicit) if !explicit.is_empty() => explicit,
-                _ => {
-                    token = crypto::sha256_hex(format!("confirmation:{}", job.id).as_bytes());
-                    token.as_str()
-                }
-            };
-            // D12: persist the bearer before sending so the mailed link is redeemable.
-            // Overwrite = idempotent: a retried job re-stores the same deterministic token.
-            if let Err(err) = store.store_email_token(token, crate::domain::EmailToken {
-                account_id,
-                kind: crate::domain::EmailTokenKind::Confirmation,
-                created_at_ms: job.created_at_ms,
-            }) {
-                tracing::warn!(error = %err, "confirmation token store failed");
-            }
-            mailer.send_confirmation(email, account_id, token)
+            let (account_id, email, token) =
+                mail_job_fields(job, store, "send_confirmation_email")?;
+            mailer.send_confirmation(email, account_id, &token)
         }
         JobKind::SendPasswordResetEmail => {
-            let account_id = job
-                .payload
-                .get("account_id")
-                .and_then(|v| v.as_u64())
-                .map(Id::new)
-                .ok_or_else(|| Error::Internal("send_password_reset_email: missing account_id".into()))?;
-            let email = job
-                .payload
-                .get("email")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| Error::Internal("send_password_reset_email: missing email".into()))?;
-            let token = job
-                .payload
-                .get("token")
-                .and_then(|v| v.as_str())
-                .filter(|t| !t.is_empty())
-                .ok_or_else(|| Error::Internal("send_password_reset_email: missing token".into()))?;
-            mailer.send_password_reset(email, account_id, token)
+            let (account_id, email, token) =
+                mail_job_fields(job, store, "send_password_reset_email")?;
+            mailer.send_password_reset(email, account_id, &token)
         }
         JobKind::FanOutNotification => {
             // Idempotent: the notification store dedups by
@@ -305,10 +258,13 @@ pub fn handle_with_transcode(
         // does not have: the worker owns `WebPushDelivery`, and offline
         // drains complete it without doing work.
         JobKind::WebPushDelivery => Ok(()),
-        // Storage overhaul skeletons (Step 0): agents B/C own the bodies.
-        // No-op until their batches land; payloads stay < 64 KiB, batches
-        // bounded to 500 rows, no blobs in the transaction.
-        JobKind::CacheEvict | JobKind::ReconcileStorage => Ok(()),
+        // Cache maintenance runs in the job worker, which owns the
+        // `CacheMaintenance` service (async fetch + blocking redb writes).
+        // The sync drain has no such service: completing the job here
+        // would silently drop eviction/reconciliation work, so fail loudly.
+        JobKind::CacheEvict | JobKind::ReconcileStorage => Err(Error::Internal(
+            "cache maintenance runs in the job worker (CacheMaintenance), not here".into(),
+        )),
         // Gaps batch skeletons (`docs/gaps.md` Step 0): G-C owns
         // `CollectionFanout`, G-D owns `QuoteReverify` + `RelayForward`.
         // `CollectionFanout` runs here (sync use case over the same store);
@@ -324,6 +280,38 @@ pub fn handle_with_transcode(
             "deliver_activity runs in the job worker (federation::delivery), not here".into(),
         )),
     }
+}
+
+/// Read `{account_id, email, token}` from a mail job and recover the bearer.
+///
+/// The bearer is minted and persisted (as a digest) in the transaction that
+/// queued the job; there is no fallback derivation. A missing field, a
+/// missing encryption key or a failed authentication is an error, so the job
+/// retries and finally quarantines instead of mailing something unredeemable.
+fn mail_job_fields<'job>(
+    job: &'job Job,
+    store: &dyn Store,
+    label: &str,
+) -> Result<(Id, &'job str, String)> {
+    let account_id: Id = job
+        .payload
+        .get("account_id")
+        .and_then(|v| v.as_u64())
+        .map(Id::new)
+        .ok_or_else(|| Error::Internal(format!("{label}: missing account_id")))?;
+    let email: &str = job
+        .payload
+        .get("email")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::Internal(format!("{label}: missing email")))?;
+    let stored: &str = job
+        .payload
+        .get("token")
+        .and_then(|v| v.as_str())
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| Error::Internal(format!("{label}: missing token")))?;
+    let token: String = store.reveal_mail_token(account_id, stored)?;
+    Ok((account_id, email, token))
 }
 
 /// Parse a `FanOutNotification` payload (used by tests and the handler).

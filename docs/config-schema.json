@@ -5,10 +5,12 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
+    "mode": { "type": "string", "enum": ["production", "lab"], "description": "Deployment mode. Default production: refuses federation_allow_http, federation_allowlist, federation_extra_ca and rate_limit_multiplier > 1 unless mode is lab or unsafe_production_override is set. CLI: --lab." },
+    "unsafe_production_override": { "type": ["string", "null"], "description": "Exact phrase I-ACCEPT-WEAKENED-SECURITY-IN-PRODUCTION lets a production-mode node start with weakened settings (logged at warn). Any other value is ignored." },
     "public_url": { "type": "string", "description": "Public base URL for actor/object URIs (http/https)." },
     "data_dir": { "type": "string", "description": "Directory holding birchtree.redb and media." },
     "listen": { "type": "string", "description": "Socket address, e.g. \"0.0.0.0:3000\"." },
-    "trusted_proxies": { "type": "array", "items": { "type": "string" }, "description": "IPs trusted to set X-Forwarded-For." },
+    "trusted_proxies": { "type": "array", "items": { "type": "string" }, "description": "Proxy IPs trusted to set X-Forwarded-For. When the TCP peer is listed, the client is the rightmost X-Forwarded-For entry that is not itself a trusted proxy; otherwise the peer address is used and forwarding headers are ignored." },
     "max_file_size": { "type": "integer", "minimum": 1, "description": "Max media upload, bytes. No CLI flag; file-only." },
     "max_body_size": { "type": "integer", "minimum": 1, "description": "Max HTTP body, bytes. Must be >= max_file_size." },
     "max_status_chars": { "type": "integer", "minimum": 1, "maximum": 3000, "description": "Max status length (URLs count 23). 500 = Mastodon parity." },
@@ -68,6 +70,8 @@
     "mail_from": { "type": ["string", "null"], "description": "Envelope sender. Required when smtp_url is set. CLI: --mail-from." },
     "relay_inboxes": { "type": "array", "items": { "type": "string" }, "description": "Relay peer inbox URLs public activities forward to. Empty (default) = no relay traffic. CLI: --relay-inbox= (repeatable)." },
     "password_reset_ttl_hours": { "type": "integer", "minimum": 1, "maximum": 72, "description": "Password-reset bearer lifetime, hours. Default 6. CLI: --password-reset-ttl-hours." },
+    "secret_keyring_file": { "type": ["string", "null"], "description": "Secret-encryption keyring file (one <id>:<64 hex> per line, first line active). Required in production; lab without one keeps secrets in plaintext. CLI: --secret-keyring-file." },
+    "secret_keyring_env": { "type": ["string", "null"], "description": "Env var holding the same keyring text; used only when secret_keyring_file is unset. CLI: --secret-keyring-env." },
     "site_terms_file": { "type": ["string", "null"], "description": "File with the terms-of-service text served by the instance sub-resources. Null = honest-absence 404. CLI: --site-terms-file." },
     "site_privacy_file": { "type": ["string", "null"], "description": "File with the privacy-policy text. Null = honest-absence 404. CLI: --site-privacy-file." },
     "site_extended_file": { "type": ["string", "null"], "description": "File with the extended-description text. Null = honest-absence 404. CLI: --site-extended-file." }

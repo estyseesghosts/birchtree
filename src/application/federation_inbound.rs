@@ -109,7 +109,25 @@ pub struct NoteIngest {
 /// Idempotent by URI. A usable attached poll is stored with the status and
 /// seeded with the origin's tallies; an unusable one is dropped (poll-less
 /// status), never a refusal.
+///
+/// The default cache policy applies (on demand: ingest enqueues no fetch);
+/// use [`ingest_note_with_config`] when the operator policy is available.
 pub fn ingest_note(store: &dyn Store, note: RemoteNote, poll: Option<RemotePoll>, now_ms: u64) -> Result<NoteIngest> {
+    ingest_note_with_config(store, note, poll, now_ms, &crate::config::RemoteCacheConfig::default())
+}
+
+/// As [`ingest_note`], with the operator's remote-media cache policy: the
+/// eager `FetchRemoteMedia` enqueue happens only when
+/// [`crate::media::cache_maintenance::fetch_at_ingest`] allows it, so on
+/// demand stays the effective policy and bytes are fetched at the first
+/// cache miss instead.
+pub fn ingest_note_with_config(
+    store: &dyn Store,
+    note: RemoteNote,
+    poll: Option<RemotePoll>,
+    now_ms: u64,
+    remote_cache: &crate::config::RemoteCacheConfig,
+) -> Result<NoteIngest> {
     if let Some(existing) = store.status_by_uri(&note.uri)? {
         return Ok(NoteIngest {
             status: existing,
@@ -190,11 +208,10 @@ pub fn ingest_note(store: &dyn Store, note: RemoteNote, poll: Option<RemotePoll>
     }
     for (media_id, source_url) in pending_fetches {
         // Metadata-first shell in the cache ledger (storage overhaul,
-        // `docs/database.md` Agent B): no bytes, no accounting change. The
-        // eager `FetchRemoteMedia` enqueue below is kept until the
-        // fetch-on-first-request miss path lands (follow-up); warming stays
-        // off by default behind `should_warm`. Empty sources skip the shell
-        // (the job quarantines them as before).
+        // `docs/database.md` Agent B): no bytes, no accounting change.
+        // The fetch itself is on demand (first cache miss) unless scoped
+        // warming explicitly opts in: without this gate the unconditional
+        // enqueue below would make eager fetching the effective policy.
         if !source_url.is_empty() {
             crate::federation::media::record_metadata_first(
                 store as &dyn crate::application::federation_ports::FederationContentStore,
@@ -203,11 +220,13 @@ pub fn ingest_note(store: &dyn Store, note: RemoteNote, poll: Option<RemotePoll>
                 now_ms,
             )?;
         }
-        store.enqueue(
-            JobKind::FetchRemoteMedia,
-            serde_json::json!({ "media_id": media_id.value() }),
-            now_ms,
-        )?;
+        if crate::media::cache_maintenance::fetch_at_ingest(remote_cache, false) {
+            store.enqueue(
+                JobKind::FetchRemoteMedia,
+                serde_json::json!({ "media_id": media_id.value() }),
+                now_ms,
+            )?;
+        }
     }
     // Remote emoji ingest (federation tail, G-D): `Emoji` tags fetch through
     // `FetchRemoteEmoji` (SSRF/size/type rules enforced in the worker arm).

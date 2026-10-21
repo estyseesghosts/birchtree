@@ -30,11 +30,24 @@ fn spawn_harness(dir: &std::path::Path, mode: &str, username: Option<&str>) -> s
 }
 
 fn read_line(child: &mut std::process::Child) -> String {
+    // The harness shares stdout with the server's structured startup log,
+    // so skip log lines until the protocol marker (`OPENED` / `COMMITTED
+    // <id>`). A bounded skip keeps a hung child from blocking the suite
+    // forever.
     let stdout = child.stdout.take().expect("stdout piped");
     let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
-    reader.read_line(&mut line).expect("read harness line");
-    line.trim().to_string()
+    for _ in 0..200 {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line).expect("read harness line");
+        if bytes == 0 {
+            break;
+        }
+        let line = line.trim().to_string();
+        if line == "OPENED" || line.starts_with("COMMITTED ") {
+            return line;
+        }
+    }
+    panic!("harness exited without emitting its marker");
 }
 
 #[test]

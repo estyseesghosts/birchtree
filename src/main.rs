@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-use birchtree::api::mastodon::{build_router, ApiState, ServerInfo};
+use birchtree::api::mastodon::router::build_router_with_probes;
+use birchtree::api::mastodon::{ApiState, ServerInfo};
 use birchtree::application::accounts::{create_account, CreateAccountCommand};
 use birchtree::application::context::Context;
 use birchtree::application::ports::MailSender;
@@ -115,6 +116,14 @@ fn parse_args(cfg: &mut Config) -> Args {
                 eprintln!("invalid --rate-limit-multiplier (want an integer >= 1): {v}");
                 std::process::exit(2);
             });
+        } else if arg == "--lab" {
+            cfg.mode = birchtree::config::RuntimeMode::Lab;
+        } else if let Some(v) = arg.strip_prefix("--unsafe-production-override=") {
+            cfg.unsafe_production_override = Some(v.to_string());
+        } else if let Some(v) = arg.strip_prefix("--secret-keyring-file=") {
+            cfg.secret_keyring_file = Some(std::path::PathBuf::from(v));
+        } else if let Some(v) = arg.strip_prefix("--secret-keyring-env=") {
+            cfg.secret_keyring_env = Some(v.to_string());
         } else if arg == "--registration-open" {
             cfg.registration_open = true;
         } else if arg == "--registration-closed" {
@@ -201,14 +210,35 @@ fn parse_args(cfg: &mut Config) -> Args {
     args
 }
 
-fn build_store(cfg: &Config) -> (Arc<RedbStore>, Arc<dyn Clock>, Arc<dyn IdGenerator>) {
+fn build_store(cfg: &Config) -> (Arc<RedbStore>, Arc<dyn Clock>, Arc<TimestampIdGenerator>) {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let ids: Arc<dyn IdGenerator> = Arc::new(TimestampIdGenerator::new(Box::new(SystemClock)));
+    let ids = Arc::new(TimestampIdGenerator::new(Box::new(SystemClock)));
     let store = RedbStore::open(cfg.database_path(), clock.clone(), ids.clone())
         .unwrap_or_else(|err| {
             eprintln!("open storage: {err}");
             std::process::exit(1);
         });
+    // ID seeding: the generator's last value lives in process memory, so a
+    // restart in the same millisecond, a clock rollback or a restored older
+    // database must not reset it behind the highest persisted ID (primary-key
+    // collisions would overwrite rows). A large skew means a restored backup
+    // or a rolled-back clock: keep counting above it and warn.
+    match store.highest_persisted_id() {
+        Ok(highest) => {
+            let skew_ms = ids.observe(highest);
+            if skew_ms >= birchtree::domain::id::SKEW_WARN_THRESHOLD_MS {
+                tracing::warn!(
+                    skew_ms,
+                    highest = highest.value(),
+                    "persisted IDs run ahead of the wall clock (restored database or clock rollback); issuing IDs above them"
+                );
+            }
+        }
+        Err(err) => {
+            eprintln!("read highest persisted id: {err}");
+            std::process::exit(1);
+        }
+    }
     (Arc::new(store), clock, ids)
 }
 
@@ -372,6 +402,25 @@ fn run_crash_harness(cfg: &Config, args: &Args) -> ! {
     }
 }
 
+/// Load the secret-encryption keyring from the configured source (setting
+/// both sources is rejected by [`Config::validate`], so at most one
+/// applies). The value is key material: it is never logged, only its load
+/// outcome.
+fn load_secret_box(
+    cfg: &Config,
+) -> Result<birchtree::persistence::redb::secrets::SecretBox, String> {
+    use birchtree::persistence::redb::secrets::SecretBox;
+    if let Some(path) = &cfg.secret_keyring_file {
+        return SecretBox::from_keyring_file(path)
+            .map_err(|err| format!("secret keyring file {}: {err}", path.display()));
+    }
+    if let Some(variable) = &cfg.secret_keyring_env {
+        return SecretBox::from_keyring_env(variable)
+            .map_err(|err| format!("secret keyring env {variable}: {err}"));
+    }
+    Err("no secret keyring configured (secret_keyring_file or secret_keyring_env)".to_string())
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c().await.ok();
@@ -395,12 +444,49 @@ async fn shutdown_signal() {
 
 async fn serve(cfg: Config) {
     let (store, clock, ids) = build_store(&cfg);
-    // Storage overhaul (`docs/database.md` Agent A): open the durable +
-    // cache roots as a pair (distinct roots enforced by `Config::validate`
-    // and re-checked here). All traffic still goes through the durable
-    // handle (lazy-move readable); the cache root is created now so the
-    // fetch path can be repointed without a flag day (follow-up: route
-    // `remote/*` keys through `BlobStores::pool(BlobPool::Cache)`).
+    // Secrets first: TOTP seeds, local signing keys and mail-outbox bearers
+    // seal under this keyring. Production refuses to start without one; lab
+    // runs keep long-lived secrets in plaintext with a warning.
+    let secret_box = match load_secret_box(&cfg) {
+        Ok(secret_box) => secret_box,
+        Err(err) => {
+            if cfg.mode == birchtree::config::RuntimeMode::Lab
+                || cfg.unsafe_production_override_active()
+            {
+                tracing::warn!(
+                    error = %err,
+                    "starting without a secret keyring: secrets stay in plaintext (lab only)"
+                );
+                birchtree::persistence::redb::secrets::SecretBox::disabled()
+            } else {
+                eprintln!("secret keyring: {err}; refusing to start in production mode");
+                std::process::exit(1);
+            }
+        }
+    };
+    store.install_secret_box(secret_box.clone());
+    if secret_box.is_enabled() {
+        match store.seal_legacy_secrets() {
+            Ok(report) => tracing::info!(totp_rows = report.totp_rows, "sealed legacy secrets"),
+            Err(err) => tracing::warn!(error = %err, "legacy secret sealing failed"),
+        }
+        match store.seal_legacy_actor_keys() {
+            Ok(rows) => tracing::info!(actor_key_rows = rows, "sealed legacy actor keys"),
+            Err(err) => tracing::warn!(error = %err, "legacy actor key sealing failed"),
+        }
+    }
+    // Physical layout before anything is opened: the durable pool (local
+    // uploads, never evicted) and the cache pool (remote bytes, evictable)
+    // must be disjoint trees that exclude the database file, resolved
+    // through symlinks. String comparison is not enough.
+    if let Err(err) = birchtree::media::storage_roots::validate_layout(
+        &cfg.durable_dir_resolved(),
+        &cfg.cache_dir_resolved(),
+        &cfg.database_path(),
+    ) {
+        eprintln!("storage layout: {err}");
+        std::process::exit(1);
+    }
     let (durable_blobs, cache_blobs) =
         birchtree::media::blob_store::FsBlobStore::open_pair(
             cfg.durable_dir_resolved(),
@@ -410,12 +496,44 @@ async fn serve(cfg: Config) {
             eprintln!("open blob stores: {err}");
             std::process::exit(1);
         });
-    let _ = cache_blobs;
+    // One routing handle: local keys land in the durable pool, `remote/…`
+    // keys in the cache pool (pre-split durable `remote/` bytes stay
+    // readable).
+    let pools = birchtree::media::pooled_blob_stores::PooledBlobStores::new(
+        durable_blobs.clone(),
+        cache_blobs.clone(),
+    );
+    let blobs: Arc<dyn birchtree::application::ports::BlobStore> = Arc::new(pools);
     // Storage overhaul (Agent B): install the operator budgets into the
     // process-wide cache admission ledger (in-flight reservations gate the
     // fetch path before any byte is read).
     birchtree::media::remote_cache::configure_process_ledger(cfg.remote_cache.clone());
-    let blobs: Arc<dyn birchtree::application::ports::BlobStore> = Arc::new(durable_blobs);
+    // The cache lifecycle service owns eviction + reconciliation. Restore
+    // rehydrates the ledger from the durable rows and the cache pool before
+    // traffic is accepted; the seed starts the bounded maintenance chains.
+    let maint = Arc::new(
+        birchtree::media::cache_maintenance::CacheMaintenance::new(
+            store.clone(),
+            cache_blobs.clone(),
+            cfg.remote_cache.clone(),
+        )
+        .with_durable_residue_sweep(durable_blobs.clone()),
+    );
+    match maint.restore_at_startup(clock.now_ms()) {
+        Ok(report) => tracing::info!(
+            adopted = report.adopted,
+            missing = report.missing,
+            residue_removed = report.residue_removed,
+            "cache restore at startup"
+        ),
+        Err(err) => {
+            eprintln!("cache restore at startup: {err}");
+            std::process::exit(1);
+        }
+    }
+    if let Err(err) = maint.seed_jobs(&*store, clock.now_ms()) {
+        tracing::warn!(error = %err, "maintenance seed failed");
+    }
     let server = Arc::new(ServerInfo::from_config(&cfg));
     // Phase 7.2/7.3 startup seeds: the search index is in-memory derived
     // state, so a restart re-seeds its backfill chain when empty; the tag
@@ -463,15 +581,11 @@ async fn serve(cfg: Config) {
         blobs.clone(),
         streaming.clone(),
     ));
-    // Federation (Phase 6). The allowlist and http switches are lab-only and off by default.
-    let lab = !cfg.federation_allowlist.is_empty();
-    if cfg.federation_allow_http || lab {
-        tracing::warn!(
-            allow_http = cfg.federation_allow_http,
-            allowlist_entries = cfg.federation_allowlist.len(),
-            "lab federation policy is in force: not for production"
-        );
-    }
+    // Federation (Phase 6). Lab mode permits plain-HTTP targets and
+    // private-network allowlists; production refuses them in
+    // `check_runtime_mode` unless the explicit override is set (see the
+    // startup summary logged in `main`).
+    let lab = cfg.mode == birchtree::config::RuntimeMode::Lab;
     let extra_roots = match &cfg.federation_extra_ca {
         Some(path) => {
             let pem = std::fs::read(path).unwrap_or_else(|err| {
@@ -497,7 +611,7 @@ async fn serve(cfg: Config) {
             eprintln!("instance actor: {err}");
             std::process::exit(1);
         });
-    let federation = birchtree::activitypub::build_config(
+    let federation = birchtree::activitypub::build_config_with_remote_cache(
         context.clone(),
         &cfg.normalized_public_url(),
         cfg.registration_open,
@@ -508,6 +622,7 @@ async fn serve(cfg: Config) {
         Some(&instance),
         cfg.federation_authorized_fetch,
         &cfg.relay_inboxes,
+        &cfg.remote_cache,
     )
     .await
     .unwrap_or_else(|err| {
@@ -525,10 +640,119 @@ async fn serve(cfg: Config) {
         mail_env: Arc::new(birchtree::mailer::MailEnv::from_config(&cfg)),
         invites: store.clone() as std::sync::Arc<dyn birchtree::application::accounts::InviteStore>,
     };
-    if cfg.rate_limit_multiplier > 1 {
-        tracing::warn!(multiplier = cfg.rate_limit_multiplier, "debug rate-limit weakening is in force: not for production");
-    }
-    let app = build_router(state);
+    // Readiness + metrics: storage writability, worker progress, pool
+    // writability, queue health, cache accounting and media latency. The
+    // heartbeat is beaten every worker loop iteration (idle or busy).
+    let heartbeat = Arc::new(
+        birchtree::api::mastodon::router::readiness::WorkerHeartbeat::new(),
+    );
+    let probes = {
+        use birchtree::api::mastodon::router::readiness::{
+            writable_directory_check, RuntimeProbes,
+        };
+        let store = store.clone();
+        let queue_store = store.clone();
+        let queue_age_store = store.clone();
+        let queue_retry_store = store.clone();
+        let queue_quarantine_store = store.clone();
+        let queue_maint_store = store.clone();
+        let cache_store = store.clone();
+        let cache_inflight_store = store.clone();
+        let write_store = store.clone();
+        let beat = heartbeat.clone();
+        let beat_age = heartbeat.clone();
+        let clock_now = clock.clone();
+        RuntimeProbes::new()
+            .with_check("storage_write", move || write_store.check_write())
+            .with_check("worker_progress", move || {
+                beat.is_fresh(std::time::Duration::from_secs(30))
+            })
+            .with_check(
+                "durable_pool",
+                writable_directory_check(cfg.durable_dir_resolved()),
+            )
+            .with_check(
+                "cache_pool",
+                writable_directory_check(cfg.cache_dir_resolved()),
+            )
+            .with_gauge("queue_backlog", move || {
+                queue_store
+                    .all_jobs()
+                    .map(|jobs| {
+                        jobs.iter().filter(|job| !job.state.is_terminal()).count() as u64
+                    })
+                    .unwrap_or(0)
+            })
+            .with_gauge("queue_oldest_age_ms", move || {
+                let now = clock_now.now_ms();
+                queue_age_store
+                    .all_jobs()
+                    .map(|jobs| {
+                        jobs.iter()
+                            .filter(|job| !job.state.is_terminal())
+                            .map(|job| now.saturating_sub(job.created_at_ms))
+                            .max()
+                            .unwrap_or(0)
+                    })
+                    .unwrap_or(0)
+            })
+            .with_gauge("queue_retried", move || {
+                queue_retry_store
+                    .all_jobs()
+                    .map(|jobs| {
+                        jobs.iter().filter(|job| job.attempts > 0).count() as u64
+                    })
+                    .unwrap_or(0)
+            })
+            .with_gauge("queue_quarantined", move || {
+                queue_quarantine_store
+                    .all_jobs()
+                    .map(|jobs| {
+                        jobs.iter()
+                            .filter(|job| {
+                                job.state == birchtree::domain::JobState::Quarantined
+                            })
+                            .count() as u64
+                    })
+                    .unwrap_or(0)
+            })
+            .with_gauge("queue_maintenance_pending", move || {
+                queue_maint_store
+                    .all_jobs()
+                    .map(|jobs| {
+                        jobs.iter()
+                            .filter(|job| {
+                                !job.state.is_terminal()
+                                    && matches!(
+                                        job.kind,
+                                        birchtree::domain::JobKind::CacheEvict
+                                            | birchtree::domain::JobKind::ReconcileStorage
+                                    )
+                            })
+                            .count() as u64
+                    })
+                    .unwrap_or(0)
+            })
+            .with_gauge("cache_stored_bytes", move || {
+                use birchtree::application::ports::CacheStore;
+                cache_store
+                    .cache_accounting()
+                    .map(|usage| usage.stored_total)
+                    .unwrap_or(0)
+            })
+            .with_gauge("cache_inflight_bytes", move || {
+                use birchtree::application::ports::CacheStore;
+                cache_inflight_store
+                    .cache_accounting()
+                    .map(|usage| usage.inflight_total)
+                    .unwrap_or(0)
+            })
+            .with_gauge("media_job_latency_ms", || {
+                birchtree::jobs::worker::last_media_job_latency_ms()
+            })
+            .with_gauge("worker_heartbeat_age_ms", move || beat_age.age_ms())
+    };
+    let app = build_router_with_probes(state, probes);
     // Outbound mail: real SMTP delivery through the worker when configured,
     // the explicit logging adapter otherwise (registration jobs then log
     // instead of sending; resend endpoints answer 503).
@@ -599,6 +823,9 @@ async fn serve(cfg: Config) {
         },
         push_subject: cfg.normalized_public_url(),
         transcode,
+        maintenance: maint,
+        heartbeat: heartbeat.clone(),
+        reset_token_ttl_ms: cfg.password_reset_ttl_hours * 3_600_000,
     };
     let worker = tokio::spawn(jobs::worker::run(
         store.clone(),
@@ -663,6 +890,11 @@ async fn main() {
         eprintln!("configuration error: {err}");
         std::process::exit(1);
     }
+    if let Err(err) = cfg.check_runtime_mode() {
+        eprintln!("configuration error: {err}");
+        std::process::exit(2);
+    }
+    tracing::info!(summary = ?cfg.startup_summary(), "startup configuration");
 
     match args.positional.first().map(String::as_str) {
         Some("create-account") => run_create_account(&cfg, &args),

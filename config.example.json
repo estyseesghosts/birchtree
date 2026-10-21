@@ -1,4 +1,6 @@
 {
+  "mode": "production",
+  "trusted_proxies": [],
   "public_url": "https://example.social",
   "data_dir": "./data",
   "listen": "0.0.0.0:3000",
@@ -7,5 +9,6 @@
   "registration_open": true,
   "search_mode": "embedded",
   "smtp_url": "env:BIRCHTREE_SMTP_URL",
-  "mail_from": "noreply@example.social"
+  "mail_from": "noreply@example.social",
+  "secret_keyring_file": "/etc/birchtree/keyring"
 }
