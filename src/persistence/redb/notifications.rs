@@ -60,6 +60,7 @@ fn create_notification_txn(
         filtered: input.filtered,
         created_at_ms: input.created_at_ms,
     };
+    super::statuses::ensure_id_unused(write, NOTIFICATIONS, id)?;
     {
         let mut notifications = write.open_table(NOTIFICATIONS)?;
         notifications.insert(id.value(), encode(&notification)?.as_slice())?;

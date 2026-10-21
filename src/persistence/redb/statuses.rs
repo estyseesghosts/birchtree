@@ -54,6 +54,102 @@ struct PinRecord {
     pinned_at_ms: u64,
 }
 
+/// Tables keyed by a generated row ID (`u64`, raw, not flipped), scanned to
+/// seed the ID generator above everything persisted.
+const GENERATED_ID_TABLES: &[redb::TableDefinition<'static, u64, &'static [u8]>] = &[
+    schema::ACCOUNTS,
+    schema::JOBS,
+    schema::STATUSES,
+    schema::ANNOUNCEMENTS,
+    schema::ANNOUNCEMENT_REACTIONS,
+    schema::POLLS,
+    schema::QUOTES,
+    schema::NOTIFICATIONS,
+    schema::NOTIFICATION_REQUESTS,
+    schema::MEDIA,
+    schema::PUSH_SUBSCRIPTIONS,
+    schema::LISTS,
+    schema::FILTERS,
+    schema::FILTER_KEYWORDS,
+    schema::FILTER_STATUSES,
+    schema::SCHEDULED_STATUSES,
+    schema::REPORTS,
+    schema::ADMIN_AUDIT,
+    schema::RULES,
+    schema::ACCOUNT_WARNINGS,
+    schema::SIGN_INS,
+    schema::INTERACTION_EVENTS,
+    schema::ADMIN_DOMAIN_ALLOWS,
+    schema::ADMIN_DOMAIN_BLOCKS,
+    schema::ADMIN_EMAIL_DOMAIN_BLOCKS,
+    schema::ADMIN_IP_BLOCKS,
+    schema::ADMIN_CANONICAL_EMAIL_BLOCKS,
+    schema::ADMIN_TAGS,
+    schema::TREND_LINKS,
+    schema::TREND_PUBLISHERS,
+    schema::ANNUAL_REPORTS,
+    schema::COLLECTIONS,
+];
+
+impl RedbStore {
+    /// Whether a write transaction can be opened (and rolled back) now.
+    ///
+    /// Readiness uses this to prove write capability without changing data.
+    /// It waits for any in-flight writer, so callers run it off the async
+    /// threads under a deadline.
+    pub fn can_write(&self) -> bool {
+        match self.db.begin_write() {
+            Ok(write) => write.abort().is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// The highest generated row ID persisted in any ID-keyed primary table
+    /// (zero for an empty database). Startup passes it to
+    /// [`IdGenerator::observe`](crate::domain::IdGenerator::observe) before
+    /// serving, so a restart, clock rollback or restored backup cannot mint an
+    /// ID at or below an existing row.
+    pub fn highest_persisted_id(&self) -> StoreResult<Id> {
+        use redb::ReadableDatabase;
+
+        let read = self.db.begin_read()?;
+        let mut highest: u64 = 0;
+        for definition in GENERATED_ID_TABLES {
+            let table = match read.open_table(*definition) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => continue,
+                Err(err) => return Err(err.into()),
+            };
+            if let Some(entry) = table.last()? {
+                highest = highest.max(entry.0.value());
+            }
+        }
+        Ok(Id::new(highest))
+    }
+}
+
+/// Refuse to create a row whose generated ID already exists in `definition`.
+///
+/// Primary-record creates call this before inserting so an ID collision
+/// (restored backup, rolled-back clock, bug) fails loudly with a storage
+/// error instead of silently replacing an existing row. Upserts of rows that must
+/// already exist do not use it.
+pub(super) fn ensure_id_unused(
+    write: &WriteTransaction,
+    definition: redb::TableDefinition<'static, u64, &'static [u8]>,
+    id: Id,
+) -> StoreResult<()> {
+    let table = write.open_table(definition)?;
+    if table.get(id.value())?.is_some() {
+        let collision = std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("duplicate generated id {id}"),
+        );
+        return Err(collision.into());
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Shared transaction helpers (used by other persistence modules).
 // ---------------------------------------------------------------------------
@@ -520,6 +616,7 @@ impl StatusStore for RedbStore {
             favourites_count: 0,
             quotes_count: 0,
         };
+        ensure_id_unused(&write, STATUSES, status_id)?;
         write_status_txn(&write, &status)?;
         super::federation_content::federation_event_txn(&write, self.next_id(), input.account_id, serde_json::json!({"event": "create", "status_id": status_id.value()}), now_ms)?;
         // Phase 7.2: incremental search indexing rides the same commit.
@@ -1521,6 +1618,7 @@ impl StatusStore for RedbStore {
             favourites_count: 0,
             quotes_count: 0,
         };
+        ensure_id_unused(&write, STATUSES, reblog_id)?;
         write_status_txn(&write, &reblog)?;
         {
             let mut table = write.open_table(STATUS_REBLOG_INDEX)?;

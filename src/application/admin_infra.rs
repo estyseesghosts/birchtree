@@ -204,25 +204,35 @@ pub fn is_sign_up_blocked(blocks: &[crate::domain::AdminIpBlock], client_ip: IpA
     })
 }
 
-/// Extract the client IP behind trusted proxies (Phase 1 rule): when the
-/// peer is a configured trusted proxy, the leftmost `X-Forwarded-For`
-/// entry wins; otherwise the peer address is the client IP.
+/// Extract the client IP behind trusted proxies: the same single chain rule
+/// as [`crate::api::mastodon::rate_limits::resolve_client_ip`] (reimplemented
+/// here because the application layer must not depend on the HTTP adapter).
+/// The chain is the `X-Forwarded-For` entries (in order) followed by the peer.
+/// When the peer is not a trusted proxy the header is ignored; otherwise the
+/// chain is walked from the right, skipping trusted hops, and the first
+/// untrusted hop is the client. An unparsable entry ends the walk at the last
+/// verified hop, so garbage can never select an arbitrary identity.
 pub fn client_ip(
     forwarded_for: Option<&str>,
     peer: Option<IpAddr>,
     trusted_proxies: &[IpAddr],
 ) -> Option<IpAddr> {
     let peer = peer?;
-    if trusted_proxies.contains(&peer) {
-        if let Some(header) = forwarded_for {
-            if let Some(first) = header.split(',').next() {
-                if let Ok(ip) = first.trim().parse::<IpAddr>() {
-                    return Some(ip);
-                }
-            }
+    let mut current: IpAddr = peer;
+    if !trusted_proxies.contains(&current) {
+        return Some(current);
+    }
+    let header = forwarded_for.unwrap_or("");
+    for entry in header.split(',').rev() {
+        if !trusted_proxies.contains(&current) {
+            break;
+        }
+        match entry.trim().parse::<IpAddr>() {
+            Ok(hop) => current = hop,
+            Err(_) => break,
         }
     }
-    Some(peer)
+    Some(current)
 }
 
 /// Mint a row id through the caller's id generator.
@@ -278,5 +288,18 @@ mod tests {
             client_ip(Some("203.0.113.7"), Some(stranger), &[proxy]),
             Some(stranger)
         );
+        // A forged leading entry cannot override the verified hop: the walk
+        // goes right-to-left, skipping trusted proxies.
+        let inner: IpAddr = "10.0.0.2".parse().unwrap();
+        assert_eq!(
+            client_ip(
+                Some("9.9.9.9, 198.51.100.7, 10.0.0.1"),
+                Some(inner),
+                &[inner, proxy]
+            ),
+            Some("198.51.100.7".parse().unwrap())
+        );
+        // Garbage stops the walk at the last verified hop.
+        assert_eq!(client_ip(Some("not-an-ip"), Some(proxy), &[proxy]), Some(proxy));
     }
 }

@@ -153,7 +153,24 @@ pub struct SystemClock;
 pub trait IdGenerator: Send + Sync + 'static {
     /// Generate the next strictly-increasing ID.
     fn generate(&self) -> Id;
+
+    /// Raise the generator's floor so every later ID is above `persisted`.
+    ///
+    /// Startup calls this with the highest ID found in storage. It returns
+    /// how many milliseconds `persisted` is ahead of the wall clock (zero when
+    /// the clock is ahead), so the caller can warn about a restored database
+    /// or a clock rollback. The default does nothing and reports zero.
+    fn observe(&self, persisted: Id) -> u64 {
+        let _ = persisted;
+        0
+    }
 }
+
+/// Skew (persisted IDs ahead of the wall clock) at or above which startup
+/// should log a warning: a restored backup or a rolled-back clock. Below the
+/// threshold the skew is still reported by [`IdGenerator::observe`] but is
+/// ordinary restart jitter, not worth paging an operator.
+pub const SKEW_WARN_THRESHOLD_MS: u64 = 60_000;
 
 /// Timestamp-oriented ID generator matching Mastodon's snowflake shape.
 ///
@@ -161,6 +178,21 @@ pub trait IdGenerator: Send + Sync + 'static {
 /// incremented; when it would overflow (or the clock goes backwards) the
 /// effective timestamp is advanced instead. This guarantees that numeric
 /// ordering equals insertion order, which the cursor/pagination rules rely on.
+///
+/// # Restart, rollback and restore behaviour (single-node model)
+///
+/// The last issued ID lives in process memory, so startup must call
+/// [`IdGenerator::observe`] with the highest persisted ID before the first
+/// [`IdGenerator::generate`]. After that:
+///
+/// - A restart inside the same millisecond continues above the persisted ID.
+/// - A backward clock jump never produces a smaller ID; the generator keeps
+///   counting from its last value until the clock catches up.
+/// - A database restored with IDs ahead of the wall clock keeps issuing IDs
+///   above them (their embedded timestamps run ahead of the clock until it
+///   catches up); [`IdGenerator::observe`] reports the skew for logging.
+///
+/// Running two processes on one database is unsupported.
 pub struct TimestampIdGenerator {
     clock: Box<dyn Clock>,
     last: Mutex<u64>,
@@ -173,6 +205,13 @@ impl TimestampIdGenerator {
             clock,
             last: Mutex::new(0),
         }
+    }
+
+    /// Build a generator whose first ID is above `persisted`.
+    pub fn new_seeded(clock: Box<dyn Clock>, persisted: Id) -> Self {
+        let generator = Self::new(clock);
+        generator.observe(persisted);
+        generator
     }
 }
 
@@ -188,11 +227,18 @@ impl IdGenerator for TimestampIdGenerator {
             // Same (or earlier) millisecond: continue the sequence. If the
             // sequence is exhausted, this naturally rolls into the next
             // timestamp, keeping IDs strictly increasing.
-            *last + 1
+            last.checked_add(1)
+                .expect("id space exhausted: the last ID is u64::MAX")
         };
 
         *last = candidate;
         Id::new(candidate)
+    }
+
+    fn observe(&self, persisted: Id) -> u64 {
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        *last = (*last).max(persisted.value());
+        persisted.timestamp_ms().saturating_sub(self.clock.now_ms())
     }
 }
 
@@ -283,6 +329,62 @@ mod tests {
         clock.set(1_500);
         let c = generator.generate();
         assert!(c > b);
+    }
+
+    #[test]
+    fn restart_in_same_millisecond_continues_above_persisted() {
+        let clock = TestClock::new(5_000);
+        let first = TimestampIdGenerator::new(Box::new(clock.clone()));
+        let mut highest = first.generate();
+        for _ in 0..5 {
+            highest = first.generate();
+        }
+        // A "restarted" process: new generator, same millisecond.
+        let restarted = TimestampIdGenerator::new_seeded(Box::new(clock), highest);
+        assert!(restarted.generate() > highest);
+    }
+
+    #[test]
+    fn restored_database_ahead_of_clock_keeps_ids_increasing() {
+        let clock = TestClock::new(1_000);
+        let generator = TimestampIdGenerator::new(Box::new(clock));
+        let persisted = Id::from_parts(9_000, 3);
+        let skew_ms = generator.observe(persisted);
+        assert_eq!(skew_ms, 8_000);
+        let next = generator.generate();
+        assert!(next > persisted, "{next} !> {persisted}");
+        assert!(generator.generate() > next);
+    }
+
+    #[test]
+    fn observe_never_lowers_the_floor() {
+        let clock = TestClock::new(2_000);
+        let generator = TimestampIdGenerator::new(Box::new(clock));
+        let high = generator.generate();
+        assert_eq!(generator.observe(Id::new(1)), 0);
+        assert!(generator.generate() > high);
+    }
+
+    #[test]
+    fn concurrent_generation_is_unique_and_increasing_per_thread() {
+        let clock = TestClock::new(3_000);
+        let generator = std::sync::Arc::new(TimestampIdGenerator::new(Box::new(clock)));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let generator = generator.clone();
+            handles.push(std::thread::spawn(move || {
+                (0..1_000).map(|_| generator.generate()).collect::<Vec<Id>>()
+            }));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for handle in handles {
+            let ids: Vec<Id> = handle.join().expect("worker thread");
+            assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+            for id in ids {
+                assert!(seen.insert(id), "duplicate id {id}");
+            }
+        }
+        assert_eq!(seen.len(), 8_000);
     }
 
     #[test]

@@ -62,6 +62,7 @@ pub(super) fn insert_new_poll_txn(
         voters_count: 0,
         votes_count: 0,
     };
+    super::statuses::ensure_id_unused(write, POLLS, poll_id)?;
     {
         let mut polls = write.open_table(POLLS)?;
         polls.insert(poll_id.value(), encode(&poll)?.as_slice())?;

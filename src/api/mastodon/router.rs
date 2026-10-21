@@ -6,28 +6,41 @@
 
 use axum::Router;
 use axum::Extension;
-use axum::extract::{DefaultBodyLimit, State};
-use axum::http::StatusCode;
+use axum::extract::DefaultBodyLimit;
 use axum::response::Response;
 use axum::middleware;
 use axum::routing::{delete, get, patch, post, put};
 use tower_http::trace::TraceLayer;
 
+pub mod readiness;
+
 use super::{ApiState, endpoints, rate_limits};
+use readiness::RuntimeProbes;
 use crate::api::json_body;
 use crate::api::oauth::{authorization, token};
 
-/// Build the application router.
+/// Build the application router with no extra readiness probes (storage read
+/// only, as in tests and tools).
 pub fn build_router(state: ApiState) -> Router {
+    build_router_with_probes(state, RuntimeProbes::new())
+}
+
+/// Build the application router with the runtime's readiness checks and
+/// metric gauges (see [`readiness`]).
+pub fn build_router_with_probes(state: ApiState, probes: RuntimeProbes) -> Router {
     let max_body = state.max_body_size;
-    let rate_multiplier = state.rate_limit_multiplier;
+    let limits = rate_limits::RateLimitState::new(
+        state.trusted_proxies.clone(),
+        state.rate_limit_multiplier,
+    );
     let ip_block_state = state.clone();
     let invites = state.invites.clone();
     let mail_env = state.mail_env.clone();
     Router::new()
         // Runtime probes.
         .route("/health", get(health))
-        .route("/ready", get(ready))
+        .route("/ready", get(readiness::ready))
+        .route("/metrics", get(readiness::metrics))
         // OAuth (browser authorize flow + token/revoke).
         .route(
             "/oauth/authorize",
@@ -667,6 +680,8 @@ pub fn build_router(state: ApiState) -> Router {
         // Federation (Phase 6): WebFinger, NodeInfo, the actor document and the
         // inboxes. The crate's middleware sits on these routes only.
         .merge(crate::activitypub::http::routes::<ApiState>(state.federation.clone()))
+        .layer(Extension(probes))
+        .layer(Extension(limits.clone()))
         .layer(Extension(invites))
         .layer(Extension(mail_env))
         .with_state(state)
@@ -675,7 +690,7 @@ pub fn build_router(state: ApiState) -> Router {
         // runs first, as Rack::Attack does upstream.
         .layer(middleware::from_fn_with_state(ip_block_state, endpoints::admin_infra::ip_block_middleware))
         .layer(middleware::from_fn(json_body::guard))
-        .layer(middleware::from_fn_with_state(rate_multiplier, rate_limits::middleware))
+        .layer(middleware::from_fn_with_state(limits, rate_limits::middleware))
         .layer(middleware::from_fn(vary_authorization))
         .layer(DefaultBodyLimit::max(max_body))
         .layer(TraceLayer::new_for_http())
@@ -702,13 +717,4 @@ async fn vary_authorization(
 /// Liveness probe: the process is running.
 async fn health() -> &'static str {
     "ok"
-}
-
-/// Readiness probe: storage is open and can serve a read.
-async fn ready(State(state): State<ApiState>) -> (StatusCode, &'static str) {
-    if state.context.store.is_ready() {
-        (StatusCode::OK, "ready")
-    } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "not ready")
-    }
 }

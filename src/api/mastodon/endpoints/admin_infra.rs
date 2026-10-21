@@ -579,15 +579,22 @@ pub async fn email_domain_blocks_destroy(State(state): State<ApiState>, auth: Au
 // IP blocks (+ request-path enforcement).
 // ---------------------------------------------------------------------------
 
-/// The client IP for this request under the trusted-proxy config (Phase 1
-/// rule): when the peer is a configured trusted proxy, the leftmost
-/// `X-Forwarded-For` entry wins; otherwise the peer address is the client IP.
-pub fn request_client_ip(headers: &HeaderMap, peer: Option<IpAddr>, trusted_proxies: &[IpAddr]) -> Option<IpAddr> {
-    let forwarded = headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-        .map(|item| item.to_string());
-    use_cases::client_ip(forwarded.as_deref(), peer, trusted_proxies)
+/// The client IP for this request under the trusted-proxy config: the single
+/// chain rule in [`crate::api::mastodon::rate_limits::resolve_client_ip`]
+/// (all `X-Forwarded-For` lines in order, then the peer; right-to-left walk
+/// skipping trusted proxies, headers ignored for untrusted peers).
+pub fn request_client_ip(
+    headers: &HeaderMap,
+    peer: Option<IpAddr>,
+    trusted_proxies: &[IpAddr],
+) -> Option<IpAddr> {
+    let mut forwarded: Vec<&str> = Vec::new();
+    for value in headers.get_all("x-forwarded-for") {
+        if let Ok(text) = value.to_str() {
+            forwarded.push(text);
+        }
+    }
+    crate::api::mastodon::rate_limits::resolve_client_ip(peer, &forwarded, trusted_proxies)
 }
 
 /// Axum middleware enforcing `no_access` IP blocks: a request whose client IP
