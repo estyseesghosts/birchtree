@@ -475,11 +475,21 @@ pub trait JobQueue: Send + Sync {
     fn claim_due(&self, now_ms: u64, limit: usize) -> Result<Vec<Job>>;
     /// Delete up to `limit` `Succeeded` jobs whose `due_at_ms` is older than
     /// `older_than_ms`, returning how many rows were removed. Only
-    /// `Succeeded` rows are eligible: `Pending`/`Leased` rows are live work
-    /// and `Quarantined` rows are the operator inspection surface, so both
-    /// are never touched. `complete()` keeps the row `Succeeded` (callers
-    /// prune separately through this method).
+    /// `Succeeded` rows are eligible: `Pending`/`Leased` rows are live work;
+    /// `Quarantined` rows age out separately through `prune_quarantined`.
+    /// `complete()` keeps the row `Succeeded` (callers prune separately
+    /// through this method).
     fn prune_succeeded(&self, older_than_ms: u64, limit: usize) -> Result<u64>;
+    /// Delete up to `limit` `Quarantined` jobs whose `due_at_ms` is older
+    /// than `older_than_ms`, returning how many rows were removed. Only
+    /// `Quarantined` rows are eligible: `Pending`/`Leased` rows are live
+    /// work and `Succeeded` rows age out separately through
+    /// `prune_succeeded`. Oldest first, so a capped pass always reaps the
+    /// stalest rows. Quarantine is the operator inspection surface with a
+    /// long retention (see `jobs::worker::QUARANTINE_RETENTION_MS`); prune is
+    /// delete-only (no archive export — the row's `last_error` and redacted
+    /// payload are the diagnostics).
+    fn prune_quarantined(&self, older_than_ms: u64, limit: usize) -> Result<u64>;
     fn complete(&self, id: Id) -> Result<()>;
     /// Record a failed attempt; schedules a retry or quarantines.
     fn retry(&self, id: Id, error: &str, now_ms: u64) -> Result<Job>;

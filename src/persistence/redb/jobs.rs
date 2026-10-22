@@ -8,11 +8,11 @@
 use redb::{ReadableTable, WriteTransaction};
 
 use crate::application::ports::JobQueue;
-use crate::domain::job::{backoff_ms, LEASE_MS};
+use crate::domain::job::{LEASE_MS, backoff_ms};
 use crate::domain::{Error, Id, Job, JobKind, JobState, Result};
 
 use super::schema::{self, JOBS, JOBS_INDEX};
-use super::{decode, encode, RedbStore, StoreResult};
+use super::{RedbStore, StoreResult, decode, encode};
 
 /// Insert a job and its scheduling index entry into an existing transaction.
 ///
@@ -63,6 +63,48 @@ fn add_index(write: &WriteTransaction, timestamp_ms: u64, id: Id) -> StoreResult
 }
 
 impl RedbStore {
+    /// Shared enqueue path with the untrusted-input bound enforced: a
+    /// payload whose serialized JSON exceeds
+    /// `jobs::worker::QUARANTINE_MAX_PAYLOAD_BYTES` is never stored.
+    /// Instead the row is quarantined on insert with a recorded reason and a
+    /// bounded marker payload (no scheduling-index entry — quarantined rows
+    /// hold none — so the job can never run).
+    fn enqueue_inner(
+        &self,
+        kind: JobKind,
+        payload: serde_json::Value,
+        due_at_ms: u64,
+        now_ms: u64,
+    ) -> Result<Job> {
+        let bytes: usize = serde_json::to_vec(&payload).map(|body| body.len()).unwrap_or(0);
+        let write = self.begin_write()?;
+        if bytes > crate::jobs::worker::QUARANTINE_MAX_PAYLOAD_BYTES {
+            let mut job = Job::new(
+                self.next_id(),
+                kind,
+                serde_json::json!({
+                    "truncated": true,
+                    "bytes": bytes,
+                    "kept_bytes": 0,
+                }),
+                due_at_ms,
+                now_ms,
+            );
+            job.state = JobState::Quarantined;
+            job.last_error = Some(format!(
+                "job payload exceeded {} bytes ({bytes}); stored truncated marker, job quarantined at enqueue",
+                crate::jobs::worker::QUARANTINE_MAX_PAYLOAD_BYTES
+            ));
+            store_job(&write, &job)?;
+            write.commit()?;
+            return Ok(job);
+        }
+        let job = Job::new(self.next_id(), kind, payload, due_at_ms, now_ms);
+        insert_job(&write, &job)?;
+        write.commit()?;
+        Ok(job)
+    }
+
     /// All job records (diagnostics and tests).
     pub fn all_jobs(&self) -> Result<Vec<Job>> {
         let read = self.begin_read()?;
@@ -113,11 +155,7 @@ impl RedbStore {
 
 impl JobQueue for RedbStore {
     fn enqueue(&self, kind: JobKind, payload: serde_json::Value, now_ms: u64) -> Result<Job> {
-        let job = Job::new(self.next_id(), kind, payload, now_ms, now_ms);
-        let write = self.begin_write()?;
-        insert_job(&write, &job)?;
-        write.commit()?;
-        Ok(job)
+        self.enqueue_inner(kind, payload, now_ms, now_ms)
     }
 
     fn enqueue_at(
@@ -127,11 +165,7 @@ impl JobQueue for RedbStore {
         due_at_ms: u64,
         now_ms: u64,
     ) -> Result<Job> {
-        let job = Job::new(self.next_id(), kind, payload, due_at_ms, now_ms);
-        let write = self.begin_write()?;
-        insert_job(&write, &job)?;
-        write.commit()?;
-        Ok(job)
+        self.enqueue_inner(kind, payload, due_at_ms, now_ms)
     }
 
     fn claim_due(&self, now_ms: u64, limit: usize) -> Result<Vec<Job>> {
@@ -190,7 +224,7 @@ impl JobQueue for RedbStore {
         // Collect the victims first, then delete them in the same write
         // transaction: one `redb` txn per mutation, no network I/O inside.
         // Only `Succeeded` rows qualify; `Pending`/`Leased` rows are live
-        // work and `Quarantined` rows stay for operator inspection.
+        // work and `Quarantined` rows age out through `prune_quarantined`.
         let mut victims: Vec<(u64, Id)> = Vec::new();
         {
             let write = self.begin_write()?;
@@ -216,6 +250,43 @@ impl JobQueue for RedbStore {
             // `Succeeded` rows hold no scheduling-index entries
             // (`complete` removed them at settlement), so there is nothing
             // to unindex here.
+            write.commit()?;
+        }
+        Ok(victims.len() as u64)
+    }
+
+    fn prune_quarantined(&self, older_than_ms: u64, limit: usize) -> Result<u64> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        // Mirror of `prune_succeeded` for the operator inspection surface:
+        // only `Quarantined` rows qualify. Quarantined rows hold no
+        // scheduling-index entries (`quarantine`/`retry` removed them at
+        // settlement), so only the `JOBS` table entry is deleted. Prune is
+        // delete-only: the row's `last_error` and redacted payload were the
+        // diagnostics, and they age out with the row.
+        let mut victims: Vec<(u64, Id)> = Vec::new();
+        {
+            let write = self.begin_write()?;
+            {
+                let jobs = write.open_table(JOBS)?;
+                for entry in jobs.iter()? {
+                    let (_key, value) = entry?;
+                    let job: Job = decode(value.value())?;
+                    if job.state == JobState::Quarantined && job.due_at_ms < older_than_ms {
+                        victims.push((job.due_at_ms, job.id));
+                    }
+                }
+            }
+            // Oldest first so a capped pass always reaps the stalest rows.
+            victims.sort();
+            victims.truncate(limit);
+            {
+                let mut jobs = write.open_table(JOBS)?;
+                for (_due_at_ms, id) in &victims {
+                    jobs.remove(id.value())?;
+                }
+            }
             write.commit()?;
         }
         Ok(victims.len() as u64)

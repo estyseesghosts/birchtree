@@ -69,8 +69,7 @@ pub const REBLOGS_BY_ACCOUNT: TableDefinition<&[u8], u64> =
     TableDefinition::new("reblogs_by_account");
 
 /// Edit-history snapshots: 16-byte `(status_id_be || version_be)` -> JSON snapshot.
-pub const STATUS_VERSIONS: TableDefinition<&[u8], &[u8]> =
-    TableDefinition::new("status_versions");
+pub const STATUS_VERSIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("status_versions");
 
 /// Pinned statuses per account: 16-byte `(account_id_be || status_id_be)` -> JSON pin.
 pub const STATUS_PINS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("status_pins");
@@ -120,8 +119,7 @@ pub const MUTES_BY_MUTED: TableDefinition<&[u8], ()> = TableDefinition::new("mut
 /// Dismissed follow suggestions: `(viewer_id_be || target_id_be)` ->
 /// `created_at_ms` (upstream `follow_recommendation_mutes`, fix round P1/S1).
 /// One row per dismissal; no counters or jobs attach to the write.
-pub const SUGGESTION_MUTES: TableDefinition<&[u8], u64> =
-    TableDefinition::new("suggestion_mutes");
+pub const SUGGESTION_MUTES: TableDefinition<&[u8], u64> = TableDefinition::new("suggestion_mutes");
 
 /// Announcements (fix round P1/S2): id -> JSON `AnnouncementRecord`.
 pub const ANNOUNCEMENTS: TableDefinition<u64, &[u8]> = TableDefinition::new("announcements");
@@ -300,7 +298,8 @@ pub const MARKERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("markers
 pub const FILTERS: TableDefinition<u64, &[u8]> = TableDefinition::new("filters");
 
 /// Filters owned by an account: `(account_id_be || filter_id_be)` -> ().
-pub const FILTERS_BY_ACCOUNT: TableDefinition<&[u8], ()> = TableDefinition::new("filters_by_account");
+pub const FILTERS_BY_ACCOUNT: TableDefinition<&[u8], ()> =
+    TableDefinition::new("filters_by_account");
 
 /// Filter keywords by numeric keyword ID.
 pub const FILTER_KEYWORDS: TableDefinition<u64, &[u8]> = TableDefinition::new("filter_keywords");
@@ -372,7 +371,8 @@ pub const REPORTS: TableDefinition<u64, &[u8]> = TableDefinition::new("reports")
 pub const ADMIN_AUDIT: TableDefinition<u64, &[u8]> = TableDefinition::new("admin_audit");
 
 /// The remote URL of a media attachment fetched from another server, by media ID.
-pub const REMOTE_MEDIA_SOURCE: TableDefinition<u64, &str> = TableDefinition::new("remote_media_source");
+pub const REMOTE_MEDIA_SOURCE: TableDefinition<u64, &str> =
+    TableDefinition::new("remote_media_source");
 
 // ---------------------------------------------------------------------------
 // Phase 6 (schema v10): remote tombstones (the Delete-beats-Create race) and
@@ -388,6 +388,14 @@ pub const REMOTE_TOMBSTONE: TableDefinition<&str, u64> = TableDefinition::new("r
 /// consecutive failures and the cooldown the next attempt must wait out.
 pub const DELIVERY_DEST: TableDefinition<&str, &[u8]> = TableDefinition::new("delivery_dest");
 
+/// Per-destination-host delivery sequence counter (`host -> next sequence`):
+/// every `DeliverActivity` (and `RelayForward`) enqueue mints the next
+/// monotonic number for its destination host, stamped into the payload as
+/// `seq`. The send path parks a job while an earlier sequence for the same
+/// host is still unfinished, so `Follow`/`Undo` (and `Create`/`Delete`)
+/// pairs to one inbox cannot go out on the wire (schema v23).
+pub const DELIVERY_SEQ: TableDefinition<&str, u64> = TableDefinition::new("delivery_seq");
+
 // ---------------------------------------------------------------------------
 // Phase 7.3 (schema v11): server rules, account warnings, sign-in telemetry
 // (D37 rules/warnings, D39 `active_users`).
@@ -397,8 +405,7 @@ pub const DELIVERY_DEST: TableDefinition<&str, &[u8]> = TableDefinition::new("de
 pub const RULES: TableDefinition<u64, &[u8]> = TableDefinition::new("rules");
 
 /// Account warnings (strikes) by warning id -> JSON `AccountWarning` (D37).
-pub const ACCOUNT_WARNINGS: TableDefinition<u64, &[u8]> =
-    TableDefinition::new("account_warnings");
+pub const ACCOUNT_WARNINGS: TableDefinition<u64, &[u8]> = TableDefinition::new("account_warnings");
 
 /// Password sign-in events by event id -> JSON `SignInEvent` (D39
 /// `active_users` telemetry; one row per completed browser password login).
@@ -486,8 +493,7 @@ pub const ADMIN_TAG_BY_NAME: TableDefinition<&str, u64> = TableDefinition::new("
 // ---------------------------------------------------------------------------
 
 /// Trend tag approval flags by normalized tag name -> JSON `TrendTagFlag`.
-pub const TREND_TAG_FLAGS: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("trend_tag_flags");
+pub const TREND_TAG_FLAGS: TableDefinition<&str, &[u8]> = TableDefinition::new("trend_tag_flags");
 
 /// Trend status approval flags by status ID -> JSON `TrendStatusFlag`.
 /// Absence of a row means pending review.
@@ -503,8 +509,7 @@ pub const TREND_LINKS_BY_URL: TableDefinition<&str, u64> =
 
 /// Trend publishers (preview-card providers) by numeric row ID -> JSON
 /// `TrendPublisher`.
-pub const TREND_PUBLISHERS: TableDefinition<u64, &[u8]> =
-    TableDefinition::new("trend_publishers");
+pub const TREND_PUBLISHERS: TableDefinition<u64, &[u8]> = TableDefinition::new("trend_publishers");
 
 /// Trend publisher ID by lowercased host -> row ID (upsert index).
 pub const TREND_PUBLISHERS_BY_DOMAIN: TableDefinition<&str, u64> =
@@ -571,8 +576,7 @@ pub const REMOTE_CACHE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("re
 /// Cache accounting singleton table: `"total"` / `"class:<name>"` /
 /// `"in_flight"` -> JSON byte counters. One `redb` transaction updates the
 /// counters with the mapping change they describe.
-pub const CACHE_ACCOUNTING: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("cache_accounting");
+pub const CACHE_ACCOUNTING: TableDefinition<&str, &[u8]> = TableDefinition::new("cache_accounting");
 
 /// Key for [`REMOTE_CACHE`]: `source_url_utf8 || 0xFF || variant_utf8`.
 /// `0xFF` cannot appear in a URL or in the closed variant set, so the
@@ -686,7 +690,7 @@ pub fn rule_translation_key(rule_id: u64, locale: &str) -> String {
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// Current schema version. Bump with a new migration step.
-pub const SCHEMA_VERSION: u64 = 22;
+pub const SCHEMA_VERSION: u64 = 23;
 
 /// All table names, for diagnostics and migration verification.
 pub const TABLE_NAMES: &[&str] = &[
@@ -705,6 +709,7 @@ pub const TABLE_NAMES: &[&str] = &[
     "remote_refresh",
     "remote_tombstone",
     "delivery_dest",
+    "delivery_seq",
     "reports",
     "rules",
     "rule_translations",

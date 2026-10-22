@@ -25,10 +25,12 @@
 //! `Create`/`Delete` and `Announce`/`Undo Announce` in arrival order per
 //! sender. Each destination is its own job and the worker executes a claimed
 //! batch concurrently, so two jobs for the same inbox would race on the wire
-//! without per-destination serialization. [`run`] therefore holds the
-//! per-host lock ([`destination_lock`]) across the cooldown check and the
-//! send: same-host deliveries never interleave, while different hosts proceed
-//! in parallel and global concurrency is kept.
+//! without per-destination sequencing. Every delivery payload carries its
+//! destination host's monotonic `seq` (minted at enqueue), and [`run`]
+//! parks sequence N+1 while N is still unfinished — so same-host deliveries
+//! go out in plan order while different hosts proceed in parallel. The
+//! per-host lock serializes the check-and-send; the sequence makes it FIFO,
+//! across restarts too (the counter is durable).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -55,6 +57,13 @@ pub const DEST_COOLDOWN_CAP_MS: u64 = 3_600_000;
 pub const DEST_FAILURE_BUDGET: u32 = 10;
 /// Times a job may be parked for a cooling destination before quarantine.
 pub const DEST_MAX_DEFERRALS: u32 = 25;
+/// Delay before a sequence-parked delivery is retried: long enough to let a
+/// just-finished earlier send settle, short enough that a genuinely slow
+/// earlier send only costs a few park cycles. Parking never consumes the
+/// job's retry budget and never quarantines: the blocker always settles
+/// terminally (success, quarantine, or retry-budget exhaustion), so a parked
+/// job always makes progress.
+pub const SEQ_PARK_DELAY_MS: u64 = 5_000;
 
 /// The cooldown after `failures` consecutive failures: the base, doubled per
 /// failure past the first, capped.
@@ -88,18 +97,22 @@ pub enum DeliveryError {
 // Per-destination ordering: the worker fans a claimed batch out concurrently,
 // so without serialization two jobs for the same inbox (a `Follow` and its
 // `Undo`, a `Create` and its `Delete`) could interleave on the wire and the
-// remote would apply them out of order. One async mutex per destination host
-// (see [`dest_host`]) serializes same-host sends; different hosts take
-// different locks, so global concurrency is kept.
+// remote would apply them out of order. Ordering is a durable per-host
+// sequence, not the lock:
 //
-// Ordering model: the worker spawns a claimed batch in claim order and each
-// task takes its host lock immediately, so same-host jobs normally execute in
-// claim order. That is best-effort, not a FIFO guarantee across worker
-// restarts: what makes it safe is that every payload is fixed at plan time,
-// so a retry resends identical bytes and the remote dedups by activity id.
-// Strict cross-restart sequencing would need plan-time sequence numbers in the
-// payload (out of scope: the queue schema is frozen to this change; see the
-// parent-owned `persistence/*`).
+// - every `DeliverActivity` (and `RelayForward`) enqueue mints the next
+//   monotonic number for its destination host into the payload as `seq`
+//   (see [`stamp_delivery_seq`]; the `DELIVERY_SEQ` table survives restarts,
+//   so order survives them too);
+// - [`run`] holds the per-host lock ([`destination_lock`]) and then refuses
+//   to send sequence N+1 while any earlier sequence for the same host is
+//   still `Pending` or `Leased`: the job parks (a deferred copy, no budget
+//   consumed) instead of jumping the queue. Terminal rows (`Succeeded`,
+//   `Quarantined`) never block — a permanently failed earlier send must not
+//   wedge its host (there is no operator-resend path that could revive it).
+//
+// The per-host mutex remains as the concurrency control (one send per host
+// at a time); the sequence is what makes the order FIFO.
 // ---------------------------------------------------------------------------
 
 /// Registry of per-destination-host serialization locks, keyed by
@@ -143,6 +156,28 @@ pub fn delivery_order_key(job: &Job) -> Option<(String, String)> {
     let host = Url::parse(inbox).ok().map(|url| dest_host(&url))?;
     let activity = job.payload.get("body")?.get("id")?.as_str()?.to_string();
     Some((host, activity))
+}
+
+/// Stamp a delivery payload with its destination's next monotonic sequence
+/// number (`seq`). Every `DeliverActivity` (and `RelayForward`) enqueue goes
+/// through here, so plan order and sequence order are identical: the counter
+/// mint and the job insert are one call apart at the plan site (or one
+/// transaction apart for in-transaction planning), and the worker never
+/// reorders on the wire (see the per-destination ordering note above).
+pub fn stamp_delivery_seq(
+    store: &dyn crate::application::ports::Store,
+    inbox: &str,
+    payload: serde_json::Value,
+) -> std::result::Result<serde_json::Value, String> {
+    let host = Url::parse(inbox)
+        .map(|url| dest_host(&url))
+        .unwrap_or_else(|_| inbox.to_lowercase());
+    let seq = store.delivery_seq_next(&host).map_err(|e| e.to_string())?;
+    let mut payload = payload;
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("seq".into(), Value::from(seq));
+    }
+    Ok(payload)
 }
 
 /// An outbound activity: the stored JSON, as sent. The crate needs its ID and
@@ -243,6 +278,42 @@ pub async fn run(config: &FederationConfig<FedContext>, job: &Job) -> Result<(),
     // interleave. Other hosts take other locks and proceed in parallel.
     let destination_guard_lock = destination_lock(&host);
     let _destination_guard = destination_guard_lock.lock().await;
+    // Per-destination FIFO gate: sequence N+1 for this host must not send
+    // while N is still unfinished (`Pending` or `Leased`). Park instead — a
+    // deferred copy due shortly, no retry budget consumed — so a `Follow`
+    // and its `Undo` can never go out on the wire even when the worker runs
+    // them concurrently or a restart reorders the claims. Terminal rows
+    // never block (see the ordering note above).
+    let seq = payload.get("seq").and_then(Value::as_u64).unwrap_or(0);
+    if store
+        .delivery_blocked_by(&host, seq)
+        .map_err(|e| DeliveryError::Retry(e.to_string()))?
+    {
+        let parks = payload.get("seq_parks").and_then(Value::as_u64).unwrap_or(0);
+        let mut parked = payload.clone();
+        if let Some(object) = parked.as_object_mut() {
+            object.insert("seq_parks".into(), Value::from(parks + 1));
+        }
+        store
+            .enqueue_at(
+                JobKind::DeliverActivity,
+                parked,
+                now.saturating_add(SEQ_PARK_DELAY_MS),
+                now,
+            )
+            .map_err(|e| DeliveryError::Retry(e.to_string()))?;
+        tracing::info!(
+            target: "birchtree::federation",
+            direction = "outbound",
+            inbox,
+            host = %host,
+            seq,
+            seq_parks = parks + 1,
+            outcome = "parked: earlier sequence unfinished",
+            "delivery deferred"
+        );
+        return Ok(());
+    }
     // A host inside its cooldown is not hit again: park this job as a
     // deferred copy due when the cooldown ends. The park does not consume
     // the job's retry budget; past the deferral cap the job quarantines.
@@ -437,17 +508,20 @@ pub fn plan_inbox_forward(
     }
     inboxes.truncate(FORWARD_MAX_DESTINATIONS);
     for inbox in &inboxes {
+        // Plan order is sequence order (see [`stamp_delivery_seq`]).
+        let payload = stamp_delivery_seq(
+            store,
+            inbox,
+            serde_json::json!({
+                "sender_id": author.id.value(),
+                "inbox": inbox,
+                "activity_uri": activity_uri,
+                "body": body,
+            }),
+        )
+        .map_err(|e| e.to_string())?;
         store
-            .enqueue(
-                JobKind::DeliverActivity,
-                serde_json::json!({
-                    "sender_id": author.id.value(),
-                    "inbox": inbox,
-                    "activity_uri": activity_uri,
-                    "body": body,
-                }),
-                now_ms,
-            )
+            .enqueue(JobKind::DeliverActivity, payload, now_ms)
             .map_err(|e| e.to_string())?;
     }
     Ok(inboxes.len())
@@ -509,6 +583,9 @@ pub async fn run_relay_forward(
             "inbox": relay,
             "activity_uri": activity_uri,
             "body": body,
+            // The relay host's sequence rides along from the `RelayForward`
+            // enqueue, so the send joins the same per-host FIFO.
+            "seq": job.payload.get("seq").cloned().unwrap_or(serde_json::Value::Null),
         }),
         state: job.state,
         due_at_ms: job.due_at_ms,

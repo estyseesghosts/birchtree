@@ -15,7 +15,7 @@ use tokio::task::JoinSet;
 
 use crate::activitypub::FedContext;
 use crate::application::ports::{BlobStore, MailSender, Store, StreamingSink};
-use crate::domain::{Clock, Id, Job, JobKind, JobState};
+use crate::domain::{Clock, JobKind};
 use crate::federation::delivery::{self, DeliveryError};
 use crate::federation::{events, media, preview, threads};
 use crate::media::cache_maintenance::CacheMaintenance;
@@ -82,29 +82,22 @@ pub fn job_pool(kind: JobKind) -> JobPool {
 }
 
 /// How long a `Succeeded` job row is kept before the maintenance pass may
-/// prune it (7 days in ms). `Quarantined` rows are never pruned: they are
-/// the operator inspection surface.
+/// prune it (7 days in ms). `Quarantined` rows age out separately through
+/// `prune_quarantined` (see [`QUARANTINE_RETENTION_MS`]).
 pub const SUCCEEDED_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 /// Maximum `Succeeded` rows removed per maintenance pass (bounded batch).
 pub const SUCCEEDED_PRUNE_BATCH: usize = 500;
-
-/// Cap on quarantined rows when the persistence layer enforces
-/// [`QuarantineRetention`]: beyond this many rows the oldest victims (see
-/// [`select_quarantine_victims`]) are exported (see
-/// [`export_quarantine_archive`]) and then deleted. Bounds the untrusted-input
-/// fill that `Succeeded`-only pruning leaves open.
-pub const QUARANTINE_DEFAULT_MAX_ROWS: usize = 10_000;
 
 /// How long a quarantined row is kept before it becomes a prune victim (90
 /// days in ms). Quarantine is the operator inspection surface, so this is
 /// deliberately far longer than [`SUCCEEDED_RETENTION_MS`].
 pub const QUARANTINE_RETENTION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 
-/// Largest job payload (serialized JSON bytes) kept on a quarantined row.
-/// Payloads are untrusted remote input; the export path keeps full
-/// diagnostic metadata but replaces oversize payloads with a marker (see
-/// [`export_quarantine_archive`]).
+/// Largest job payload (serialized JSON bytes) stored at enqueue.
+/// `persistence::redb` quarantines oversize payloads on insert with a
+/// recorded reason and a bounded marker (untrusted remote input must never
+/// accumulate as unbounded JSON in the store).
 pub const QUARANTINE_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 
 /// Maximum quarantined rows removed per maintenance pass (bounded batch,
@@ -116,53 +109,6 @@ pub const QUARANTINE_PRUNE_BATCH: usize = 500;
 /// truncates through [`truncate_quarantine_error`] so one verbose remote
 /// cannot bloat the row; kind/attempts/timestamps are untouched.
 pub const QUARANTINE_ERROR_CAP_BYTES: usize = 4 * 1024;
-
-/// Quarantine retention policy: how many quarantined rows to keep, for how
-/// long, and how much payload each exported row may carry.
-///
-/// Parent-merge proposal (persistence/* is outside this change; the
-/// read-only queue cannot list or delete quarantined rows through
-/// [`crate::application::ports::JobQueue`]):
-///
-/// ```ignore
-/// // application::ports::JobQueue, next to prune_succeeded:
-/// fn prune_quarantined(&self, older_than_ms: u64, limit: usize) -> Result<u64>;
-/// // persistence/redb/jobs.rs: mirror prune_succeeded but match
-/// // JobState::Quarantined (oldest first, capped at limit); the row holds
-/// // no scheduling-index entry (quarantine removed it), so only the JOBS
-/// // table entry is deleted.
-/// // Enqueue path: reject payloads whose serialized bytes exceed
-/// // QUARANTINE_MAX_PAYLOAD_BYTES before insert.
-/// ```
-///
-/// Until that lands, the worker enforces what the trait allows (error
-/// truncation on the settle path) and exposes the victim selection
-/// ([`select_quarantine_victims`]) plus the archive format
-/// ([`export_quarantine_archive`]) for the maintenance job to consume.
-#[derive(Debug, Clone, Copy)]
-pub struct QuarantineRetention {
-    /// Keep at most this many quarantined rows; older excess rows are victims.
-    pub max_rows: usize,
-    /// Keep a quarantined row at most this long (ms, from `due_at_ms`, which
-    /// the settle path leaves at the claim lease, i.e. approximately the
-    /// quarantine time, matching `prune_succeeded` age semantics).
-    pub max_age_ms: u64,
-    /// Largest payload (serialized JSON bytes) kept per exported row.
-    pub max_payload_bytes: usize,
-    /// Largest victim batch per maintenance pass.
-    pub prune_batch: usize,
-}
-
-impl Default for QuarantineRetention {
-    fn default() -> Self {
-        Self {
-            max_rows: QUARANTINE_DEFAULT_MAX_ROWS,
-            max_age_ms: QUARANTINE_RETENTION_MS,
-            max_payload_bytes: QUARANTINE_MAX_PAYLOAD_BYTES,
-            prune_batch: QUARANTINE_PRUNE_BATCH,
-        }
-    }
-}
 
 /// Truncate a quarantine failure message to [`QUARANTINE_ERROR_CAP_BYTES`]
 /// on a character boundary, marking the cut. Short messages pass through
@@ -183,78 +129,55 @@ pub fn truncate_quarantine_error(message: &str) -> String {
     )
 }
 
-/// Select the quarantined victims for one bounded maintenance pass: rows
-/// older than the policy age first, then oldest excess rows beyond the row
-/// cap. Returns ids oldest-first, at most `policy.prune_batch`. Only
-/// [`JobState::Quarantined`] rows are ever selected; live work and
-/// `Succeeded` rows (owned by `prune_succeeded`) are never touched.
-pub fn select_quarantine_victims(
-    jobs: &[Job],
-    now_ms: u64,
-    policy: &QuarantineRetention,
-) -> Vec<Id> {
-    let mut quarantined: Vec<&Job> = jobs
-        .iter()
-        .filter(|job| job.state == JobState::Quarantined)
-        .collect();
-    // Oldest first so a capped pass always reaps the stalest rows.
-    quarantined.sort_by_key(|job| (job.due_at_ms, job.id));
-    let mut victims: Vec<Id> = Vec::new();
-    for job in &quarantined {
-        if victims.len() >= policy.prune_batch {
-            break;
+/// Bounded table prunes that ride the `CacheEvict` maintenance chain (one
+/// call per pass, every arm bounded and failure-isolated): expired
+/// email-token rows, old `Succeeded` job rows, and old `Quarantined` job
+/// rows. Quarantine prune is delete-only — the row's `last_error` and
+/// redacted payload were the diagnostics, and they age out with the row
+/// (no archive export).
+pub fn run_table_prunes(store: &dyn Store, now_ms: u64, reset_ttl_ms: u64) {
+    // Expired email-token rows are pruned with the maintenance chain
+    // (bounded batch), so confirmation/reset bearers never accumulate as
+    // never-cleaned rows.
+    match store.prune_email_secrets(now_ms, reset_ttl_ms, 500) {
+        Ok(removed) if removed > 0 => {
+            tracing::info!(removed, "pruned expired email tokens");
         }
-        if job.due_at_ms.saturating_add(policy.max_age_ms) <= now_ms {
-            victims.push(job.id);
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!(error = %err, "email token prune failed");
         }
     }
-    if quarantined.len() > policy.max_rows {
-        let excess = quarantined.len() - policy.max_rows;
-        for job in quarantined.iter().take(excess) {
-            if victims.len() >= policy.prune_batch {
-                break;
-            }
-            if !victims.contains(&job.id) {
-                victims.push(job.id);
-            }
+    // Old `Succeeded` rows are pruned with the same bounded-batch
+    // maintenance chain, so completed job records stop accumulating
+    // metadata forever.
+    match store.prune_succeeded(
+        now_ms.saturating_sub(SUCCEEDED_RETENTION_MS),
+        SUCCEEDED_PRUNE_BATCH,
+    ) {
+        Ok(removed) if removed > 0 => {
+            tracing::info!(removed, "pruned old succeeded jobs");
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!(error = %err, "succeeded job prune failed");
         }
     }
-    victims
-}
-
-/// Export quarantined rows for the operator archive path: full diagnostic
-/// metadata (id, kind, attempts, timestamps, error) with the payload bounded
-/// to `policy.max_payload_bytes` (oversize payloads become a byte-size
-/// marker). Export-then-prune keeps the evidence without letting untrusted
-/// payload bytes accumulate in the store.
-pub fn export_quarantine_archive(jobs: &[Job], policy: &QuarantineRetention) -> serde_json::Value {
-    let rows: Vec<serde_json::Value> = jobs
-        .iter()
-        .filter(|job| job.state == JobState::Quarantined)
-        .map(|job| {
-            let payload_bytes = serde_json::to_vec(&job.payload).map(|bytes| bytes.len());
-            let payload = match payload_bytes {
-                Ok(len) if len <= policy.max_payload_bytes => job.payload.clone(),
-                Ok(len) => serde_json::json!({
-                    "truncated": true,
-                    "bytes": len,
-                    "kept_bytes": 0,
-                }),
-                Err(_) => serde_json::json!({"truncated": true, "unserializable": true}),
-            };
-            serde_json::json!({
-                "id": job.id.value(),
-                "kind": job.kind.as_str(),
-                "attempts": job.attempts,
-                "max_attempts": job.max_attempts,
-                "created_at_ms": job.created_at_ms,
-                "due_at_ms": job.due_at_ms,
-                "last_error": job.last_error,
-                "payload": payload,
-            })
-        })
-        .collect();
-    serde_json::json!({"version": 1, "rows": rows})
+    // Old `Quarantined` rows are pruned with the same bounded-batch chain
+    // (delete-only). Pending/leased rows are live work and are never
+    // touched.
+    match store.prune_quarantined(
+        now_ms.saturating_sub(QUARANTINE_RETENTION_MS),
+        QUARANTINE_PRUNE_BATCH,
+    ) {
+        Ok(removed) if removed > 0 => {
+            tracing::info!(removed, "pruned old quarantined jobs");
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!(error = %err, "quarantined job prune failed");
+        }
+    }
 }
 
 /// Latency of the most recently finished media job (`ProcessMedia` /
@@ -459,46 +382,10 @@ async fn process_one(
                     maint
                         .handle_job(&job, &*store, due_at_ms)
                         .map_err(|err| DeliveryError::Retry(err.to_string()))?;
-                    // Expired email-token rows are pruned with
-                    // the maintenance chain (bounded batch),
-                    // so confirmation/reset bearers never
-                    // accumulate as never-cleaned rows.
-                    {
-                        match store.prune_email_secrets(due_at_ms, reset_ttl_ms, 500) {
-                            Ok(removed) if removed > 0 => {
-                                tracing::info!(removed, "pruned expired email tokens");
-                            }
-                            Ok(_) => {}
-                            Err(err) => {
-                                tracing::warn!(
-                                    error = %err,
-                                    "email token prune failed"
-                                );
-                            }
-                        }
-                    }
-                    // Old `Succeeded` rows are pruned with the same
-                    // bounded-batch maintenance chain, so completed
-                    // job records stop accumulating metadata forever.
-                    // `Quarantined` rows are never touched (operator
-                    // inspection surface).
-                    {
-                        match store.prune_succeeded(
-                            due_at_ms.saturating_sub(SUCCEEDED_RETENTION_MS),
-                            SUCCEEDED_PRUNE_BATCH,
-                        ) {
-                            Ok(removed) if removed > 0 => {
-                                tracing::info!(removed, "pruned old succeeded jobs");
-                            }
-                            Ok(_) => {}
-                            Err(err) => {
-                                tracing::warn!(
-                                    error = %err,
-                                    "succeeded job prune failed"
-                                );
-                            }
-                        }
-                    }
+                    // Table prunes ride the maintenance chain (bounded
+                    // batches): email tokens, succeeded jobs, quarantined
+                    // jobs. Failures are isolated per table inside.
+                    run_table_prunes(&*store, due_at_ms, reset_ttl_ms);
                     Ok(())
                 })
                 .await

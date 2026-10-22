@@ -12,15 +12,16 @@ use crate::application::federation_ports::{
 };
 use crate::application::notifications::fan_out_payload;
 use crate::domain::{
-    Account, ActorKeys, DeliveryDestState, Error, Follow, FollowState, Id, Job, JobKind, NotificationType, Result,
+    Account, ActorKeys, DeliveryDestState, Error, Follow, FollowState, Id, Job, JobKind, JobState,
+    NotificationType, Result,
 };
 
 use super::relationships::{read_follow_txn, read_stats_txn, write_stats_txn};
 use super::schema::{
-    self, ACCOUNTS, ACCOUNT_BY_ACTOR_URI, ACTIVITY_DEDUP, ACTOR_KEYS, DELIVERY_DEST,
-    FOLLOWS, FOLLOWS_BY_FOLLOWED, FOLLOW_BY_URI, HANDLE_INDEX,
+    self, ACCOUNT_BY_ACTOR_URI, ACCOUNTS, ACTIVITY_DEDUP, ACTOR_KEYS, DELIVERY_DEST, DELIVERY_SEQ,
+    FOLLOW_BY_URI, FOLLOWS, FOLLOWS_BY_FOLLOWED, HANDLE_INDEX, JOBS,
 };
-use super::{decode, encode, RedbStore, StoreResult};
+use super::{RedbStore, StoreResult, decode, encode};
 
 /// The key record stored per account. Remote accounts store no private key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,9 +56,20 @@ fn account_txn(write: &WriteTransaction, id: Id) -> StoreResult<Option<Account>>
 }
 
 /// Build the durable `DeliverActivity` job for a delivery spec. The payload
-/// carries the exact JSON, so a retry sends the same bytes.
-pub(super) fn delivery_job(job_id: Id, spec: &DeliverySpec, now_ms: u64) -> Job {
-    Job::new(
+/// carries the exact JSON, so a retry sends the same bytes. The payload also
+/// carries the destination's next monotonic `seq` (minted in the caller's
+/// transaction, so plan order and sequence order can never diverge), which
+/// the send path uses to park a job while an earlier sequence for the same
+/// host is still unfinished.
+pub(super) fn delivery_job(
+    write: &WriteTransaction,
+    job_id: Id,
+    spec: &DeliverySpec,
+    now_ms: u64,
+) -> StoreResult<Job> {
+    let host = delivery_host_key(&spec.inbox_uri);
+    let seq = next_delivery_seq_txn(write, &host)?;
+    Ok(Job::new(
         job_id,
         JobKind::DeliverActivity,
         serde_json::json!({
@@ -65,10 +77,40 @@ pub(super) fn delivery_job(job_id: Id, spec: &DeliverySpec, now_ms: u64) -> Job 
             "inbox": spec.inbox_uri,
             "activity_uri": spec.activity_uri,
             "body": spec.body,
+            "seq": seq,
         }),
         now_ms,
         now_ms,
-    )
+    ))
+}
+
+/// The sequence domain of an inbox URI: the lowercased host with the
+/// explicit port when one is named. Mirrors
+/// `federation::delivery::dest_host` (which takes a parsed `Url`); kept
+/// local so persistence never depends on the send path.
+fn delivery_host_key(inbox_uri: &str) -> String {
+    let Ok(url) = url::Url::parse(inbox_uri) else {
+        return inbox_uri.to_lowercase();
+    };
+    match (url.host_str(), url.port()) {
+        (Some(host), Some(port)) => format!("{}:{port}", host.to_lowercase()),
+        (Some(host), None) => host.to_lowercase(),
+        (None, _) => inbox_uri.to_lowercase(),
+    }
+}
+
+/// Mint the next sequence number for `host` inside the caller's write
+/// transaction (starting at 1). Sharing the caller's transaction is what
+/// keeps plan order and sequence order identical for in-transaction
+/// delivery planning (`request_follow`, `undo_follow`, ...).
+fn next_delivery_seq_txn(write: &WriteTransaction, host: &str) -> StoreResult<u64> {
+    let mut table = write.open_table(DELIVERY_SEQ)?;
+    let next = match table.get(host)? {
+        Some(guard) => guard.value().saturating_add(1).max(1),
+        None => 1,
+    };
+    table.insert(host, next)?;
+    Ok(next)
 }
 
 /// Insert or update the remote account for `actor` inside an existing
@@ -90,12 +132,18 @@ fn upsert_remote_txn(
     let mut account = match existing_id {
         Some(id) => {
             let Some(mut account) = account_txn(write, Id::new(id))? else {
-                return Err(Error::Storage(format!("dangling actor index for {}", actor.actor_uri)));
+                return Err(Error::Storage(format!(
+                    "dangling actor index for {}",
+                    actor.actor_uri
+                )));
             };
             if account.normalized_username != normalized || account.domain != actor.domain {
                 // The actor changed its handle: move the index entry.
                 let mut handles = write.open_table(HANDLE_INDEX)?;
-                let old = crate::domain::account::handle_key(&account.normalized_username, &account.domain);
+                let old = crate::domain::account::handle_key(
+                    &account.normalized_username,
+                    &account.domain,
+                );
                 handles.remove(old.as_str())?;
                 handles.insert(handle.as_str(), account.id.value())?;
                 account.normalized_username = normalized.clone();
@@ -107,7 +155,9 @@ fn upsert_remote_txn(
             {
                 let handles = write.open_table(HANDLE_INDEX)?;
                 if handles.get(handle.as_str())?.is_some() {
-                    return Err(Error::Conflict(format!("handle already registered: {handle}")));
+                    return Err(Error::Conflict(format!(
+                        "handle already registered: {handle}"
+                    )));
                 }
             }
             Account {
@@ -278,9 +328,7 @@ impl FederationStore for RedbStore {
         };
         // Fail closed: a missing key, an unknown key id or tampering is an
         // error, never a reason to generate a replacement key.
-        let opened = self
-            .secret_box()
-            .open_text(&context, sealed_pem)?;
+        let opened = self.secret_box().open_text(&context, sealed_pem)?;
         if opened.needs_reseal {
             self.rewrite_actor_key(account_id, &stored, &opened.text)?;
         }
@@ -314,10 +362,9 @@ impl FederationStore for RedbStore {
                     // (plaintext only when no keyring is configured, so
                     // development rows keep working). The first stored key
                     // wins: concurrent first fetches never fork the identity.
-                    let sealed: String = self.secret_box().seal_text_if_enabled(
-                        &actor_key_context(account_id),
-                        private_key_pem,
-                    )?;
+                    let sealed: String = self
+                        .secret_box()
+                        .seal_text_if_enabled(&actor_key_context(account_id), private_key_pem)?;
                     let fresh = StoredKeys {
                         key_id: key_id.to_string(),
                         public_key_pem: public_key_pem.to_string(),
@@ -381,6 +428,59 @@ impl FederationStore for RedbStore {
         }
         write.commit()?;
         Ok(())
+    }
+
+    fn delivery_seq_next(&self, host: &str) -> Result<u64> {
+        let write = self.begin_write()?;
+        let next = {
+            let mut table = write.open_table(DELIVERY_SEQ)?;
+            let next = match table.get(host)? {
+                Some(guard) => guard.value().saturating_add(1).max(1),
+                None => 1,
+            };
+            table.insert(host, next)?;
+            next
+        };
+        write.commit()?;
+        Ok(next)
+    }
+
+    fn delivery_blocked_by(&self, host: &str, seq: u64) -> Result<bool> {
+        let read = self.begin_read()?;
+        let table = read.open_table(JOBS)?;
+        for entry in table.iter()? {
+            let (_, value) = entry?;
+            let job: Job = decode(value.value())?;
+            if job.state != JobState::Pending && job.state != JobState::Leased {
+                continue;
+            }
+            let (job_host, job_seq) = match job.kind {
+                JobKind::DeliverActivity => {
+                    let Some(inbox) = job.payload.get("inbox").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let seq = job.payload.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+                    (delivery_host_key(inbox), seq)
+                }
+                JobKind::RelayForward => {
+                    let Some(relay) = job
+                        .payload
+                        .get("relay_inbox")
+                        .or_else(|| job.payload.get("inbox"))
+                        .and_then(|v| v.as_str())
+                    else {
+                        continue;
+                    };
+                    let seq = job.payload.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+                    (delivery_host_key(relay), seq)
+                }
+                _ => continue,
+            };
+            if job_host == host && job_seq < seq {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn commit_inbound(
@@ -456,7 +556,9 @@ impl FederationStore for RedbStore {
         now_ms: u64,
     ) -> Result<Follow> {
         if follower_id == followed_id {
-            return Err(Error::Forbidden("Following your own account is not allowed".into()));
+            return Err(Error::Forbidden(
+                "Following your own account is not allowed".into(),
+            ));
         }
         let write = self.begin_write()?;
         let key = schema::pair_key(follower_id.value(), followed_id.value());
@@ -483,14 +585,17 @@ impl FederationStore for RedbStore {
         }
         {
             let mut by_followed = write.open_table(FOLLOWS_BY_FOLLOWED)?;
-            by_followed.insert(schema::pair_key(followed_id.value(), follower_id.value()).as_slice(), ())?;
+            by_followed.insert(
+                schema::pair_key(followed_id.value(), follower_id.value()).as_slice(),
+                (),
+            )?;
         }
         {
             let mut by_uri = write.open_table(FOLLOW_BY_URI)?;
             by_uri.insert(follow_uri, key.as_slice())?;
         }
         write_stats_txn(&write, followed_id, &followed_stats)?;
-        let job = delivery_job(self.next_id(), &delivery, now_ms);
+        let job = delivery_job(&write, self.next_id(), &delivery, now_ms)?;
         super::jobs::insert_job(&write, &job)?;
         write.commit()?;
         Ok(follow)
@@ -511,7 +616,8 @@ impl FederationStore for RedbStore {
         now_ms: u64,
     ) -> Result<Option<Follow>> {
         let write = self.begin_write()?;
-        let Some(removed) = super::relationships::unfollow_txn(&write, follower_id, followed_id)? else {
+        let Some(removed) = super::relationships::unfollow_txn(&write, follower_id, followed_id)?
+        else {
             return Ok(None);
         };
         if let Some(uri) = removed.uri.as_deref() {
@@ -519,7 +625,7 @@ impl FederationStore for RedbStore {
             let mut by_uri = write.open_table(FOLLOW_BY_URI)?;
             by_uri.remove(uri)?;
         }
-        let job = delivery_job(self.next_id(), &delivery, now_ms);
+        let job = delivery_job(&write, self.next_id(), &delivery, now_ms)?;
         super::jobs::insert_job(&write, &job)?;
         write.commit()?;
         Ok(Some(removed))
@@ -551,12 +657,14 @@ impl RedbStore {
         now_ms: u64,
     ) -> Result<InboundDisposition> {
         if remote.id == target.id {
-            return Err(Error::Forbidden("Following your own account is not allowed".into()));
+            return Err(Error::Forbidden(
+                "Following your own account is not allowed".into(),
+            ));
         }
         let key = schema::pair_key(remote.id.value(), target.id.value());
         let old_state = read_follow_txn(write, key.as_slice())?.map(|f| f.state);
-        let created_at_ms = read_follow_txn(write, key.as_slice())?
-            .map_or(now_ms, |f| f.created_at_ms);
+        let created_at_ms =
+            read_follow_txn(write, key.as_slice())?.map_or(now_ms, |f| f.created_at_ms);
 
         // Unlocked targets accept at once, as Mastodon does for a plain follow.
         let new_state = if target.locked {
@@ -584,7 +692,8 @@ impl RedbStore {
             }
             (None, FollowState::Pending) => target_stats.follow_requests_count += 1,
             (Some(FollowState::Pending), FollowState::Active) => {
-                target_stats.follow_requests_count = target_stats.follow_requests_count.saturating_sub(1);
+                target_stats.follow_requests_count =
+                    target_stats.follow_requests_count.saturating_sub(1);
                 target_stats.followers_count += 1;
                 remote_stats.following_count += 1;
             }
@@ -611,7 +720,7 @@ impl RedbStore {
         }
 
         if new_state == FollowState::Active {
-            let job = delivery_job(self.next_id(), &accept, now_ms);
+            let job = delivery_job(write, self.next_id(), &accept, now_ms)?;
             super::jobs::insert_job(write, &job)?;
         }
 
@@ -621,7 +730,10 @@ impl RedbStore {
         }
         {
             let mut by_followed = write.open_table(FOLLOWS_BY_FOLLOWED)?;
-            by_followed.insert(schema::pair_key(target.id.value(), remote.id.value()).as_slice(), ())?;
+            by_followed.insert(
+                schema::pair_key(target.id.value(), remote.id.value()).as_slice(),
+                (),
+            )?;
         }
         write_stats_txn(write, target.id, &target_stats)?;
         write_stats_txn(write, remote.id, &remote_stats)?;
@@ -642,10 +754,14 @@ impl RedbStore {
             found
         };
         let Some(key) = key else {
-            return Ok(InboundDisposition::Ignored(format!("no outbound follow {follow_uri}")));
+            return Ok(InboundDisposition::Ignored(format!(
+                "no outbound follow {follow_uri}"
+            )));
         };
         let Some(mut follow) = read_follow_txn(write, key.as_slice())? else {
-            return Ok(InboundDisposition::Ignored(format!("follow row missing for {follow_uri}")));
+            return Ok(InboundDisposition::Ignored(format!(
+                "follow row missing for {follow_uri}"
+            )));
         };
         if follow.followed_id != remote.id {
             return Ok(InboundDisposition::Ignored(
@@ -686,10 +802,14 @@ impl RedbStore {
             found
         };
         let Some(key) = key else {
-            return Ok(InboundDisposition::Ignored(format!("no outbound follow {follow_uri}")));
+            return Ok(InboundDisposition::Ignored(format!(
+                "no outbound follow {follow_uri}"
+            )));
         };
         let Some(follow) = read_follow_txn(write, key.as_slice())? else {
-            return Ok(InboundDisposition::Ignored(format!("follow row missing for {follow_uri}")));
+            return Ok(InboundDisposition::Ignored(format!(
+                "follow row missing for {follow_uri}"
+            )));
         };
         if follow.followed_id != remote.id {
             return Ok(InboundDisposition::Ignored(

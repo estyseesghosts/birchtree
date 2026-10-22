@@ -9,7 +9,10 @@
 //! crate's job, driven by the adapters in `activitypub/` and `federation/`.
 
 use crate::domain::federation::RefreshRecord;
-use crate::domain::{Account, ActorKeys, DeliveryDestState, Follow, Id, MediaAttachment, QuoteRecord, QuoteState, Report, Result, Status};
+use crate::domain::{
+    Account, ActorKeys, DeliveryDestState, Follow, Id, MediaAttachment, QuoteRecord, QuoteState,
+    Report, Result, Status,
+};
 
 /// The payload of one outbound delivery: which local actor signs it, where it
 /// goes, and the activity that is sent. The activity is fixed at commit time,
@@ -99,6 +102,21 @@ pub trait FederationStore: Send + Sync {
     /// network I/O. The caller computes the state (see
     /// `federation::delivery`); a success resets it to zero failures.
     fn set_delivery_dest(&self, host: &str, state: DeliveryDestState) -> Result<()>;
+
+    /// Mint the next monotonic delivery sequence number for a destination
+    /// host (starting at 1; one transaction, no network I/O). Every
+    /// `DeliverActivity` (and `RelayForward`) enqueue stamps the returned
+    /// number into its payload as `seq`, so the send path can park a job
+    /// while an earlier sequence for the same host is still unfinished.
+    fn delivery_seq_next(&self, host: &str) -> Result<u64>;
+
+    /// Whether sending sequence `seq` to `host` must wait: true when another
+    /// `DeliverActivity` (or `RelayForward`) job for the same host with a
+    /// smaller sequence is still `Pending` or `Leased`. Terminal rows
+    /// (`Succeeded`, `Quarantined`) never block — a permanently failed
+    /// earlier send must not wedge its host. Jobs without a stamped `seq`
+    /// (enqueued before schema v23) read as sequence 0, i.e. oldest.
+    fn delivery_blocked_by(&self, host: &str, seq: u64) -> Result<bool>;
 
     /// Upsert the remote account, record the activity, apply its effect and
     /// commit the follow-up jobs, all in ONE transaction. A duplicate activity

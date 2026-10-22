@@ -1,21 +1,22 @@
 //! Worker scheduling fixes: head-of-line fan-out, per-destination delivery
-//! ordering, bounded media blocking pool, and quarantine retention.
+//! ordering, bounded media blocking pool, and quarantine error bounds.
 //!
 //! Covers the four worker jobs without touching the network: the scheduling
 //! pattern is exercised with the worker's own constants, the delivery lock
-//! and the blocking gate are the production paths, and the quarantine
-//! selection runs over real job envelopes.
+//! and the blocking gate are the production paths, and the quarantine error
+//! cap runs over real strings. Store-side quarantine pruning
+//! (`prune_quarantined`, the maintenance tick, enqueue payload bound) is
+//! covered by `tests/fix_quarantine_prune.rs` against a real store.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use birchtree::domain::{Id, Job, JobKind, JobState};
+use birchtree::domain::{Id, Job, JobKind};
 use birchtree::federation::delivery::{delivery_order_key, dest_host, destination_lock};
 use birchtree::jobs::worker::{
-    JobPool, MAX_IN_FLIGHT_LOCAL, MAX_IN_FLIGHT_NETWORK, QUARANTINE_ERROR_CAP_BYTES,
-    QUARANTINE_MAX_PAYLOAD_BYTES, QuarantineRetention, export_quarantine_archive, job_pool,
-    select_quarantine_victims, truncate_quarantine_error,
+    JobPool, MAX_IN_FLIGHT_LOCAL, MAX_IN_FLIGHT_NETWORK, QUARANTINE_ERROR_CAP_BYTES, job_pool,
+    truncate_quarantine_error,
 };
 use birchtree::media::processing::{MAX_MEDIA_BLOCKING_JOBS, run_bounded_blocking};
 
@@ -274,77 +275,9 @@ async fn media_blocking_pool_is_bounded() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Quarantine retention.
+// 4. Quarantine error bound (store-side retention lives in
+// `tests/fix_quarantine_prune.rs`).
 // ---------------------------------------------------------------------------
-
-fn quarantined(id: u64, due_at_ms: u64) -> Job {
-    let mut job = Job::new(
-        Id::new(id),
-        JobKind::DeliverActivity,
-        serde_json::json!({"inbox": "https://remote.example/inbox"}),
-        due_at_ms,
-        due_at_ms,
-    );
-    job.state = JobState::Quarantined;
-    job
-}
-
-#[test]
-fn quarantine_victims_prefer_oldest_over_cap_rows() {
-    let jobs: Vec<Job> = (1..=5).map(|id| quarantined(id, id * 1_000)).collect();
-    let policy = QuarantineRetention {
-        max_rows: 3,
-        max_age_ms: u64::MAX,
-        ..QuarantineRetention::default()
-    };
-    let victims = select_quarantine_victims(&jobs, 9_000, &policy);
-    assert_eq!(victims, vec![Id::new(1), Id::new(2)]);
-}
-
-#[test]
-fn quarantine_victims_prefer_over_age_rows() {
-    let jobs = vec![quarantined(1, 1_000), quarantined(2, 9_500)];
-    let policy = QuarantineRetention {
-        max_rows: usize::MAX,
-        max_age_ms: 1_000,
-        ..QuarantineRetention::default()
-    };
-    let victims = select_quarantine_victims(&jobs, 10_000, &policy);
-    assert_eq!(victims, vec![Id::new(1)]);
-}
-
-#[test]
-fn quarantine_victims_are_bounded_and_ignore_live_rows() {
-    let mut jobs: Vec<Job> = (1..=5).map(|id| quarantined(id, id * 1_000)).collect();
-    let mut pending = Job::new(
-        Id::new(6),
-        JobKind::DeliverActivity,
-        serde_json::json!({}),
-        1,
-        1,
-    );
-    pending.state = JobState::Pending;
-    let mut succeeded = Job::new(
-        Id::new(7),
-        JobKind::UserCreated,
-        serde_json::json!({}),
-        1,
-        1,
-    );
-    succeeded.state = JobState::Succeeded;
-    jobs.push(pending);
-    jobs.push(succeeded);
-    let policy = QuarantineRetention {
-        max_rows: 0,
-        max_age_ms: u64::MAX,
-        prune_batch: 2,
-        ..QuarantineRetention::default()
-    };
-    // Every quarantined row is over the (zero) cap, but the batch caps the
-    // pass at the two oldest; live rows are never selected.
-    let victims = select_quarantine_victims(&jobs, 9_000, &policy);
-    assert_eq!(victims, vec![Id::new(1), Id::new(2)]);
-}
 
 #[test]
 fn truncate_quarantine_error_caps_and_marks() {
@@ -363,50 +296,4 @@ fn truncate_quarantine_error_caps_and_marks() {
     assert!(cut.contains("[truncated"), "cut: {cut}");
     assert!(cut.is_char_boundary(cut.len()));
     assert!(cut.len() <= QUARANTINE_ERROR_CAP_BYTES + 64);
-}
-
-#[test]
-fn export_quarantine_archive_keeps_metadata_and_bounds_payloads() {
-    let mut small = quarantined(1, 1_000);
-    small.attempts = 5;
-    small.last_error = Some("refused".to_string());
-    let mut big = quarantined(2, 2_000);
-    big.payload = serde_json::json!({"blob": "y".repeat(QUARANTINE_MAX_PAYLOAD_BYTES + 1)});
-    let live = Job::new(
-        Id::new(3),
-        JobKind::UserCreated,
-        serde_json::json!({}),
-        1,
-        1,
-    );
-    let policy = QuarantineRetention::default();
-    let archive = export_quarantine_archive(&[small, big, live], &policy);
-    let rows = archive
-        .get("rows")
-        .expect("rows")
-        .as_array()
-        .expect("array");
-    assert_eq!(rows.len(), 2, "only quarantined rows export");
-    assert_eq!(rows[0].get("kind").expect("kind"), "deliver_activity");
-    assert_eq!(rows[0].get("attempts").expect("attempts"), 5);
-    assert_eq!(
-        rows[0].get("last_error").expect("error"),
-        &serde_json::json!("refused")
-    );
-    assert!(
-        rows[0]
-            .get("payload")
-            .expect("payload")
-            .get("inbox")
-            .is_some(),
-        "small payloads stay intact"
-    );
-    assert_eq!(
-        rows[1].get("payload").expect("payload"),
-        &serde_json::json!({
-            "truncated": true,
-            "bytes": QUARANTINE_MAX_PAYLOAD_BYTES + 1 + serde_json::json!({"blob": ""}).to_string().len(),
-            "kept_bytes": 0,
-        })
-    );
 }

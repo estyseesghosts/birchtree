@@ -7,21 +7,21 @@
 
 use redb::{Database, ReadableDatabase, ReadableTable};
 
-use super::schema::{
-    self, ACCESS_TOKENS, ACCOUNTS, ACCOUNT_NOTES, ACCOUNT_STATS, AUTHORIZATION_CODES, BLOCKS,
-    BLOCKS_BY_BLOCKED, BOOKMARKS, BOOKMARKS_BY_STATUS, CUSTOM_EMOJI, DOMAIN_BLOCKS,
-    DOMAIN_BLOCKS_BY_ID, ENDORSEMENTS,
-    ENDORSEMENTS_BY_ENDORSED, FAVOURITES, FAVOURITES_BY_STATUS, FILTERS, FILTER_KEYWORDS,
-    FILTER_KEYWORDS_BY_FILTER, FILTER_STATUSES, FILTER_STATUSES_BY_FILTER, FILTERS_BY_ACCOUNT,
-    FOLLOWS, FOLLOWS_BY_FOLLOWED, HANDLE_INDEX, HASHTAG_INDEX, IDEMPOTENCY, JOBS, JOBS_INDEX,
-    LISTS, LISTS_BY_ACCOUNT, LIST_MEMBERS, LOCAL_USERS, MARKERS, MEDIA, MEDIA_BY_OWNER,
-    MEMBERSHIPS_BY_ACCOUNT, MENTIONS_BY_ACCOUNT, META, MUTES, MUTES_BY_MUTED, NOTIFICATIONS,
-    NOTIFICATIONS_BY_RECIPIENT, NOTIFICATION_DEDUP, OAUTH_APPS, POLL_BY_STATUS, POLLS, POLL_VOTES,
-    QUOTES, QUOTES_BY_QUOTED, QUOTES_BY_QUOTING, REBLOGS_BY_ACCOUNT, SCHEDULED_BY_ACCOUNT,
-    SCHEDULED_STATUSES, SESSIONS, STATUSES, STATUS_AUTHOR_INDEX, STATUS_PARENT_INDEX,
-    STATUS_PINS, STATUS_REBLOG_INDEX, STATUS_VERSIONS, TIMELINE_LOCAL, TIMELINE_PUBLIC,
-};
 use super::StoreError;
+use super::schema::{
+    self, ACCESS_TOKENS, ACCOUNT_NOTES, ACCOUNT_STATS, ACCOUNTS, AUTHORIZATION_CODES, BLOCKS,
+    BLOCKS_BY_BLOCKED, BOOKMARKS, BOOKMARKS_BY_STATUS, CUSTOM_EMOJI, DOMAIN_BLOCKS,
+    DOMAIN_BLOCKS_BY_ID, ENDORSEMENTS, ENDORSEMENTS_BY_ENDORSED, FAVOURITES, FAVOURITES_BY_STATUS,
+    FILTER_KEYWORDS, FILTER_KEYWORDS_BY_FILTER, FILTER_STATUSES, FILTER_STATUSES_BY_FILTER,
+    FILTERS, FILTERS_BY_ACCOUNT, FOLLOWS, FOLLOWS_BY_FOLLOWED, HANDLE_INDEX, HASHTAG_INDEX,
+    IDEMPOTENCY, JOBS, JOBS_INDEX, LIST_MEMBERS, LISTS, LISTS_BY_ACCOUNT, LOCAL_USERS, MARKERS,
+    MEDIA, MEDIA_BY_OWNER, MEMBERSHIPS_BY_ACCOUNT, MENTIONS_BY_ACCOUNT, META, MUTES,
+    MUTES_BY_MUTED, NOTIFICATION_DEDUP, NOTIFICATIONS, NOTIFICATIONS_BY_RECIPIENT, OAUTH_APPS,
+    POLL_BY_STATUS, POLL_VOTES, POLLS, QUOTES, QUOTES_BY_QUOTED, QUOTES_BY_QUOTING,
+    REBLOGS_BY_ACCOUNT, SCHEDULED_BY_ACCOUNT, SCHEDULED_STATUSES, SESSIONS, STATUS_AUTHOR_INDEX,
+    STATUS_PARENT_INDEX, STATUS_PINS, STATUS_REBLOG_INDEX, STATUS_VERSIONS, STATUSES,
+    TIMELINE_LOCAL, TIMELINE_PUBLIC,
+};
 
 /// Desired schema version for this build.
 pub fn target_version() -> u64 {
@@ -152,8 +152,8 @@ pub fn apply(db: &Database) -> Result<u64, StoreError> {
             // scan is bounded by the status count of the pre-v4 database
             // (federation is Phase 6, so this is one node's worth of rows)
             // and idempotent: re-inserting the same keys is a no-op.
-            use redb::{ReadableTable, ReadableTableMetadata};
             use crate::domain::{Account, Status, Visibility};
+            use redb::{ReadableTable, ReadableTableMetadata};
             let backfill: Vec<(u64, bool)> = {
                 let statuses = write.open_table(STATUSES)?;
                 let accounts = write.open_table(ACCOUNTS)?;
@@ -197,8 +197,8 @@ pub fn apply(db: &Database) -> Result<u64, StoreError> {
         // with creation time, and rows that already carry an id are kept, so
         // the step is idempotent. The scan is bounded by the pre-v5 block count.
         if current < 5 {
-            use redb::ReadableTable;
             use crate::domain::{DomainBlock, Id};
+            use redb::ReadableTable;
 
             #[derive(serde::Deserialize)]
             struct LegacyDomainBlock {
@@ -244,15 +244,22 @@ pub fn apply(db: &Database) -> Result<u64, StoreError> {
             let mut order: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].2).collect();
             order.sort_by(|&a, &b| {
                 let (x, y) = (&rows[a].1, &rows[b].1);
-                (x.account_id.value(), x.created_at_ms, &x.domain)
-                    .cmp(&(y.account_id.value(), y.created_at_ms, &y.domain))
+                (x.account_id.value(), x.created_at_ms, &x.domain).cmp(&(
+                    y.account_id.value(),
+                    y.created_at_ms,
+                    &y.domain,
+                ))
             });
             let mut last: Option<(u64, u64)> = None;
             let mut rank = 0u64;
             for i in order {
                 let account = rows[i].1.account_id.value();
                 let created = rows[i].1.created_at_ms;
-                rank = if last == Some((account, created)) { rank + 1 } else { 0 };
+                rank = if last == Some((account, created)) {
+                    rank + 1
+                } else {
+                    0
+                };
                 last = Some((account, created));
                 rows[i].1.id = Id::new((created << SEQUENCE_BITS) | rank);
             }
@@ -279,8 +286,8 @@ pub fn apply(db: &Database) -> Result<u64, StoreError> {
             let _ = write.open_table(schema::ACTOR_KEYS)?;
             let _ = write.open_table(schema::ACTIVITY_DEDUP)?;
             let _ = write.open_table(schema::FOLLOW_BY_URI)?;
-            use redb::ReadableTable;
             use crate::domain::Account;
+            use redb::ReadableTable;
             let rows: Vec<(u64, String)> = {
                 let accounts = write.open_table(ACCOUNTS)?;
                 let mut rows = Vec::new();
@@ -305,8 +312,8 @@ pub fn apply(db: &Database) -> Result<u64, StoreError> {
             let _ = write.open_table(schema::REMOTE_MEDIA_SOURCE)?;
             let _ = write.open_table(schema::QUOTE_BY_APPROVAL)?;
             let _ = write.open_table(schema::UNRESOLVED_PARENT)?;
-            use redb::ReadableTable;
             use crate::domain::Status;
+            use redb::ReadableTable;
             let rows: Vec<(String, u64)> = {
                 let statuses = write.open_table(STATUSES)?;
                 let mut rows = Vec::new();
@@ -473,20 +480,13 @@ pub fn apply(db: &Database) -> Result<u64, StoreError> {
                 let mut rewrites = Vec::new();
                 for entry in quotes.iter()? {
                     let (_, value) = entry?;
-                    let record: crate::domain::QuoteRecord = serde_json::from_slice(
-                        value.value(),
-                    )
-                    .map_err(|err| {
-                        StoreError::Migration(format!("quote row decode: {err}"))
-                    })?;
+                    let record: crate::domain::QuoteRecord = serde_json::from_slice(value.value())
+                        .map_err(|err| StoreError::Migration(format!("quote row decode: {err}")))?;
                     let mut old_key = [0u8; 16];
-                    old_key[..8]
-                        .copy_from_slice(&record.quoted_status_id.value().to_be_bytes());
-                    old_key[8..16]
-                        .copy_from_slice(&record.quoting_status_id.value().to_be_bytes());
+                    old_key[..8].copy_from_slice(&record.quoted_status_id.value().to_be_bytes());
+                    old_key[8..16].copy_from_slice(&record.quoting_status_id.value().to_be_bytes());
                     let mut new_key = [0u8; 16];
-                    new_key[..8]
-                        .copy_from_slice(&record.quoted_status_id.value().to_be_bytes());
+                    new_key[..8].copy_from_slice(&record.quoted_status_id.value().to_be_bytes());
                     new_key[8..16].copy_from_slice(&record.id.value().to_be_bytes());
                     rewrites.push((old_key, new_key));
                 }
@@ -499,10 +499,7 @@ pub fn apply(db: &Database) -> Result<u64, StoreError> {
                     // New value = quoting id, recovered from the old key.
                     let mut quoting = [0u8; 8];
                     quoting.copy_from_slice(&old_key[8..16]);
-                    by_quoted.insert(
-                        new_key.as_slice(),
-                        u64::from_be_bytes(quoting),
-                    )?;
+                    by_quoted.insert(new_key.as_slice(), u64::from_be_bytes(quoting))?;
                 }
                 drop(quotes);
                 for (old_key, new_key) in &rewrites {
@@ -560,12 +557,17 @@ pub fn apply(db: &Database) -> Result<u64, StoreError> {
             let _ = write.open_table(schema::STATUSES)?;
         }
 
+        // Step v23: per-destination delivery sequence counters (prod-2 item
+        // 9). Table only; counters start empty and mint from 1 per host, so
+        // there is nothing to backfill (jobs enqueued before v23 carry no
+        // `seq` and read as sequence 0, i.e. oldest).
+        if current < 23 {
+            let _ = write.open_table(schema::DELIVERY_SEQ)?;
+        }
+
         {
             let mut meta = write.open_table(META)?;
-            meta.insert(
-                schema::SCHEMA_VERSION_KEY,
-                target.to_be_bytes().as_slice(),
-            )?;
+            meta.insert(schema::SCHEMA_VERSION_KEY, target.to_be_bytes().as_slice())?;
         }
     }
     write.commit()?;
@@ -663,7 +665,10 @@ mod tests {
                         "created_at_ms": created,
                     });
                     blocks
-                        .insert(key.as_slice(), serde_json::to_vec(&legacy).unwrap().as_slice())
+                        .insert(
+                            key.as_slice(),
+                            serde_json::to_vec(&legacy).unwrap().as_slice(),
+                        )
                         .unwrap();
                 }
             }
@@ -699,8 +704,7 @@ mod tests {
             .unwrap()
         {
             let (_key, value) = entry.unwrap();
-            let block: crate::domain::DomainBlock =
-                serde_json::from_slice(value.value()).unwrap();
+            let block: crate::domain::DomainBlock = serde_json::from_slice(value.value()).unwrap();
             domains.push(block.domain);
         }
         assert_eq!(domains, ["c.example", "b.example", "a.example"]);
