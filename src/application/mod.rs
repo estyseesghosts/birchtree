@@ -7,6 +7,8 @@ pub mod policy;
 pub mod ports;
 
 pub mod accounts;
+pub mod accounts_mfa;
+pub mod accounts_webauthn;
 pub mod admin;
 pub mod admin_infra;
 pub mod admin_page;
@@ -23,7 +25,9 @@ pub mod license_policy;
 pub mod lists;
 pub mod markers;
 pub mod media;
+pub mod media_commit;
 pub mod media_input;
+pub mod media_validate;
 pub mod notifications;
 pub mod page;
 pub mod place_policy;

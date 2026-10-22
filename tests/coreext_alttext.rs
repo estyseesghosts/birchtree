@@ -74,7 +74,10 @@ fn policy_surface_matrix() {
 
 #[test]
 fn block_message_is_pinned() {
-    assert_eq!(BLOCK_MESSAGE, "Validation failed: Description can't be blank");
+    assert_eq!(
+        BLOCK_MESSAGE,
+        "Validation failed: Description can't be blank"
+    );
     assert_eq!(NAG_HEADER_NAME, "X-Birchtree-Alt-Text-Nag");
     assert_eq!(NAG_HEADER_VALUE, "1");
     let err = check_block("block", &[("image", "")]).expect_err("must block");
@@ -104,9 +107,17 @@ async fn register_app(srv: &TestServer, scopes: &str) -> Value {
         enc("https://client.example/cb"),
         enc(scopes),
     );
-    let (status, _h, bytes) =
-        send(&srv.router, form_request("POST", "/api/v1/apps", &body, None)).await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    let (status, _h, bytes) = send(
+        &srv.router,
+        form_request("POST", "/api/v1/apps", &body, None),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
     json(&bytes)
 }
 
@@ -117,9 +128,17 @@ async fn app_token(srv: &TestServer, app: &Value, scopes: &str) -> String {
         enc(app["client_secret"].as_str().unwrap()),
         enc(scopes),
     );
-    let (status, _h, bytes) =
-        send(&srv.router, form_request("POST", "/oauth/token", &body, None)).await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    let (status, _h, bytes) = send(
+        &srv.router,
+        form_request("POST", "/oauth/token", &body, None),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
     json(&bytes)["access_token"].as_str().unwrap().to_string()
 }
 
@@ -130,9 +149,17 @@ async fn register_account(srv: &TestServer, app: &Value, username: &str) -> Stri
         enc(username),
         enc(&format!("{username}@example.social")),
     );
-    let (status, _h, bytes) =
-        send(&srv.router, form_request("POST", "/api/v1/accounts", &body, Some(&app))).await;
-    assert_eq!(status, StatusCode::OK, "register: {}", String::from_utf8_lossy(&bytes));
+    let (status, _h, bytes) = send(
+        &srv.router,
+        form_request("POST", "/api/v1/accounts", &body, Some(&app)),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "register: {}",
+        String::from_utf8_lossy(&bytes)
+    );
     json(&bytes)["access_token"].as_str().unwrap().to_string()
 }
 
@@ -146,14 +173,29 @@ struct Part {
 }
 
 fn field(name: &'static str, value: &str) -> Part {
-    Part { name, filename: None, mime: None, value: value.as_bytes().to_vec() }
+    Part {
+        name,
+        filename: None,
+        mime: None,
+        value: value.as_bytes().to_vec(),
+    }
 }
 
 fn file(name: &'static str, filename: &str, mime: &'static str, bytes: Vec<u8>) -> Part {
-    Part { name, filename: Some(filename.to_string()), mime: Some(mime), value: bytes }
+    Part {
+        name,
+        filename: Some(filename.to_string()),
+        mime: Some(mime),
+        value: bytes,
+    }
 }
 
-fn multipart_request(method: &str, uri: &str, token: Option<&str>, parts: &[Part]) -> Request<Body> {
+fn multipart_request(
+    method: &str,
+    uri: &str,
+    token: Option<&str>,
+    parts: &[Part],
+) -> Request<Body> {
     let mut body: Vec<u8> = Vec::new();
     for part in parts {
         body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
@@ -189,7 +231,8 @@ fn png_bytes() -> Vec<u8> {
         image::Rgba([(x * 40 + 10) as u8, (y * 90 + 20) as u8, 128, 255])
     }));
     let mut cursor = std::io::Cursor::new(Vec::new());
-    img.write_to(&mut cursor, image::ImageFormat::Png).expect("encode png fixture");
+    img.write_to(&mut cursor, image::ImageFormat::Png)
+        .expect("encode png fixture");
     cursor.into_inner()
 }
 
@@ -207,7 +250,9 @@ async fn setup(policy: &str, username: &str) -> (TestServer, String) {
 }
 
 fn has_nag(headers: &axum::http::HeaderMap) -> bool {
-    headers.get(NAG_HEADER_NAME).is_some_and(|v| v == NAG_HEADER_VALUE)
+    headers
+        .get(NAG_HEADER_NAME)
+        .is_some_and(|v| v == NAG_HEADER_VALUE)
 }
 
 async fn upload(
@@ -220,8 +265,11 @@ async fn upload(
     if let Some(text) = description {
         parts.push(field("description", text));
     }
-    let (status, headers, bytes) =
-        send(&srv.router, multipart_request("POST", uri, Some(token), &parts)).await;
+    let (status, headers, bytes) = send(
+        &srv.router,
+        multipart_request("POST", uri, Some(token), &parts),
+    )
+    .await;
     (status, headers, json(&bytes))
 }
 
@@ -234,8 +282,11 @@ async fn post_status(
     if let Some(id) = media_id {
         body.push_str(&format!("&media_ids[]={}", enc(id)));
     }
-    let (status, headers, bytes) =
-        send(&srv.router, form_request("POST", "/api/v1/statuses", &body, Some(token))).await;
+    let (status, headers, bytes) = send(
+        &srv.router,
+        form_request("POST", "/api/v1/statuses", &body, Some(token)),
+    )
+    .await;
     (status, headers, json(&bytes))
 }
 
@@ -264,8 +315,7 @@ async fn nag_signals_but_never_blocks() {
     }
     // Status create with an undescribed image succeeds with the header.
     let (_, _, media) = upload(&srv, &token, "/api/v1/media", None).await;
-    let (status, headers, _) =
-        post_status(&srv, &token, Some(media["id"].as_str().unwrap())).await;
+    let (status, headers, _) = post_status(&srv, &token, Some(media["id"].as_str().unwrap())).await;
     assert_eq!(status, StatusCode::OK);
     assert!(has_nag(&headers), "nag on post with undescribed image");
     // Text-only post: no nag.
@@ -333,33 +383,34 @@ async fn block_refuses_undescribed_writes() {
 
 #[test]
 fn block_gate_applies_at_status_write_regardless_of_upload_policy() {
-    use birchtree::application::media::upload_media;
+    use birchtree::application::media::upload_media_with_input;
+    use birchtree::application::media_input::{UploadFile, UploadInput};
     use birchtree::application::statuses::{
         CreateStatusCommand, UpdateStatusCommand, create_status, update_status,
     };
 
     let (_dir, store) = common::temp_store();
-    let blobs = birchtree::media::blob_store::FsBlobStore::open(
-        _dir.path().join("media"),
-    )
-    .expect("blobs");
+    let blobs =
+        birchtree::media::blob_store::FsBlobStore::open(_dir.path().join("media")).expect("blobs");
     let owner = common::mk_account(&store, "flip").id;
     // Upload undescribed while the policy is off.
-    let undescribed = upload_media(
+    let undescribed = upload_media_with_input(
         &*store,
         &blobs,
-        common::TEST_PUBLIC_URL,
-        common::T0,
-        owner,
-        &png_bytes(),
-        None,
-        "",
-        None,
-        false,
-        16 * 1024 * 1024,
-        "off",
-        None,
-        "off",
+        UploadInput {
+            now_ms: common::T0,
+            account_id: owner,
+            file: UploadFile::Bytes(&png_bytes()),
+            thumbnail_bytes: None,
+            description: "",
+            focus: None,
+            delay: false,
+            max_file_size: 16 * 1024 * 1024,
+            config: None,
+            license_policy: "off",
+            license: None,
+            alt_text_policy: "off",
+        },
     )
     .expect("upload");
     // Posting it under block 422s with the pinned body.

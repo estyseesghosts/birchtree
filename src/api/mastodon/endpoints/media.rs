@@ -38,6 +38,7 @@ use crate::api::mastodon::auth::Auth;
 use crate::api::mastodon::dto;
 use crate::api::mastodon::errors::{ApiError, ApiResult};
 use crate::application::media;
+use crate::application::media_input;
 use crate::application::ports::{BlobStore, Store};
 use crate::domain::{Error as DomainError, Id, MediaAttachment, MediaState};
 use crate::media::public_media::{self, PublicMediaKind, RangeOutcome};
@@ -551,37 +552,41 @@ async fn upload(state: &ApiState, auth: &Auth, request: Request, delay: bool) ->
             let description: String = fields.description.take().unwrap_or_default();
             let focus: Option<String> = fields.focus.take();
             match fields.file.as_mut() {
-                Some(file) => media::upload_media_spooled(
+                Some(file) => media::upload_media_with_input(
                     &*store,
                     &*blobs,
-                    now_ms,
-                    account_id,
-                    file,
-                    thumbnail.as_deref(),
-                    &description,
-                    focus.as_deref(),
-                    delay,
-                    max_file_size,
-                    transcode.as_ref(),
-                    &license_policy,
-                    license,
-                    &alt_text_policy,
+                    media_input::UploadInput {
+                        now_ms,
+                        account_id,
+                        file: media_input::UploadFile::Spooled(file),
+                        thumbnail_bytes: thumbnail.as_deref(),
+                        description: &description,
+                        focus: focus.as_deref(),
+                        delay,
+                        max_file_size,
+                        config: transcode.as_ref(),
+                        license_policy: &license_policy,
+                        license,
+                        alt_text_policy: &alt_text_policy,
+                    },
                 ),
-                None => media::upload_media_with_config(
+                None => media::upload_media_with_input(
                     &*store,
                     &*blobs,
-                    now_ms,
-                    account_id,
-                    &[],
-                    thumbnail.as_deref(),
-                    &description,
-                    focus.as_deref(),
-                    delay,
-                    max_file_size,
-                    transcode.as_ref(),
-                    &license_policy,
-                    license,
-                    &alt_text_policy,
+                    media_input::UploadInput {
+                        now_ms,
+                        account_id,
+                        file: media_input::UploadFile::Bytes(&[]),
+                        thumbnail_bytes: thumbnail.as_deref(),
+                        description: &description,
+                        focus: focus.as_deref(),
+                        delay,
+                        max_file_size,
+                        config: transcode.as_ref(),
+                        license_policy: &license_policy,
+                        license,
+                        alt_text_policy: &alt_text_policy,
+                    },
                 ),
             }
         })

@@ -7,13 +7,13 @@
 //! decision, the unattached-only delete) is exercised through the ports
 //! exactly as the REST adapter would drive them.
 
-use crate::application::ports::{
-    BlobStore, MediaPatch, MediaProcessingResult, NewMediaUpload, Store,
-};
+use super::media_commit;
+use super::media_input::UploadInput;
+use super::media_validate;
+use crate::application::ports::{BlobStore, MediaPatch, MediaProcessingResult, Store};
 use crate::domain::{Error, FocusPoint, Id, MediaAttachment, MediaState, Result};
 use crate::media::ingest::{self, Sniffed};
 use crate::media::staging::StagingGuard;
-use crate::media::upload_spool::{SNIFF_PREFIX_BYTES, UploadSpool};
 
 /// Mastodon's `file_type_error`: the attachment cannot be decoded.
 pub const FILE_TYPE_ERROR: &str = "File type of uploaded media could not be verified";
@@ -26,13 +26,14 @@ pub const IN_USAGE_ERROR: &str = "Media attachment is currently used by a status
 /// identified or decoded (an "unsupported media type" style reason).
 pub const UNSUPPORTED_REASON: &str = "unsupported media type";
 
-const ERR_BLANK_FILE: &str = "Validation failed: File can't be blank";
-const ERR_CONTENT_TYPE: &str = "Validation failed: File content type is invalid, File is invalid";
-const ERR_DESCRIPTION_TOO_LONG: &str =
+pub(crate) const ERR_BLANK_FILE: &str = "Validation failed: File can't be blank";
+pub(crate) const ERR_CONTENT_TYPE: &str =
+    "Validation failed: File content type is invalid, File is invalid";
+pub(crate) const ERR_DESCRIPTION_TOO_LONG: &str =
     "Validation failed: Description is too long (maximum is 10000 characters)";
-const ERR_THUMBNAIL_BLANK: &str = "Validation failed: Thumbnail must be blank";
-const ERR_THUMBNAIL_INVALID: &str = "Validation failed: Thumbnail is invalid";
-const ERR_FOCUS_INVALID: &str = "Validation failed: Focus is invalid";
+pub(crate) const ERR_THUMBNAIL_BLANK: &str = "Validation failed: Thumbnail must be blank";
+pub(crate) const ERR_THUMBNAIL_INVALID: &str = "Validation failed: Thumbnail is invalid";
+pub(crate) const ERR_FOCUS_INVALID: &str = "Validation failed: Focus is invalid";
 
 /// Mastodon's `MediaAttachment::MAX_DESCRIPTION_LENGTH`.
 const MAX_DESCRIPTION_LENGTH: usize = 10_000;
@@ -43,7 +44,7 @@ const MAX_DESCRIPTION_LENGTH: usize = 10_000;
 //
 // Mastodon shards attachment bytes by the attachment id
 // (`000/000/<id>/original/<hex>.<ext>`), but bytes must be staged BEFORE the
-// metadata row commits (`birchtree.md` §5 — file storage cannot join the
+// metadata row commits (`birchtree.md` Ã‚Â§5 Ã¢â‚¬â€ file storage cannot join the
 // `redb` transaction) and the id is minted by the store inside that commit.
 // The key therefore cannot carry the id. Instead each upload mints one random
 // 16-hex name and every blob of that attachment lives in the same shard:
@@ -52,21 +53,10 @@ const MAX_DESCRIPTION_LENGTH: usize = 10_000;
 //   `{aa}/{bb}/{random16}/small.{ext}`       generated image preview
 //   `{aa}/{bb}/{random16}/thumbnail.{ext}`   operator-supplied cover image
 //
-// where `aa`/`bb` are the random name's first two byte-hex pairs — 65 536
+// where `aa`/`bb` are the random name's first two byte-hex pairs Ã¢â‚¬â€ 65 536
 // shards with the same spread an id partition would give. `dto::media_file_url`
 // serves `file_key` verbatim under `/system/media_attachments/files/`, so any
 // traversal-free relative key works (and `FsBlobStore` rejects traversal).
-
-/// A fresh `{aa}/{bb}/{random16}` shard for one attachment.
-fn new_shard() -> String {
-    let hex = crate::application::crypto::random_token_hex(8);
-    format!("{}/{}/{}", &hex[0..2], &hex[2..4], hex)
-}
-
-/// `{shard}/{style}.{ext}`.
-fn shard_key(shard: &str, style: &str, ext: &str) -> String {
-    format!("{shard}/{style}.{ext}")
-}
 
 /// A sibling key in the same shard as `file_key` (`.../{style}.{ext}`), or
 /// `None` when the key carries no shard (e.g. an empty placeholder).
@@ -115,7 +105,7 @@ pub fn file_too_large_error(limit: u64) -> Error {
 }
 
 /// Parse Mastodon's `focus` param (`"x,y"`, both floats). Blank is ignored
-/// (returns `None`); a non-numeric value is a validation error — Ruby's
+/// (returns `None`); a non-numeric value is a validation error Ã¢â‚¬â€ Ruby's
 /// `Float()` in the pinned model accepts only numeric pairs, and a
 /// non-numeric focus would otherwise silently become `(0.0, 0.0)` (documented
 /// deviation: we reject it with Mastodon's `Focus is invalid` instead of
@@ -144,71 +134,19 @@ pub fn parse_focus(value: &str) -> Result<Option<FocusPoint>> {
 /// for Mastodon's larger-format deferral (`delay_processing?`: video/audio on
 /// the v2 endpoint stay `Pending` and answer 202 until the job runs).
 ///
-/// `file_bytes` is classified by its magic bytes — the declared multipart
-/// content type is never trusted. `max_file_size` is the configured cap
-/// (images AND video/audio alike; Mastodon's separate 99 MB video limit has
-/// no second knob in our config).
-#[allow(clippy::too_many_arguments)]
-pub fn upload_media(
+/// Thin orchestrator over [`media_validate`] (steps 1-6b),
+/// [`media_commit::stage_bytes`], [`media_commit::commit_row`] and
+/// [`media_commit::finish_inline`]. All rules live in those stages with the
+/// existing validation strings; this function only sequences them.
+pub fn upload_media_with_input(
     store: &dyn Store,
     blobs: &dyn BlobStore,
-    _server_public_url: &str,
-    now_ms: u64,
-    account_id: Id,
-    file_bytes: &[u8],
-    thumbnail_bytes: Option<&[u8]>,
-    description: &str,
-    focus: Option<&str>,
-    delay: bool,
-    max_file_size: u64,
-    license_policy: &str,
-    license: Option<i64>,
-    alt_text_policy: &str,
+    input: UploadInput<'_>,
 ) -> Result<MediaAttachment> {
-    stage_and_finish_upload(
-        store,
-        blobs,
+    let UploadInput {
         now_ms,
         account_id,
-        UploadFile::Bytes(file_bytes),
-        thumbnail_bytes,
-        description,
-        focus,
-        delay,
-        max_file_size,
-        None,
-        license_policy,
-        license,
-        alt_text_policy,
-    )
-}
-
-/// Config-aware upload (Phase 7.1): when `config` is `Some` and enabled,
-/// formats that need a transcode defer on `delay` (v2 → 202) and transcode
-/// inline otherwise (v1 → 200). With `None` (or disabled) the legacy
-/// lifecycle is kept exactly.
-pub fn upload_media_with_config(
-    store: &dyn Store,
-    blobs: &dyn BlobStore,
-    now_ms: u64,
-    account_id: Id,
-    file_bytes: &[u8],
-    thumbnail_bytes: Option<&[u8]>,
-    description: &str,
-    focus: Option<&str>,
-    delay: bool,
-    max_file_size: u64,
-    config: Option<&crate::media::transcode::TranscodeConfig>,
-    license_policy: &str,
-    license: Option<i64>,
-    alt_text_policy: &str,
-) -> Result<MediaAttachment> {
-    stage_and_finish_upload(
-        store,
-        blobs,
-        now_ms,
-        account_id,
-        UploadFile::Bytes(file_bytes),
+        mut file,
         thumbnail_bytes,
         description,
         focus,
@@ -218,215 +156,30 @@ pub fn upload_media_with_config(
         license_policy,
         license,
         alt_text_policy,
-    )
-}
-
-/// The uploaded file: resident bytes, or a capped spool file the HTTP layer
-/// already wrote to disk (published onto its blob key with one rename).
-pub enum UploadFile<'upload> {
-    Bytes(&'upload [u8]),
-    Spooled(&'upload mut UploadSpool),
-}
-
-impl UploadFile<'_> {
-    fn len(&self) -> u64 {
-        match self {
-            UploadFile::Bytes(bytes) => bytes.len() as u64,
-            UploadFile::Spooled(spool) => spool.len(),
-        }
-    }
-
-    /// Leading bytes used for content sniffing.
-    fn prefix(&self) -> &[u8] {
-        match self {
-            UploadFile::Bytes(bytes) => &bytes[..bytes.len().min(SNIFF_PREFIX_BYTES)],
-            UploadFile::Spooled(spool) => spool.prefix(),
-        }
-    }
-}
-
-/// Upload with the file already spooled to disk (the streaming HTTP path):
-/// identical rules to [`upload_media_with_config`], but the original is
-/// moved onto its blob key by rename instead of being held in memory.
-#[allow(clippy::too_many_arguments)]
-pub fn upload_media_spooled(
-    store: &dyn Store,
-    blobs: &dyn BlobStore,
-    now_ms: u64,
-    account_id: Id,
-    file: &mut UploadSpool,
-    thumbnail_bytes: Option<&[u8]>,
-    description: &str,
-    focus: Option<&str>,
-    delay: bool,
-    max_file_size: u64,
-    config: Option<&crate::media::transcode::TranscodeConfig>,
-    license_policy: &str,
-    license: Option<i64>,
-    alt_text_policy: &str,
-) -> Result<MediaAttachment> {
-    stage_and_finish_upload(
+    } = input;
+    let file_len = file.len();
+    media_validate::check_blank(file_len)?;
+    let sniffed = media_validate::sniff_accepted_or_err(file.prefix())?;
+    media_validate::check_size(file_len, max_file_size)?;
+    media_validate::check_description(description)?;
+    let focus = media_validate::parse_focus_or_err(focus)?;
+    media_validate::check_alt_text(alt_text_policy, sniffed.r#type, description)?;
+    let license = media_validate::resolve_license(license_policy, license)?;
+    let thumbnail = media_validate::check_thumbnail(sniffed, thumbnail_bytes, max_file_size)?;
+    let staged = media_commit::stage_bytes(blobs, &mut file, sniffed, thumbnail)?;
+    let media = media_commit::commit_row(
         store,
-        blobs,
+        staged,
         now_ms,
         account_id,
-        UploadFile::Spooled(file),
-        thumbnail_bytes,
+        sniffed,
         description,
+        file_len,
         focus,
         delay,
-        max_file_size,
-        config,
-        license_policy,
         license,
-        alt_text_policy,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn stage_and_finish_upload(
-    store: &dyn Store,
-    blobs: &dyn BlobStore,
-    now_ms: u64,
-    account_id: Id,
-    mut file: UploadFile<'_>,
-    thumbnail_bytes: Option<&[u8]>,
-    description: &str,
-    focus: Option<&str>,
-    delay: bool,
-    max_file_size: u64,
-    config: Option<&crate::media::transcode::TranscodeConfig>,
-    license_policy: &str,
-    license: Option<i64>,
-    alt_text_policy: &str,
-) -> Result<MediaAttachment> {
-    let file_len: u64 = file.len();
-    // 1. A missing/blank file param.
-    if file_len == 0 {
-        return Err(Error::InvalidInput(ERR_BLANK_FILE.into()));
-    }
-    // 2. Content sniffed from a bounded prefix (never the declared type).
-    let sniffed = sniff_accepted(file.prefix()).ok_or_else(|| {
-        Error::InvalidInput(ERR_CONTENT_TYPE.into())
-    })?;
-    // 3. Size limit.
-    if file_len > max_file_size {
-        return Err(file_too_large_error(max_file_size));
-    }
-    // 4. Description length.
-    if description.chars().count() > MAX_DESCRIPTION_LENGTH {
-        return Err(Error::InvalidInput(ERR_DESCRIPTION_TOO_LONG.into()));
-    }
-    // 5. Focus.
-    let focus = parse_focus(focus.unwrap_or_default())?;
-    // 5b. Core extension CORE-T: under `block`, an undescribed
-    // image/video/gifv upload is a 422 (no store). Local writes only;
-    // text-only posts and audio are unaffected.
-    crate::application::alt_text_policy::check_block(
-        alt_text_policy,
-        &[(sniffed.r#type, description)],
     )?;
-    // 5c. Core extension CORE-L: the license rides on the attachment row.
-    // Under `off` the param is accepted-and-ignored entirely (not even
-    // parsed, so garbage values are ignored too); otherwise an out-of-enum
-    // value is a 422 and the upload itself never gates on licenses.
-    let license = if license_policy == "off" {
-        None
-    } else {
-        crate::domain::license::parse_license(license)?
-    };
-    // 6. Thumbnail: only video/audio may carry one (Mastodon's
-    //    `validates :thumbnail, absence: true, if: !audio_or_video?`).
-    let thumbnail = match thumbnail_bytes {
-        None | Some(&[]) => None,
-        Some(bytes) => {
-            if !ingest::is_large_format(sniffed) {
-                return Err(Error::InvalidInput(ERR_THUMBNAIL_BLANK.into()));
-            }
-            if bytes.len() as u64 > max_file_size {
-                return Err(file_too_large_error(max_file_size));
-            }
-            let thumb = sniff_accepted(bytes)
-                .filter(|sniffed| ingest::is_image(*sniffed))
-                .ok_or_else(|| Error::InvalidInput(ERR_THUMBNAIL_INVALID.into()))?;
-            Some((bytes, thumb))
-        }
-    };
-
-    // Stage bytes FIRST (blob storage cannot join the `redb` transaction).
-    // The guard removes everything staged here if any later step fails.
-    let mut staging = StagingGuard::new(blobs);
-    let shard = new_shard();
-    let file_key = shard_key(&shard, "original", sniffed.extension);
-    match &mut file {
-        UploadFile::Bytes(bytes) => staging.put(&file_key, bytes)?,
-        UploadFile::Spooled(spool) => {
-            let tmp = spool.disarm();
-            if let Err(err) = staging.publish_file(&tmp, &file_key) {
-                // Stores without `publish_tmp` leave the spool file behind.
-                let _ = std::fs::remove_file(&tmp);
-                return Err(err);
-            }
-        }
-    }
-    let thumbnail_key = match &thumbnail {
-        Some((bytes, thumb)) => {
-            let key = shard_key(&shard, "thumbnail", thumb.extension);
-            staging.put(&key, bytes)?;
-            Some(key)
-        }
-        None => None,
-    };
-
-    // ONE transaction: metadata row + owner index + ProcessMedia job.
-    let media = store.create_media_upload(
-        NewMediaUpload {
-            account_id,
-            r#type: sniffed.r#type.to_string(),
-            mime_type: sniffed.mime_type.to_string(),
-            description: description.to_string(),
-            file_size: file_len,
-            file_key,
-            thumbnail_key,
-            focus,
-            delay,
-            width: None,
-            height: None,
-            duration_ms: None,
-            frame_rate: None,
-            bitrate: None,
-            license,
-        },
-        now_ms,
-    )?;
-    staging.commit();
-
-    // Inline processing (v1 always; v2 only when the format needs no
-    // deferred work). The committed job stays queued and is a no-op when a
-    // worker replays it — processing is idempotent.
-    let transcode_deferred = config.is_some_and(|c| c.enabled)
-        && crate::media::transcode::needs_transcode(&media.mime_type);
-    if delay && (media.larger_media_format() || transcode_deferred) {
-        return Ok(media);
-    }
-    process_media_job_with_config(store, blobs, media.id, now_ms, config)?;
-    let media = store
-        .media_by_id(media.id)?
-        .ok_or_else(|| Error::Internal("media row disappeared after upload".into()))?;
-    if media.state == MediaState::Failed {
-        // Mastodon's two `rescue` bodies: unidentifiable bytes -> 422
-        // `FILE_TYPE_ERROR`; any other Paperclip failure -> 500
-        // `THUMBNAIL_ERROR`.
-        if media
-            .error
-            .as_deref()
-            .is_some_and(|reason| reason.starts_with(THUMBNAIL_ERROR))
-        {
-            return Err(Error::Internal(THUMBNAIL_ERROR.into()));
-        }
-        return Err(Error::InvalidInput(FILE_TYPE_ERROR.into()));
-    }
-    Ok(media)
+    media_commit::finish_inline(store, blobs, media, delay, now_ms, config)
 }
 
 /// Sniff `bytes` and keep only accepted upload types.
@@ -456,8 +209,8 @@ pub fn process_media_job(
 
 /// Config-aware processing finish: rows whose MIME needs a transcode take
 /// the ffmpeg pipeline when `config` is `Some` and enabled (Phase 7.1);
-/// every other row — and every row when no config is threaded (sync drains,
-/// unit tests) — takes the legacy pure-Rust finish.
+/// every other row Ã¢â‚¬â€ and every row when no config is threaded (sync drains,
+/// unit tests) Ã¢â‚¬â€ takes the legacy pure-Rust finish.
 pub fn process_media_job_with_config(
     store: &dyn Store,
     blobs: &dyn BlobStore,
@@ -531,7 +284,7 @@ fn process_media_job_legacy(
                 MediaProcessingResult {
                     state: MediaState::Ready,
                     // The wire type was decided at upload (by content); an
-                    // animated GIF stays `image` (no mp4 transcode → no
+                    // animated GIF stays `image` (no mp4 transcode Ã¢â€ â€™ no
                     // `gifv`, documented deviation).
                     r#type: media.r#type.clone(),
                     blurhash: processed.blurhash,
@@ -627,7 +380,7 @@ fn mark_failed(
 // Read / update / delete.
 // ---------------------------------------------------------------------------
 
-/// `GET /api/v1/media/:id` — Mastodon's `set_media_attachment`: only the
+/// `GET /api/v1/media/:id` Ã¢â‚¬â€ Mastodon's `set_media_attachment`: only the
 /// owner's *unattached* rows are addressable, others 404. A `Failed` row
 /// 422s with the processing error (`check_processing`) instead of rendering.
 pub fn show_media(store: &dyn Store, account_id: Id, id: Id) -> Result<MediaAttachment> {
@@ -638,7 +391,7 @@ pub fn show_media(store: &dyn Store, account_id: Id, id: Id) -> Result<MediaAtta
     Ok(media)
 }
 
-/// `PUT/PATCH /api/v1/media/:id` — apply description/focus/thumbnail.
+/// `PUT/PATCH /api/v1/media/:id` Ã¢â‚¬â€ apply description/focus/thumbnail.
 ///
 /// `description`/`focus`: `None` leaves the field unchanged; a present-blank
 /// focus clears the point (Mastodon's `focus=` ignores blank on write, which
@@ -684,10 +437,7 @@ pub fn update_media(
     }
     // Core extension CORE-T: the resulting description (patched or stored)
     // gates under `block`.
-    let effective_description = patch
-        .description
-        .as_deref()
-        .unwrap_or(&media.description);
+    let effective_description = patch.description.as_deref().unwrap_or(&media.description);
     crate::application::alt_text_policy::check_block(
         alt_text_policy,
         &[(&media.r#type, effective_description)],
@@ -722,7 +472,7 @@ pub fn update_media(
         .ok_or_else(|| Error::NotFound("media".into()))?;
     staging.commit();
     // When the cover was replaced and the new key differs, drop the old blob
-    // (best-effort: a failure leaves an orphan blob, never a broken row — the
+    // (best-effort: a failure leaves an orphan blob, never a broken row Ã¢â‚¬â€ the
     // row already committed).
     if let Some(old) = replaced_thumbnail
         && updated.thumbnail_key.as_deref() != Some(old.as_str())
@@ -733,7 +483,7 @@ pub fn update_media(
     Ok(updated)
 }
 
-/// `DELETE /api/v1/media/:id` — only the owner's *unattached* rows; the
+/// `DELETE /api/v1/media/:id` Ã¢â‚¬â€ only the owner's *unattached* rows; the
 /// remaining bytes are removed after the row commits (a crash in between
 /// leaves an orphan blob, never a dangling row).
 pub fn delete_media(
@@ -751,11 +501,7 @@ pub fn delete_media(
     store
         .delete_media(account_id, id)?
         .ok_or_else(|| Error::NotFound("media".into()))?;
-    let keys = [
-        Some(media.file_key),
-        media.preview_key,
-        media.thumbnail_key,
-    ];
+    let keys = [Some(media.file_key), media.preview_key, media.thumbnail_key];
     for key in keys.into_iter().flatten().filter(|key| !key.is_empty()) {
         if let Err(err) = blobs.delete(&key) {
             tracing::warn!(media = id.value(), error = %err, "orphan media blob left in place");
@@ -766,11 +512,7 @@ pub fn delete_media(
 
 /// The owner's unattached row (`set_media_attachment`); foreign or attached
 /// rows are `Record not found`.
-fn load_addressable_media(
-    store: &dyn Store,
-    account_id: Id,
-    id: Id,
-) -> Result<MediaAttachment> {
+fn load_addressable_media(store: &dyn Store, account_id: Id, id: Id) -> Result<MediaAttachment> {
     let media = store
         .owner_media(account_id, id)?
         .ok_or_else(|| Error::NotFound("Record not found".into()))?;
@@ -785,16 +527,20 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::application::media_input::{UploadFile, UploadInput};
     use crate::application::ports::{JobQueue, MailSender, MediaStore};
     use crate::domain::{Clock, IdGenerator, SystemClock, TimestampIdGenerator};
     use crate::mail::LoggingMailSender;
     use crate::persistence::redb::RedbStore;
 
-    fn test_deps() -> (tempfile::TempDir, Arc<RedbStore>, crate::media::blob_store::FsBlobStore) {
+    fn test_deps() -> (
+        tempfile::TempDir,
+        Arc<RedbStore>,
+        crate::media::blob_store::FsBlobStore,
+    ) {
         let dir = tempfile::tempdir().expect("tempdir");
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-        let ids: Arc<dyn IdGenerator> =
-            Arc::new(TimestampIdGenerator::new(Box::new(SystemClock)));
+        let ids: Arc<dyn IdGenerator> = Arc::new(TimestampIdGenerator::new(Box::new(SystemClock)));
         let store = Arc::new(
             RedbStore::open(dir.path().join("birchtree.redb"), clock, ids).expect("open store"),
         );
@@ -811,7 +557,8 @@ mod tests {
             image::Rgba([10, 20, 30, 255]),
         ));
         let mut cursor = std::io::Cursor::new(Vec::new());
-        img.write_to(&mut cursor, image::ImageFormat::Png).expect("png");
+        img.write_to(&mut cursor, image::ImageFormat::Png)
+            .expect("png");
         cursor.into_inner()
     }
 
@@ -858,21 +605,23 @@ mod tests {
         // 1 KB" message (the HTTP path uses the configured 16 MB default).
         let mut big = png_bytes();
         big.extend_from_slice(&[0u8; 2048]);
-        let err = upload_media(
+        let err = upload_media_with_input(
             &*store,
             &blobs,
-            "https://example.social",
-            1_700_000_000_000,
-            account_id,
-            &big,
-            None,
-            "",
-            None,
-            false,
-            1024,
-            "off",
-            None,
-            "off",
+            UploadInput {
+                now_ms: 1_700_000_000_000,
+                account_id,
+                file: UploadFile::Bytes(&big),
+                thumbnail_bytes: None,
+                description: "",
+                focus: None,
+                delay: false,
+                max_file_size: 1024,
+                config: None,
+                license_policy: "off",
+                license: None,
+                alt_text_policy: "off",
+            },
         )
         .expect_err("oversized upload rejected");
         assert_invalid_input(
@@ -884,40 +633,44 @@ mod tests {
     #[test]
     fn blank_and_unaccepted_uploads_are_rejected_before_staging() {
         let (_dir, store, blobs) = test_deps();
-        let err = upload_media(
+        let err = upload_media_with_input(
             &*store,
             &blobs,
-            "https://example.social",
-            1,
-            Id::new(1),
-            b"",
-            None,
-            "",
-            None,
-            false,
-            1024 * 1024,
-            "off",
-            None,
-            "off",
+            UploadInput {
+                now_ms: 1,
+                account_id: Id::new(1),
+                file: UploadFile::Bytes(b""),
+                thumbnail_bytes: None,
+                description: "",
+                focus: None,
+                delay: false,
+                max_file_size: 1024 * 1024,
+                config: None,
+                license_policy: "off",
+                license: None,
+                alt_text_policy: "off",
+            },
         )
         .expect_err("blank file");
         assert_invalid_input(err, ERR_BLANK_FILE);
 
-        let err = upload_media(
+        let err = upload_media_with_input(
             &*store,
             &blobs,
-            "https://example.social",
-            1,
-            Id::new(1),
-            b"plain text, definitely not media",
-            None,
-            "",
-            None,
-            false,
-            1024 * 1024,
-            "off",
-            None,
-            "off",
+            UploadInput {
+                now_ms: 1,
+                account_id: Id::new(1),
+                file: UploadFile::Bytes(b"plain text, definitely not media"),
+                thumbnail_bytes: None,
+                description: "",
+                focus: None,
+                delay: false,
+                max_file_size: 1024 * 1024,
+                config: None,
+                license_policy: "off",
+                license: None,
+                alt_text_policy: "off",
+            },
         )
         .expect_err("text file");
         assert_invalid_input(err, ERR_CONTENT_TYPE);
@@ -927,21 +680,23 @@ mod tests {
     fn image_upload_processes_inline_and_is_idempotent() {
         let (_dir, store, blobs) = test_deps();
         let bytes = png_bytes();
-        let media = upload_media(
+        let media = upload_media_with_input(
             &*store,
             &blobs,
-            "https://example.social",
-            1_700_000_000_000,
-            Id::new(7),
-            &bytes,
-            None,
-            "a description",
-            Some("0.5,-0.25"),
-            false,
-            16 * 1024 * 1024,
-            "off",
-            None,
-            "off",
+            UploadInput {
+                now_ms: 1_700_000_000_000,
+                account_id: Id::new(7),
+                file: UploadFile::Bytes(&bytes),
+                thumbnail_bytes: None,
+                description: "a description",
+                focus: Some("0.5,-0.25"),
+                delay: false,
+                max_file_size: 16 * 1024 * 1024,
+                config: None,
+                license_policy: "off",
+                license: None,
+                alt_text_policy: "off",
+            },
         )
         .expect("upload");
         assert_eq!(media.state, MediaState::Ready);
@@ -970,21 +725,23 @@ mod tests {
     fn delayed_mp4_stays_pending_until_the_job_runs() {
         let (_dir, store, blobs) = test_deps();
         let bytes = mp4_bytes();
-        let media = upload_media(
+        let media = upload_media_with_input(
             &*store,
             &blobs,
-            "https://example.social",
-            1_700_000_000_000,
-            Id::new(9),
-            &bytes,
-            None,
-            "",
-            None,
-            true,
-            16 * 1024 * 1024,
-            "off",
-            None,
-            "off",
+            UploadInput {
+                now_ms: 1_700_000_000_000,
+                account_id: Id::new(9),
+                file: UploadFile::Bytes(&bytes),
+                thumbnail_bytes: None,
+                description: "",
+                focus: None,
+                delay: true,
+                max_file_size: 16 * 1024 * 1024,
+                config: None,
+                license_policy: "off",
+                license: None,
+                alt_text_policy: "off",
+            },
         )
         .expect("upload");
         assert_eq!(media.state, MediaState::Pending);
@@ -1001,7 +758,7 @@ mod tests {
             &blobs,
             &crate::application::ports::NoStreaming,
         )
-            .expect("handle");
+        .expect("handle");
         let processed = store.media_by_id(media.id).unwrap().unwrap();
         assert_eq!(processed.state, MediaState::Ready);
         // No tkhd box in this stub container: dimensions stay None (honest).
@@ -1011,21 +768,23 @@ mod tests {
     #[test]
     fn thumbnails_are_video_audio_only() {
         let (_dir, store, blobs) = test_deps();
-        let err = upload_media(
+        let err = upload_media_with_input(
             &*store,
             &blobs,
-            "https://example.social",
-            1,
-            Id::new(11),
-            &png_bytes(),
-            Some(&png_bytes()),
-            "",
-            None,
-            false,
-            16 * 1024 * 1024,
-            "off",
-            None,
-            "off",
+            UploadInput {
+                now_ms: 1,
+                account_id: Id::new(11),
+                file: UploadFile::Bytes(&png_bytes()),
+                thumbnail_bytes: Some(&png_bytes()),
+                description: "",
+                focus: None,
+                delay: false,
+                max_file_size: 16 * 1024 * 1024,
+                config: None,
+                license_policy: "off",
+                license: None,
+                alt_text_policy: "off",
+            },
         )
         .expect_err("thumbnail on an image");
         assert_invalid_input(err, ERR_THUMBNAIL_BLANK);
@@ -1034,21 +793,23 @@ mod tests {
     #[test]
     fn update_and_delete_round_trip() {
         let (_dir, store, blobs) = test_deps();
-        let media = upload_media(
+        let media = upload_media_with_input(
             &*store,
             &blobs,
-            "https://example.social",
-            1_700_000_000_000,
-            Id::new(13),
-            &png_bytes(),
-            None,
-            "",
-            None,
-            false,
-            16 * 1024 * 1024,
-            "off",
-            None,
-            "off",
+            UploadInput {
+                now_ms: 1_700_000_000_000,
+                account_id: Id::new(13),
+                file: UploadFile::Bytes(&png_bytes()),
+                thumbnail_bytes: None,
+                description: "",
+                focus: None,
+                delay: false,
+                max_file_size: 16 * 1024 * 1024,
+                config: None,
+                license_policy: "off",
+                license: None,
+                alt_text_policy: "off",
+            },
         )
         .expect("upload");
 
@@ -1075,8 +836,20 @@ mod tests {
         // Foreign accounts cannot see or patch it.
         assert!(show_media(&*store, Id::new(99), media.id).is_err());
         assert!(
-            update_media(&*store, &blobs, Id::new(99), media.id, Some("x"), None, None, 2, "off", None, "off")
-                .is_err()
+            update_media(
+                &*store,
+                &blobs,
+                Id::new(99),
+                media.id,
+                Some("x"),
+                None,
+                None,
+                2,
+                "off",
+                None,
+                "off"
+            )
+            .is_err()
         );
 
         let preview = updated.preview_key.clone().expect("preview staged");
