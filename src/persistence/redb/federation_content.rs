@@ -258,7 +258,7 @@ impl FederationContentStore for RedbStore {
             let mut quoted = status_txn(&write, input.quoted_status_id)?
                 .ok_or_else(|| Error::NotFound("quoted status".into()))?;
             quoted.quotes_count = quoted.quotes_count.saturating_add(1);
-            super::statuses::write_status_txn(&write, &quoted)?;
+            super::statuses_read::write_status_txn(&write, &quoted)?;
         }
         write.commit()?;
         Ok(record)
@@ -294,12 +294,12 @@ impl FederationContentStore for RedbStore {
             let mut quoted = status_txn(&write, quote.quoted_status_id)?
                 .ok_or_else(|| Error::NotFound("quoted status".into()))?;
             quoted.quotes_count = quoted.quotes_count.saturating_add(1);
-            super::statuses::write_status_txn(&write, &quoted)?;
+            super::statuses_read::write_status_txn(&write, &quoted)?;
         } else if was == QuoteState::Accepted && state != QuoteState::Accepted {
             let mut quoted = status_txn(&write, quote.quoted_status_id)?
                 .ok_or_else(|| Error::NotFound("quoted status".into()))?;
             quoted.quotes_count = quoted.quotes_count.saturating_sub(1);
-            super::statuses::write_status_txn(&write, &quoted)?;
+            super::statuses_read::write_status_txn(&write, &quoted)?;
         }
         {
             let mut quotes = write.open_table(QUOTES)?;
@@ -330,10 +330,10 @@ impl FederationContentStore for RedbStore {
             )?;
         }
         parent.replies_count = parent.replies_count.saturating_add(1);
-        super::statuses::write_status_txn(&write, &parent)?;
+        super::statuses_read::write_status_txn(&write, &parent)?;
         child.in_reply_to_id = Some(parent_id);
         child.in_reply_to_account_id = Some(parent.account_id);
-        super::statuses::write_status_txn(&write, &child)?;
+        super::statuses_read::write_status_txn(&write, &child)?;
         {
             let mut table = write.open_table(UNRESOLVED_PARENT)?;
             table.remove(child_id.value())?;

@@ -45,7 +45,7 @@ pub(super) fn attach_quote_txn(
     quoting_account_id: Id,
     now_ms: u64,
 ) -> StoreResult<QuoteRecord> {
-    let mut quoted = super::statuses::read_status_txn(write, spec.quoted_status_id)?
+    let mut quoted = super::statuses_read::read_status_txn(write, spec.quoted_status_id)?
         .ok_or_else(|| StoreError::Migration("quoted status missing".into()))?;
     // A local quoted author accepts at creation when the policy allows (the use
     // case decided). A remote author must approve first: the quote is pending,
@@ -67,7 +67,7 @@ pub(super) fn attach_quote_txn(
     };
     if state == QuoteState::Accepted {
         quoted.quotes_count = quoted.quotes_count.saturating_add(1);
-        super::statuses::write_status_txn(write, &quoted)?;
+        super::statuses_read::write_status_txn(write, &quoted)?;
     }
     let record = QuoteRecord {
         id: quote_id,
@@ -201,7 +201,7 @@ impl QuoteStore for RedbStore {
                 continue;
             }
             // Skip quotes whose quoting status is gone or tombstoned.
-            let Some(status) = super::statuses::read_status_txn(&write, quoting_status_id)?
+            let Some(status) = super::statuses_read::read_status_txn(&write, quoting_status_id)?
             else {
                 continue;
             };
@@ -248,10 +248,10 @@ impl QuoteStore for RedbStore {
         // revoked/deleted are sticky.
         if quote.state == QuoteState::Accepted {
             quote.state = QuoteState::Revoked;
-            let mut quoted = super::statuses::read_status_txn(&write, quoted_status_id)?
+            let mut quoted = super::statuses_read::read_status_txn(&write, quoted_status_id)?
                 .ok_or_else(|| StoreError::Migration("quoted status missing".into()))?;
             quoted.quotes_count = quoted.quotes_count.saturating_sub(1);
-            super::statuses::write_status_txn(&write, &quoted)?;
+            super::statuses_read::write_status_txn(&write, &quoted)?;
         } else if quote.state != QuoteState::Revoked {
             quote.state = QuoteState::Rejected;
         }

@@ -100,7 +100,7 @@ impl MediaStore for RedbStore {
             license: input.license,
         };
 
-        super::statuses::ensure_id_unused(&write, MEDIA, media.id)?;
+        super::statuses_read::ensure_id_unused(&write, MEDIA, media.id)?;
         {
             let mut table = write.open_table(MEDIA)?;
             table.insert(media.id.value(), encode(&media)?.as_slice())?;

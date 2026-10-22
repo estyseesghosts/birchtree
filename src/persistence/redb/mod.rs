@@ -25,7 +25,12 @@ pub mod places;
 pub mod polls;
 pub mod quotes;
 pub mod relationships;
-pub mod statuses;
+pub mod statuses_create;
+pub mod statuses_delete;
+pub mod statuses_impl;
+pub mod statuses_interactions;
+pub mod statuses_read;
+pub mod statuses_update;
 pub mod web;
 
 // Phase 4 storage modules: timelines, lists, markers, filters, scheduled
