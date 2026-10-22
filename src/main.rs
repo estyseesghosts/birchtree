@@ -7,7 +7,7 @@ use tokio::sync::watch;
 
 use birchtree::api::mastodon::router::build_router_with_probes;
 use birchtree::api::mastodon::{ApiState, ServerInfo};
-use birchtree::application::accounts::{create_account, CreateAccountCommand};
+use birchtree::application::accounts::{CreateAccountCommand, create_account};
 use birchtree::application::context::Context;
 use birchtree::application::ports::MailSender;
 use birchtree::config::Config;
@@ -114,10 +114,11 @@ fn parse_args(cfg: &mut Config) -> Args {
         } else if let Some(v) = arg.strip_prefix("--federation-extra-ca=") {
             cfg.federation_extra_ca = Some(std::path::PathBuf::from(v));
         } else if let Some(v) = arg.strip_prefix("--federation-allow-private=") {
-            cfg.federation_allowlist = birchtree::federation::policy::parse_allowlist(v).unwrap_or_else(|err| {
-                eprintln!("invalid --federation-allow-private: {err}");
-                std::process::exit(2);
-            });
+            cfg.federation_allowlist = birchtree::federation::policy::parse_allowlist(v)
+                .unwrap_or_else(|err| {
+                    eprintln!("invalid --federation-allow-private: {err}");
+                    std::process::exit(2);
+                });
         } else if arg == "--debug-weak-rate-limits" {
             cfg.rate_limit_multiplier = 10;
         } else if let Some(v) = arg.strip_prefix("--rate-limit-multiplier=") {
@@ -140,11 +141,10 @@ fn parse_args(cfg: &mut Config) -> Args {
         } else if arg == "--registration-require-approval" {
             cfg.registration_requires_approval = true;
         } else if let Some(v) = arg.strip_prefix("--search-mode=") {
-            cfg.search_mode =
-                birchtree::search::SearchMode::parse(v).unwrap_or_else(|| {
-                    eprintln!("invalid --search-mode (want embedded|database|off): {v}");
-                    std::process::exit(2);
-                });
+            cfg.search_mode = birchtree::search::SearchMode::parse(v).unwrap_or_else(|| {
+                eprintln!("invalid --search-mode (want embedded|database|off): {v}");
+                std::process::exit(2);
+            });
         } else if arg == "--no-transcode" {
             cfg.transcoding_enabled = false;
         } else if let Some(v) = arg.strip_prefix("--ffmpeg-path=") {
@@ -228,8 +228,8 @@ fn parse_args(cfg: &mut Config) -> Args {
 fn build_store(cfg: &Config) -> (Arc<RedbStore>, Arc<dyn Clock>, Arc<TimestampIdGenerator>) {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let ids = Arc::new(TimestampIdGenerator::new(Box::new(SystemClock)));
-    let store = RedbStore::open(cfg.database_path(), clock.clone(), ids.clone())
-        .unwrap_or_else(|err| {
+    let store =
+        RedbStore::open(cfg.database_path(), clock.clone(), ids.clone()).unwrap_or_else(|err| {
             eprintln!("open storage: {err}");
             std::process::exit(1);
         });
@@ -298,7 +298,10 @@ fn run_create_account(cfg: &Config, args: &Args) -> ! {
                 }
             }
             // IDs are decimal strings on the wire.
-            println!("created account id={} username={}", account.id, account.username);
+            println!(
+                "created account id={} username={}",
+                account.id, account.username
+            );
             std::process::exit(0);
         }
         Err(err) => {
@@ -354,7 +357,10 @@ fn run_grant_role(cfg: &Config, args: &Args) -> ! {
                 birchtree::domain::UserRole::Moderator => "moderator",
                 birchtree::domain::UserRole::None => "none",
             };
-            println!("granted role={label} account id={} username={}", account.id, account.username);
+            println!(
+                "granted role={label} account id={} username={}",
+                account.id, account.username
+            );
             std::process::exit(0);
         }
         Err(err) => {
@@ -442,7 +448,8 @@ async fn shutdown_signal() {
     };
     #[cfg(unix)]
     let terminate = async {
-        if let Ok(mut sig) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         {
             sig.recv().await;
         }
@@ -483,11 +490,23 @@ async fn serve(cfg: Config) {
     if secret_box.is_enabled() {
         match store.seal_legacy_secrets() {
             Ok(report) => tracing::info!(totp_rows = report.totp_rows, "sealed legacy secrets"),
-            Err(err) => tracing::warn!(error = %err, "legacy secret sealing failed"),
+            Err(err) => {
+                if birchtree::mailer::seal_failure_is_fatal(cfg.mode) {
+                    eprintln!("legacy secret sealing failed: {err}; refusing to start");
+                    std::process::exit(1);
+                }
+                tracing::warn!(error = %err, "legacy secret sealing failed");
+            }
         }
         match store.seal_legacy_actor_keys() {
             Ok(rows) => tracing::info!(actor_key_rows = rows, "sealed legacy actor keys"),
-            Err(err) => tracing::warn!(error = %err, "legacy actor key sealing failed"),
+            Err(err) => {
+                if birchtree::mailer::seal_failure_is_fatal(cfg.mode) {
+                    eprintln!("legacy actor key sealing failed: {err}; refusing to start");
+                    std::process::exit(1);
+                }
+                tracing::warn!(error = %err, "legacy actor key sealing failed");
+            }
         }
     }
     // Physical layout before anything is opened: the durable pool (local
@@ -502,15 +521,14 @@ async fn serve(cfg: Config) {
         eprintln!("storage layout: {err}");
         std::process::exit(1);
     }
-    let (durable_blobs, cache_blobs) =
-        birchtree::media::blob_store::FsBlobStore::open_pair(
-            cfg.durable_dir_resolved(),
-            cfg.cache_dir_resolved(),
-        )
-        .unwrap_or_else(|err| {
-            eprintln!("open blob stores: {err}");
-            std::process::exit(1);
-        });
+    let (durable_blobs, cache_blobs) = birchtree::media::blob_store::FsBlobStore::open_pair(
+        cfg.durable_dir_resolved(),
+        cfg.cache_dir_resolved(),
+    )
+    .unwrap_or_else(|err| {
+        eprintln!("open blob stores: {err}");
+        std::process::exit(1);
+    });
     // One routing handle: local keys land in the durable pool, `remote/…`
     // keys in the cache pool (pre-split durable `remote/` bytes stay
     // readable).
@@ -581,7 +599,8 @@ async fn serve(cfg: Config) {
         ) {
             tracing::warn!(error = %err, "tag backfill seed failed");
         }
-    }    let streams = birchtree::streaming::Hub::new(
+    }
+    let streams = birchtree::streaming::Hub::new(
         store.clone(),
         clock.clone(),
         server.clone(),
@@ -660,12 +679,10 @@ async fn serve(cfg: Config) {
     // Readiness + metrics: storage writability, worker progress, pool
     // writability, queue health, cache accounting and media latency. The
     // heartbeat is beaten every worker loop iteration (idle or busy).
-    let heartbeat = Arc::new(
-        birchtree::api::mastodon::router::readiness::WorkerHeartbeat::new(),
-    );
+    let heartbeat = Arc::new(birchtree::api::mastodon::router::readiness::WorkerHeartbeat::new());
     let probes = {
         use birchtree::api::mastodon::router::readiness::{
-            writable_directory_check, RuntimeProbes,
+            RuntimeProbes, writable_directory_check,
         };
         let store = store.clone();
         let queue_store = store.clone();
@@ -695,9 +712,7 @@ async fn serve(cfg: Config) {
             .with_gauge("queue_backlog", move || {
                 queue_store
                     .all_jobs()
-                    .map(|jobs| {
-                        jobs.iter().filter(|job| !job.state.is_terminal()).count() as u64
-                    })
+                    .map(|jobs| jobs.iter().filter(|job| !job.state.is_terminal()).count() as u64)
                     .unwrap_or(0)
             })
             .with_gauge("queue_oldest_age_ms", move || {
@@ -716,9 +731,7 @@ async fn serve(cfg: Config) {
             .with_gauge("queue_retried", move || {
                 queue_retry_store
                     .all_jobs()
-                    .map(|jobs| {
-                        jobs.iter().filter(|job| job.attempts > 0).count() as u64
-                    })
+                    .map(|jobs| jobs.iter().filter(|job| job.attempts > 0).count() as u64)
                     .unwrap_or(0)
             })
             .with_gauge("queue_quarantined", move || {
@@ -726,9 +739,7 @@ async fn serve(cfg: Config) {
                     .all_jobs()
                     .map(|jobs| {
                         jobs.iter()
-                            .filter(|job| {
-                                job.state == birchtree::domain::JobState::Quarantined
-                            })
+                            .filter(|job| job.state == birchtree::domain::JobState::Quarantined)
                             .count() as u64
                     })
                     .unwrap_or(0)
@@ -792,12 +803,27 @@ async fn serve(cfg: Config) {
         Arc::new(LoggingMailSender)
     };
 
-    let listener = tokio::net::TcpListener::bind(cfg.listen)
-        .await
-        .unwrap_or_else(|err| {
-            eprintln!("bind {}: {err}", cfg.listen);
+    let listener = {
+        // Fail closed when signup could strand confirmation mail (open
+        // registrations or enabled invites with no SMTP provider): never
+        // bind a server that mints unconfirmable accounts. Lab passes with
+        // a warning (the mail job stays explicitly undelivered).
+        if let Err(err) = birchtree::mailer::require_mail_for_open_registration(&cfg) {
+            eprintln!("configuration error: {err}");
             std::process::exit(1);
-        });
+        }
+        if birchtree::mailer::signup_without_mail(&cfg) {
+            tracing::warn!(
+                "signups are possible without an SMTP provider; confirmation mail will not deliver"
+            );
+        }
+        tokio::net::TcpListener::bind(cfg.listen)
+            .await
+            .unwrap_or_else(|err| {
+                eprintln!("bind {}: {err}", cfg.listen);
+                std::process::exit(1);
+            })
+    };
 
     tracing::info!(
         listen = %cfg.listen,
@@ -826,10 +852,7 @@ async fn serve(cfg: Config) {
         tracing::info!(swept, "removed stale transcode temp files at startup");
     }
     let worker_extra = jobs::worker::WorkerExtra {
-        push_client: reqwest::Client::builder()
-            .no_proxy()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
+        push_client: birchtree::application::push_client::production_push_client()
             .unwrap_or_else(|err| {
                 eprintln!("build push http client: {err}");
                 std::process::exit(1);
@@ -1065,7 +1088,6 @@ subcommands:
     );
 }
 
-
 /// `create-rule --text=<text> [--hint=<hint>]`: create one server rule
 /// (D37; operator-managed, like custom emoji). Moderators attach rules to
 /// reports through the admin report update. Prints the numeric id.
@@ -1093,10 +1115,15 @@ fn run_create_rule(cfg: &Config, args: &Args) -> ! {
 fn run_delete_rule(cfg: &Config, args: &Args) -> ! {
     use birchtree::application::ports::AdminInfraStore;
     use birchtree::domain::Id;
-    let id: Id = args.id.as_deref().unwrap_or("").parse().unwrap_or_else(|_| {
-        eprintln!("delete-rule requires --id=<rule id>");
-        std::process::exit(2);
-    });
+    let id: Id = args
+        .id
+        .as_deref()
+        .unwrap_or("")
+        .parse()
+        .unwrap_or_else(|_| {
+            eprintln!("delete-rule requires --id=<rule id>");
+            std::process::exit(2);
+        });
     let (store, _clock, _ids) = build_store(cfg);
     match store.admin_delete_rule(id) {
         Ok(true) => {
@@ -1161,10 +1188,15 @@ fn run_create_text(cfg: &Config, args: &Args) -> ! {
 fn run_set_rule_translation(cfg: &Config, args: &Args) -> ! {
     use birchtree::application::ports::AdminInfraStore;
     use birchtree::domain::Id;
-    let id: Id = args.id.as_deref().unwrap_or("").parse().unwrap_or_else(|_| {
-        eprintln!("set-rule-translation requires --id=<rule id>");
-        std::process::exit(2);
-    });
+    let id: Id = args
+        .id
+        .as_deref()
+        .unwrap_or("")
+        .parse()
+        .unwrap_or_else(|_| {
+            eprintln!("set-rule-translation requires --id=<rule id>");
+            std::process::exit(2);
+        });
     let locale = args.locale.clone().unwrap_or_else(|| {
         eprintln!("set-rule-translation requires --locale=<BCP-47 tag>");
         std::process::exit(2);
@@ -1196,10 +1228,15 @@ fn run_set_rule_translation(cfg: &Config, args: &Args) -> ! {
 fn run_delete_rule_translation(cfg: &Config, args: &Args) -> ! {
     use birchtree::application::ports::AdminInfraStore;
     use birchtree::domain::Id;
-    let id: Id = args.id.as_deref().unwrap_or("").parse().unwrap_or_else(|_| {
-        eprintln!("delete-rule-translation requires --id=<rule id>");
-        std::process::exit(2);
-    });
+    let id: Id = args
+        .id
+        .as_deref()
+        .unwrap_or("")
+        .parse()
+        .unwrap_or_else(|_| {
+            eprintln!("delete-rule-translation requires --id=<rule id>");
+            std::process::exit(2);
+        });
     let locale = args.locale.clone().unwrap_or_else(|| {
         eprintln!("delete-rule-translation requires --locale=<BCP-47 tag>");
         std::process::exit(2);

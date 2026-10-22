@@ -6,7 +6,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
 use birchtree::api::mastodon::{ApiState, ServerInfo, build_router};
-use birchtree::application::accounts::{create_account, CreateAccountCommand};
+use birchtree::application::accounts::{CreateAccountCommand, create_account};
 use birchtree::application::context::Context;
 use birchtree::config::Config;
 use birchtree::domain::{Account, Clock, IdGenerator, SystemClock, TimestampIdGenerator};
@@ -92,10 +92,7 @@ impl TestServer {
     /// Open a fresh server with a config tweak (core-extension policy
     /// tests set `license_policy` / `place_policy` / `alt_text_policy`).
     /// (Ported from core-ext; new on this branch.)
-    pub fn with_config(
-        registration_open: bool,
-        configure: impl FnOnce(&mut Config),
-    ) -> Self {
+    pub fn with_config(registration_open: bool, configure: impl FnOnce(&mut Config)) -> Self {
         let (dir, store) = temp_store();
         let mut cfg = Config {
             public_url: TEST_PUBLIC_URL.to_string(),
@@ -125,6 +122,39 @@ impl TestServer {
         Self::assemble_with_cfg(dir, store, cfg, limits)
     }
 
+    /// Rebuild the full router sharing this server's store, with mail
+    /// disabled. Tests that pin the mail-disabled refusals (503 resends)
+    /// use this explicitly; the default router enables mail so registration
+    /// tests exercise the fail-closed guard's pass path.
+    pub fn disabled_mail_router(&self) -> axum::Router {
+        use birchtree::api::mastodon::{ApiState, build_router};
+        use birchtree::application::accounts::InviteStore;
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let ids: Arc<dyn IdGenerator> =
+            Arc::new(TimestampIdGenerator::new(Box::new(SystemClock)));
+        let server = server_info();
+        let streams = self.streams.clone();
+        let context = Arc::new(Context::new(
+            clock,
+            ids,
+            self.store.clone(),
+            self.blobs.clone(),
+            Arc::new(streams.clone()),
+        ));
+        let federation = federation_config(context.clone(), TEST_PUBLIC_URL);
+        build_router(ApiState {
+            context,
+            trusted_proxies: Arc::new(Vec::new()),
+            max_body_size: 16 * 1024 * 1024,
+            server,
+            streams: streams.clone(),
+            federation,
+            rate_limit_multiplier: 1,
+            mail_env: std::sync::Arc::new(birchtree::mailer::MailEnv::disabled()),
+            invites: self.store.clone() as std::sync::Arc<dyn InviteStore>,
+        })
+    }
+
     fn assemble_with_cfg(
         dir: tempfile::TempDir,
         store: Arc<RedbStore>,
@@ -132,8 +162,7 @@ impl TestServer {
         limits: Limits,
     ) -> Self {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-        let ids: Arc<dyn IdGenerator> =
-            Arc::new(TimestampIdGenerator::new(Box::new(SystemClock)));
+        let ids: Arc<dyn IdGenerator> = Arc::new(TimestampIdGenerator::new(Box::new(SystemClock)));
         let blobs: Arc<birchtree::media::blob_store::FsBlobStore> = Arc::new(
             birchtree::media::blob_store::FsBlobStore::open(dir.path().join("media"))
                 .expect("open blob store"),
@@ -156,7 +185,15 @@ impl TestServer {
             streams: streams.clone(),
             federation,
             rate_limit_multiplier: 1,
-            mail_env: std::sync::Arc::new(birchtree::mailer::MailEnv::disabled()),
+            // Mail enabled: public registration refuses when confirmation
+            // mail cannot deliver (fail closed), so the harness must offer
+            // it — like production with SMTP configured. Tests that pin
+            // the mail-disabled refusals (503 resends) build their own
+            // disabled router explicitly.
+            mail_env: std::sync::Arc::new(birchtree::mailer::MailEnv::new(
+                "noreply@example.social",
+                true,
+            )),
             // Durable redb invites, like production (`main.rs`): the
             // harness's store is the invite store, so invite-gated
             // registration paths are exercisable end to end.
@@ -174,7 +211,10 @@ impl TestServer {
 }
 
 /// Send a request through the router and return `(status, headers, body)`.
-pub async fn send(router: &axum::Router, request: Request<Body>) -> (StatusCode, HeaderMap, Vec<u8>) {
+pub async fn send(
+    router: &axum::Router,
+    request: Request<Body>,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
     let response = router
         .clone()
         .oneshot(request)
@@ -190,12 +230,7 @@ pub async fn send(router: &axum::Router, request: Request<Body>) -> (StatusCode,
 }
 
 /// Build a form-encoded request, optionally carrying a bearer token.
-pub fn form_request(
-    method: &str,
-    uri: &str,
-    body: &str,
-    token: Option<&str>,
-) -> Request<Body> {
+pub fn form_request(method: &str, uri: &str, body: &str, token: Option<&str>) -> Request<Body> {
     let mut builder = Request::builder()
         .method(method)
         .uri(uri)

@@ -52,7 +52,12 @@ fn token_with_email(srv: &TestServer, username: &str, email: Option<&str>, scope
 async fn invite_show_unknown_code_is_handler_404() {
     let srv = TestServer::new(true);
     let (status, _, bytes) = send(&srv.router, get_request("/invite/nope-nope", None, None)).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
     let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
     assert_eq!(body["error"], "Record not found");
 }
@@ -62,13 +67,21 @@ async fn email_confirmation_without_provider_is_explicit_503() {
     let srv = TestServer::new(true);
     // `write` scope covers `write:accounts` via the broad-scope rule.
     let user = token_with_email(&srv, "alice", Some("alice@example.com"), "read write");
+    // Explicitly mail-disabled router (the default test router enables
+    // mail so registration tests exercise the fail-closed guard's pass path).
+    let router = srv.disabled_mail_router();
     let (status, _, bytes) = send(
-        &srv.router,
+        &router,
         form_request("POST", "/api/v1/emails/confirmations", "", Some(&user)),
     )
     .await;
     // Explicit disabled state (no SMTP configured), never a fake success.
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
 }
 
 #[tokio::test]
@@ -76,9 +89,17 @@ async fn notification_policy_and_requests_routes_are_wired() {
     let srv = TestServer::new(true);
     // No token → 401 from the handler, which proves the route exists
     // (an absent route would 404 without reaching auth).
-    let (status, _, _) = send(&srv.router, get_request("/api/v1/notifications/policy", None, None)).await;
+    let (status, _, _) = send(
+        &srv.router,
+        get_request("/api/v1/notifications/policy", None, None),
+    )
+    .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    let (status, _, _) = send(&srv.router, get_request("/api/v1/notifications/requests", None, None)).await;
+    let (status, _, _) = send(
+        &srv.router,
+        get_request("/api/v1/notifications/requests", None, None),
+    )
+    .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     // Authenticated policy read works and carries the upstream defaults.
@@ -88,7 +109,12 @@ async fn notification_policy_and_requests_routes_are_wired() {
         get_request("/api/v1/notifications/policy", Some(&user), None),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
     let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
     assert_eq!(body["filter_private_mentions"], true);
 
@@ -98,7 +124,12 @@ async fn notification_policy_and_requests_routes_are_wired() {
         get_request("/api/v1/notifications/requests", Some(&user), None),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
     let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
     assert_eq!(body, serde_json::json!([]));
 }

@@ -27,6 +27,7 @@ use birchtree::mailer::mailer_from_config;
 use birchtree::mailer::open_registration_without_mail;
 use birchtree::mailer::require_mail_for_open_registration;
 use birchtree::mailer::seal_failure_is_fatal;
+use birchtree::mailer::signup_without_mail;
 use birchtree::observability::redacted_path;
 
 #[test]
@@ -90,7 +91,16 @@ fn open_registration_without_smtp_refuses_production_startup() {
 
     let closed = Config::default();
     assert!(!open_registration_without_mail(&closed));
-    assert!(require_mail_for_open_registration(&closed).is_ok());
+    // The default config leaves invites enabled: invite signup still
+    // enqueues confirmation mail, so production startup refuses without
+    // SMTP even with registrations closed.
+    assert!(require_mail_for_open_registration(&closed).is_err());
+
+    let closed_no_invites = Config {
+        invites_enabled: false,
+        ..Config::default()
+    };
+    assert!(require_mail_for_open_registration(&closed_no_invites).is_ok());
 
     let with_smtp = Config {
         registration_open: true,
@@ -100,6 +110,37 @@ fn open_registration_without_smtp_refuses_production_startup() {
     };
     assert!(!open_registration_without_mail(&with_smtp));
     assert!(require_mail_for_open_registration(&with_smtp).is_ok());
+}
+
+#[test]
+fn invite_signup_without_smtp_refuses_production_startup() {
+    // Closed registrations with invites enabled still strand confirmation
+    // mail: the predicate covers every path that enqueues the job.
+    let closed_invites = Config {
+        registration_open: false,
+        invites_enabled: true,
+        ..Config::default()
+    };
+    assert!(!open_registration_without_mail(&closed_invites));
+    assert!(signup_without_mail(&closed_invites));
+    assert!(require_mail_for_open_registration(&closed_invites).is_err());
+
+    // Invites disabled too: nothing can sign up, startup passes.
+    let fully_closed = Config {
+        registration_open: false,
+        invites_enabled: false,
+        ..Config::default()
+    };
+    assert!(!signup_without_mail(&fully_closed));
+    assert!(require_mail_for_open_registration(&fully_closed).is_ok());
+
+    // Lab passes either way; the mail job itself stays explicitly
+    // undelivered (retry, never `Ok`).
+    let lab = Config {
+        mode: RuntimeMode::Lab,
+        ..closed_invites.clone()
+    };
+    assert!(require_mail_for_open_registration(&lab).is_ok());
 }
 
 #[test]

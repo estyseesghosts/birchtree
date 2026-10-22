@@ -15,7 +15,10 @@ use birchtree::application::auth;
 use birchtree::application::context::Context;
 use birchtree::application::ports::{AccountStore, JobQueue};
 use birchtree::domain::{Clock, Id, IdGenerator, Job, JobKind, SystemClock, TimestampIdGenerator};
-use common::{T0, TestServer, federation_config, form_request, get_request, send, server_info, TEST_PUBLIC_URL};
+use common::{
+    T0, TEST_PUBLIC_URL, TestServer, federation_config, form_request, get_request, send,
+    server_info,
+};
 
 /// A minimal SMTP sink: greets, accepts one message, records the DATA.
 /// Speaks just enough for lettre's sync client (EHLO, MAIL, RCPT, DATA,
@@ -59,14 +62,21 @@ async fn handle_conn(stream: TcpStream, data: Arc<Mutex<Vec<String>>>) {
         }
         let upper = line.to_ascii_uppercase();
         if upper.starts_with("EHLO") || upper.starts_with("HELO") {
-            writer.write_all(b"250-Hello\r\n250 8BITMIME\r\n").await.ok();
+            writer
+                .write_all(b"250-Hello\r\n250 8BITMIME\r\n")
+                .await
+                .ok();
         } else if upper.starts_with("MAIL FROM") || upper.starts_with("RCPT TO") {
             writer.write_all(b"250 ok\r\n").await.ok();
         } else if upper == "DATA" {
             in_data = true;
             writer.write_all(b"354 end with .\r\n").await.ok();
         } else if upper == "QUIT" || upper == "RSET" {
-            let reply = if upper == "QUIT" { b"221 bye\r\n".as_slice() } else { b"250 ok\r\n".as_slice() };
+            let reply = if upper == "QUIT" {
+                b"221 bye\r\n".as_slice()
+            } else {
+                b"250 ok\r\n".as_slice()
+            };
             writer.write_all(reply).await.ok();
             if upper == "QUIT" {
                 break;
@@ -84,7 +94,11 @@ fn smtp_mailer(addr: std::net::SocketAddr) -> birchtree::mailer::SmtpMailer {
 
 fn user_token(srv: &TestServer, username: &str, email: Option<&str>) -> String {
     use birchtree::application::accounts::{CreateAccountCommand, create_account};
-    let account = match srv.store.account_by_handle(username, "example.social").expect("store") {
+    let account = match srv
+        .store
+        .account_by_handle(username, "example.social")
+        .expect("store")
+    {
         Some(account) => account,
         None => create_account(
             &*srv.store,
@@ -150,7 +164,12 @@ fn enabled_router(srv: &TestServer, from: &str) -> axum::Router {
 }
 
 fn last_data(sink: &Sink) -> String {
-    sink.data.lock().expect("sink").last().cloned().expect("one message")
+    sink.data
+        .lock()
+        .expect("sink")
+        .last()
+        .cloned()
+        .expect("one message")
 }
 
 /// Undo quoted-printable soft line breaks (`=\n`) and the escaped `=`
@@ -208,8 +227,14 @@ async fn reset_job_delivers_through_worker_handler() {
     )
     .expect("handler delivers");
     let got = unfold_qp(&last_data(&sink));
-    assert!(got.contains("reset_password_token=reset-token-xyz"), "{got}");
-    assert!(got.contains("https://example.social/auth/password/edit"), "{got}");
+    assert!(
+        got.contains("reset_password_token=reset-token-xyz"),
+        "{got}"
+    );
+    assert!(
+        got.contains("https://example.social/auth/password/edit"),
+        "{got}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -225,7 +250,12 @@ async fn confirmation_endpoint_enqueues_and_worker_delivers() {
         form_request("POST", "/api/v1/emails/confirmations", "", Some(&user)),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
 
     // The job carries a random (unguessable) token.
     let jobs = srv.store.claim_due(4_000_000_000_000, 64).expect("claim");
@@ -253,16 +283,21 @@ async fn confirmation_endpoint_enqueues_and_worker_delivers() {
     .expect("handler delivers");
     srv.store.complete(job.id).expect("complete");
     let got = unfold_qp(&last_data(&sink));
-    assert!(got.contains(&format!("confirmation_token={token}")), "{got}");
+    assert!(
+        got.contains(&format!("confirmation_token={token}")),
+        "{got}"
+    );
 }
 
 #[tokio::test]
 async fn confirmation_endpoint_still_refuses_when_disabled() {
-    // The default test router wires MailEnv::disabled().
+    // An explicitly mail-disabled router (the default test router enables
+    // mail so registration tests exercise the fail-closed guard's pass path).
     let srv = TestServer::new(true);
+    let router = srv.disabled_mail_router();
     let user = user_token(&srv, "bob", Some("bob@example.com"));
     let (status, _, _) = send(
-        &srv.router,
+        &router,
         form_request("POST", "/api/v1/emails/confirmations", "", Some(&user)),
     )
     .await;
@@ -273,5 +308,10 @@ async fn confirmation_endpoint_still_refuses_when_disabled() {
         get_request("/api/v1/emails/check_confirmation", Some(&user), None),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
 }

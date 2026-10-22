@@ -32,8 +32,6 @@ fn translation_prefixes_are_judged_by_the_embedded_ipv4_address() {
         "64:ff9b::7f00:1",
         "64:ff9b::a00:1",
         "64:ff9b::c0a8:101",
-        "64:ff9b:1::7f00:1",
-        "64:ff9b:1::a00:1",
     ] {
         assert!(
             !policy::is_public_unicast(ip(blocked)),
@@ -46,6 +44,32 @@ fn translation_prefixes_are_judged_by_the_embedded_ipv4_address() {
             "{public} must be allowed"
         );
     }
+}
+
+/// Local-use `64:ff9b:1::/48` (RFC 8215) is denied outright with no
+/// embedded-v4 check: even a public-looking tail is refused, and only an
+/// allowlist entry admits it (same as any other private range).
+#[test]
+fn local_use_nat64_is_denied_regardless_of_tail() {
+    for blocked in [
+        "64:ff9b:1::7f00:1",
+        "64:ff9b:1::a00:1",
+        "64:ff9b:1::808:808",
+        "64:ff9b:1::101:101",
+        "64:ff9b:1:ffff:ffff:ffff:ffff:ffff",
+    ] {
+        assert!(
+            !policy::is_public_unicast(ip(blocked)),
+            "{blocked} must be blocked"
+        );
+    }
+    // Well-known `64:ff9b::/96` keeps the embedded-v4 check: a public tail
+    // stays dialable.
+    assert!(policy::is_public_unicast(ip("64:ff9b::808:808")));
+    // An allowlist entry is the only way through for the local-use prefix.
+    let list = policy::parse_allowlist("64:ff9b:1::/48").expect("allowlist parses");
+    assert!(policy::address_allowed(ip("64:ff9b:1::808:808"), &list));
+    assert!(!policy::address_allowed(ip("64:ff9b:1::808:808"), &[]));
 }
 
 #[test]

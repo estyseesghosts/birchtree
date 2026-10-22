@@ -6,25 +6,27 @@
 //! endpoints accept `read`/`read:accounts`; `verify_credentials` and
 //! `update_credentials` require a user token.
 
-use axum::extract::{ConnectInfo, Extension, FromRequest, Multipart, Path, RawQuery, Request, State};
+use axum::extract::{
+    ConnectInfo, Extension, FromRequest, Multipart, Path, RawQuery, Request, State,
+};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
 use crate::api::forms::{self, FormBody};
+use crate::api::mastodon::ApiState;
 use crate::api::mastodon::auth::Auth;
 use crate::api::mastodon::dto;
 use crate::api::mastodon::errors::{ApiError, ApiResult};
-use crate::api::mastodon::ApiState;
 use crate::application::accounts::{self, RegisterAccountCommand};
 use crate::application::media::human_size;
 use crate::application::ports::{
     AccountProfileUpdate, ProfileImageData, Store, UserSettingsUpdate,
 };
 use crate::application::relationships;
-use crate::domain::Error as DomainError;
 use crate::domain::EmailTokenKind;
+use crate::domain::Error as DomainError;
 use crate::mailer::{MailEnv, MailError};
 
 /// Scope alternatives accepted by the write endpoints.
@@ -79,7 +81,17 @@ pub async fn register(
         .into_response();
     }
     // Mastodon's `check_enabled_registrations` answers 403 Forbidden.
-    if !state.server.registrations_open {
+    // Upstream parity (`allowed_registration?`): a usable invite opens
+    // closed registrations. Unknown/unusable codes while closed stay 403;
+    // while open they are ignored by the use case below. The check is a
+    // boolean only (no validity oracle: both refusals answer the same 403).
+    let invite_opens = state.server.invites_enabled
+        && forms::get(&pairs, "invite_code")
+            .is_some_and(|code| !code.trim().is_empty())
+        && forms::get(&pairs, "invite_code").is_some_and(|code| {
+            accounts::invite_status(&*state.invites, code, state.context.now_ms()).is_ok()
+        });
+    if !state.server.registrations_open && !invite_opens {
         return ApiError::forbidden("Forbidden").into_response();
     }
     // Phase 7.3 IP sign-up blocks (`sign_up_block` severity): refuse
@@ -87,11 +99,8 @@ pub async fn register(
     {
         use crate::api::mastodon::endpoints::admin_infra;
         let peer_ip = peer.map(|info| info.0.ip());
-        let client = admin_infra::request_client_ip(
-            &headers,
-            peer_ip,
-            state.trusted_proxies.as_slice(),
-        );
+        let client =
+            admin_infra::request_client_ip(&headers, peer_ip, state.trusted_proxies.as_slice());
         if client.is_some_and(|ip| admin_infra::is_sign_up_blocked_for(&state, ip)) {
             return ApiError::forbidden("Forbidden").into_response();
         }
@@ -121,6 +130,14 @@ pub async fn register(
         time_zone: field("time_zone"),
         date_of_birth: field("date_of_birth"),
     };
+
+    // Fail closed when confirmation mail cannot deliver: refuse before the
+    // account (and its `SendConfirmationEmail` job) is created, on both the
+    // open and the invite path. The endpoint maps this to 403, the same
+    // explicit refusal as the resend endpoints' 503.
+    if let Err(err) = accounts::check_registration_mail(&state.mail_env) {
+        return ApiError::from(err).into_response();
+    }
 
     let store: &dyn Store = &*state.context.store;
     // Invite-aware registration (D12): a usable invite opens closed
@@ -266,7 +283,10 @@ async fn apply_credentials_update(
     let field = |key: &str| forms::get(&pairs, key);
 
     let display_name = field("display_name").map(str::to_string);
-    if display_name.as_deref().is_some_and(|v| v.chars().count() > 40) {
+    if display_name
+        .as_deref()
+        .is_some_and(|v| v.chars().count() > 40)
+    {
         return validation_error(
             "Validation failed: Display name is too long (maximum is 40 characters)",
             json!({}),
@@ -287,24 +307,26 @@ async fn apply_credentials_update(
     let bot = field("bot").map(bool_cast);
     // `fields_attributes` absent → leave stored fields unchanged (upstream
     // nested-attributes semantics); present → replace the whole list.
-    let profile_fields: Option<Vec<crate::domain::AccountField>> =
-        if pairs.iter().any(|(key, _)| key.starts_with("fields_attributes")) {
-            match parse_profile_fields(&pairs) {
-                Ok(fields) => Some(
-                    fields
-                        .into_iter()
-                        .map(|(name, value)| crate::domain::AccountField {
-                            name,
-                            value,
-                            verified_at: None,
-                        })
-                        .collect(),
-                ),
-                Err(err) => return err,
-            }
-        } else {
-            None
-        };
+    let profile_fields: Option<Vec<crate::domain::AccountField>> = if pairs
+        .iter()
+        .any(|(key, _)| key.starts_with("fields_attributes"))
+    {
+        match parse_profile_fields(&pairs) {
+            Ok(fields) => Some(
+                fields
+                    .into_iter()
+                    .map(|(name, value)| crate::domain::AccountField {
+                        name,
+                        value,
+                        verified_at: None,
+                    })
+                    .collect(),
+            ),
+            Err(err) => return err,
+        }
+    } else {
+        None
+    };
     // Same presence rule for `attribution_domains[]`.
     let attribution_domains: Option<Vec<String>> = pairs
         .iter()
@@ -354,7 +376,9 @@ async fn apply_credentials_update(
     ] {
         if field(key).is_some_and(|v| v.chars().count() > MAX_IMAGE_DESCRIPTION_LEN) {
             return validation_error(
-                format!("Validation failed: {label} description is too long (maximum is {MAX_IMAGE_DESCRIPTION_LEN} characters)"),
+                format!(
+                    "Validation failed: {label} description is too long (maximum is {MAX_IMAGE_DESCRIPTION_LEN} characters)"
+                ),
                 json!({}),
             );
         }
@@ -388,7 +412,7 @@ async fn apply_credentials_update(
                         return ApiError::unprocessable(
                             crate::domain::license::ERR_LICENSE_INVALID,
                         )
-                        .into_response()
+                        .into_response();
                     }
                 }
             }
@@ -472,7 +496,7 @@ async fn apply_credentials_update(
                     return validation_error(
                         "Validation failed: Display media is not included in the list",
                         json!({}),
-                    )
+                    );
                 }
             },
         };
@@ -620,7 +644,11 @@ pub async fn profile_update(
 /// avatar associated with the profile, the response will still indicate a
 /// successful deletion"). The stale blob is dropped best-effort after the
 /// commit, like the update path.
-async fn clear_profile_image(state: &ApiState, account_id: crate::domain::Id, slot: &str) -> Response {
+async fn clear_profile_image(
+    state: &ApiState,
+    account_id: crate::domain::Id,
+    slot: &str,
+) -> Response {
     debug_assert!(slot == "avatar" || slot == "header");
     let store: &dyn Store = &*state.context.store;
     let previous = store
@@ -759,9 +787,10 @@ async fn credential_multipart(
             Some("avatar") => fields.avatar = Some(bytes),
             Some("header") => fields.header = Some(bytes),
             Some(name) => {
-                fields
-                    .pairs
-                    .push((name.to_string(), String::from_utf8_lossy(&bytes).into_owned()));
+                fields.pairs.push((
+                    name.to_string(),
+                    String::from_utf8_lossy(&bytes).into_owned(),
+                ));
             }
             None => {}
         }
@@ -795,7 +824,13 @@ fn profile_image_slot(
 ) -> Result<Option<Option<ProfileImageData>>, Response> {
     match upload {
         Some(bytes) if !bytes.is_empty() => {
-            let (mime_type, extension) = validate_profile_image(bytes.len(), &bytes, label, limit, state.server.max_file_size)?;
+            let (mime_type, extension) = validate_profile_image(
+                bytes.len(),
+                &bytes,
+                label,
+                limit,
+                state.server.max_file_size,
+            )?;
             let key = stage_profile_image(&*state.context.blobs, kind, &bytes, extension)?;
             Ok(Some(Some(ProfileImageData {
                 key,
@@ -944,7 +979,10 @@ fn parse_profile_fields(pairs: &[(String, String)]) -> Result<Vec<(String, Strin
         ));
     }
     // `EmptyProfileFieldNamesValidator`: a value without a label 422s.
-    if fields.iter().any(|(name, value)| name.is_empty() && !value.is_empty()) {
+    if fields
+        .iter()
+        .any(|(name, value)| name.is_empty() && !value.is_empty())
+    {
         return Err(validation_error(
             "Validation failed: Fields contains values with missing labels",
             json!({}),
@@ -1059,8 +1097,7 @@ pub async fn lookup(
             // G-D live WebFinger: unknown REMOTE handles resolve live over
             // webfinger when the caller is authenticated; 404 only when
             // truly missing. Local unknowns still 404.
-            let Some((_, domain)) = crate::activitypub::objects::split_remote_acct(stripped)
-            else {
+            let Some((_, domain)) = crate::activitypub::objects::split_remote_acct(stripped) else {
                 return ApiError::not_found().into_response();
             };
             if !crate::activitypub::objects::lookup_should_resolve_live(
@@ -1177,15 +1214,9 @@ pub async fn search(
             None => (q.to_ascii_lowercase(), state.server.domain.clone()),
         };
         if domain == state.server.domain {
-            exact = store
-                .account_by_handle(&username, &domain)
-                .ok()
-                .flatten();
+            exact = store.account_by_handle(&username, &domain).ok().flatten();
         } else {
-            exact = store
-                .account_by_handle(&username, &domain)
-                .ok()
-                .flatten();
+            exact = store.account_by_handle(&username, &domain).ok().flatten();
             // `resolve=true` on a remote handle: fetch it over federation
             // (mirrors the v2 search resolve path; unknown handles add
             // nothing, like upstream's `ResolveAccountService` miss).
@@ -1197,9 +1228,7 @@ pub async fn search(
             }
         }
         // `following=true` gates the exact match too.
-        if following
-            && let Some(ref account) = exact
-        {
+        if following && let Some(ref account) = exact {
             let followed = match store.follow_of(viewer, account.id) {
                 Ok(Some(follow)) => follow.state == crate::domain::FollowState::Active,
                 _ => false,
@@ -1237,9 +1266,7 @@ pub async fn search(
                     }
                     if following {
                         let followed = match store.follow_of(viewer, account.id) {
-                            Ok(Some(follow)) => {
-                                follow.state == crate::domain::FollowState::Active
-                            }
+                            Ok(Some(follow)) => follow.state == crate::domain::FollowState::Active,
                             _ => false,
                         };
                         if !followed {

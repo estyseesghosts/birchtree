@@ -8,23 +8,15 @@ use crate::domain::bookmark::Bookmark;
 use crate::domain::favourite::Favourite;
 use crate::domain::{
     AccessToken, Account, AccountNote, AccountStats, AdminAccountOverview, AdminAuditRecord,
-    AdminCanonicalEmailBlock,
-    AdminDomainAllow, AdminDomainBlock, AdminDomainSeverity, AdminEmailDomainBlock, AdminIpBlock,
-    AdminIpSeverity, AdminMediaOwner, AdminReportTarget, AdminTag, AnnualReport,
-    AuthorizationCode, Block, CustomEmoji, CustomFilter,
-    DomainBlock,
-    EmailToken,
-    Endorsement, Error, FilterKeyword, FilterStatus, Follow, FollowMetricRow, Id, Job, JobKind,
-    InteractionEvent, InteractionEventKind,
-    List,
-    LocalUser,
-    LoginSession, Marker, MediaAttachment, Mute, NewAnnualReport, Notification, NotificationPolicy,
-    NotificationRequest, NotificationType,
-    OAuthApplication,
-    Poll, QuotePolicy, QuoteRecord, RepliesPolicy, Report, Result, Rule, RuleTranslation,
-    ScheduledStatus, Status,
-    StatusApplication, StatusVersion, TagUsage, TrendLink, TrendPublisher, TrendStatusFlag,
-    TrendTagFlag, UserRole, Visibility,
+    AdminCanonicalEmailBlock, AdminDomainAllow, AdminDomainBlock, AdminDomainSeverity,
+    AdminEmailDomainBlock, AdminIpBlock, AdminIpSeverity, AdminMediaOwner, AdminReportTarget,
+    AdminTag, AnnualReport, AuthorizationCode, Block, CustomEmoji, CustomFilter, DomainBlock,
+    EmailToken, Endorsement, Error, FilterKeyword, FilterStatus, Follow, FollowMetricRow, Id,
+    InteractionEvent, InteractionEventKind, Job, JobKind, List, LocalUser, LoginSession, Marker,
+    MediaAttachment, Mute, NewAnnualReport, Notification, NotificationPolicy, NotificationRequest,
+    NotificationType, OAuthApplication, Poll, QuotePolicy, QuoteRecord, RepliesPolicy, Report,
+    Result, Rule, RuleTranslation, ScheduledStatus, Status, StatusApplication, StatusVersion,
+    TagUsage, TrendLink, TrendPublisher, TrendStatusFlag, TrendTagFlag, UserRole, Visibility,
 };
 
 // Re-export the two kernel ports under their canonical names.
@@ -187,7 +179,8 @@ pub trait AccountStore: Send + Sync {
 
     fn account_by_id(&self, id: Id) -> Result<Option<Account>>;
 
-    fn account_by_handle(&self, normalized_username: &str, domain: &str) -> Result<Option<Account>>;
+    fn account_by_handle(&self, normalized_username: &str, domain: &str)
+    -> Result<Option<Account>>;
 
     fn user_by_account_id(&self, account_id: Id) -> Result<Option<LocalUser>>;
 
@@ -216,7 +209,8 @@ pub trait AccountStore: Send + Sync {
     ) -> Result<Account>;
 
     /// Apply a preferences patch, returning the updated credential record.
-    fn update_user_settings(&self, account_id: Id, update: UserSettingsUpdate) -> Result<LocalUser>;
+    fn update_user_settings(&self, account_id: Id, update: UserSettingsUpdate)
+    -> Result<LocalUser>;
 
     /// Grant or clear a staff role (`admin`, `moderator`, `none`) in ONE
     /// transaction, returning the updated credential record. `NotFound` when
@@ -263,44 +257,50 @@ pub trait AccountStore: Send + Sync {
     /// Login IPs for `account_id`, newest first, bounded by `cap`
     /// (fix round P1/P3; backs the admin `ips` field as `(ip, used_at)`
     /// pairs; `ip` is the latest entry).
-    fn login_ips_for(
-        &self,
-        account_id: Id,
-        cap: usize,
-    ) -> Result<Vec<(std::net::IpAddr, u64)>>;
+    fn login_ips_for(&self, account_id: Id, cap: usize) -> Result<Vec<(std::net::IpAddr, u64)>>;
 
     /// Resolve a local account by email address (normalized lowercase; D12
     /// public forgot-password). `None` for unknown addresses — the caller,
     /// not this method, decides what to reveal (no enumeration oracle here).
     /// Scaffold default refuses loudly; RedbStore overrides.
     fn account_by_email(&self, _normalized_email: &str) -> Result<Option<Account>> {
-        Err(Error::Internal("account_by_email is not implemented".into()))
+        Err(Error::Internal(
+            "account_by_email is not implemented".into(),
+        ))
     }
 
     /// Flip the email-verified flag (D12 confirmation redemption).
     /// Scaffold default refuses loudly; RedbStore overrides.
     fn set_email_verified(&self, _account_id: Id, _verified: bool) -> Result<LocalUser> {
-        Err(Error::Internal("set_email_verified is not implemented".into()))
+        Err(Error::Internal(
+            "set_email_verified is not implemented".into(),
+        ))
     }
 
     /// Store a pending email token (D12 redemption; single-use bearer).
     /// Scaffold default refuses loudly; RedbStore overrides.
     fn store_email_token(&self, _token: &str, _record: EmailToken) -> Result<()> {
-        Err(Error::Internal("store_email_token is not implemented".into()))
+        Err(Error::Internal(
+            "store_email_token is not implemented".into(),
+        ))
     }
 
     /// Consume a pending email token: returns the record and deletes the row
     /// (`None` for unknown/already-used tokens). Scaffold default refuses
     /// loudly; RedbStore overrides.
     fn redeem_email_token(&self, _token: &str) -> Result<Option<EmailToken>> {
-        Err(Error::Internal("redeem_email_token is not implemented".into()))
+        Err(Error::Internal(
+            "redeem_email_token is not implemented".into(),
+        ))
     }
 
     /// Set a local user's password hash in ONE transaction (D12
     /// password-reset redemption). `NotFound` when no local user exists for
     /// `account_id`. Scaffold default refuses loudly; RedbStore overrides.
     fn set_user_password(&self, _account_id: Id, _password_hash: String) -> Result<LocalUser> {
-        Err(Error::Internal("set_user_password is not implemented".into()))
+        Err(Error::Internal(
+            "set_user_password is not implemented".into(),
+        ))
     }
 }
 
@@ -322,7 +322,8 @@ pub trait OAuthStore: Send + Sync {
     fn revoke_account_tokens(&self, account_id: Id) -> Result<Vec<Id>>;
 
     fn create_authorization_code(&self, input: NewAuthCode) -> Result<AuthorizationCode>;
-    fn authorization_code_by_plaintext(&self, plaintext: &str) -> Result<Option<AuthorizationCode>>;
+    fn authorization_code_by_plaintext(&self, plaintext: &str)
+    -> Result<Option<AuthorizationCode>>;
     /// Atomically mark the code used and issue its token. Returns an error if
     /// the code is missing, already used, or expired — so a replay can never
     /// mint a second token.
@@ -374,6 +375,16 @@ pub trait BlobStore: Send + Sync {
         None
     }
 
+    /// Filesystem root of the evictable cache pool, when the handle fronts
+    /// both pools (the `PooledBlobStores` runtime handle). The public file
+    /// route streams `remote/…` keys from here after the durable root, so a
+    /// large remote costs a file-backed response instead of a full in-memory
+    /// copy per request. `None` (single-pool handles, in-memory doubles)
+    /// leaves the durable root as the only streaming root.
+    fn cache_root_path(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
     /// Publish an already-staged tmp file onto `key` (atomic rename; storage
     /// overhaul, Agent C). The default refuses; `FsBlobStore` resolves the
     /// key under its root and renames.
@@ -388,7 +399,9 @@ pub trait BlobStore: Send + Sync {
     /// `FsBlobStore` overrides with tmp+rename.
     fn put_streamed(&self, key: &str, bytes: &[u8], max_bytes: u64) -> Result<()> {
         if bytes.len() as u64 > max_bytes {
-            return Err(Error::InvalidInput(format!("stream body exceeds {max_bytes} bytes")));
+            return Err(Error::InvalidInput(format!(
+                "stream body exceeds {max_bytes} bytes"
+            )));
         }
         self.put(key, bytes)
     }
@@ -412,12 +425,21 @@ pub trait BlobStores: Send + Sync {
 /// Remote-cache metadata + accounting (`docs/database.md` Step 0).
 /// Payloads < 64 KiB; evict batches bounded (<= 500 rows).
 pub trait CacheStore: Send + Sync {
-    fn cache_get(&self, source_url: &str, variant: &str)
-        -> Result<Option<crate::media::remote_cache::RemoteCacheEntry>>;
-    fn cache_put_metadata(&self, entry: crate::media::remote_cache::RemoteCacheEntry) -> Result<()>;
+    fn cache_get(
+        &self,
+        source_url: &str,
+        variant: &str,
+    ) -> Result<Option<crate::media::remote_cache::RemoteCacheEntry>>;
+    fn cache_put_metadata(&self, entry: crate::media::remote_cache::RemoteCacheEntry)
+    -> Result<()>;
     fn cache_mark_stored(
-        &self, source_url: &str, variant: &str, blob_key: &str,
-        size: u64, etag: Option<String>, now_ms: u64,
+        &self,
+        source_url: &str,
+        variant: &str,
+        blob_key: &str,
+        size: u64,
+        etag: Option<String>,
+        now_ms: u64,
     ) -> Result<()>;
     /// Drop the byte mapping, keep the metadata shell; returns the blob key
     /// the caller must delete. `None` when already shell-only / missing.
@@ -428,19 +450,17 @@ pub trait CacheStore: Send + Sync {
     /// then other classes, never avatar unless need is avatar. One txn for
     /// mapping+accounting; caller deletes the returned keys (own keys only).
     fn cache_evict_batch(
-        &self, need: crate::media::remote_cache::MediaClass,
-        bytes_to_free: u64, now_ms: u64, cap: usize,
+        &self,
+        need: crate::media::remote_cache::MediaClass,
+        bytes_to_free: u64,
+        now_ms: u64,
+        cap: usize,
     ) -> Result<Vec<String>>;
 }
 
 /// Durable job queue.
 pub trait JobQueue: Send + Sync {
-    fn enqueue(
-        &self,
-        kind: JobKind,
-        payload: serde_json::Value,
-        now_ms: u64,
-    ) -> Result<Job>;
+    fn enqueue(&self, kind: JobKind, payload: serde_json::Value, now_ms: u64) -> Result<Job>;
 
     /// Enqueue a job that becomes claimable at `due_at_ms` (scheduled-status
     /// publication, delayed retries).
@@ -715,8 +735,12 @@ pub trait StatusStore: Send + Sync {
     ) -> Result<Vec<(Id, Id)>>;
     /// Accounts that reblogged `status_id`, newest first, as
     /// `(account_id, reblog_status_id)` pairs; the reblog id is the cursor.
-    fn reblogged_by(&self, status_id: Id, max_id: Option<Id>, limit: usize)
-    -> Result<Vec<(Id, Id)>>;
+    fn reblogged_by(
+        &self,
+        status_id: Id,
+        max_id: Option<Id>,
+        limit: usize,
+    ) -> Result<Vec<(Id, Id)>>;
 
     /// The viewer's favourites, newest first (cursor = favourite row id).
     fn favourited_statuses(
@@ -821,7 +845,12 @@ pub trait RelationshipStore: Send + Sync {
     fn unfollow(&self, follower_id: Id, followed_id: Id, now_ms: u64) -> Result<Option<Follow>>;
 
     /// Remove an inbound follow (the caller's own follower).
-    fn remove_follower(&self, account_id: Id, follower_id: Id, now_ms: u64) -> Result<Option<Follow>>;
+    fn remove_follower(
+        &self,
+        account_id: Id,
+        follower_id: Id,
+        now_ms: u64,
+    ) -> Result<Option<Follow>>;
 
     /// Pending inbound follow requests, newest first (cursor = follower id;
     /// upstream paginates `FollowRequest` row ids, which are client-opaque
@@ -836,8 +865,12 @@ pub trait RelationshipStore: Send + Sync {
 
     /// Convert a pending request to an active follow (atomic + notification
     /// job); NotFound when no request exists.
-    fn authorize_follow_request(&self, target_id: Id, follower_id: Id, now_ms: u64)
-    -> Result<Follow>;
+    fn authorize_follow_request(
+        &self,
+        target_id: Id,
+        follower_id: Id,
+        now_ms: u64,
+    ) -> Result<Follow>;
 
     /// Drop a pending request (atomic).
     fn reject_follow_request(
@@ -1007,8 +1040,10 @@ pub trait WebStore: Send + Sync {
         user_id: Id,
         id: Id,
     ) -> Result<Option<WebPushSubscription>>;
-    fn destroy_web_push_subscription_by_token(&self, token: &str)
-        -> Result<Option<WebPushSubscription>>;
+    fn destroy_web_push_subscription_by_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<WebPushSubscription>>;
     fn follow_tag(&self, account_id: Id, tag: &str, now_ms: u64) -> Result<TagFollow>;
     fn unfollow_tag(&self, account_id: Id, tag: &str) -> Result<Option<TagFollow>>;
     fn followed_tags(
@@ -1132,10 +1167,8 @@ pub trait AdminInfraStore: Send + Sync {
     /// The email-domain block for one normalized domain, if any (targeted
     /// signup lookup; domains are unique at creation, so at most one row).
     /// `None` for blank/unknown domains — never an error.
-    fn email_domain_block_for_domain(
-        &self,
-        domain: &str,
-    ) -> Result<Option<AdminEmailDomainBlock>>;    fn admin_delete_email_domain_block(&self, id: Id) -> Result<Option<AdminEmailDomainBlock>>;
+    fn email_domain_block_for_domain(&self, domain: &str) -> Result<Option<AdminEmailDomainBlock>>;
+    fn admin_delete_email_domain_block(&self, id: Id) -> Result<Option<AdminEmailDomainBlock>>;
 
     // -- IP blocks --
     fn admin_create_ip_block(
@@ -1165,9 +1198,13 @@ pub trait AdminInfraStore: Send + Sync {
     fn admin_delete_ip_block(&self, id: Id) -> Result<Option<AdminIpBlock>>;
 
     // -- Canonical email blocks --
-    fn admin_create_canonical_email_block(&self, email_hash: &str, now_ms: u64)
-    -> Result<AdminCanonicalEmailBlock>;
-    fn admin_canonical_email_block_by_id(&self, id: Id) -> Result<Option<AdminCanonicalEmailBlock>>;
+    fn admin_create_canonical_email_block(
+        &self,
+        email_hash: &str,
+        now_ms: u64,
+    ) -> Result<AdminCanonicalEmailBlock>;
+    fn admin_canonical_email_block_by_id(&self, id: Id)
+    -> Result<Option<AdminCanonicalEmailBlock>>;
     fn admin_canonical_email_blocks_page(
         &self,
         max_id: Option<Id>,
@@ -1176,8 +1213,14 @@ pub trait AdminInfraStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<AdminCanonicalEmailBlock>>;
     /// Rows whose hash matches (the `test` endpoint), newest first.
-    fn admin_canonical_blocks_for_hash(&self, email_hash: &str) -> Result<Vec<AdminCanonicalEmailBlock>>;
-    fn admin_delete_canonical_email_block(&self, id: Id) -> Result<Option<AdminCanonicalEmailBlock>>;
+    fn admin_canonical_blocks_for_hash(
+        &self,
+        email_hash: &str,
+    ) -> Result<Vec<AdminCanonicalEmailBlock>>;
+    fn admin_delete_canonical_email_block(
+        &self,
+        id: Id,
+    ) -> Result<Option<AdminCanonicalEmailBlock>>;
 
     // -- Tags --
     /// Ensure a tag row for `name` (idempotent; materializes real hashtag
@@ -1279,7 +1322,9 @@ pub trait AdminInfraStore: Send + Sync {
         _hint: String,
         _now_ms: u64,
     ) -> Result<RuleTranslation> {
-        Err(Error::Internal("admin_set_rule_translation is not implemented".into()))
+        Err(Error::Internal(
+            "admin_set_rule_translation is not implemented".into(),
+        ))
     }
     /// Delete one `(rule, locale)` translation; `true` when a row existed.
     fn admin_delete_rule_translation(&self, _rule_id: Id, _locale: &str) -> Result<bool> {
@@ -1607,11 +1652,8 @@ pub trait NotificationStore: Send + Sync {
     fn notification_requests(&self, recipient_id: Id) -> Result<Vec<NotificationRequest>>;
 
     /// One request row of the recipient (`None` when missing or foreign).
-    fn notification_request(
-        &self,
-        recipient_id: Id,
-        id: Id,
-    ) -> Result<Option<NotificationRequest>>;
+    fn notification_request(&self, recipient_id: Id, id: Id)
+    -> Result<Option<NotificationRequest>>;
 
     /// Delete one request row of the recipient; `false` when missing or
     /// foreign (accept/dismiss destroy the row after doing their work).
@@ -1620,43 +1662,23 @@ pub trait NotificationStore: Send + Sync {
     /// How many *filtered* notification rows the recipient still holds from
     /// this actor (the request DTO `notifications_count`, computed live so
     /// it can never drift from the rows).
-    fn count_filtered_notifications(
-        &self,
-        recipient_id: Id,
-        from_account_id: Id,
-    ) -> Result<u64>;
+    fn count_filtered_notifications(&self, recipient_id: Id, from_account_id: Id) -> Result<u64>;
 
     /// Unhide every filtered notification from this actor (accept path);
     /// returns how many rows flipped. One transaction.
-    fn unfilter_notifications(
-        &self,
-        recipient_id: Id,
-        from_account_id: Id,
-    ) -> Result<u64>;
+    fn unfilter_notifications(&self, recipient_id: Id, from_account_id: Id) -> Result<u64>;
 
     /// Delete every *filtered* notification from this actor (dismiss path);
     /// returns how many rows were removed. Unfiltered rows are kept.
-    fn delete_filtered_notifications(
-        &self,
-        recipient_id: Id,
-        from_account_id: Id,
-    ) -> Result<u64>;
+    fn delete_filtered_notifications(&self, recipient_id: Id, from_account_id: Id) -> Result<u64>;
 
     /// Record that future notifications from this actor bypass the filter
     /// (upstream `NotificationPermission`, created on accept). Idempotent.
-    fn grant_notification_permission(
-        &self,
-        recipient_id: Id,
-        from_account_id: Id,
-    ) -> Result<()>;
+    fn grant_notification_permission(&self, recipient_id: Id, from_account_id: Id) -> Result<()>;
 
     /// Whether such a permission row exists (upstream
     /// `FilterCondition#override_for_sender?`).
-    fn has_notification_permission(
-        &self,
-        recipient_id: Id,
-        from_account_id: Id,
-    ) -> Result<bool>;
+    fn has_notification_permission(&self, recipient_id: Id, from_account_id: Id) -> Result<bool>;
 }
 
 /// Media attachment metadata (bytes/lifecycle are Phase 4).
@@ -1758,8 +1780,12 @@ pub trait MediaStore: Send + Sync {
     fn create_media(&self, input: NewMedia) -> Result<MediaAttachment>;
     /// The subset of `ids` owned by `owner_id` and unattached (or already
     /// attached to `status_id`), returned in the requested order.
-    fn attachable_media(&self, owner_id: Id, ids: &[Id], status_id: Option<Id>)
-    -> Result<Vec<MediaAttachment>>;
+    fn attachable_media(
+        &self,
+        owner_id: Id,
+        ids: &[Id],
+        status_id: Option<Id>,
+    ) -> Result<Vec<MediaAttachment>>;
     fn media_by_id(&self, id: Id) -> Result<Option<MediaAttachment>>;
 
     /// Attachments by id in ONE transaction (page loader; missing ids omitted,
@@ -1911,8 +1937,11 @@ pub trait FilterStore: Send + Sync {
     fn create_filter(&self, input: NewFilter, now_ms: u64) -> Result<FilterBundle>;
     fn filter_by_id(&self, id: Id) -> Result<Option<FilterBundle>>;
     /// The account's filters (optionally narrowed to a context), bounded.
-    fn filters_by_account(&self, account_id: Id, context: Option<&str>)
-    -> Result<Vec<FilterBundle>>;
+    fn filters_by_account(
+        &self,
+        account_id: Id,
+        context: Option<&str>,
+    ) -> Result<Vec<FilterBundle>>;
     /// Patch an owned filter; `None` when missing/foreign.
     fn update_filter(
         &self,
@@ -1993,8 +2022,12 @@ pub trait ScheduledStore: Send + Sync {
     /// Rows due for publication at `now_ms` (bounded).
     fn due_scheduled(&self, now_ms: u64, cap: usize) -> Result<Vec<ScheduledStatus>>;
     /// `(total, today)` counts against Mastodon's 300/25 limits.
-    fn scheduled_counts(&self, account_id: Id, day_start_ms: u64, day_end_ms: u64)
-    -> Result<(usize, usize)>;
+    fn scheduled_counts(
+        &self,
+        account_id: Id,
+        day_start_ms: u64,
+        day_end_ms: u64,
+    ) -> Result<(usize, usize)>;
 }
 
 pub trait EmojiStore: Send + Sync {
@@ -2313,7 +2346,9 @@ pub trait InteractionLog: Send + Sync {
     /// journal at the use-case commit, never in a job handler).
     fn record_interaction(&self, event: InteractionEvent) -> Result<()> {
         let _ = event;
-        Err(Error::Internal("record_interaction is not implemented".into()))
+        Err(Error::Internal(
+            "record_interaction is not implemented".into(),
+        ))
     }
 
     /// Count journaled events in `[since_ms, until_ms)`, optionally filtered
@@ -2324,7 +2359,9 @@ pub trait InteractionLog: Send + Sync {
         _since_ms: u64,
         _until_ms: u64,
     ) -> Result<u64> {
-        Err(Error::Internal("count_interactions is not implemented".into()))
+        Err(Error::Internal(
+            "count_interactions is not implemented".into(),
+        ))
     }
 }
 
@@ -2546,16 +2583,16 @@ impl<T> Store for T where
         + TrendStore
         + AnnualReportStore
         + crate::application::federation_ports::FederationStore
-    + crate::application::federation_ports::FederationContentStore
-    + AdminInfraStore
-    + AdminStore
-    + crate::application::announcements::AnnouncementStore
-    + crate::application::conversations::ConversationStore
-    + crate::application::push::PushSubscriptionStore
-    + WebStore
-    + CacheStore
-    + crate::application::accounts::SecondFactorStore
-    + CollectionStore
+        + crate::application::federation_ports::FederationContentStore
+        + AdminInfraStore
+        + AdminStore
+        + crate::application::announcements::AnnouncementStore
+        + crate::application::conversations::ConversationStore
+        + crate::application::push::PushSubscriptionStore
+        + WebStore
+        + CacheStore
+        + crate::application::accounts::SecondFactorStore
+        + CollectionStore
 {
 }
 

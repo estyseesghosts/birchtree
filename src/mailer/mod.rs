@@ -418,10 +418,25 @@ impl MailEnv {
     }
 }
 
+/// Startup predicate: signup is possible but no mail provider is configured,
+/// so a new account's `SendConfirmationEmail` job could never deliver and the
+/// user could never receive their token.
+///
+/// Signup is possible through open registrations OR through an invite
+/// (`register_account_with_invite` enqueues the confirmation job on both
+/// paths, even when registrations are closed), so both flags are covered.
+/// `true` means "would strand confirmation mail".
+#[must_use]
+pub fn signup_without_mail(cfg: &Config) -> bool {
+    (cfg.registration_open || cfg.invites_enabled) && !cfg.mail_enabled()
+}
+
 /// Startup predicate: registrations are open but no mail provider is
 /// configured, so a new account's `SendConfirmationEmail` job could never
 /// deliver and the user could never receive their token.
 ///
+/// Kept for the open-registration case; prefer [`signup_without_mail`],
+/// which additionally covers invite signup while registrations are closed.
 /// The job itself still fails loudly (retry, never `Ok`) when this slips
 /// through; this predicate lets startup (and the registration endpoint) fail
 /// closed instead. `true` means "would strand confirmation mail".
@@ -430,17 +445,18 @@ pub fn open_registration_without_mail(cfg: &Config) -> bool {
     cfg.registration_open && !cfg.mail_enabled()
 }
 
-/// Production startup guard for open registrations without a mail provider.
+/// Production startup guard for signup without a mail provider.
 ///
 /// Returns `Err` (fatal, with an operator-actionable message naming only the
-/// flags, never any secret) when production has open registrations and no
-/// SMTP provider. Lab passes: the caller logs a warning and the mail job
-/// stays explicitly undelivered (retry, never `Ok`).
+/// flags, never any secret) when production allows signup — open
+/// registrations or enabled invites — and no SMTP provider is configured.
+/// Lab passes: the caller logs a warning and the mail job stays explicitly
+/// undelivered (retry, never `Ok`).
 pub fn require_mail_for_open_registration(cfg: &Config) -> Result<(), String> {
-    if open_registration_without_mail(cfg) && cfg.mode == RuntimeMode::Production {
-        return Err("registrations are open but no SMTP provider is configured \
+    if signup_without_mail(cfg) && cfg.mode == RuntimeMode::Production {
+        return Err("signups are possible but no SMTP provider is configured \
              (--smtp-url and --mail-from); confirmation mail could never deliver: \
-             configure SMTP or close registrations"
+             configure SMTP, close registrations and disable invites"
             .to_string());
     }
     Ok(())

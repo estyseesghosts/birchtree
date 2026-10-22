@@ -103,6 +103,14 @@ pub fn build_push_client(config: &PushClientConfig) -> Result<reqwest::Client, S
     })
 }
 
+/// The production delivery client: [`build_push_client`] under the default
+/// (default-deny) policy. This is the single constructor `main.rs` uses for
+/// `WorkerExtra.push_client`; regression tests that must prove what
+/// production dials call this too rather than hand-building a client.
+pub fn production_push_client() -> Result<reqwest::Client, String> {
+    build_push_client(&PushClientConfig::default())
+}
+
 /// Check an endpoint URL's shape without touching the network: it must parse,
 /// use HTTPS (or HTTP when the config allows it, lab only), carry no
 /// credentials, have a host, and — for IP literals — name an allowed

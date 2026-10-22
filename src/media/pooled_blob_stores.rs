@@ -252,6 +252,12 @@ impl BlobStore for PooledBlobStores {
         self.durable.root_path()
     }
 
+    /// The cache-pool root, so the public file route streams `remote/…`
+    /// keys from disk instead of buffering them through [`BlobStore::get`].
+    fn cache_root_path(&self) -> Option<PathBuf> {
+        Some(self.cache.root().to_path_buf())
+    }
+
     fn publish_tmp(&self, tmp: &Path, key: &str) -> Result<()> {
         self.pool_for(key).publish_tmp(tmp, key)
     }

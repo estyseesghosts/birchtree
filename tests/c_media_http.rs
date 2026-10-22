@@ -48,14 +48,16 @@ impl Harness {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let ids: Arc<dyn IdGenerator> = Arc::new(TimestampIdGenerator::new(Box::new(SystemClock)));
         let store = Arc::new(
-            RedbStore::open(dir.path().join("birchtree.redb"), clock.clone(), ids.clone())
-                .expect("open store"),
+            RedbStore::open(
+                dir.path().join("birchtree.redb"),
+                clock.clone(),
+                ids.clone(),
+            )
+            .expect("open store"),
         );
-        let (durable, cache) = FsBlobStore::open_pair(
-            dir.path().join("media"),
-            dir.path().join("media_cache"),
-        )
-        .expect("open pools");
+        let (durable, cache) =
+            FsBlobStore::open_pair(dir.path().join("media"), dir.path().join("media_cache"))
+                .expect("open pools");
         store.attach_cache_pool(cache.clone());
         let pools = PooledBlobStores::new(durable, cache);
         let blobs: Arc<dyn BlobStore> = Arc::new(pools.clone());
@@ -68,7 +70,12 @@ impl Harness {
             ..Config::default()
         };
         let server = Arc::new(ServerInfo::from_config(&cfg));
-        let streams = Hub::new(store.clone(), clock.clone(), server.clone(), Limits::default());
+        let streams = Hub::new(
+            store.clone(),
+            clock.clone(),
+            server.clone(),
+            Limits::default(),
+        );
         let context = Arc::new(Context::new(
             clock,
             ids,
@@ -85,7 +92,10 @@ impl Harness {
             streams,
             federation,
             rate_limit_multiplier: 1,
-            mail_env: Arc::new(birchtree::mailer::MailEnv::disabled()),
+            mail_env: Arc::new(birchtree::mailer::MailEnv::new(
+                "noreply@example.social",
+                true,
+            )),
             invites: store.clone() as Arc<dyn birchtree::application::accounts::InviteStore>,
         });
         Self {
@@ -168,7 +178,12 @@ async fn user_token(h: &Harness, username: &str) -> String {
         form_request("POST", "/api/v1/accounts", &body, Some(&app_token)),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
     json(&bytes)["access_token"].as_str().unwrap().to_string()
 }
 
@@ -207,7 +222,11 @@ fn crc32(bytes: &[u8]) -> u32 {
     for byte in bytes {
         crc ^= u32::from(*byte);
         for _ in 0..8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
         }
     }
     !crc
@@ -248,7 +267,10 @@ fn upload_request(token: &str, uri: &str, body: Body) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri(uri)
-        .header("content-type", format!("multipart/form-data; boundary={BOUNDARY}"))
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
         .header("authorization", format!("Bearer {token}"))
         .body(body)
         .expect("upload request")
@@ -271,10 +293,19 @@ async fn configured_file_limit_is_enforced_independently_of_the_body_limit() {
     let token = user_token(&h, "alice").await;
 
     let (status, _h, body) = send(&h.router, upload_bytes_request(&token, &padded_png(8000))).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
     let error = json(&body)["error"].as_str().unwrap().to_string();
     assert!(error.contains("File must be less than 4 KB"), "{error}");
-    assert!(h.durable_files().is_empty(), "rejected upload leaves no file: {:?}", h.durable_files());
+    assert!(
+        h.durable_files().is_empty(),
+        "rejected upload leaves no file: {:?}",
+        h.durable_files()
+    );
 
     // Within the file limit it succeeds, and the original is on disk.
     let (status, _h, body) = send(&h.router, upload_bytes_request(&token, &png_bytes())).await;
@@ -328,13 +359,21 @@ async fn oversized_field_is_aborted_before_the_full_payload_is_resident() {
     let pulled = Arc::new(AtomicUsize::new(0));
     let body = counting_body(16 * 1024, 2048, pulled.clone(), true);
     let (status, _h, bytes) = send(&h.router, upload_request(&token, "/api/v1/media", body)).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
     let consumed = pulled.load(Ordering::SeqCst);
     assert!(
         consumed <= 16,
         "server pulled {consumed} x 16 KiB chunks before aborting a 64 KiB cap"
     );
-    assert!(walk_files(&h.durable_root()).is_empty(), "partial spool removed");
+    assert!(
+        walk_files(&h.durable_root()).is_empty(),
+        "partial spool removed"
+    );
 }
 
 #[tokio::test]
@@ -353,7 +392,10 @@ async fn malformed_multipart_cleans_the_spool() {
         status == StatusCode::BAD_REQUEST || status == StatusCode::UNPROCESSABLE_ENTITY,
         "malformed body answered {status}"
     );
-    assert!(walk_files(&h.durable_root()).is_empty(), "no spool or blob remains");
+    assert!(
+        walk_files(&h.durable_root()).is_empty(),
+        "no spool or blob remains"
+    );
 }
 
 #[tokio::test]
@@ -370,8 +412,14 @@ async fn client_disconnect_mid_upload_cleans_the_spool() {
         h.router.clone().oneshot(request),
     )
     .await;
-    assert!(outcome.is_err(), "the stalled upload must still be in flight");
-    assert!(pulled.load(Ordering::SeqCst) >= 1, "some bytes were spooled");
+    assert!(
+        outcome.is_err(),
+        "the stalled upload must still be in flight"
+    );
+    assert!(
+        pulled.load(Ordering::SeqCst) >= 1,
+        "some bytes were spooled"
+    );
     // Dropped futures run their destructors synchronously.
     assert!(
         walk_files(&h.durable_root()).is_empty(),
@@ -389,8 +437,16 @@ async fn decompression_bomb_is_rejected_before_decode() {
     assert!(bomb.len() < 128);
     let started = std::time::Instant::now();
     let (status, _h, body) = send(&h.router, upload_bytes_request(&token, &bomb)).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{}", String::from_utf8_lossy(&body));
-    assert!(started.elapsed().as_secs() < 5, "rejected from the header, not by decoding");
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        started.elapsed().as_secs() < 5,
+        "rejected from the header, not by decoding"
+    );
 
     // Many pixels but within the cap still decodes (sanity: limit is a cap,
     // not a blanket refusal of big dimensions).
@@ -464,9 +520,13 @@ async fn byte_ranges_are_honored_for_large_media() {
     assert_eq!(headers["x-content-type-options"], "nosniff");
     assert_eq!(body, media);
 
-    let (status, headers, body) = send(&h.router, get_with_range(&path, Some("bytes=100-199"))).await;
+    let (status, headers, body) =
+        send(&h.router, get_with_range(&path, Some("bytes=100-199"))).await;
     assert_eq!(status, StatusCode::PARTIAL_CONTENT);
-    assert_eq!(headers["content-range"], format!("bytes 100-199/{}", media.len()).as_str());
+    assert_eq!(
+        headers["content-range"],
+        format!("bytes 100-199/{}", media.len()).as_str()
+    );
     assert_eq!(headers["content-length"], "100");
     assert_eq!(body, &media[100..200]);
 
@@ -474,14 +534,23 @@ async fn byte_ranges_are_honored_for_large_media() {
     assert_eq!(status, StatusCode::PARTIAL_CONTENT);
     assert_eq!(
         headers["content-range"],
-        format!("bytes {}-{}/{}", media.len() - 1000, media.len() - 1, media.len()).as_str()
+        format!(
+            "bytes {}-{}/{}",
+            media.len() - 1000,
+            media.len() - 1,
+            media.len()
+        )
+        .as_str()
     );
     assert_eq!(body, &media[media.len() - 1000..]);
 
     // Open-ended range across several read chunks.
     let start = 70_000usize;
-    let (status, _headers, body) =
-        send(&h.router, get_with_range(&path, Some(&format!("bytes={start}-")))).await;
+    let (status, _headers, body) = send(
+        &h.router,
+        get_with_range(&path, Some(&format!("bytes={start}-"))),
+    )
+    .await;
     assert_eq!(status, StatusCode::PARTIAL_CONTENT);
     assert_eq!(body, &media[start..]);
 
@@ -491,7 +560,10 @@ async fn byte_ranges_are_honored_for_large_media() {
     )
     .await;
     assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
-    assert_eq!(headers["content-range"], format!("bytes */{}", media.len()).as_str());
+    assert_eq!(
+        headers["content-range"],
+        format!("bytes */{}", media.len()).as_str()
+    );
 
     // Multi-range and garbage are answered with the whole body.
     for odd in ["bytes=0-1,5-6", "items=0-5", "bytes=oops"] {
@@ -514,14 +586,21 @@ async fn public_route_serves_only_published_keys() {
 
     // Staging and scratch files exist on disk next to the real blob.
     let dir = h.durable_root().join(shard);
-    std::fs::write(dir.join(".original.png.part-1-2"), b"partial-bytes-not-media").unwrap();
+    std::fs::write(
+        dir.join(".original.png.part-1-2"),
+        b"partial-bytes-not-media",
+    )
+    .unwrap();
     std::fs::write(dir.join("derived.webm"), b"scratch-transcode-output").unwrap();
     std::fs::write(dir.join("notes.txt"), b"not media").unwrap();
     std::fs::create_dir_all(h.durable_root().join("tmp")).unwrap();
     std::fs::write(h.durable_root().join("tmp/1-2-3.part"), b"downloading").unwrap();
     std::fs::write(h.dir.path().join("outside.txt"), b"outside the media root").unwrap();
     h.pools
-        .put("custom_emojis/images/6b/65/key/original/key.png", &png_bytes())
+        .put(
+            "custom_emojis/images/6b/65/key/original/key.png",
+            &png_bytes(),
+        )
         .unwrap();
 
     let (status, headers, body) = send(&h.router, get_request(&route(&good), None, None)).await;
@@ -556,10 +635,13 @@ async fn public_route_serves_only_published_keys() {
         String::new(),
     ];
     for path in denied {
-        let (status, _headers, body) = send(&h.router, get_request(&route(&path), None, None)).await;
+        let (status, _headers, body) =
+            send(&h.router, get_request(&route(&path), None, None)).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{path:?} answered {status}");
         assert!(
-            !body.windows(7).any(|w| w == b"partial" || w == b"scratch" || w == b"outside"),
+            !body
+                .windows(7)
+                .any(|w| w == b"partial" || w == b"scratch" || w == b"outside"),
             "{path:?} leaked file contents"
         );
     }
@@ -579,7 +661,10 @@ async fn public_route_never_follows_symlinks() {
     // A linked shard directory.
     symlink(h.dir.path(), h.durable_root().join("ee")).unwrap();
 
-    for path in ["ab/cd/0123456789abcdef/original.png", "ee/cd/0123456789abcdef/original.png"] {
+    for path in [
+        "ab/cd/0123456789abcdef/original.png",
+        "ee/cd/0123456789abcdef/original.png",
+    ] {
         let (status, _h, _b) = send(&h.router, get_request(&route(path), None, None)).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
     }
@@ -612,7 +697,11 @@ async fn evicted_remote_cache_bytes_answer_404_and_queue_one_refetch() {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
     let after = jobs_of_kind(&h, birchtree::domain::JobKind::FetchRemoteMedia);
-    assert_eq!(after - before, 1, "single-flight: one refetch job for five misses");
+    assert_eq!(
+        after - before,
+        1,
+        "single-flight: one refetch job for five misses"
+    );
 
     // Once the bytes are back in the cache pool the same URL serves them.
     h.pools
@@ -650,12 +739,15 @@ async fn emoji_route_serves_only_published_shapes() {
         .unwrap();
 
     // Staging and scratch files exist on disk next to the real image.
-    let dir = h.durable_root().join("custom_emojis/images/70/61/party/original");
+    let dir = h
+        .durable_root()
+        .join("custom_emojis/images/70/61/party/original");
     std::fs::write(dir.join(".party.png.part-1-2"), b"partial-bytes-not-emoji").unwrap();
     std::fs::write(dir.join("derived.png"), b"scratch-output").unwrap();
     std::fs::write(h.dir.path().join("outside.png"), png_bytes()).unwrap();
 
-    let (status, headers, body) = send(&h.router, get_request(&emoji_route(good), None, None)).await;
+    let (status, headers, body) =
+        send(&h.router, get_request(&emoji_route(good), None, None)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, png_bytes());
     assert_eq!(headers["content-type"], "image/png");
@@ -700,12 +792,16 @@ async fn emoji_route_never_follows_symlinks() {
     let h = Harness::new(8 * 1024 * 1024, 16 * 1024 * 1024);
     let outside = h.dir.path().join("outside.png");
     std::fs::write(&outside, png_bytes()).unwrap();
-    let shard_dir = h.durable_root().join("custom_emojis/images/70/61/party/original");
+    let shard_dir = h
+        .durable_root()
+        .join("custom_emojis/images/70/61/party/original");
     std::fs::create_dir_all(&shard_dir).unwrap();
     symlink(&outside, shard_dir.join("party.png")).unwrap();
 
-    let (status, _h, _b) =
-        send(&h.router, get_request(&emoji_route("70/61/party/original/party.png"), None, None))
-            .await;
+    let (status, _h, _b) = send(
+        &h.router,
+        get_request(&emoji_route("70/61/party/original/party.png"), None, None),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }

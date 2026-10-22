@@ -373,9 +373,10 @@ pub const MAX_PUSH_REDIRECTS: usize = 3;
 /// the production default-deny policy), and up to [`MAX_PUSH_REDIRECTS`]
 /// redirects are followed manually, revalidating each `Location` target the
 /// same way. Redirects re-POST the same body and headers, except the VAPID
-/// `Authorization` header, which is dropped once the origin changes (a
-/// cross-origin endpoint must never receive another origin's bearer
-/// credential). `Crypto-Key` is kept: it carries only the VAPID *public* key
+/// `Authorization` header and the `Unsubscribe-URL` header, which are both
+/// dropped once the origin changes (a cross-origin endpoint must never
+/// receive another origin's bearer credential or its subscription-management
+/// URL). `Crypto-Key` is kept: it carries only the VAPID *public* key
 /// and the ephemeral sender point, never a secret.
 ///
 /// Settlement: a policy refusal (bad shape, prohibited address) deletes the
@@ -423,6 +424,11 @@ pub async fn deliver_push_with_policy(
         Err(_) => return PushOutcome::Gone,
     };
     let mut authorization: Option<&str> = Some(request.authorization.as_str());
+    // `Unsubscribe-URL` names the subscription-management endpoint for this
+    // subscription. Like the VAPID bearer credential it must not leak to a
+    // cross-origin hop: drop it whenever `authorization` is dropped (any hop
+    // whose origin is not the original subscription origin).
+    let mut unsubscribe: Option<&str> = request.unsubscribe_url.as_deref();
     for _hop in 0..=MAX_PUSH_REDIRECTS {
         match push_client::validate_delivery_target(&url, config).await {
             Ok(()) => {}
@@ -435,6 +441,7 @@ pub async fn deliver_push_with_policy(
         }
         if !push_client::same_origin(&original_origin, &url) {
             authorization = None;
+            unsubscribe = None;
         }
         let mut outgoing = client.post(url.clone());
         if let Some(authorization) = authorization {
@@ -452,8 +459,8 @@ pub async fn deliver_push_with_policy(
         if let Some(encryption) = &request.encryption {
             outgoing = outgoing.header("Encryption", encryption.clone());
         }
-        if let Some(unsubscribe) = &request.unsubscribe_url {
-            outgoing = outgoing.header("Unsubscribe-URL", unsubscribe.clone());
+        if let Some(unsubscribe) = unsubscribe {
+            outgoing = outgoing.header("Unsubscribe-URL", unsubscribe);
         }
         let response = match outgoing.body(request.body.clone()).send().await {
             Ok(response) => response,

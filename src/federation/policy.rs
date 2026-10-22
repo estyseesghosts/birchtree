@@ -137,10 +137,13 @@ fn normalize(ip: IpAddr) -> IpAddr {
 ///
 /// Blocks unspecified, loopback, private, link-local, shared (CGNAT),
 /// benchmarking, documentation, protocol-assignment, multicast and reserved
-/// ranges. IPv6 forms that translate an IPv4 address (mapped `::ffff:0:0/96`,
-/// NAT64 `64:ff9b::/96` and local-use `64:ff9b:1::/48`) are judged by the
-/// embedded address, so `::ffff:127.0.0.1` and `64:ff9b::7f00:1` are refused.
-/// Every other non-global range in the IANA IPv6 Special-Purpose Registry
+/// ranges. Mapped `::ffff:0:0/96` and well-known NAT64 `64:ff9b::/96` carry
+/// an IPv4 address in the last 32 bits and are judged by the address they
+/// carry, so `::ffff:127.0.0.1` and `64:ff9b::7f00:1` are refused. The
+/// local-use `64:ff9b:1::/48` prefix (RFC 8215) is refused outright, whatever
+/// it embeds: its trailing 32 bits are operator-assigned and a
+/// public-looking tail (e.g. `64:ff9b:1::808:808`) must not pass. Every
+/// other non-global range in the IANA IPv6 Special-Purpose Registry
 /// (`global = false`: 6to4, Teredo, `2001::/23`, `2001:db8::/32`,
 /// `3fff::/20`, AS112-v6, SRv6 SIDs, 6bone, discard, IPv4-compatible) is
 /// refused outright, whatever it embeds.
@@ -173,15 +176,18 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
     let s = ip.segments();
     // Translation prefixes carry an IPv4 address in the last 32 bits: the
     // risk is whatever the translator would reach, so judge the embedded
-    // address. Well-known `64:ff9b::/96` (RFC 6052) and local-use
-    // `64:ff9b:1::/48` (RFC 8215) share the trailing-32-bits layout.
+    // address. Well-known `64:ff9b::/96` (RFC 6052) shares the
+    // trailing-32-bits layout.
     if s[0] == 0x64 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
         // 64:ff9b::/96 well-known translation prefix.
         return is_public_v4(last32_as_v4(s[6], s[7]));
     }
+    // Local-use `64:ff9b:1::/48` (RFC 8215) is denied outright: its embedded
+    // bits are operator-assigned, so a public-looking tail proves nothing.
+    // An allowlist entry is the only way through (same as any other private
+    // range: see `address_allowed`).
     if s[0] == 0x64 && s[1] == 0xff9b && s[2] == 0x1 {
-        // 64:ff9b:1::/48 local-use translation prefix.
-        return is_public_v4(last32_as_v4(s[6], s[7]));
+        return false;
     }
     // 2002::/16 6to4 (historic, RFC 7526): never globally reachable, whatever
     // IPv4 address it embeds.

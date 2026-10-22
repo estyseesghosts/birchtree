@@ -78,6 +78,16 @@ fn tickle(endpoint: &str, keys: &push::VapidKeys) -> push::PushRequest {
     .expect("tickle builds")
 }
 
+/// Like [`tickle`] but with an `Unsubscribe-URL` set (upstream sends it on
+/// every standard + legacy request once the subscription minted a token).
+/// Cross-origin redirect tests use this to prove the header is dropped with
+/// `Authorization`; same-origin tests prove both are kept.
+fn tickle_with_unsubscribe(endpoint: &str, keys: &push::VapidKeys) -> push::PushRequest {
+    let mut request = tickle(endpoint, keys);
+    request.unsubscribe_url = Some("https://example.social/push/unsubscribe/abc".to_string());
+    request
+}
+
 fn lab_config() -> PushClientConfig {
     PushClientConfig::lab_loopback()
 }
@@ -210,6 +220,7 @@ struct Captured {
     authorization: Option<String>,
     crypto_key: Option<String>,
     ttl: Option<String>,
+    unsubscribe_url: Option<String>,
 }
 
 fn slot() -> Arc<Mutex<Option<Captured>>> {
@@ -230,6 +241,10 @@ fn record(slot: &Arc<Mutex<Option<Captured>>>, headers: &axum::http::HeaderMap, 
             .map(str::to_string),
         ttl: headers
             .get("ttl")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string),
+        unsubscribe_url: headers
+            .get("unsubscribe-url")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string),
     });
@@ -304,7 +319,7 @@ async fn default_policy_refuses_loopback_delivery() {
 }
 
 /// Same-origin redirects (including relative `Location` values) keep the
-/// VAPID headers and re-POST.
+/// VAPID headers and `Unsubscribe-URL`, and re-POST.
 #[tokio::test]
 async fn same_origin_redirect_keeps_authorization() {
     let seen = slot();
@@ -335,7 +350,7 @@ async fn same_origin_redirect_keeps_authorization() {
     let (addr, handle) = serve(router).await;
 
     let keys = test_vapid_keys();
-    let request = tickle(&format!("http://{addr}/old"), &keys);
+    let request = tickle_with_unsubscribe(&format!("http://{addr}/old"), &keys);
     let outcome = push::deliver_push_with_policy(&lab_client(), &request, &lab_config()).await;
     assert_eq!(outcome, push::PushOutcome::Delivered);
     let captured = seen_reader
@@ -349,11 +364,16 @@ async fn same_origin_redirect_keeps_authorization() {
             .authorization
             .is_some_and(|v| v.starts_with("vapid t="))
     );
+    assert_eq!(
+        captured.unsubscribe_url.as_deref(),
+        Some("https://example.social/push/unsubscribe/abc")
+    );
     handle.abort();
 }
 
 /// A cross-origin redirect strips `Authorization` (the VAPID bearer
-/// credential) while still delivering when the target validates.
+/// credential) and `Unsubscribe-URL` (the subscription-management URL)
+/// while still delivering when the target validates.
 #[tokio::test]
 async fn cross_origin_redirect_strips_authorization() {
     let seen_b = slot();
@@ -390,7 +410,7 @@ async fn cross_origin_redirect_strips_authorization() {
     let (addr_a, handle_a) = serve(router_a).await;
 
     let keys = test_vapid_keys();
-    let request = tickle(&format!("http://{addr_a}/push"), &keys);
+    let request = tickle_with_unsubscribe(&format!("http://{addr_a}/push"), &keys);
     let outcome = push::deliver_push_with_policy(&lab_client(), &request, &lab_config()).await;
     assert_eq!(outcome, push::PushOutcome::Delivered);
     let first = seen_a_reader
@@ -403,12 +423,17 @@ async fn cross_origin_redirect_strips_authorization() {
             .authorization
             .is_some_and(|v| v.starts_with("vapid t="))
     );
+    assert_eq!(
+        first.unsubscribe_url.as_deref(),
+        Some("https://example.social/push/unsubscribe/abc")
+    );
     let second = seen_b_reader
         .lock()
         .expect("capture")
         .clone()
         .expect("second hop");
     assert_eq!(second.authorization, None);
+    assert_eq!(second.unsubscribe_url, None);
     handle_a.abort();
     handle_b.abort();
 }
@@ -468,4 +493,173 @@ async fn delivery_to_prohibited_literal_is_gone() {
     let request = tickle("https://169.254.169.254/sub", &keys);
     let outcome = push::deliver_push_with_policy(&lab_client(), &request, &lab_config()).await;
     assert_eq!(outcome, push::PushOutcome::Gone);
+}
+
+// ---------------------------------------------------------------------------
+// Production-constructor tests: the same client `main.rs` hands the worker.
+// ---------------------------------------------------------------------------
+
+/// The production constructor builds under the default-deny policy. A
+/// loopback endpoint is refused before any connection: the server observes
+/// zero requests, so nothing private is dialed.
+#[tokio::test]
+async fn production_client_does_not_dial_loopback() {
+    let seen = slot();
+    let seen_reader = seen.clone();
+    let router = axum::Router::new().route(
+        "/push",
+        axum::routing::post(move |headers: axum::http::HeaderMap| {
+            let seen = seen.clone();
+            async move {
+                record(&seen, &headers, "POST");
+                "ok"
+            }
+        }),
+    );
+    let (addr, handle) = serve(router).await;
+
+    let client = push_client::production_push_client().expect("production client builds");
+    let keys = test_vapid_keys();
+    let request = tickle(&format!("http://{addr}/push"), &keys);
+    let outcome =
+        push::deliver_push_with_policy(&client, &request, &PushClientConfig::default()).await;
+    assert!(matches!(outcome, push::PushOutcome::Gone), "{outcome:?}");
+    assert!(
+        seen_reader.lock().expect("capture").is_none(),
+        "production client must not dial the loopback endpoint"
+    );
+    handle.abort();
+}
+
+/// The production-built client follows redirects manually under policy, not
+/// via reqwest: a loopback endpoint that 302s to a private literal settles
+/// as gone (a client with automatic redirects would attempt the private
+/// target and settle as a network retry instead).
+#[tokio::test]
+async fn production_client_redirect_to_private_is_gone_not_dialed() {
+    let router = axum::Router::new().route(
+        "/push",
+        axum::routing::post(async || {
+            (
+                axum::http::StatusCode::FOUND,
+                [(axum::http::header::LOCATION, "http://169.254.169.254/")],
+                "",
+            )
+        }),
+    );
+    let (addr, handle) = serve(router).await;
+
+    // The lab policy lets the first (loopback) hop through so the redirect
+    // hop is actually exercised; the client itself is the production build
+    // (`Policy::none` via `net::client`), which is what this test proves.
+    let client = push_client::production_push_client().expect("production client builds");
+    let keys = test_vapid_keys();
+    let request = tickle(&format!("http://{addr}/push"), &keys);
+    let outcome = push::deliver_push_with_policy(&client, &request, &lab_config()).await;
+    assert_eq!(outcome, push::PushOutcome::Gone);
+    handle.abort();
+}
+
+/// The production-built client drops both `Authorization` and
+/// `Unsubscribe-URL` on a cross-origin hop: reqwest-level automatic
+/// redirects would forward the custom `Unsubscribe-URL` header, so its
+/// absence proves redirects are followed manually (`Policy::none`).
+#[tokio::test]
+async fn production_client_cross_origin_drops_both_headers() {
+    let seen_b = slot();
+    let seen_b_reader = seen_b.clone();
+    let router_b = axum::Router::new().route(
+        "/target",
+        axum::routing::post(move |headers: axum::http::HeaderMap| {
+            let seen_b = seen_b.clone();
+            async move {
+                record(&seen_b, &headers, "POST");
+                "ok"
+            }
+        }),
+    );
+    let (addr_b, handle_b) = serve(router_b).await;
+
+    let location = format!("http://{addr_b}/target");
+    let router_a = axum::Router::new().route(
+        "/push",
+        axum::routing::post(move || {
+            let location = location.clone();
+            async move {
+                (
+                    axum::http::StatusCode::FOUND,
+                    [(axum::http::header::LOCATION, location)],
+                    "",
+                )
+            }
+        }),
+    );
+    let (addr_a, handle_a) = serve(router_a).await;
+
+    let client = push_client::production_push_client().expect("production client builds");
+    let keys = test_vapid_keys();
+    let request = tickle_with_unsubscribe(&format!("http://{addr_a}/push"), &keys);
+    let outcome = push::deliver_push_with_policy(&client, &request, &lab_config()).await;
+    assert_eq!(outcome, push::PushOutcome::Delivered);
+    let second = seen_b_reader
+        .lock()
+        .expect("capture")
+        .clone()
+        .expect("second hop");
+    assert_eq!(second.authorization, None);
+    assert_eq!(second.unsubscribe_url, None);
+    handle_a.abort();
+    handle_b.abort();
+}
+
+/// The production-built client keeps both headers on a same-origin hop.
+#[tokio::test]
+async fn production_client_same_origin_keeps_both_headers() {
+    let seen = slot();
+    let seen_reader = seen.clone();
+    let router = axum::Router::new()
+        .route(
+            "/old",
+            axum::routing::post(async || {
+                (
+                    axum::http::StatusCode::FOUND,
+                    [(axum::http::header::LOCATION, "/new")],
+                    "",
+                )
+            }),
+        )
+        .route(
+            "/new",
+            axum::routing::post(
+                move |method: axum::http::Method, headers: axum::http::HeaderMap| {
+                    let seen = seen.clone();
+                    async move {
+                        record(&seen, &headers, method.as_str());
+                        "ok"
+                    }
+                },
+            ),
+        );
+    let (addr, handle) = serve(router).await;
+
+    let client = push_client::production_push_client().expect("production client builds");
+    let keys = test_vapid_keys();
+    let request = tickle_with_unsubscribe(&format!("http://{addr}/old"), &keys);
+    let outcome = push::deliver_push_with_policy(&client, &request, &lab_config()).await;
+    assert_eq!(outcome, push::PushOutcome::Delivered);
+    let captured = seen_reader
+        .lock()
+        .expect("capture")
+        .clone()
+        .expect("captured");
+    assert!(
+        captured
+            .authorization
+            .is_some_and(|v| v.starts_with("vapid t="))
+    );
+    assert_eq!(
+        captured.unsubscribe_url.as_deref(),
+        Some("https://example.social/push/unsubscribe/abc")
+    );
+    handle.abort();
 }

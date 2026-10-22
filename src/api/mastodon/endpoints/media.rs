@@ -188,9 +188,9 @@ pub async fn destroy(
 
 /// Bytes located for a public request.
 enum Located {
-    /// A regular file under the durable root, streamed from disk.
+    /// A regular file under a streaming root, streamed from disk.
     File { file: tokio::fs::File, len: u64 },
-    /// Bytes read through the pool-routing store (cache pool blobs).
+    /// Bytes read through a rootless handle (in-memory test doubles only).
     Bytes(Vec<u8>),
 }
 
@@ -233,18 +233,15 @@ pub async fn serve_file(
     }
 }
 
-/// Find the bytes for `key`: every streaming root first (durable today —
-/// local keys and pre-split durable `remote/` shadows stream from disk),
-/// then the pool-routing store for cache keys.
+/// Find the bytes for `key`: every streaming root first (durable, then the
+/// cache pool — local keys and pre-split durable `remote/` shadows stream
+/// from disk, and cache-pool remotes stream from disk too), then the
+/// pool-routing store for rootless doubles only.
 ///
 /// `Located::File` streams from disk and seeks for `Range`; `Located::Bytes`
-/// is the buffered fallback for cache-pool keys and rootless doubles: it
-/// holds the whole blob in memory, so a large remote costs a full copy per
-/// request until the parent lands the proposed `BlobStore::cache_root_path`
-/// port addition, which adds the cache root to [`stream_roots`] and makes
-/// every served byte stream. The pool-aware open that addition enables
-/// already exists and is covered without buffering at the storage layer
-/// ([`PooledBlobStores::open_in_pool`](crate::media::pooled_blob_stores::PooledBlobStores::open_in_pool)).
+/// is the buffered fallback for handles with no filesystem root at all
+/// (in-memory test doubles): it holds the whole blob in memory. `get()` is
+/// never called for a key that exists as a file in either pool.
 async fn locate(state: &ApiState, key: &str) -> Result<Option<Located>, DomainError> {
     let blobs = state.context.blobs.clone();
     let roots: Vec<PathBuf> = stream_roots(&blobs);
@@ -267,7 +264,7 @@ async fn locate(state: &ApiState, key: &str) -> Result<Option<Located>, DomainEr
             }));
         }
     }
-    if !had_roots || crate::media::remote_cache::is_cache_key(key) {
+    if !had_roots {
         let key_owned: String = key.to_string();
         let bytes = tokio::task::spawn_blocking(move || blobs.get(&key_owned))
             .await
@@ -279,14 +276,15 @@ async fn locate(state: &ApiState, key: &str) -> Result<Option<Located>, DomainEr
 
 /// Filesystem roots served by streaming, durable first.
 ///
-/// Today this is the durable root only (`BlobStore::root_path`): the public
-/// file route streams local bytes and legacy durable shadows, while
-/// cache-pool keys fall through to the buffered `get()` in [`locate`]. The
-/// proposed `BlobStore::cache_root_path` port addition appends the cache
-/// root here (durable stays first so legacy shadows keep resolving), and
-/// from then on [`locate`] streams every key.
+/// The durable root streams local bytes and legacy durable shadows; the
+/// cache root streams cache-pool remotes (durable stays first so legacy
+/// shadows keep resolving to the same bytes). Handles with no filesystem
+/// root (in-memory doubles) yield no roots and fall back to the buffered
+/// `get()` in [`locate`].
 fn stream_roots(blobs: &Arc<dyn BlobStore>) -> Vec<PathBuf> {
-    blobs.root_path().into_iter().collect()
+    let mut roots: Vec<PathBuf> = blobs.root_path().into_iter().collect();
+    roots.extend(blobs.cache_root_path());
+    roots
 }
 
 /// Heal a missing cache entry: queue the single-flight refetch of a missing
