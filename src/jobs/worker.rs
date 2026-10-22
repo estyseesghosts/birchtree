@@ -14,13 +14,14 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::activitypub::FedContext;
-use crate::application::ports::{BlobStore, MailSender, Store, StreamingSink};
-use crate::domain::{Clock, JobKind};
+use crate::application::ports::Store;
+use crate::domain::JobKind;
 use crate::federation::delivery::{self, DeliveryError};
-use crate::federation::{events, media, preview, threads};
+use crate::federation::preview;
 use crate::media::cache_maintenance::CacheMaintenance;
 
 use super::handlers;
+use super::worker_ctx::WorkerCtx;
 
 /// How many jobs a worker claims per poll.
 pub const DEFAULT_BATCH: usize = 32;
@@ -247,92 +248,31 @@ fn spawn_user_keys(federation: FederationConfig<FedContext>, job: &crate::domain
 /// `complete` on success, `quarantine` on terminal failure, `retry`
 /// otherwise. Every arm is idempotent, so a task lost to a crash simply
 /// leaves its lease to expire and be reclaimed.
-#[allow(clippy::too_many_arguments)]
-async fn process_one(
-    store: Arc<dyn Store>,
-    clock: Arc<dyn Clock>,
-    mailer: Arc<dyn MailSender>,
-    blobs: Arc<dyn BlobStore>,
-    streaming: Arc<dyn StreamingSink>,
-    federation: FederationConfig<FedContext>,
-    extra: WorkerExtra,
-    job: crate::domain::Job,
-) {
+async fn process_one(ctx: &WorkerCtx, job: crate::domain::Job) {
     // Deliveries await the network, so the worker runs them itself.
     // Every other kind is synchronous and goes through the handlers.
     // The outcome is `(quarantine, message)` on failure.
     let outcome = match job.kind {
-        JobKind::DeliverActivity => delivery::run(&federation, &job).await,
-        JobKind::FederationEvent => events::run(&federation, &job).await,
-        JobKind::ResolveParent => threads::resolve_parent(&federation, &job).await,
-        JobKind::CrawlReplies => threads::crawl_replies(&federation, &job).await,
-        JobKind::FetchRemoteMedia => media::fetch(&federation, &job).await,
-        JobKind::QuoteReverify => threads::run_quote_reverify(&federation, &job).await,
-        JobKind::RelayForward => delivery::run_relay_forward(&federation, &job).await,
-        JobKind::SyncFollowers => threads::run_sync_followers(&federation, &job).await,
-        JobKind::FetchRemoteEmoji => {
-            let ctx: &FedContext = &federation;
-            // Expression-style like the sibling arms (the
-            // match evaluates to the outcome; `?` cannot be
-            // used at arm level).
-            (async {
-                let shortcode = job
-                    .payload
-                    .get("shortcode")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                let domain = job
-                    .payload
-                    .get("domain")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                let source = job
-                    .payload
-                    .get("source_url")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                let url =
-                    crate::federation::media::validate_remote_emoji(&shortcode, &domain, &source)
-                        .map_err(DeliveryError::Quarantine)?;
-                let (bytes, _mime) = crate::federation::media::fetch_remote_emoji_bytes(
-                    &ctx.media_client,
-                    &url,
-                    ctx.http.allow_http,
-                    &ctx.http.allowlist,
-                )
-                .await?;
-                let key = crate::federation::media::remote_emoji_shortcode(&shortcode, &domain);
-                crate::federation::media::store_remote_emoji(
-                    &*store,
-                    &*blobs,
-                    &*store,
-                    crate::media::remote_cache::process_ledger(),
-                    &key,
-                    &domain,
-                    url.as_str(),
-                    &bytes,
-                    clock.now_ms(),
-                    &ctx.remote_cache,
-                )
-                .map_err(DeliveryError::Quarantine)?;
-                Ok::<(), DeliveryError>(())
-            })
-            .await
-        }
+        JobKind::DeliverActivity => handlers::deliver::handle(ctx, &job).await,
+        JobKind::FederationEvent => handlers::federation_event::handle(ctx, &job).await,
+        JobKind::ResolveParent => handlers::threads::handle(ctx, &job).await,
+        JobKind::CrawlReplies => handlers::threads::handle(ctx, &job).await,
+        JobKind::FetchRemoteMedia => handlers::remote_media::handle(ctx, &job).await,
+        JobKind::QuoteReverify => handlers::threads::handle(ctx, &job).await,
+        JobKind::RelayForward => delivery::run_relay_forward(&ctx.federation, &job).await,
+        JobKind::SyncFollowers => handlers::threads::handle(ctx, &job).await,
+        JobKind::FetchRemoteEmoji => handlers::remote_media::handle(ctx, &job).await,
         JobKind::PreviewCardFetch => {
-            let ctx: &FedContext = &federation;
-            preview::fetch(&*store, &ctx.media_client, &ctx.http, &job).await
+            let fed: &FedContext = &ctx.federation;
+            preview::fetch(&*ctx.store, &fed.media_client, &fed.http, &job).await
         }
         JobKind::WebPushDelivery => crate::application::push::run_push_job_record(
-            &*store,
-            &extra.push_client,
-            &extra.vapid,
-            &extra.push_subject,
+            &*ctx.store,
+            &ctx.extra.push_client,
+            &ctx.extra.vapid,
+            &ctx.extra.push_subject,
             &job,
-            clock.now_ms(),
+            ctx.clock.now_ms(),
         )
         .await
         .map_err(|(quarantine, message)| {
@@ -347,11 +287,11 @@ async fn process_one(
             // The job is self-describing (`{media_id}`); the
             // toolchain comes from the worker context.
             let started = std::time::Instant::now();
-            let store = Arc::clone(&store);
-            let blobs = Arc::clone(&blobs);
+            let store = Arc::clone(&ctx.store);
+            let blobs = Arc::clone(&ctx.blobs);
             let job = job.clone();
-            let due_at_ms = clock.now_ms();
-            let config = extra.transcode.clone();
+            let due_at_ms = ctx.clock.now_ms();
+            let config = ctx.extra.transcode.clone();
             let sync = tokio::task::spawn_blocking(move || {
                 let media_id =
                     crate::media::transcode::TranscodeJobPayload::media_id_from_json(&job.payload)
@@ -376,11 +316,11 @@ async fn process_one(
             // the normal policy; the chain re-seeds its
             // follow-up on success.
             if matches!(job.kind, JobKind::CacheEvict | JobKind::ReconcileStorage) {
-                let maint = Arc::clone(&extra.maintenance);
-                let store = Arc::clone(&store);
+                let maint = Arc::clone(&ctx.extra.maintenance);
+                let store = Arc::clone(&ctx.store);
                 let job = job.clone();
-                let due_at_ms = clock.now_ms();
-                let reset_ttl_ms = extra.reset_token_ttl_ms;
+                let due_at_ms = ctx.clock.now_ms();
+                let reset_ttl_ms = ctx.extra.reset_token_ttl_ms;
                 tokio::task::spawn_blocking(move || {
                     maint
                         .handle_job(&job, &*store, due_at_ms)
@@ -404,12 +344,12 @@ async fn process_one(
                 // the same gate the HTTP upload path uses, so remote
                 // influx and local uploads share one global bound.
                 let started = std::time::Instant::now();
-                let store = Arc::clone(&store);
-                let mailer = Arc::clone(&mailer);
-                let blobs = Arc::clone(&blobs);
-                let streaming = Arc::clone(&streaming);
+                let store = Arc::clone(&ctx.store);
+                let mailer = Arc::clone(&ctx.mailer);
+                let blobs = Arc::clone(&ctx.blobs);
+                let streaming = Arc::clone(&ctx.streaming);
                 let owned = job.clone();
-                let transcode = extra.transcode.clone();
+                let transcode = ctx.extra.transcode.clone();
                 let gated = crate::media::processing::run_bounded_blocking(move || {
                     handlers::handle_with_transcode(
                         &owned,
@@ -431,18 +371,18 @@ async fn process_one(
             } else {
                 let sync = handlers::handle_with_transcode(
                     &job,
-                    &*store,
-                    &*mailer,
-                    &*blobs,
-                    &*streaming,
-                    Some(&extra.transcode),
+                    &*ctx.store,
+                    &*ctx.mailer,
+                    &*ctx.blobs,
+                    &*ctx.streaming,
+                    Some(&ctx.extra.transcode),
                 )
                 .map_err(|err| DeliveryError::Retry(err.to_string()));
                 if job.kind == JobKind::UserCreated && sync.is_ok() {
                     // The local signing key is made ahead of the first remote request.
                     // It takes seconds in a debug build, so it runs detached: the
                     // worker must not wait on it. A failure leaves the lazy path in place.
-                    spawn_user_keys(federation.clone(), &job);
+                    spawn_user_keys(ctx.federation.clone(), &job);
                 }
                 sync
             }
@@ -454,19 +394,20 @@ async fn process_one(
     });
     match outcome {
         Ok(()) => {
-            if let Err(err) = store.complete(job.id, clock.now_ms()) {
+            if let Err(err) = ctx.store.complete(job.id, ctx.clock.now_ms()) {
                 tracing::error!(job = %job.id, error = %err, "complete failed");
             }
         }
         Err((true, msg)) => {
             tracing::warn!(job = %job.id, error = %msg, "job quarantined");
             if let Err(err) =
-                store.quarantine(job.id, &truncate_quarantine_error(&msg), clock.now_ms())
+                ctx.store
+                    .quarantine(job.id, &truncate_quarantine_error(&msg), ctx.clock.now_ms())
             {
                 tracing::error!(job = %job.id, error = %err, "quarantine failed");
             }
         }
-        Err((false, msg)) => match store.retry(job.id, &msg, clock.now_ms()) {
+        Err((false, msg)) => match ctx.store.retry(job.id, &msg, ctx.clock.now_ms()) {
             Ok(updated) => tracing::warn!(
                 job = %job.id,
                 state = ?updated.state,
@@ -482,13 +423,7 @@ async fn process_one(
 
 /// Run the worker until `shutdown` becomes `true`.
 pub async fn run(
-    store: Arc<dyn Store>,
-    clock: Arc<dyn Clock>,
-    mailer: Arc<dyn MailSender>,
-    blobs: Arc<dyn BlobStore>,
-    streaming: Arc<dyn StreamingSink>,
-    federation: FederationConfig<FedContext>,
-    extra: WorkerExtra,
+    ctx: WorkerCtx,
     poll_interval: Duration,
     batch: usize,
     mut shutdown: watch::Receiver<bool>,
@@ -498,8 +433,8 @@ pub async fn run(
         return;
     }
     loop {
-        extra.heartbeat.beat();
-        match store.claim_due(clock.now_ms(), batch) {
+        ctx.extra.heartbeat.beat();
+        match ctx.store.claim_due(ctx.clock.now_ms(), batch) {
             Ok(jobs) if jobs.is_empty() => {}
             Ok(jobs) => {
                 tracing::debug!(count = jobs.len(), "claimed jobs");
@@ -541,13 +476,7 @@ pub async fn run(
                         JobPool::Local => Some(Arc::clone(&local_semaphore)),
                         JobPool::Blocking => None,
                     };
-                    let store = Arc::clone(&store);
-                    let clock = Arc::clone(&clock);
-                    let mailer = Arc::clone(&mailer);
-                    let blobs = Arc::clone(&blobs);
-                    let streaming = Arc::clone(&streaming);
-                    let federation = federation.clone();
-                    let extra = extra.clone();
+                    let ctx = ctx.clone();
                     in_flight.spawn(async move {
                         let _permit = match semaphore {
                             Some(sem) => match sem.acquire_owned().await {
@@ -556,10 +485,7 @@ pub async fn run(
                             },
                             None => None,
                         };
-                        process_one(
-                            store, clock, mailer, blobs, streaming, federation, extra, job,
-                        )
-                        .await;
+                        process_one(&ctx, job).await;
                     });
                 }
                 while in_flight.join_next().await.is_some() {}

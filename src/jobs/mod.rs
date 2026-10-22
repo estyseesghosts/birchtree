@@ -1,9 +1,9 @@
-pub mod types;
-pub mod queue;
-pub mod worker;
-pub mod worker_ctx;
+pub mod account_deletion;
 pub mod handlers;
+pub mod queue;
 pub mod search_index;
 pub mod tag_backfill;
 pub mod transcode;
-pub mod account_deletion;
+pub mod types;
+pub mod worker;
+pub mod worker_ctx;

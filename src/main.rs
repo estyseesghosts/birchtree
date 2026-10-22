@@ -471,13 +471,15 @@ async fn serve(cfg: Config) {
         reset_token_ttl_ms: cfg.password_reset_ttl_hours * 3_600_000,
     };
     let worker = tokio::spawn(jobs::worker::run(
-        store.clone(),
-        clock.clone(),
-        mailer,
-        blobs,
-        streaming,
-        federation,
-        worker_extra,
+        birchtree::jobs::worker_ctx::WorkerCtx {
+            store: store.clone(),
+            clock: clock.clone(),
+            mailer,
+            blobs,
+            streaming,
+            federation,
+            extra: worker_extra,
+        },
         cfg.worker_poll_interval,
         jobs::worker::DEFAULT_BATCH,
         shutdown_rx,
