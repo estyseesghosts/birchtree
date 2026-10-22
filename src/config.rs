@@ -2,6 +2,12 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
+pub mod remote_cache;
+pub mod transcode;
+pub mod validate;
+
+pub use remote_cache::{RemoteCacheConfig, RemoteCacheMode};
+
 /// Millis-since-epoch style `Duration` encoding for the JSON config file:
 /// a plain number of milliseconds (`worker_poll_interval_ms`).
 mod serde_millis {
@@ -15,26 +21,6 @@ mod serde_millis {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Duration, D::Error> {
         Ok(Duration::from_millis(u64::deserialize(de)?))
-    }
-}
-
-/// Remote-media cache backing mode (`docs/remote-media-cache-plan.md` §4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RemoteCacheMode {
-    /// No persistence: startup refuses this mode until a non-persisting
-    /// streaming/proxy delivery path exists (adversarial-2 F1). The ledger
-    /// refuses every reservation and commit loudly while disabled.
-    Disabled,
-    /// Fetch on first request, cache, auto-evict (default).
-    OnDemand,
-    /// Proactive fetch behind config + rate limit + budget (scoped warming).
-    Warm,
-}
-
-impl Default for RemoteCacheMode {
-    fn default() -> Self {
-        Self::OnDemand
     }
 }
 
@@ -90,41 +76,6 @@ pub struct StartupSummary {
     pub unsafe_production_override_active: bool,
     /// Human-readable list of weakened settings in force.
     pub warnings: Vec<String>,
-}
-
-/// Byte budgets + lifecycle for the remote-media cache (Step 0 skeleton:
-/// config surface only; enforcement lands with agents B/C).
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct RemoteCacheConfig {
-    pub mode: RemoteCacheMode,
-    /// Hard global byte cap (all classes + in-flight).
-    pub global_cap_bytes: u64,
-    /// Reserved class: avatars, headers, custom emoji.
-    pub avatar_emoji_cap_bytes: u64,
-    /// Reserved class: image previews / thumbnails.
-    pub preview_cap_bytes: u64,
-    /// Reserved class: full image originals.
-    pub full_cap_bytes: u64,
-    /// Avatar/emoji entry retention in days.
-    pub avatar_retention_days: u64,
-    /// Scoped warming reuse of `FetchRemoteMedia` (off by default,
-    /// relay-excluded when enabled).
-    pub warming: bool,
-}
-
-impl Default for RemoteCacheConfig {
-    fn default() -> Self {
-        Self {
-            mode: RemoteCacheMode::OnDemand,
-            global_cap_bytes: 512 * 1024 * 1024,
-            avatar_emoji_cap_bytes: 128 * 1024 * 1024,
-            preview_cap_bytes: 256 * 1024 * 1024,
-            full_cap_bytes: 128 * 1024 * 1024,
-            avatar_retention_days: 30,
-            warming: false,
-        }
-    }
 }
 
 /// Server configuration. Validated before any services are built.
@@ -227,12 +178,12 @@ pub struct Config {
     pub transcoding_enabled: bool,
     /// ffmpeg binary path (Phase 7.1).
     pub ffmpeg_path: String,
-    /// libwebp `-quality` 0–100 (Phase 7.1; still-image pipeline).
+    /// libwebp `-quality` 0Ã¢â‚¬â€œ100 (Phase 7.1; still-image pipeline).
     pub webp_quality: u8,
-    /// VP9 `-crf` 0–63, constrained-quality mode with `-b:v 0` (Phase 7.1;
+    /// VP9 `-crf` 0Ã¢â‚¬â€œ63, constrained-quality mode with `-b:v 0` (Phase 7.1;
     /// GIF and video pipelines).
     pub vp9_crf: u8,
-    /// VP9 `-cpu-used` 0–5; higher is faster and slightly worse (Phase 7.1).
+    /// VP9 `-cpu-used` 0Ã¢â‚¬â€œ5; higher is faster and slightly worse (Phase 7.1).
     pub vp9_cpu_used: u8,
     /// Opus `-b:a` in kbit/s (Phase 7.1; video-with-audio pipeline).
     pub opus_bitrate_kbps: u32,
@@ -408,221 +359,7 @@ impl Default for Config {
 impl Config {
     /// Validate configuration. Returns a human-readable error string.
     pub fn validate(&self) -> Result<(), String> {
-        if self.public_url.trim().is_empty() {
-            return Err("--public-url must not be empty".to_string());
-        }
-        if !(self.public_url.starts_with("http://") || self.public_url.starts_with("https://")) {
-            return Err("--public-url must start with http:// or https://".to_string());
-        }
-        if self.data_dir.as_os_str().is_empty() {
-            return Err("--data-dir must not be empty".to_string());
-        }
-        if self.max_file_size == 0 {
-            return Err("max_file_size must be > 0".to_string());
-        }
-        if self.max_body_size == 0 {
-            return Err("max_body_size must be > 0".to_string());
-        }
-        if self.max_file_size > self.max_body_size as u64 {
-            return Err("max_file_size must not exceed max_body_size".to_string());
-        }
-        if self.max_status_chars == 0 {
-            return Err("max_status_chars must be > 0".to_string());
-        }
-        if self.max_status_chars > 3000 {
-            return Err("max_status_chars must not exceed 3000".to_string());
-        }
-        if self.worker_poll_interval.is_zero() {
-            return Err("worker_poll_interval must be > 0".to_string());
-        }
-        if self.transcode_wall_time_secs == 0 {
-            return Err("transcode_wall_time_secs must be > 0".to_string());
-        }
-        if self.transcode_max_output_bytes == 0 {
-            return Err("transcode_max_output_bytes must be > 0".to_string());
-        }
-        if self.transcode_max_memory_bytes == 0 {
-            return Err("transcode_max_memory_bytes must be > 0".to_string());
-        }
-        if self.webp_quality > 100 {
-            return Err(format!(
-                "webp_quality {} out of range 0-100",
-                self.webp_quality
-            ));
-        }
-        if self.vp9_crf > 63 {
-            return Err(format!("vp9_crf {} out of range 0-63", self.vp9_crf));
-        }
-        if self.vp9_cpu_used > 5 {
-            return Err(format!(
-                "vp9_cpu_used {} out of range 0-5",
-                self.vp9_cpu_used
-            ));
-        }
-        if self.opus_bitrate_kbps == 0 {
-            return Err("opus_bitrate_kbps must be > 0".to_string());
-        }
-        // Feed access gates mirror upstream's `FEED_ACCESS_MODES`
-        // (`public`/`authenticated`/`disabled`) and
-        // `ALTERNATE_FEED_ACCESS_MODES` (`public`/`authenticated`, no
-        // `disabled` for the local topic feed).
-        for (key, value) in [
-            ("local_live_feed_access", &self.local_live_feed_access),
-            ("remote_live_feed_access", &self.remote_live_feed_access),
-            ("remote_topic_feed_access", &self.remote_topic_feed_access),
-        ] {
-            if !["public", "authenticated", "disabled"].contains(&value.as_str()) {
-                return Err(format!(
-                    "{key} must be one of public, authenticated, disabled"
-                ));
-            }
-        }
-        if !["public", "authenticated"].contains(&self.local_topic_feed_access.as_str()) {
-            return Err("local_topic_feed_access must be one of public, authenticated".to_string());
-        }
-        // Core extension policies (Stage 1): strict three-state enums.
-        if !["off", "unenforced", "enforced"].contains(&self.license_policy.as_str()) {
-            return Err("license_policy must be one of off, unenforced, enforced".to_string());
-        }
-        if !["off", "unenforced", "enforced"].contains(&self.place_policy.as_str()) {
-            return Err("place_policy must be one of off, unenforced, enforced".to_string());
-        }
-        if !["off", "nag", "block"].contains(&self.alt_text_policy.as_str()) {
-            return Err("alt_text_policy must be one of off, nag, block".to_string());
-        }
-        if let Some(base) = &self.streaming_api_base_url {
-            let valid = ["ws://", "wss://", "http://", "https://"]
-                .iter()
-                .any(|scheme| base.starts_with(scheme) && base.len() > scheme.len());
-            if !valid {
-                return Err(
-                    "--streaming-url must start with ws://, wss://, http:// or https://"
-                        .to_string(),
-                );
-            }
-        }
-        // Mail: a half-configured provider is a hard startup error, never a
-        // silent pass (round 3, area A). Unconfigured mail is a valid state —
-        // sends then fail explicitly with 503 at the HTTP layer.
-        match (&self.smtp_url, &self.mail_from) {
-            (None, None) => {}
-            (None, Some(_)) => {
-                return Err(
-                    "--mail-from is set but --smtp-url is not; mail would never send".to_string(),
-                );
-            }
-            (Some(url), from) => {
-                let rest = url
-                    .strip_prefix("smtp://")
-                    .or_else(|| url.strip_prefix("smtps://"));
-                if rest.is_none_or(|r| r.is_empty()) {
-                    return Err("--smtp-url must start with smtp:// or smtps://".to_string());
-                }
-                match from {
-                    Some(addr) if addr.contains('@') => {}
-                    _ => {
-                        return Err(
-                            "--smtp-url is set but --mail-from is missing or invalid; refusal address required"
-                                .to_string(),
-                        );
-                    }
-                }
-            }
-        }
-        // Remote-media cache budgets (`docs/database.md` Step 0): caps > 0,
-        // distinct roots, global covers the reserved classes. The 40 MiB
-        // per-file ceiling (`federation::media::MAX_REMOTE_MEDIA_BYTES`)
-        // stays inside the class/global budgets (not a config key).
-        // Disabled mode is refused at startup until a non-persisting
-        // streaming/proxy path exists (adversarial-2 F1): accepting it would
-        // let fetches evict cached bytes and still fail to deliver.
-        if self.remote_cache.mode == RemoteCacheMode::Disabled {
-            return Err(
-                "remote_cache.mode = disabled is not supported yet: no non-persisting delivery path"
-                    .to_string(),
-            );
-        }
-        if self.remote_cache.global_cap_bytes == 0 {
-            return Err("remote_cache.global_cap_bytes must be > 0".to_string());
-        }
-        if self.remote_cache.avatar_emoji_cap_bytes == 0 {
-            return Err("remote_cache.avatar_emoji_cap_bytes must be > 0".to_string());
-        }
-        if self.remote_cache.preview_cap_bytes == 0 {
-            return Err("remote_cache.preview_cap_bytes must be > 0".to_string());
-        }
-        if self.remote_cache.full_cap_bytes == 0 {
-            return Err("remote_cache.full_cap_bytes must be > 0".to_string());
-        }
-        if self.remote_cache.avatar_retention_days == 0 {
-            return Err("remote_cache.avatar_retention_days must be > 0".to_string());
-        }
-        let reserved = self
-            .remote_cache
-            .avatar_emoji_cap_bytes
-            .saturating_add(self.remote_cache.preview_cap_bytes)
-            .saturating_add(self.remote_cache.full_cap_bytes);
-        if self.remote_cache.global_cap_bytes < reserved {
-            return Err(
-                "remote_cache.global_cap_bytes must cover the reserved class caps".to_string(),
-            );
-        }
-        if self.cache_dir_resolved() == self.durable_dir_resolved() {
-            return Err("cache_dir and durable_dir must be different directories".to_string());
-        }
-        // Gaps batch (`docs/gaps.md` Step 0): reset bearer lifetime + site
-        // text file authoring. All optional; file paths are read at serve
-        // time (G-A), so existence is not checked here — only shape.
-        if self.password_reset_ttl_hours == 0 || self.password_reset_ttl_hours > 72 {
-            return Err("password_reset_ttl_hours must be between 1 and 72".to_string());
-        }
-        if self.minimum_age_years < 13 || self.minimum_age_years > 21 {
-            return Err("minimum_age_years must be between 13 and 21".to_string());
-        }
-        // Federation tail (G-D): relay inboxes must be http(s) inbox URLs
-        // without credentials; empty (default) disables relay traffic.
-        for relay in &self.relay_inboxes {
-            let parsed = url::Url::parse(relay)
-                .map_err(|_| "relay_inboxes entries must be http(s) inbox URLs".to_string())?;
-            if !matches!(parsed.scheme(), "http" | "https")
-                || parsed.host_str().is_none()
-                || !parsed.username().is_empty()
-                || parsed.password().is_some()
-            {
-                return Err("relay_inboxes entries must be http(s) inbox URLs".to_string());
-            }
-        }
-        for (key, path) in [
-            ("site_terms_file", &self.site_terms_file),
-            ("site_privacy_file", &self.site_privacy_file),
-            ("site_extended_file", &self.site_extended_file),
-        ] {
-            if path.as_ref().is_some_and(|p| p.as_os_str().is_empty()) {
-                return Err(format!("{key} must not be empty"));
-            }
-        }
-        // At most one keyring source; an empty file path or variable name is
-        // a typo, and the keyring itself must stay out of the config file.
-        if self.secret_keyring_file.is_some() && self.secret_keyring_env.is_some() {
-            return Err(
-                "secret_keyring_file and secret_keyring_env are mutually exclusive".to_string(),
-            );
-        }
-        if self
-            .secret_keyring_file
-            .as_ref()
-            .is_some_and(|p| p.as_os_str().is_empty())
-        {
-            return Err("secret_keyring_file must not be empty".to_string());
-        }
-        if self
-            .secret_keyring_env
-            .as_deref()
-            .is_some_and(str::is_empty)
-        {
-            return Err("secret_keyring_env must not be empty".to_string());
-        }
-        Ok(())
+        validate::validate(self)
     }
 
     /// Lab-only or weakened settings currently enabled, as operator-readable
@@ -755,29 +492,6 @@ impl Config {
     /// Normalize the public URL (strip trailing slash) for actor/object URIs.
     pub fn normalized_public_url(&self) -> String {
         self.public_url.trim_end_matches('/').to_string()
-    }
-
-    /// Build the Phase 7.1 transcode configuration, proving the toolchain
-    /// when transcoding is enabled: a missing or non-working ffmpeg is an
-    /// error here (serve startup), never a silent passthrough. CLI and
-    /// harness paths never call this, so they never need ffmpeg.
-    pub fn transcode_config(&self) -> Result<crate::media::transcode::TranscodeConfig, String> {
-        let config = crate::media::transcode::TranscodeConfig {
-            enabled: self.transcoding_enabled,
-            ffmpeg_path: self.ffmpeg_path.clone(),
-            webp_quality: self.webp_quality,
-            vp9_crf: self.vp9_crf,
-            vp9_cpu_used: self.vp9_cpu_used,
-            opus_bitrate_kbps: self.opus_bitrate_kbps,
-            wall_time_secs: self.transcode_wall_time_secs,
-            max_output_bytes: self.transcode_max_output_bytes,
-            max_memory_bytes: self.transcode_max_memory_bytes,
-            max_file_size: self.max_file_size,
-        };
-        if self.transcoding_enabled {
-            config.validate().map_err(|e| format!("transcoding: {e}"))?;
-        }
-        Ok(config)
     }
 
     /// Path of the `redb` database file.
