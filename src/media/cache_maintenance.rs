@@ -442,6 +442,42 @@ impl CacheMaintenance {
     // CacheEvict.
     // -----------------------------------------------------------------
 
+    /// Shared eviction primitive for fetch-time admission and scheduled
+    /// maintenance: select victims in durable storage first
+    /// ([`CacheStore::cache_evict_batch`]: `REMOTE_CACHE` rows plus counters
+    /// in ONE transaction), then delete exactly those blob keys, then catch
+    /// the in-memory admission ledger up.
+    ///
+    /// Never deletes first: a crash between the transaction and the deletes
+    /// leaves at most uncounted orphan blobs for the reconciler, never rows
+    /// that claim bytes that are gone. A durable failure deletes nothing and
+    /// the caller must not proceed (admission treats it as transient and
+    /// retries without fetching).
+    pub fn evict_pressure(
+        &self,
+        need: MediaClass,
+        bytes_to_free: u64,
+        now_ms: u64,
+    ) -> Result<EvictReport> {
+        let batch: usize = self.batch();
+        let outcome = evict_pressure_durable_first(
+            &*self.store,
+            &self.cache,
+            self.durable.as_ref().map(|durable| durable as &dyn BlobStore),
+            self.ledger,
+            need,
+            bytes_to_free,
+            now_ms,
+            batch,
+        )?;
+        Ok(EvictReport {
+            expired: 0,
+            pressure: outcome.victims.len(),
+            blobs_deleted: outcome.blobs_deleted,
+            more_work: outcome.victims.len() >= batch,
+        })
+    }
+
     /// One bounded eviction pass: TTL expiry first, then pressure relief for
     /// each class cap and the global cap. Only cache-pool keys returned by
     /// the ledger transaction are deleted.
@@ -475,10 +511,10 @@ impl CacheMaintenance {
             pressure.push((MediaClass::Full, global_over));
         }
         for (class, bytes) in pressure {
-            let evicted: Vec<String> = self.store.cache_evict_batch(class, bytes, now_ms, batch)?;
-            report.pressure += evicted.len();
-            report.more_work |= evicted.len() >= batch;
-            report.blobs_deleted += self.delete_cache_blobs(&evicted)?;
+            let pass = self.evict_pressure(class, bytes, now_ms)?;
+            report.pressure += pass.pressure;
+            report.more_work |= pass.more_work;
+            report.blobs_deleted += pass.blobs_deleted;
         }
         Ok(report)
     }
@@ -507,6 +543,56 @@ impl CacheMaintenance {
             self.lock_ledger()?.evict_by_blob_key(key);
         }
         Ok(deleted)
+    }
+
+    /// Enforce the configured caps after [`CacheMaintenance::restore_at_startup`],
+    /// before traffic is accepted: repeat the bounded eviction pass until
+    /// every class cap and the global cap hold. A restart (or a shadow
+    /// migration that adopted more bytes than the caps allow) must never
+    /// serve while over cap; the same durable-first primitive backs every
+    /// pass, so redb and disk agree throughout.
+    ///
+    /// Bounded (100 passes of at most [`MAINTENANCE_BATCH`] rows each): gives
+    /// up with an error — startup refuses — rather than looping forever.
+    pub fn enforce_caps_at_startup(&self, now_ms: u64) -> Result<EvictReport> {
+        let mut total = EvictReport::default();
+        for _ in 0..100 {
+            if self.caps_hold()? {
+                total.more_work = false;
+                return Ok(total);
+            }
+            let pass = self.run_cache_evict(now_ms)?;
+            total.expired += pass.expired;
+            total.pressure += pass.pressure;
+            total.blobs_deleted += pass.blobs_deleted;
+            total.more_work = pass.more_work;
+            if !pass.more_work && self.caps_hold()? {
+                total.more_work = false;
+                return Ok(total);
+            }
+        }
+        if self.caps_hold()? {
+            total.more_work = false;
+            return Ok(total);
+        }
+        Err(Error::Storage(
+            "cache still over its caps after bounded startup eviction".into(),
+        ))
+    }
+
+    /// Whether every class cap and the global cap currently hold.
+    fn caps_hold(&self) -> Result<bool> {
+        let usage: CacheUsage = self.store.cache_accounting()?;
+        for (class, stored) in [
+            (MediaClass::AvatarEmoji, usage.stored_avatar_emoji),
+            (MediaClass::Preview, usage.stored_preview),
+            (MediaClass::Full, usage.stored_full),
+        ] {
+            if stored > class.cap_bytes(&self.config) {
+                return Ok(false);
+            }
+        }
+        Ok(usage.stored_total <= self.config.global_cap_bytes)
     }
 
     // -----------------------------------------------------------------
@@ -658,10 +744,79 @@ impl CacheMaintenance {
     }
 }
 
+/// Outcome of one durable-first pressure eviction.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PressureEvictOutcome {
+    /// Blob keys unmapped (rows + counters) and deleted.
+    pub victims: Vec<String>,
+    /// Victim blobs actually removed from disk (a victim whose bytes were
+    /// already gone still counts in `victims`, never here).
+    pub blobs_deleted: usize,
+}
+
+/// Shared eviction primitive for fetch-time admission and scheduled
+/// maintenance: select victims in durable storage first
+/// ([`CacheStore::cache_evict_batch`]: `REMOTE_CACHE` rows plus counters in
+/// ONE transaction), then delete exactly those blob keys, then catch the
+/// in-memory admission ledger up.
+///
+/// `blobs` is the pool the victims live in (the pooled runtime handle on
+/// the fetch path, the cache pool on the maintenance path);
+/// `durable_shadow` additionally clears a pre-split durable copy when the
+/// caller fronts the pools separately (maintenance only; the pooled handle
+/// already clears both). `ledger` is the admission ledger to catch up
+/// (best-effort: it is rebuilt from durable rows at startup).
+///
+/// Never deletes first: a crash between the transaction and the deletes
+/// leaves at most uncounted orphan blobs for the reconciler, never rows
+/// that claim bytes that are gone. A durable failure deletes nothing and
+/// the caller must not proceed (admission treats it as transient and
+/// retries without fetching).
+pub fn evict_pressure_durable_first(
+    store: &(impl CacheStore + ?Sized),
+    blobs: &dyn BlobStore,
+    durable_shadow: Option<&dyn BlobStore>,
+    ledger: &Mutex<CacheLedger>,
+    need: MediaClass,
+    bytes_to_free: u64,
+    now_ms: u64,
+    batch: usize,
+) -> Result<PressureEvictOutcome> {
+    // 1. Durable victim selection first: rows + counters in ONE transaction.
+    let victims: Vec<String> = store.cache_evict_batch(need, bytes_to_free, now_ms, batch)?;
+    // 2. Then delete exactly the returned keys (own keys only).
+    let mut blobs_deleted = 0;
+    for key in &victims {
+        if !remote_cache::is_cache_key(key) {
+            return Err(Error::InvalidInput(format!(
+                "refusing to evict a non-cache key: {key}"
+            )));
+        }
+        if blobs.exists(key).unwrap_or(false) {
+            blobs_deleted += 1;
+        }
+        blobs.delete(key)?;
+        if let Some(durable) = durable_shadow
+            && durable.exists(key).unwrap_or(false)
+        {
+            durable.delete(key)?;
+        }
+    }
+    // 3. In-memory admission ledger follows.
+    if let Ok(mut ledger) = ledger.lock() {
+        for key in &victims {
+            ledger.evict_by_blob_key(key);
+        }
+    }
+    Ok(PressureEvictOutcome {
+        victims,
+        blobs_deleted,
+    })
+}
+
 // ---------------------------------------------------------------------
 // Fetch policy.
 // ---------------------------------------------------------------------
-
 /// Whether ingest should enqueue `FetchRemoteMedia` eagerly for the
 /// attachments of a freshly received status.
 ///

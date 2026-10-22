@@ -309,30 +309,29 @@ pub async fn fetch(
     // Worst-case reservation first: concurrent fetches each hold their ceiling
     // until headers shrink it, so the committed total never overshoots.
     let mut reserved = MAX_REMOTE_MEDIA_BYTES;
+    if lock_ledger()?
+        .reserve(MediaClass::Full, reserved)
+        .is_err()
     {
-        let mut ledger = lock_ledger()?;
-        if let Err(err) = ledger.reserve(MediaClass::Full, reserved) {
-            // Make room (mapping first, accounting, then delete own keys),
-            // then reserve once. Refusal after full eviction is transient.
-            match ledger.evict_for(MediaClass::Full, reserved, now) {
-                Ok(victims) => {
-                    drop(ledger);
-                    for victim in &victims {
-                        cache_store(ctx)
-                            .delete(victim)
-                            .map_err(|e| DeliveryError::Retry(e.to_string()))?;
-                    }
-                    let mut ledger = lock_ledger()?;
-                    ledger
-                        .reserve(MediaClass::Full, reserved)
-                        .map_err(ledger_outcome)?;
-                }
-                Err(evict_err) => {
-                    let _ = err;
-                    return Err(ledger_outcome(evict_err));
-                }
-            }
-        }
+        // Make room through the durable-first eviction shared with scheduled
+        // maintenance: victims are unmapped (rows + counters) in one redb
+        // transaction BEFORE any blob is deleted, then the blobs go, then
+        // the in-memory ledger catches up. A durable failure deletes nothing
+        // and the fetch does not proceed (transient retry, no download).
+        crate::media::cache_maintenance::evict_pressure_durable_first(
+            store,
+            cache_store(ctx),
+            None,
+            remote_cache::process_ledger(),
+            MediaClass::Full,
+            reserved,
+            now,
+            crate::media::cache_maintenance::MAINTENANCE_BATCH,
+        )
+        .map_err(|err| DeliveryError::Retry(err.to_string()))?;
+        lock_ledger()?
+            .reserve(MediaClass::Full, reserved)
+            .map_err(ledger_outcome)?;
     }
     let release = |ledger: &mut CacheLedger, amount: u64| {
         ledger.release(MediaClass::Full, amount);

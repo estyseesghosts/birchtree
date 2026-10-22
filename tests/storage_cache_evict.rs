@@ -13,21 +13,24 @@
 
 mod common;
 
+use std::sync::Mutex;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::sync::Mutex;
 
 use birchtree::application::accounts::{CreateAccountCommand, create_account};
 use birchtree::application::federation_ports::FederationContentStore;
-use birchtree::application::ports::{BlobStore, MediaStore, NewMedia};
-use birchtree::config::{RemoteCacheMode, RemoteCacheConfig};
+use birchtree::application::ports::{BlobStore, CacheStore, MediaStore, NewMedia};
+use birchtree::config::{RemoteCacheConfig, RemoteCacheMode};
 use birchtree::domain::{Id, SystemClock, TimestampIdGenerator};
 use birchtree::federation::media::{self, MAX_REMOTE_MEDIA_BYTES};
 use birchtree::media::blob_store::FsBlobStore;
+use birchtree::media::cache_maintenance::{
+    CacheMaintenance, MAINTENANCE_BATCH, evict_pressure_durable_first,
+};
 use birchtree::media::remote_cache::{
-    self, CacheError, CacheLedger, MediaClass, RemoteCacheEntry, PER_FILE_CEILING_BYTES,
+    self, CacheError, CacheLedger, MediaClass, PER_FILE_CEILING_BYTES, RemoteCacheEntry,
 };
 use birchtree::persistence::redb::RedbStore;
 
@@ -104,7 +107,10 @@ fn concurrent_reservations_never_exceed_cap() {
         h.join().unwrap();
     }
     let guard = ledger.lock().unwrap();
-    assert!(!violated.load(Ordering::SeqCst), "cap overshot under concurrency");
+    assert!(
+        !violated.load(Ordering::SeqCst),
+        "cap overshot under concurrency"
+    );
     assert!(guard.committed_total() <= cfg.global_cap_bytes);
     assert_eq!(guard.inflight_total(), 0, "every reservation settled");
 }
@@ -145,8 +151,10 @@ fn evicted_entry_refetches_while_source_lives() {
     assert_eq!(ledger.stored_total(), 3 * 256 * 1024);
 
     // The victim's metadata shell survives with its source URL (re-fetchable).
-    let victim_key =
-        birchtree::persistence::redb::schema::remote_cache_key("https://cdn.example/0.png", "original");
+    let victim_key = birchtree::persistence::redb::schema::remote_cache_key(
+        "https://cdn.example/0.png",
+        "original",
+    );
     let shell = ledger.get(&victim_key).expect("metadata shell survives");
     assert!(!shell.has_bytes);
     assert_eq!(shell.source_url, "https://cdn.example/0.png");
@@ -157,7 +165,13 @@ fn evicted_entry_refetches_while_source_lives() {
         .commit(
             MediaClass::Full,
             256 * 1024,
-            stored_full("https://cdn.example/0.png", "remote/0", 256 * 1024, now + 2, &cfg),
+            stored_full(
+                "https://cdn.example/0.png",
+                "remote/0",
+                256 * 1024,
+                now + 2,
+                &cfg,
+            ),
         )
         .unwrap();
     assert_eq!(ledger.stored_total(), cfg.global_cap_bytes);
@@ -284,6 +298,171 @@ fn local_uploads_survive_aggressive_eviction() {
     assert_eq!(blobs.get(cache_key).unwrap(), None);
 }
 
+/// Admission eviction is durable-first: victims are unmapped (rows +
+/// counters) in one redb transaction before any blob is deleted, so redb and
+/// disk agree without any reconciler pass — including across a restart that
+/// drops the in-memory ledger.
+#[test]
+fn admission_eviction_keeps_redb_and_disk_in_agreement() {
+    use std::time::Duration;
+
+    let cfg = RemoteCacheConfig {
+        mode: RemoteCacheMode::OnDemand,
+        global_cap_bytes: 32 * 1024,
+        avatar_emoji_cap_bytes: 256 * 1024,
+        preview_cap_bytes: 512 * 1024,
+        full_cap_bytes: 16 * 1024,
+        avatar_retention_days: 30,
+        warming: false,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("birchtree.redb");
+    let cache_dir = dir.path().join("media_cache");
+
+    fn disk_bytes(cache: &FsBlobStore) -> u64 {
+        cache
+            .list_keys(None, 500, Duration::ZERO)
+            .expect("list")
+            .iter()
+            .map(|key| cache.size_of(key).expect("size").unwrap_or(0))
+            .sum()
+    }
+
+    let victims: Vec<String> = {
+        let store = RedbStore::open(
+            &db_path,
+            Arc::new(SystemClock),
+            Arc::new(TimestampIdGenerator::new(Box::new(SystemClock))),
+        )
+        .expect("open store");
+        let cache = FsBlobStore::open(&cache_dir).expect("cache pool");
+        let ledger = Mutex::new(CacheLedger::new(cfg.clone()));
+        // Four 4 KiB entries fill the 16 KiB class cap, with real files.
+        for i in 0..4u64 {
+            let source = format!("https://cdn.example/agree-{i}.png");
+            let blob_key = format!("remote/{}", 1000 + i);
+            cache.put(&blob_key, &vec![i as u8; 4096]).unwrap();
+            store
+                .cache_mark_stored(&source, "original", &blob_key, 4096, None, T0)
+                .unwrap();
+            let mut guard = ledger.lock().unwrap();
+            guard.reserve(MediaClass::Full, 4096).unwrap();
+            guard
+                .commit(
+                    MediaClass::Full,
+                    4096,
+                    RemoteCacheEntry::stored(
+                        &source,
+                        "original",
+                        MediaClass::Full,
+                        &blob_key,
+                        4096,
+                        T0,
+                        &cfg,
+                    ),
+                )
+                .unwrap();
+        }
+        assert_eq!(store.cache_accounting().unwrap().stored_full, 16 * 1024);
+
+        // Admission of 8 KiB more: the shared durable-first primitive frees
+        // room (rows + counters first, blobs second, ledger last).
+        let outcome = evict_pressure_durable_first(
+            &store,
+            &cache,
+            None,
+            &ledger,
+            MediaClass::Full,
+            8 * 1024,
+            T0 + 1,
+            MAINTENANCE_BATCH,
+        )
+        .expect("durable-first eviction");
+        assert!(!outcome.victims.is_empty());
+        // The freed room admits the new reservation in the ledger.
+        ledger
+            .lock()
+            .unwrap()
+            .reserve(MediaClass::Full, 8 * 1024)
+            .expect("room was made");
+
+        // Agreement with NO reconciler pass: redb claims exactly the bytes
+        // on disk, and every victim is gone from both.
+        let usage = store.cache_accounting().unwrap();
+        assert_eq!(usage.stored_total, disk_bytes(&cache));
+        assert_eq!(usage.stored_full, 8 * 1024);
+        for victim in &outcome.victims {
+            assert!(!cache.exists(victim).unwrap(), "{victim} deleted");
+            let row = store.cache_row_by_blob_key(victim).unwrap();
+            assert!(
+                row.is_none_or(|(_, row)| !row.has_bytes),
+                "{victim} unmapped"
+            );
+        }
+        outcome.victims
+    };
+
+    // Restart: the ledger is gone, the store reopens, and agreement still
+    // holds with no reconciler pass.
+    let store = RedbStore::open(
+        &db_path,
+        Arc::new(SystemClock),
+        Arc::new(TimestampIdGenerator::new(Box::new(SystemClock))),
+    )
+    .expect("reopen store");
+    let cache = FsBlobStore::open(&cache_dir).expect("cache pool");
+    assert_eq!(store.cache_accounting().unwrap().stored_total, disk_bytes(&cache));
+    for victim in &victims {
+        assert!(!cache.exists(victim).unwrap(), "{victim} stays deleted");
+    }
+}
+
+/// Startup cap enforcement: over-cap rows after a restore (e.g. a shadow
+/// migration that adopted more bytes than the caps allow) are evicted with
+/// the same durable-first primitive before traffic is accepted.
+#[test]
+fn startup_enforcement_brings_over_cap_pool_within_caps() {
+    use std::time::Duration;
+
+    let cfg = RemoteCacheConfig {
+        mode: RemoteCacheMode::OnDemand,
+        global_cap_bytes: 32 * 1024,
+        avatar_emoji_cap_bytes: 256 * 1024,
+        preview_cap_bytes: 512 * 1024,
+        full_cap_bytes: 16 * 1024,
+        avatar_retention_days: 30,
+        warming: false,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(open_store(dir.path()));
+    let cache = FsBlobStore::open(dir.path().join("media_cache")).expect("cache pool");
+    // Five 4 KiB entries: 20 KiB over the 16 KiB class cap.
+    for i in 0..5u64 {
+        let source = format!("https://cdn.example/startup-{i}.png");
+        let blob_key = format!("remote/{}", 2000 + i);
+        cache.put(&blob_key, &vec![i as u8; 4096]).unwrap();
+        store
+            .cache_mark_stored(&source, "original", &blob_key, 4096, None, T0)
+            .unwrap();
+    }
+    assert_eq!(store.cache_accounting().unwrap().stored_full, 20 * 1024);
+
+    let maint = CacheMaintenance::new(store.clone(), cache.clone(), cfg.clone());
+    let report = maint.enforce_caps_at_startup(T0 + 1).expect("enforce");
+    assert!(report.pressure > 0);
+
+    let usage = store.cache_accounting().unwrap();
+    assert!(usage.stored_full <= cfg.full_cap_bytes);
+    assert!(usage.stored_total <= cfg.global_cap_bytes);
+    let on_disk: u64 = cache
+        .list_keys(None, 500, Duration::ZERO)
+        .expect("list")
+        .iter()
+        .map(|key| cache.size_of(key).expect("size").unwrap_or(0))
+        .sum();
+    assert_eq!(usage.stored_total, on_disk);
+}
+
 /// Oversize / unsupported / missing / exhausted map to Mastodon
 /// `422`/`404`/`503` with `{ "error": ... }` — never a Misskey Drive shape.
 #[test]
@@ -299,22 +478,30 @@ fn refusal_shapes_are_mastodon() {
     assert!(matches!(stream, Err(CacheError::Unsupported(_))));
 
     // Fill the pool, then refuse one more byte with 503.
-    ledger.reserve(MediaClass::Full, cfg.global_cap_bytes).unwrap();
+    ledger
+        .reserve(MediaClass::Full, cfg.global_cap_bytes)
+        .unwrap();
     ledger
         .commit(
             MediaClass::Full,
             cfg.global_cap_bytes,
-            stored_full("https://cdn.example/big.png", "remote/1", cfg.global_cap_bytes, T0, &cfg),
+            stored_full(
+                "https://cdn.example/big.png",
+                "remote/1",
+                cfg.global_cap_bytes,
+                T0,
+                &cfg,
+            ),
         )
         .unwrap();
     let exhausted = ledger.reserve(MediaClass::Full, 1);
-    assert!(matches!(
-        exhausted,
-        Err(CacheError::BudgetExhausted { .. })
-    ));
+    assert!(matches!(exhausted, Err(CacheError::BudgetExhausted { .. })));
 
     for err in [
-        CacheError::Oversize { size: 1, ceiling: 1 },
+        CacheError::Oversize {
+            size: 1,
+            ceiling: 1,
+        },
         CacheError::Unsupported("bad content".into()),
         CacheError::Missing("attachment has no source".into()),
         CacheError::OriginDown("origin timed out".into()),
@@ -338,7 +525,10 @@ fn warming_stays_off_and_relay_excluded() {
     let cfg = test_cfg();
     assert!(!cfg.warming);
     assert!(!media::should_warm(&cfg, false));
-    let on = RemoteCacheConfig { warming: true, ..test_cfg() };
+    let on = RemoteCacheConfig {
+        warming: true,
+        ..test_cfg()
+    };
     assert!(media::should_warm(&on, false));
     assert!(!media::should_warm(&on, true), "relay is always excluded");
 }

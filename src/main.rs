@@ -564,6 +564,26 @@ async fn serve(cfg: Config) {
             std::process::exit(1);
         }
     }
+    // Over-cap after restore (or after a shadow migration that adopted more
+    // bytes than the caps allow) is evicted with the same durable-first
+    // primitive as admission and maintenance, before the listener binds:
+    // redb and disk agree before traffic is accepted.
+    match maint.enforce_caps_at_startup(clock.now_ms()) {
+        Ok(report) => {
+            if report.pressure > 0 || report.expired > 0 {
+                tracing::info!(
+                    expired = report.expired,
+                    pressure = report.pressure,
+                    blobs_deleted = report.blobs_deleted,
+                    "cache startup cap enforcement"
+                );
+            }
+        }
+        Err(err) => {
+            eprintln!("cache startup cap enforcement: {err}");
+            std::process::exit(1);
+        }
+    }
     if let Err(err) = maint.seed_jobs(&*store, clock.now_ms()) {
         tracing::warn!(error = %err, "maintenance seed failed");
     }
