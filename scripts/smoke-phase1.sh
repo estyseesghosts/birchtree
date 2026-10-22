@@ -10,6 +10,11 @@ BASE="http://127.0.0.1:${PORT}"
 DATA_DIR="$(mktemp -d)"
 BIN="${BIRCHTREE_BIN:-target/debug/birchtree}"
 PID=""
+# Fail-closed secrets (prod-2 item 4): production refuses to start without a
+# keyring, so smoke mints a throwaway one (0600) inside the data dir.
+KEYRING="$DATA_DIR/keyring"
+printf '%s\n' '1:0000000000000000000000000000000000000000000000000000000000000000' > "$KEYRING"
+chmod 600 "$KEYRING"
 
 cleanup() {
   if [ -n "$PID" ]; then
@@ -25,7 +30,7 @@ cargo build --bin birchtree >/dev/null
 start_server() {
   # Dummy SMTP (shape-validated only): production refuses to serve signup
   # without a mail provider, even in smoke.
-  "$BIN" --data-dir="$DATA_DIR" --listen="127.0.0.1:${PORT}" --public-url="$BASE" --no-transcode --smtp-url=smtp://127.0.0.1:25 --mail-from=noreply@example.social &
+  "$BIN" --data-dir="$DATA_DIR" --listen="127.0.0.1:${PORT}" --public-url="$BASE" --no-transcode --smtp-url=smtp://127.0.0.1:25 --mail-from=noreply@example.social --secret-keyring-file="$KEYRING" &
   PID=$!
   for _ in $(seq 1 100); do
     if curl -fsS "$BASE/health" >/dev/null 2>&1; then

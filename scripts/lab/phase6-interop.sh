@@ -24,6 +24,10 @@ DATA="${BT_DATA:-/root/parity/birchtree-lab-data}"
 pkill -x birchtree 2>/dev/null || true
 for i in $(seq 1 20); do pgrep -x birchtree >/dev/null || break; sleep 1; done
 rm -rf "$DATA" && mkdir -p "$DATA"
+# Fail-closed secrets (prod-2 item 4): production refuses to start without a
+# keyring; the lab keeps a throwaway one next to the lab data dir.
+printf '%s\n' '1:0000000000000000000000000000000000000000000000000000000000000000' > "$DATA/keyring"
+chmod 600 "$DATA/keyring"
 (cd "$HERE/../.." && ./target/debug/birchtree --data-dir="$DATA" --public-url=$BT create-account --username=bob --password=BobLabPass-2026 --email=bob@lab.test) >/dev/null 2>&1
 "$HERE/start-birchtree.sh" > "$LAB/birchtree-phase6.log" 2>&1 &
 sleep 10
@@ -186,7 +190,7 @@ check "context read sets async-refresh header (if eligible)" "0"
 say "== Authorized fetch"
 # restart birchtree with authorized fetch
 pkill -x birchtree; sleep 3
-RUST_LOG=info /root/birchtree/target/debug/birchtree --data-dir="$DATA" --public-url=$BT --listen=0.0.0.0:8080 --federation-allow-private=172.28.0.0/24 --federation-extra-ca="$LAB/certs/lab-ca.crt" --federation-allow-http --trusted-proxy=172.28.0.20 --federation-authorized-fetch --smtp-url=smtp://127.0.0.1:25 --mail-from=noreply@example.social > "$LAB/birchtree-auth.log" 2>&1 &
+RUST_LOG=info /root/birchtree/target/debug/birchtree --data-dir="$DATA" --public-url=$BT --listen=0.0.0.0:8080 --federation-allow-private=172.28.0.0/24 --federation-extra-ca="$LAB/certs/lab-ca.crt" --federation-allow-http --trusted-proxy=172.28.0.20 --federation-authorized-fetch --smtp-url=smtp://127.0.0.1:25 --mail-from=noreply@example.social --secret-keyring-file="$DATA/keyring" > "$LAB/birchtree-auth.log" 2>&1 &
 sleep 15
 # post a note as bob (authenticated) so there is a note URL to test
 TOK2=$(python3 -I "$LAB/birchtree_token.py" $BT bob BobLabPass-2026 "$CA" | python3 -c 'import json,sys;print(json.load(sys.stdin)["access_token"])')

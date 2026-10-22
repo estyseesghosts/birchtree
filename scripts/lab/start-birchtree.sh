@@ -7,8 +7,16 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 LAB="${LAB:-/root/parity/lab}"
 BT_DATA="${BT_DATA:-/root/parity/birchtree-lab-data}"
 cd "$ROOT"
+# Fail-closed secrets (prod-2 item 4): production refuses to start without a
+# keyring; the lab launcher keeps a throwaway one next to the lab data dir.
+LAB_KEYRING="${BT_DATA}/keyring"
+if [ ! -f "$LAB_KEYRING" ]; then
+  printf '%s\n' '1:0000000000000000000000000000000000000000000000000000000000000000' > "$LAB_KEYRING"
+  chmod 600 "$LAB_KEYRING"
+fi
 RUST_LOG="${RUST_LOG:-info,birchtree::federation=debug,birchtree::jobs::worker=debug,activitypub_federation=debug}" \
   exec ./target/debug/birchtree --data-dir="$BT_DATA" --public-url=https://birchtree.lab \
   --listen=0.0.0.0:8080 --federation-allow-private=172.28.0.0/24 \
   --federation-extra-ca="$LAB/certs/lab-ca.crt" --federation-allow-http --trusted-proxy=172.28.0.20 \
-  --smtp-url=smtp://127.0.0.1:25 --mail-from=noreply@example.social
+  --smtp-url=smtp://127.0.0.1:25 --mail-from=noreply@example.social \
+  --secret-keyring-file="$LAB_KEYRING"
