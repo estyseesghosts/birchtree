@@ -4,35 +4,42 @@
 //! `application::ports`. Values are JSON-encoded; keys are ordered primitives
 //! so index scans stay bounded. No redb types escape this module.
 
-pub mod schema;
-pub mod migrations;
 pub mod accounts;
-pub mod oauth;
 pub mod jobs;
+pub mod migrations;
+pub mod oauth;
+pub mod schema;
 
-pub mod admin_infra;
-pub mod statuses;
-pub mod relationships;
+pub mod admin_infra_audit;
+pub mod admin_infra_domain;
+pub mod admin_infra_email;
+pub mod admin_infra_impl;
+pub mod admin_infra_ip;
+pub mod admin_infra_metrics;
+pub mod admin_infra_tags;
+pub mod admin_scan_ctx;
 pub mod conversations_push;
-pub mod web;
-pub mod quotes;
-pub mod polls;
 pub mod media;
 pub mod notifications;
 pub mod places;
+pub mod polls;
+pub mod quotes;
+pub mod relationships;
+pub mod statuses;
+pub mod web;
 
 // Phase 4 storage modules: timelines, lists, markers, filters, scheduled
 // statuses and custom emoji.
-pub mod timelines;
-pub mod trends;
+pub mod announcements;
+pub mod emoji;
+pub mod filters;
 pub mod lists;
 pub mod markers;
-pub mod filters;
 pub mod scheduled;
-pub mod emoji;
-pub mod suggestions;
-pub mod announcements;
 pub mod search;
+pub mod suggestions;
+pub mod timelines;
+pub mod trends;
 
 // Phase 6: federation keys, remote accounts, inbound dedup and follow commands.
 pub mod federation;
@@ -263,7 +270,10 @@ impl RedbStore {
     /// Current counter values (tests measure deltas around a workload).
     pub fn metrics(&self) -> MetricsSnapshot {
         MetricsSnapshot {
-            read_txns: self.metrics.read_txns.load(std::sync::atomic::Ordering::Relaxed),
+            read_txns: self
+                .metrics
+                .read_txns
+                .load(std::sync::atomic::Ordering::Relaxed),
             write_txns: self
                 .metrics
                 .write_txns
@@ -381,8 +391,7 @@ mod tests {
             for loose in [0o707, 0o755, 0o750, 0o770] {
                 let nested = dir.path().join(format!("data-{loose:o}"));
                 std::fs::create_dir(&nested).unwrap();
-                std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(loose))
-                    .unwrap();
+                std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(loose)).unwrap();
                 prepare_data_dir(&nested).expect("tightened to 0700");
                 let mode = std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777;
                 assert_eq!(mode, 0o700, "from {loose:o}");
@@ -402,7 +411,11 @@ mod tests {
                 Arc::new(TimestampIdGenerator::new(Box::new(SystemClock))),
             )
             .unwrap();
-            let mode = std::fs::metadata(store.path()).unwrap().permissions().mode() & 0o777;
+            let mode = std::fs::metadata(store.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
             assert_eq!(mode & 0o077, 0, "mode {mode:o}");
         }
     }
