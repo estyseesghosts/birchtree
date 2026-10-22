@@ -183,6 +183,44 @@ impl JobQueue for RedbStore {
         Ok(claimed)
     }
 
+    fn prune_succeeded(&self, older_than_ms: u64, limit: usize) -> Result<u64> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        // Collect the victims first, then delete them in the same write
+        // transaction: one `redb` txn per mutation, no network I/O inside.
+        // Only `Succeeded` rows qualify; `Pending`/`Leased` rows are live
+        // work and `Quarantined` rows stay for operator inspection.
+        let mut victims: Vec<(u64, Id)> = Vec::new();
+        {
+            let write = self.begin_write()?;
+            {
+                let jobs = write.open_table(JOBS)?;
+                for entry in jobs.iter()? {
+                    let (_key, value) = entry?;
+                    let job: Job = decode(value.value())?;
+                    if job.state == JobState::Succeeded && job.due_at_ms < older_than_ms {
+                        victims.push((job.due_at_ms, job.id));
+                    }
+                }
+            }
+            // Oldest first so a capped pass always reaps the stalest rows.
+            victims.sort();
+            victims.truncate(limit);
+            {
+                let mut jobs = write.open_table(JOBS)?;
+                for (_due_at_ms, id) in &victims {
+                    jobs.remove(id.value())?;
+                }
+            }
+            // `Succeeded` rows hold no scheduling-index entries
+            // (`complete` removed them at settlement), so there is nothing
+            // to unindex here.
+            write.commit()?;
+        }
+        Ok(victims.len() as u64)
+    }
+
     fn complete(&self, id: Id) -> Result<()> {
         let write = self.begin_write()?;
         let Some(mut job) = read_job_txn(&write, id)? else {

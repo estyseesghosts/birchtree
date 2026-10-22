@@ -381,7 +381,7 @@ Do not call Birchtree production-ready until all of these are demonstrated on th
 - [ ] File size and decoded-image limits are enforced; uploads and downloads are streamed; expensive processing is bounded and off the async executor.
 - [ ] Durable and cache roots are truly separate; cache accounting restores after restart; eviction and reconciliation actually run.
 - [ ] No staging files are publicly served; upload/metadata failures clean up or are reconciled.
-- [ ] Background jobs have bounded class-specific concurrency, retention, redaction and reliable crash recovery.
+- [x] Background jobs have bounded class-specific concurrency, retention, redaction and reliable crash recovery.
 - [ ] No network-facing RSA signer uses an unblinded private-key operation. AWS-LC-RS is the selected and tested RSA provider; RustCrypto RSA is absent from production dependency paths, or any remaining use is explicitly justified and documented. Legacy wire compatibility and any Ed25519/RFC 9421 policy are tested rather than assumed.
 - [ ] Authorized-fetch and ordinary federation tests both pass for the target compatibility matrix.
 - [ ] Restart/clock rollback cannot duplicate IDs; MFA lookup has an account index.

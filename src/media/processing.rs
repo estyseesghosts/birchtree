@@ -146,6 +146,9 @@ fn process_image(mime_type: &str, bytes: &[u8]) -> Result<Processed, ProcessErro
 
     let rgba = preview_img.to_rgba8();
     let (components_x, components_y) = blurhash_components(preview_w, preview_h);
+    // Encode-only use: this is the single `blurhash::` call in the tree, and
+    // `decode` is never called (nor reachable through any dependency), so the
+    // crafted-input decode advisory (RUSTSEC-2023-0083) does not apply here.
     let blurhash = blurhash::encode(
         components_x,
         components_y,
