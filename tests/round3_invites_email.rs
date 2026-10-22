@@ -11,11 +11,10 @@ use std::sync::Mutex;
 use birchtree::application::accounts::{
     CreateInviteCommand, InviteStore, MemoryInviteStore, RegisterAccountCommand,
     allowed_registration, create_invite, invite_status, redeem_invite,
-    register_account_with_invite, request_confirmation_email, request_password_reset,
+    register_account_with_invite,
 };
-use birchtree::application::ports::{
-    AccountStore, NewApp, NewAuthCode, NewToken, OAuthStore,
-};
+use birchtree::application::accounts_mfa::{request_confirmation_email, request_password_reset};
+use birchtree::application::ports::{AccountStore, NewApp, NewAuthCode, NewToken, OAuthStore};
 use birchtree::config::Config;
 use birchtree::domain::user::{INVITE_COMMENT_LIMIT, Invite, is_valid_invite_code_shape};
 use birchtree::domain::{
@@ -82,10 +81,7 @@ impl OAuthStore for FakeOAuth {
     fn revoke_account_tokens(&self, _account_id: Id) -> Result<Vec<Id>, Error> {
         unimplemented!()
     }
-    fn create_authorization_code(
-        &self,
-        _input: NewAuthCode,
-    ) -> Result<AuthorizationCode, Error> {
+    fn create_authorization_code(&self, _input: NewAuthCode) -> Result<AuthorizationCode, Error> {
         unimplemented!()
     }
     fn authorization_code_by_plaintext(
@@ -432,7 +428,11 @@ fn confirmation_mail_enqueued_via_log_backend() {
     assert_eq!(out[0].to, "newuser@example.com");
     assert_eq!(out[0].subject, "Confirmation instructions");
     assert!(out[0].body_text.contains("confirm-token-abc"));
-    assert!(out[0].body_text.contains("/auth/confirmation?confirmation_token="));
+    assert!(
+        out[0]
+            .body_text
+            .contains("/auth/confirmation?confirmation_token=")
+    );
 }
 
 #[test]
@@ -451,22 +451,20 @@ fn password_reset_mail_enqueued_via_log_backend() {
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].subject, "Reset password instructions");
     assert!(out[0].body_text.contains("reset-token-xyz"));
-    assert!(out[0].body_text.contains("/auth/password/edit?reset_password_token="));
+    assert!(
+        out[0]
+            .body_text
+            .contains("/auth/password/edit?reset_password_token=")
+    );
 }
 
 #[test]
 fn no_mail_config_is_explicit_disabled_state() {
     // Production default: no provider -> every send fails loudly.
     let mailer = mailer_from_config(None, None).expect("builds");
-    let err = request_confirmation_email(
-        &*mailer,
-        "",
-        "u@example.com",
-        Id::new(1),
-        "tok",
-        BASE_URL,
-    )
-    .expect_err("disabled");
+    let err =
+        request_confirmation_email(&*mailer, "", "u@example.com", Id::new(1), "tok", BASE_URL)
+            .expect_err("disabled");
     assert!(matches!(err, MailError::Disabled(_)), "got {err:?}");
     let err = request_password_reset(&*mailer, "", "u@example.com", Id::new(1), "tok", BASE_URL)
         .expect_err("disabled");

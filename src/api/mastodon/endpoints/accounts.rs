@@ -6,11 +6,11 @@
 //! endpoints accept `read`/`read:accounts`; `verify_credentials` and
 //! `update_credentials` require a user token.
 
+use axum::body::Body;
+use axum::extract::multipart::Field;
 use axum::extract::{
     ConnectInfo, Extension, FromRequest, Multipart, Path, RawQuery, Request, State,
 };
-use axum::body::Body;
-use axum::extract::multipart::Field;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
@@ -91,8 +91,7 @@ pub async fn register(
     // while open they are ignored by the use case below. The check is a
     // boolean only (no validity oracle: both refusals answer the same 403).
     let invite_opens = state.server.invites_enabled
-        && forms::get(&pairs, "invite_code")
-            .is_some_and(|code| !code.trim().is_empty())
+        && forms::get(&pairs, "invite_code").is_some_and(|code| !code.trim().is_empty())
         && forms::get(&pairs, "invite_code").is_some_and(|code| {
             accounts::invite_status(&*state.invites, code, state.context.now_ms()).is_ok()
         });
@@ -153,21 +152,25 @@ pub async fn register(
     // Policy-aware path (G-E): `time_zone`/`date_of_birth` capture + min-age
     // gate, email-domain/canonical-email blocks reconciled with confirmation
     // state. Delegates to the invite path for everything else.
-    match accounts::register_account_with_profile(
-        store,
-        store,
-        &*state.invites,
-        store,
-        &state.server.public_url,
-        state.context.now_ms(),
-        state.server.registrations_open,
-        state.server.registrations_require_approval,
-        state.server.invites_enabled,
-        state.server.minimum_age_years,
-        &auth.0.app,
-        &profile,
+    match accounts::register(accounts::RegisterInput {
+        accounts: store,
+        oauth: store,
+        base_url: &state.server.public_url,
+        now_ms: state.context.now_ms(),
+        registration_open: state.server.registrations_open,
+        require_approval: state.server.registrations_require_approval,
+        app: &auth.0.app,
         cmd,
-    ) {
+        invite: Some(accounts::InviteInput {
+            invites: &*state.invites,
+            enabled: state.server.invites_enabled,
+        }),
+        policy: Some(accounts::PolicyInput {
+            infra: store,
+            minimum_age_years: state.server.minimum_age_years,
+            profile: &profile,
+        }),
+    }) {
         Ok(registered) => {
             let body = dto::token_json(
                 &registered.token_plaintext,
@@ -810,14 +813,24 @@ async fn credential_multipart(
         match name.as_deref() {
             Some("avatar") => {
                 fields.avatar = Some(
-                    spool_field(state, field, "Avatar", state.server.max_file_size.min(AVATAR_LIMIT))
-                        .await?,
+                    spool_field(
+                        state,
+                        field,
+                        "Avatar",
+                        state.server.max_file_size.min(AVATAR_LIMIT),
+                    )
+                    .await?,
                 );
             }
             Some("header") => {
                 fields.header = Some(
-                    spool_field(state, field, "Header", state.server.max_file_size.min(HEADER_LIMIT))
-                        .await?,
+                    spool_field(
+                        state,
+                        field,
+                        "Header",
+                        state.server.max_file_size.min(HEADER_LIMIT),
+                    )
+                    .await?,
                 );
             }
             Some(name) => {
@@ -861,7 +874,10 @@ async fn spool_field(
             .await
             .map_err(|err| spool_error(label, err))?;
     }
-    spool.finish().await.map_err(|err| spool_error(label, err))?;
+    spool
+        .finish()
+        .await
+        .map_err(|err| spool_error(label, err))?;
     Ok(spool)
 }
 
@@ -916,14 +932,8 @@ async fn profile_image_slot(
             let owned_label = label.to_string();
             let (bytes, mime_type, extension) = upload_gate::media_work_gate()
                 .run(move || {
-                    validate_profile_image(
-                        bytes.len(),
-                        &bytes,
-                        &owned_label,
-                        limit,
-                        max_file_size,
-                    )
-                    .map(|(mime_type, extension)| (bytes, mime_type, extension))
+                    validate_profile_image(bytes.len(), &bytes, &owned_label, limit, max_file_size)
+                        .map(|(mime_type, extension)| (bytes, mime_type, extension))
                 })
                 .await
                 .map_err(|err| ApiError::from(err).into_response())??;

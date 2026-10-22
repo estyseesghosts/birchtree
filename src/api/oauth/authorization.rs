@@ -16,7 +16,8 @@ use crate::api::mastodon::ApiState;
 use crate::api::oauth::consent_page;
 use crate::api::oauth::pkce;
 use crate::api::oauth::scopes;
-use crate::application::accounts::{self, SecondFactorStore};
+use crate::application::accounts::SecondFactorStore;
+use crate::application::accounts_mfa;
 use crate::application::auth;
 use crate::application::crypto;
 use crate::application::ports::Store;
@@ -187,11 +188,7 @@ fn redirect_with(redirect_uri: &str, params: &[(&str, String)]) -> Response {
         .collect::<Vec<_>>()
         .join("&");
     let location = format!("{redirect_uri}{separator}{query}");
-    (
-        StatusCode::FOUND,
-        [(header::LOCATION, location)],
-    )
-        .into_response()
+    (StatusCode::FOUND, [(header::LOCATION, location)]).into_response()
 }
 
 fn urlencode(value: &str) -> String {
@@ -221,12 +218,10 @@ pub async fn authorize_get(
     let force_login = field(&pairs, "force_login").is_some_and(|v| v == "true" || v == "1");
     let hidden = prepared.hidden_fields();
     match session_account(&state, &headers) {
-        Some((_id, username)) if !force_login => (StatusCode::OK, consent_page::consent_page(
-            &hidden,
-            &username,
-            &prepared.app.name,
-            &prepared.scopes,
-        ))
+        Some((_id, username)) if !force_login => (
+            StatusCode::OK,
+            consent_page::consent_page(&hidden, &username, &prepared.app.name, &prepared.scopes),
+        )
             .into_response(),
         _ => (StatusCode::OK, consent_page::login_page(&hidden, None)).into_response(),
     }
@@ -273,7 +268,7 @@ pub async fn authorize_post(
         let mfa: &dyn SecondFactorStore = &*state.context.store;
         let domain = state.server.domain.clone();
         let mfa_code = field(&pairs, "otp_attempt");
-        match accounts::login_with_mfa(
+        match accounts_mfa::login_with_mfa(
             store,
             mfa,
             username,
@@ -282,7 +277,7 @@ pub async fn authorize_post(
             mfa_code,
             state.context.now_ms(),
         ) {
-            Ok(accounts::LoginOutcome::MfaRequired(_user)) => {
+            Ok(accounts_mfa::LoginOutcome::MfaRequired(_user)) => {
                 let prepared = prepare(&state, &pairs);
                 let hidden = prepared.map(|p| p.hidden_fields()).unwrap_or_default();
                 let body = consent_page::login_page(
@@ -291,7 +286,7 @@ pub async fn authorize_post(
                 );
                 return (StatusCode::OK, body).into_response();
             }
-            Ok(accounts::LoginOutcome::Authenticated(user)) => {
+            Ok(accounts_mfa::LoginOutcome::Authenticated(user)) => {
                 // D39: one sign-in event per completed password login (the
                 // admin `active_users` telemetry). Recording is best-effort:
                 // the login itself already succeeded. The client IP backs
@@ -330,7 +325,8 @@ pub async fn authorize_post(
                         // (readable by first-party JS; must be echoed back
                         // as `X-CSRF-Token` on state-changing requests).
                         let csrf = crypto::random_token_hex(32);
-                        if let Ok(value) = header::HeaderValue::from_str(&csrf_cookie(&state, &csrf))
+                        if let Ok(value) =
+                            header::HeaderValue::from_str(&csrf_cookie(&state, &csrf))
                         {
                             response.headers_mut().append(header::SET_COOKIE, value);
                         }
@@ -345,7 +341,7 @@ pub async fn authorize_post(
                 let message = match &err {
                     DomainError::Unauthorized(msg)
                         if msg.as_str()
-                            == crate::application::accounts::INVALID_2FA_MESSAGE =>
+                            == crate::application::accounts_mfa::INVALID_2FA_MESSAGE =>
                     {
                         "Invalid two-factor authentication code"
                     }

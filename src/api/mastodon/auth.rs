@@ -11,14 +11,14 @@
 //! accepts (e.g. `["read", "read:accounts"]`).
 
 use axum::extract::FromRequestParts;
-use axum::http::request::Parts;
 use axum::http::StatusCode;
+use axum::http::request::Parts;
 
 use crate::api::mastodon::ApiState;
 use crate::api::mastodon::errors::{ApiError, ApiResult};
 use crate::application::accounts::SecondFactorStore;
-use crate::domain::user::AdminAction;
 use crate::application::ports::{AccountStore, Store};
+use crate::domain::user::AdminAction;
 use crate::domain::{AccessToken, Id, OAuthApplication, UserRole};
 
 /// A validated bearer token and the application that owns it.
@@ -62,7 +62,9 @@ impl Authenticated {
     pub fn require_user(&self) -> ApiResult<Id> {
         let user_id = self.token.user_id.ok_or_else(ApiError::requires_user)?;
         if !self.approved {
-            return Err(ApiError::forbidden("Your login is currently pending approval"));
+            return Err(ApiError::forbidden(
+                "Your login is currently pending approval",
+            ));
         }
         Ok(user_id)
     }
@@ -166,11 +168,7 @@ impl Authenticated {
     /// confirmed TOTP enrollment or at least one WebAuthn credential exists.
     /// Store errors fail closed (the login flow treats them as an internal
     /// error, never as "no MFA").
-    pub fn mfa_required(
-        &self,
-        mfa: &dyn SecondFactorStore,
-        user_id: Id,
-    ) -> ApiResult<bool> {
+    pub fn mfa_required(&self, mfa: &dyn SecondFactorStore, user_id: Id) -> ApiResult<bool> {
         let totp = mfa
             .totp_for(user_id)
             .map_err(ApiError::from)?
@@ -197,11 +195,11 @@ impl Authenticated {
         code: &str,
         now_ms: u64,
     ) -> ApiResult<()> {
-        match crate::application::accounts::verify_second_factor(mfa, user_id, code, now_ms) {
+        match crate::application::accounts_mfa::verify_second_factor(mfa, user_id, code, now_ms) {
             Ok(_) => Ok(()),
             Err(_) => Err(ApiError::new(
                 StatusCode::UNAUTHORIZED,
-                crate::application::accounts::INVALID_2FA_MESSAGE,
+                crate::application::accounts_mfa::INVALID_2FA_MESSAGE,
             )),
         }
     }
@@ -254,7 +252,11 @@ async fn resolve(state: &ApiState, plaintext: &str) -> ApiResult<Authenticated> 
             .map(|user| user.approved)
             .unwrap_or(true),
     };
-    Ok(Authenticated { token, app, approved })
+    Ok(Authenticated {
+        token,
+        app,
+        approved,
+    })
 }
 
 #[axum::async_trait]

@@ -21,24 +21,28 @@ use axum::http::StatusCode;
 
 use birchtree::api::mastodon::auth::{AdminArea, Authenticated};
 use birchtree::application::accounts::{
-    MemorySecondFactorStore, SecondFactorStore,
+    CreateAccountCommand, EmailPolicyOutcome, RegisterAccountCommand, RegistrationProfile,
+    SecondFactorKind, check_registration_email, confirm_email, create_account,
+    register_account_with_profile,
 };
-use birchtree::application::accounts::{
-    EmailPolicyOutcome, LoginOutcome, RegistrationProfile, SecondFactorKind,
-    begin_webauthn_authentication, begin_webauthn_registration, check_registration_email,
-    confirm_email, confirm_totp, create_account, enroll_totp, finish_webauthn_authentication,
-    finish_webauthn_registration, login_with_mfa, register_account_with_profile,
-    verify_second_factor, CreateAccountCommand, RegisterAccountCommand, INVALID_2FA_MESSAGE,
+use birchtree::application::accounts::{MemorySecondFactorStore, SecondFactorStore};
+use birchtree::application::accounts_mfa::{
+    INVALID_2FA_MESSAGE, LoginOutcome, confirm_totp, enroll_totp, login_with_mfa,
+    verify_second_factor,
+};
+use birchtree::application::accounts_webauthn::{
+    begin_webauthn_authentication, begin_webauthn_registration, finish_webauthn_authentication,
+    finish_webauthn_registration,
 };
 use birchtree::application::admin_infra as infra_uc;
 use birchtree::application::auth as auth_uc;
 use birchtree::application::ports::{AccountStore, AdminInfraStore};
 use birchtree::domain::user::{
-    AdminAction, TotpRecord, WebauthnChallenge, WebauthnPurpose, base32_decode, base32_encode,
-    check_date_of_birth, totp_code_at, totp_counter_at, validate_time_zone, verify_totp_at,
-    ADMIN_PERMISSIONS, MODERATOR_PERMISSIONS, PERM_MANAGE_BLOCKS, PERM_MANAGE_FEDERATION,
-    PERM_MANAGE_REPORTS, PERM_MANAGE_TAXONOMIES, PERM_MANAGE_USERS, PERM_VIEW_AUDIT_LOG,
-    PERM_VIEW_DASHBOARD, PERM_VIEW_FEEDS,
+    ADMIN_PERMISSIONS, AdminAction, MODERATOR_PERMISSIONS, PERM_MANAGE_BLOCKS,
+    PERM_MANAGE_FEDERATION, PERM_MANAGE_REPORTS, PERM_MANAGE_TAXONOMIES, PERM_MANAGE_USERS,
+    PERM_VIEW_AUDIT_LOG, PERM_VIEW_DASHBOARD, PERM_VIEW_FEEDS, TotpRecord, WebauthnChallenge,
+    WebauthnPurpose, base32_decode, base32_encode, check_date_of_birth, totp_code_at,
+    totp_counter_at, validate_time_zone, verify_totp_at,
 };
 use birchtree::domain::{EmailToken, EmailTokenKind, Error, Id, OAuthApplication, UserRole};
 
@@ -128,7 +132,10 @@ fn totp_base32_round_trip_and_known_vector() {
     assert_eq!(base32_decode("MY======").expect("decode"), b"f");
     assert_eq!(base32_decode("my").expect("lowercase"), b"f");
     let raw: Vec<u8> = (0u8..=255).collect();
-    assert_eq!(base32_decode(&base32_encode(&raw)).expect("round-trip"), raw);
+    assert_eq!(
+        base32_decode(&base32_encode(&raw)).expect("round-trip"),
+        raw
+    );
     assert!(base32_decode("!!!!").is_err());
     assert!(base32_decode("A").is_err());
 }
@@ -141,10 +148,18 @@ fn totp_enroll_confirm_verify_backup_single_use() {
     let now_ms = 1_700_000_001_000u64;
 
     // Enroll: URI shape + 32-char secret (20 bytes, no padding).
-    let enrollment = enroll_totp(&mfa, "totp-alice", "example.social", account.id, now_ms)
-        .expect("enroll");
-    assert!(enrollment.otpauth_uri.starts_with("otpauth://totp/example.social:totp-alice?"));
-    assert!(enrollment.otpauth_uri.contains("algorithm=SHA1&digits=6&period=30"));
+    let enrollment =
+        enroll_totp(&mfa, "totp-alice", "example.social", account.id, now_ms).expect("enroll");
+    assert!(
+        enrollment
+            .otpauth_uri
+            .starts_with("otpauth://totp/example.social:totp-alice?")
+    );
+    assert!(
+        enrollment
+            .otpauth_uri
+            .contains("algorithm=SHA1&digits=6&period=30")
+    );
     assert_eq!(enrollment.secret_base32.len(), 32);
     // Second enrollment without revoke is refused (never two live secrets).
     assert!(matches!(
@@ -212,14 +227,23 @@ fn totp_enroll_confirm_verify_backup_single_use() {
     assert_eq!(record.backup_hashes.len(), 9);
     let stored_json = serde_json::to_string(&record).expect("json");
     for spent in [&backup_codes[0]] {
-        assert!(!stored_json.contains(spent), "spent plaintext must not persist");
+        assert!(
+            !stored_json.contains(spent),
+            "spent plaintext must not persist"
+        );
     }
     // The live secret must persist (verification needs it) inside the 0700
     // store file — but it never appears in Debug output.
     assert!(stored_json.contains(&enrollment.secret_base32));
     let debug = format!("{record:?}");
-    assert!(!debug.contains(&enrollment.secret_base32), "secret leaked to Debug");
-    assert!(!debug.contains(&backup_codes[1]), "backup plaintext leaked to Debug");
+    assert!(
+        !debug.contains(&enrollment.secret_base32),
+        "secret leaked to Debug"
+    );
+    assert!(
+        !debug.contains(&backup_codes[1]),
+        "backup plaintext leaked to Debug"
+    );
     assert!(debug.contains("[redacted]"));
 }
 
@@ -231,7 +255,10 @@ fn totp_window_accepts_adjacent_counters() {
     let secret = b"12345678901234567890";
     let now_ms = 150_000; // counter 5
     assert_eq!(totp_counter_at(now_ms), 5);
-    assert_eq!(verify_totp_at(secret, &totp_code_at(secret, 5), now_ms, 3), Some(5));
+    assert_eq!(
+        verify_totp_at(secret, &totp_code_at(secret, 5), now_ms, 3),
+        Some(5)
+    );
     let prev = totp_code_at(secret, 4);
     let next = totp_code_at(secret, 6);
     assert_eq!(verify_totp_at(secret, &prev, now_ms, 3), Some(4));
@@ -342,7 +369,9 @@ fn p256_sign(pkcs8: &[u8], message: &[u8]) -> Vec<u8> {
 }
 
 fn sha256_bytes(data: &[u8]) -> Vec<u8> {
-    ring::digest::digest(&ring::digest::SHA256, data).as_ref().to_vec()
+    ring::digest::digest(&ring::digest::SHA256, data)
+        .as_ref()
+        .to_vec()
 }
 
 /// COSE_Key for ES256: `{1: 2, 3: -7, -1: 1, -2: x, -3: y}`.
@@ -398,15 +427,20 @@ fn webauthn_none_attestation_round_trip() {
     let (pub_raw, _priv) = p256_pair();
     let cred_id = b"test-credential-id-001".to_vec();
 
-    let challenge =
-        begin_webauthn_registration(&mfa, account_id, T0).expect("begin registration");
+    let challenge = begin_webauthn_registration(&mfa, account_id, T0).expect("begin registration");
     assert_eq!(challenge.challenge_b64.len(), 43); // 32 bytes, no pad
     let client_data = client_data_json("webauthn.create", &challenge.challenge_b64, ORIGIN);
     let auth_data = registration_auth_data(RP_ID, &cred_id, &cose_es256(&pub_raw), 0, 0x41);
     let att_obj = attestation_object("none", &auth_data, enc::map(vec![]));
 
     let credential = finish_webauthn_registration(
-        &mfa, RP_ID, ORIGIN, &challenge.challenge_b64, T0, &client_data, &att_obj,
+        &mfa,
+        RP_ID,
+        ORIGIN,
+        &challenge.challenge_b64,
+        T0,
+        &client_data,
+        &att_obj,
     )
     .expect("finish registration");
     assert_eq!(credential.account_id, account_id);
@@ -416,7 +450,13 @@ fn webauthn_none_attestation_round_trip() {
 
     // The challenge is single-use: finishing twice is refused.
     let again = finish_webauthn_registration(
-        &mfa, RP_ID, ORIGIN, &challenge.challenge_b64, T0, &client_data, &att_obj,
+        &mfa,
+        RP_ID,
+        ORIGIN,
+        &challenge.challenge_b64,
+        T0,
+        &client_data,
+        &att_obj,
     );
     assert!(
         matches!(again, Err(Error::InvalidInput(ref message)) if message.contains("already used")),
@@ -431,7 +471,13 @@ fn webauthn_none_attestation_round_trip() {
     let att_obj2 = attestation_object("none", &auth_data2, enc::map(vec![]));
     assert!(matches!(
         finish_webauthn_registration(
-            &mfa, RP_ID, ORIGIN, &challenge2.challenge_b64, T0, &client_data2, &att_obj2,
+            &mfa,
+            RP_ID,
+            ORIGIN,
+            &challenge2.challenge_b64,
+            T0,
+            &client_data2,
+            &att_obj2,
         ),
         Err(Error::Conflict(_))
     ));
@@ -451,7 +497,11 @@ fn webauthn_registration_refusals() {
     let cose = cose_es256(&pub_raw);
 
     // Unknown challenge.
-    let client_data = client_data_json("webauthn.create", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", ORIGIN);
+    let client_data = client_data_json(
+        "webauthn.create",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ORIGIN,
+    );
     let auth_data = registration_auth_data(RP_ID, &cred_id, &cose, 0, 0x41);
     let att_obj = attestation_object("none", &auth_data, enc::map(vec![]));
     assert!(matches!(
@@ -461,7 +511,11 @@ fn webauthn_registration_refusals() {
 
     // Wrong origin.
     let challenge = begin_webauthn_registration(&mfa, account_id, T0).expect("begin");
-    let bad_origin = client_data_json("webauthn.create", &challenge.challenge_b64, "https://evil.example");
+    let bad_origin = client_data_json(
+        "webauthn.create",
+        &challenge.challenge_b64,
+        "https://evil.example",
+    );
     let att_bad = attestation_object("none", &auth_data, enc::map(vec![]));
     assert!(matches!(
         finish_webauthn_registration(&mfa, RP_ID, ORIGIN, &challenge.challenge_b64, T0, &bad_origin, &att_bad),
@@ -548,7 +602,13 @@ fn webauthn_packed_self_attestation_verifies_signature() {
     ]);
     let att_obj = attestation_object("packed", &auth_data, stmt);
     finish_webauthn_registration(
-        &mfa, RP_ID, ORIGIN, &challenge.challenge_b64, T0, &client_data, &att_obj,
+        &mfa,
+        RP_ID,
+        ORIGIN,
+        &challenge.challenge_b64,
+        T0,
+        &client_data,
+        &att_obj,
     )
     .expect("packed self-attestation verifies");
 
@@ -595,8 +655,13 @@ fn webauthn_authentication_and_sign_count() {
     let reg_data = client_data_json("webauthn.create", &reg.challenge_b64, ORIGIN);
     let reg_auth = registration_auth_data(RP_ID, &cred_id, &cose_es256(&pub_raw), 0, 0x41);
     finish_webauthn_registration(
-        &mfa, RP_ID, ORIGIN, &reg.challenge_b64, T0,
-        &reg_data, &attestation_object("none", &reg_auth, enc::map(vec![])),
+        &mfa,
+        RP_ID,
+        ORIGIN,
+        &reg.challenge_b64,
+        T0,
+        &reg_data,
+        &attestation_object("none", &reg_auth, enc::map(vec![])),
     )
     .expect("registered");
 
@@ -611,8 +676,15 @@ fn webauthn_authentication_and_sign_count() {
     message.extend_from_slice(&sha256_bytes(&client_data));
     let sig = p256_sign(&priv_pkcs8, &message);
     let (stored, kind) = finish_webauthn_authentication(
-        &mfa, RP_ID, ORIGIN, &login.challenge_b64, T0,
-        &cred_id, &client_data, &auth_data, &sig,
+        &mfa,
+        RP_ID,
+        ORIGIN,
+        &login.challenge_b64,
+        T0,
+        &cred_id,
+        &client_data,
+        &auth_data,
+        &sig,
     )
     .expect("authentication verifies");
     assert_eq!(kind, SecondFactorKind::WebAuthn);
@@ -656,8 +728,15 @@ fn webauthn_authentication_and_sign_count() {
 
     // Revocation removes the credential (and refuses strangers' deletes).
     assert!(mfa.delete_webauthn(account_id, &cred_id).expect("delete"));
-    assert!(mfa.webauthn_for_account(account_id).expect("list").is_empty());
-    assert!(!mfa.delete_webauthn(account_id, &cred_id).expect("second delete"));
+    assert!(
+        mfa.webauthn_for_account(account_id)
+            .expect("list")
+            .is_empty()
+    );
+    assert!(
+        !mfa.delete_webauthn(account_id, &cred_id)
+            .expect("second delete")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -671,9 +750,21 @@ fn min_age_gate() {
     let err = check_date_of_birth("2007-11-15", T0).expect_err("one day short");
     assert!(matches!(err, Error::InvalidInput(message) if message.contains("at least 16")));
     assert!(check_date_of_birth("1990-05-30", T0).is_ok());
-    assert!(check_date_of_birth("2000-02-29", T0).is_ok(), "leap day parses");
+    assert!(
+        check_date_of_birth("2000-02-29", T0).is_ok(),
+        "leap day parses"
+    );
     // Impossible, malformed, and future dates share the invalid shape.
-    for bad in ["2021-02-29", "2007-13-01", "2007-00-10", "2007-11-31", "not-a-date", "2007/11/14", "", "2030-01-01"] {
+    for bad in [
+        "2021-02-29",
+        "2007-13-01",
+        "2007-00-10",
+        "2007-11-31",
+        "not-a-date",
+        "2007/11/14",
+        "",
+        "2030-01-01",
+    ] {
         let err = check_date_of_birth(bad, T0).expect_err(&format!("{bad} refused"));
         assert!(
             matches!(err, Error::InvalidInput(ref message) if message.contains("invalid")),
@@ -684,10 +775,25 @@ fn min_age_gate() {
 
 #[test]
 fn time_zone_gate() {
-    for good in ["America/New_York", "Europe/Paris", "UTC", "utc", "America/Argentina/Buenos_Aires", "Pacific/Auckland"] {
+    for good in [
+        "America/New_York",
+        "Europe/Paris",
+        "UTC",
+        "utc",
+        "America/Argentina/Buenos_Aires",
+        "Pacific/Auckland",
+    ] {
         assert!(validate_time_zone(good).is_ok(), "{good} accepted");
     }
-    for bad in ["", "Foo", "America New York", "America//New_York", "/Paris", "America/", &"A".repeat(65)] {
+    for bad in [
+        "",
+        "Foo",
+        "America New York",
+        "America//New_York",
+        "/Paris",
+        "America/",
+        &"A".repeat(65),
+    ] {
         assert!(validate_time_zone(bad).is_err(), "{bad} refused");
     }
 }
@@ -705,8 +811,18 @@ fn registration_profile_gates_before_account_exists() {
     };
     let before = store.account_count().expect("count");
     let err = register_account_with_profile(
-        &store, &store, &store, &store,
-        "https://example.social", T0, true, false, true, 16, &app, &under_age,
+        &store,
+        &store,
+        &store,
+        &store,
+        "https://example.social",
+        T0,
+        true,
+        false,
+        true,
+        16,
+        &app,
+        &under_age,
         reg_cmd("kiddo", "kiddo@example.com"),
     )
     .expect_err("under-age refused");
@@ -733,8 +849,18 @@ fn registration_profile_gates_before_account_exists() {
         date_of_birth: Some("1990-05-30".to_string()),
     };
     let registered = register_account_with_profile(
-        &store, &store, &store, &store,
-        "https://example.social", T0, true, false, true, 16, &app, &good,
+        &store,
+        &store,
+        &store,
+        &store,
+        "https://example.social",
+        T0,
+        true,
+        false,
+        true,
+        16,
+        &app,
+        &good,
         reg_cmd("adult", "adult@example.com"),
     )
     .expect("adult registers");
@@ -764,8 +890,18 @@ fn email_block_policy_matrix() {
 
     let attempt = |username: &str, email: &str| {
         register_account_with_profile(
-            &store, &store, &store, &store,
-            "https://example.social", T0, true, false, true, 16, &app, &profile,
+            &store,
+            &store,
+            &store,
+            &store,
+            "https://example.social",
+            T0,
+            true,
+            false,
+            true,
+            16,
+            &app,
+            &profile,
             reg_cmd(username, email),
         )
     };
@@ -788,7 +924,11 @@ fn email_block_policy_matrix() {
     assert!(!user.approved, "approval-gated address queues");
 
     // Canonical block: the exact address and its canonical equivalents refuse.
-    for email in ["victim@example.com", "Victim@Example.COM", "v.i.c.t.i.m+tag@example.com"] {
+    for email in [
+        "victim@example.com",
+        "Victim@Example.COM",
+        "v.i.c.t.i.m+tag@example.com",
+    ] {
         let err = attempt("v", email).expect_err(&format!("canonical {email}"));
         assert!(
             matches!(err, Error::InvalidInput(ref message) if message.contains("Email is blocked")),
@@ -798,7 +938,13 @@ fn email_block_policy_matrix() {
 
     // A merely similar address is unaffected.
     let clean = attempt("victim2", "victim2@example.com").expect("similar ok");
-    assert!(store.user_by_account_id(clean.account.id).expect("user").expect("row").approved);
+    assert!(
+        store
+            .user_by_account_id(clean.account.id)
+            .expect("user")
+            .expect("row")
+            .approved
+    );
 
     // Pure-policy unit matrix (no store): domain allow / approval / refuse.
     let blocks = store
@@ -823,7 +969,11 @@ fn email_blocks_reconciled_with_confirmation() {
     store
         .store_email_token(
             "ge-legacy-token",
-            EmailToken { account_id: legacy.id, kind: EmailTokenKind::Confirmation, created_at_ms: T0 },
+            EmailToken {
+                account_id: legacy.id,
+                kind: EmailTokenKind::Confirmation,
+                created_at_ms: T0,
+            },
         )
         .expect("token");
     store
@@ -845,8 +995,17 @@ fn email_blocks_reconciled_with_confirmation() {
     let app = test_app(8202);
     assert!(matches!(
         register_account_with_profile(
-            &store, &store, &store, &store,
-            "https://example.social", T0, true, false, true, 16, &app,
+            &store,
+            &store,
+            &store,
+            &store,
+            "https://example.social",
+            T0,
+            true,
+            false,
+            true,
+            16,
+            &app,
             &RegistrationProfile::default(),
             reg_cmd("late", "late@soon-blocked.example"),
         ),
@@ -912,7 +1071,7 @@ fn ip_block_true_client_matrix() {
 
     // (peer, X-Forwarded-For, trusted proxies, expected resolved client)
     let shapes: Vec<(IpAddr, Option<&str>, Vec<IpAddr>, IpAddr)> = vec![
-        (client, None, vec![], client), // direct
+        (client, None, vec![], client),                      // direct
         (proxy1, Some("203.0.113.7"), vec![proxy1], client), // single proxy
         (
             proxy2,
@@ -927,23 +1086,27 @@ fn ip_block_true_client_matrix() {
     ];
     for (peer, xff, trusted, expected) in &shapes {
         // Both client-IP helpers agree on every shape.
-        let via_api = birchtree::api::mastodon::request::client_ip(
-            &header_map(*xff),
-            *peer,
-            trusted,
-        );
+        let via_api =
+            birchtree::api::mastodon::request::client_ip(&header_map(*xff), *peer, trusted);
         assert_eq!(via_api, *expected, "api helper for peer {peer} xff {xff:?}");
         let forwarded = xff.as_deref().map(str::to_string);
         let via_uc = infra_uc::client_ip(forwarded.as_deref(), Some(*peer), trusted)
             .expect("peer always resolves");
-        assert_eq!(via_uc, *expected, "use-case helper for peer {peer} xff {xff:?}");
+        assert_eq!(
+            via_uc, *expected,
+            "use-case helper for peer {peer} xff {xff:?}"
+        );
     }
 
     // Enforcement on the resolved address: the /24 no_access block fires for
     // the true client in every trusted shape, never for the spoof.
     for (peer, xff, trusted, expected) in &shapes {
-        let resolved = infra_uc::client_ip(xff.as_deref().map(str::to_string).as_deref(), Some(*peer), trusted)
-            .expect("resolve");
+        let resolved = infra_uc::client_ip(
+            xff.as_deref().map(str::to_string).as_deref(),
+            Some(*peer),
+            trusted,
+        )
+        .expect("resolve");
         assert_eq!(resolved, *expected);
         let blocked = infra_uc::is_no_access_blocked(&blocks, resolved, T0);
         assert_eq!(
@@ -992,11 +1155,19 @@ impl RoleFixture {
             T0,
         )
         .expect("register app");
-        Self { _dir: dir, store, app: registered.app }
+        Self {
+            _dir: dir,
+            store,
+            app: registered.app,
+        }
     }
 
     fn auth(&self, username: &str, role: UserRole, scopes: &[&str]) -> Authenticated {
-        let account = match self.store.account_by_handle(username, "example.social").expect("store") {
+        let account = match self
+            .store
+            .account_by_handle(username, "example.social")
+            .expect("store")
+        {
             Some(account) => account,
             None => common::mk_account(&self.store, username),
         };
@@ -1011,7 +1182,11 @@ impl RoleFixture {
             T0,
         )
         .expect("token");
-        Authenticated { token, app: self.app.clone(), approved: true }
+        Authenticated {
+            token,
+            app: self.app.clone(),
+            approved: true,
+        }
     }
 }
 
@@ -1053,7 +1228,9 @@ fn per_action_flag_matrix() {
     // Admin passes every action; role-less passes none (role error, not scope).
     for action in ALL_ACTIONS {
         assert!(
-            admin.require_admin_action(&*fx.store, action, full_scopes).is_ok(),
+            admin
+                .require_admin_action(&*fx.store, action, full_scopes)
+                .is_ok(),
             "admin {:?}",
             action
         );
@@ -1086,7 +1263,11 @@ fn per_action_flag_matrix() {
         T0,
     )
     .expect("app token");
-    let app_auth = Authenticated { token: app_token, app: fx.app.clone(), approved: true };
+    let app_auth = Authenticated {
+        token: app_token,
+        app: fx.app.clone(),
+        approved: true,
+    };
     let err = app_auth
         .require_admin_action(&*fx.store, AdminAction::ViewAccounts, &["admin:read"])
         .expect_err("app-only refused");
@@ -1160,14 +1341,22 @@ fn admin_account_serializer_is_numeric_with_real_bitmask() {
     let admin = cli_account(&store, "ser-admin", Some("ser-admin@example.com"));
     let moderator = cli_account(&store, "ser-mod", Some("ser-mod@example.com"));
     let plain = cli_account(&store, "ser-plain", None);
-    store.set_user_role(admin.id, UserRole::Admin).expect("grant");
-    store.set_user_role(moderator.id, UserRole::Moderator).expect("grant");
+    store
+        .set_user_role(admin.id, UserRole::Admin)
+        .expect("grant");
+    store
+        .set_user_role(moderator.id, UserRole::Moderator)
+        .expect("grant");
 
     let render = |id: Id| {
         let account = store.account_by_id(id).expect("account").expect("row");
         let user = store.user_by_account_id(id).expect("user");
         birchtree::api::mastodon::endpoints::admin_accounts::admin_account_json(
-            &server, &store, &store, &account, user.as_ref(),
+            &server,
+            &store,
+            &store,
+            &account,
+            user.as_ref(),
         )
     };
     let admin_role = &render(admin.id)["role"];
@@ -1187,7 +1376,10 @@ fn admin_account_serializer_is_numeric_with_real_bitmask() {
     for account_id in [admin.id, moderator.id, plain.id] {
         let body = serde_json::to_string(&render(account_id)).expect("json");
         assert!(!body.contains("\"-1\""), "no -1 role id: {body}");
-        assert!(!body.contains("\"permissions\":\"\""), "no empty bitmask: {body}");
+        assert!(
+            !body.contains("\"permissions\":\"\""),
+            "no empty bitmask: {body}"
+        );
     }
 }
 
@@ -1197,8 +1389,12 @@ async fn admin_accounts_http_numeric_roles_and_role_ids_filter() {
     let srv = TestServer::new(false);
     let admin = common::mk_account(&srv.store, "http-admin");
     let moderator = common::mk_account(&srv.store, "http-mod");
-    srv.store.set_user_role(admin.id, UserRole::Admin).expect("grant");
-    srv.store.set_user_role(moderator.id, UserRole::Moderator).expect("grant");
+    srv.store
+        .set_user_role(admin.id, UserRole::Admin)
+        .expect("grant");
+    srv.store
+        .set_user_role(moderator.id, UserRole::Moderator)
+        .expect("grant");
     let app = auth_uc::register_app(
         &*srv.store,
         "http roles".to_string(),
@@ -1232,7 +1428,12 @@ async fn admin_accounts_http_numeric_roles_and_role_ids_filter() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
     let body = json(&bytes);
     assert_eq!(body["role"]["id"], serde_json::json!(1));
     assert_eq!(body["role"]["permissions"], serde_json::json!("1049884"));
@@ -1240,10 +1441,19 @@ async fn admin_accounts_http_numeric_roles_and_role_ids_filter() {
     // `role_ids=1` (numeric) selects the moderator; `role_ids=2` the admin.
     let (status, _, bytes) = send(
         &srv.router,
-        get_request("/api/v2/admin/accounts?role_ids=1", Some(&admin_token), None),
+        get_request(
+            "/api/v2/admin/accounts?role_ids=1",
+            Some(&admin_token),
+            None,
+        ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
     let page = json(&bytes);
     let ids: Vec<String> = page
         .as_array()
@@ -1251,8 +1461,14 @@ async fn admin_accounts_http_numeric_roles_and_role_ids_filter() {
         .iter()
         .map(|row| row["id"].as_str().expect("id").to_string())
         .collect();
-    assert!(ids.contains(&moderator.id.to_string()), "moderator listed: {ids:?}");
-    assert!(!ids.contains(&admin.id.to_string()), "admin excluded: {ids:?}");
+    assert!(
+        ids.contains(&moderator.id.to_string()),
+        "moderator listed: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&admin.id.to_string()),
+        "admin excluded: {ids:?}"
+    );
 
     // A moderator still passes the accounts reads (per-action flag gate).
     let mod_token = token(moderator.id);
@@ -1283,32 +1499,69 @@ fn login_with_mfa_stages_and_verifies() {
 
     // No factor: straight through.
     assert!(matches!(
-        login_with_mfa(&store, &mfa, "login-alice", "example.social", "password123", None, T0),
+        login_with_mfa(
+            &store,
+            &mfa,
+            "login-alice",
+            "example.social",
+            "password123",
+            None,
+            T0
+        ),
         Ok(LoginOutcome::Authenticated(_))
     ));
     // Wrong password: uniform refusal (no MFA enrolled yet).
-    let no_mfa_err = match login_with_mfa(&store, &mfa, "login-alice", "example.social", "wrongpass1", None, T0) {
+    let no_mfa_err = match login_with_mfa(
+        &store,
+        &mfa,
+        "login-alice",
+        "example.social",
+        "wrongpass1",
+        None,
+        T0,
+    ) {
         Err(err) => err,
         Ok(_) => panic!("wrong password must fail"),
     };
-    assert!(matches!(no_mfa_err, Error::Unauthorized(message) if message == "Invalid username or password"));
+    assert!(
+        matches!(no_mfa_err, Error::Unauthorized(message) if message == "Invalid username or password")
+    );
 
     // Enroll + confirm.
-    let enrollment = enroll_totp(&mfa, "login-alice", "example.social", account.id, T0).expect("enroll");
+    let enrollment =
+        enroll_totp(&mfa, "login-alice", "example.social", account.id, T0).expect("enroll");
     let secret = base32_decode(&enrollment.secret_base32).expect("secret");
     let code = totp_code_at(&secret, totp_counter_at(T0));
     confirm_totp(&mfa, account.id, &code, T0).expect("confirm");
 
     // Wrong password now gives the SAME refusal (no enrollment oracle).
-    let mfa_err = match login_with_mfa(&store, &mfa, "login-alice", "example.social", "wrongpass1", None, T0) {
+    let mfa_err = match login_with_mfa(
+        &store,
+        &mfa,
+        "login-alice",
+        "example.social",
+        "wrongpass1",
+        None,
+        T0,
+    ) {
         Err(err) => err,
         Ok(_) => panic!("wrong password must fail"),
     };
-    assert!(matches!(mfa_err, Error::Unauthorized(message) if message == "Invalid username or password"));
+    assert!(
+        matches!(mfa_err, Error::Unauthorized(message) if message == "Invalid username or password")
+    );
 
     // Right password without a code stages the second step (no secrets in hand).
     assert!(matches!(
-        login_with_mfa(&store, &mfa, "login-alice", "example.social", "password123", None, T0),
+        login_with_mfa(
+            &store,
+            &mfa,
+            "login-alice",
+            "example.social",
+            "password123",
+            None,
+            T0
+        ),
         Ok(LoginOutcome::MfaRequired(_))
     ));
     // Wrong second factor: the uniform second-factor refusal.
@@ -1320,7 +1573,15 @@ fn login_with_mfa_stages_and_verifies() {
     ));
     // Right second factor: authenticated. Unknown users share the password shape.
     assert!(matches!(
-        login_with_mfa(&store, &mfa, "login-alice", "example.social", "password123", Some(&fresh), later_ms),
+        login_with_mfa(
+            &store,
+            &mfa,
+            "login-alice",
+            "example.social",
+            "password123",
+            Some(&fresh),
+            later_ms
+        ),
         Ok(LoginOutcome::Authenticated(_))
     ));
     assert!(matches!(
@@ -1341,14 +1602,26 @@ fn auth_gate_mfa_required_and_verify_shapes() {
     // Unconfirmed enrollments do not gate (cannot lock the owner out mid-setup).
     assert!(!authed.mfa_required(&mfa, user_id).expect("unconfirmed"));
     let secret = base32_decode(&enrollment.secret_base32).expect("secret");
-    confirm_totp(&mfa, user_id, &totp_code_at(&secret, totp_counter_at(T0)), T0).expect("confirm");
+    confirm_totp(
+        &mfa,
+        user_id,
+        &totp_code_at(&secret, totp_counter_at(T0)),
+        T0,
+    )
+    .expect("confirm");
     assert!(authed.mfa_required(&mfa, user_id).expect("confirmed gates"));
 
     // Verify gate: ok on the live code, uniform 401 otherwise.
     let later_ms = (totp_counter_at(T0) + 2) * 30 * 1000;
     let fresh = totp_code_at(&secret, totp_counter_at(later_ms));
-    assert!(authed.verify_second_factor(&mfa, user_id, &fresh, later_ms).is_ok());
-    let err = authed.verify_second_factor(&mfa, user_id, "000000", later_ms).expect_err("wrong");
+    assert!(
+        authed
+            .verify_second_factor(&mfa, user_id, &fresh, later_ms)
+            .is_ok()
+    );
+    let err = authed
+        .verify_second_factor(&mfa, user_id, "000000", later_ms)
+        .expect_err("wrong");
     assert_eq!(err.status, StatusCode::UNAUTHORIZED);
     assert_eq!(err.message, INVALID_2FA_MESSAGE);
     let err = authed
