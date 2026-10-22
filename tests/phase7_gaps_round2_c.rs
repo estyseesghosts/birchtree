@@ -76,7 +76,12 @@ fn approval_server(require_approval: bool) -> ApprovalSrv {
         ..Config::default()
     };
     let server = Arc::new(ServerInfo::from_config(&cfg));
-    let streams = Hub::new(store.clone(), clock.clone(), server.clone(), Limits::default());
+    let streams = Hub::new(
+        store.clone(),
+        clock.clone(),
+        server.clone(),
+        Limits::default(),
+    );
     let context = Arc::new(Context::new(
         clock,
         ids,
@@ -93,7 +98,12 @@ fn approval_server(require_approval: bool) -> ApprovalSrv {
         streams: streams.clone(),
         federation,
         rate_limit_multiplier: 1,
-        mail_env: std::sync::Arc::new(birchtree::mailer::MailEnv::disabled()),
+        // Mail enabled: public registration refuses when confirmation mail
+        // cannot deliver (fail closed), and this harness registers through
+        // the endpoint.
+        mail_env: std::sync::Arc::new(
+            birchtree::mailer::MailEnv::new("noreply@example.social", true),
+        ),
         invites: std::sync::Arc::new(
             birchtree::application::accounts::MemoryInviteStore::default(),
         ),
@@ -114,7 +124,12 @@ async fn register_app(router: &axum::Router, scopes: &str) -> serde_json::Value 
         enc(scopes),
     );
     let (status, _h, bytes) = send(router, form_request("POST", "/api/v1/apps", &body, None)).await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
     json(&bytes)
 }
 
@@ -126,7 +141,12 @@ async fn app_token(router: &axum::Router, app: &serde_json::Value, scopes: &str)
         enc(scopes),
     );
     let (status, _h, bytes) = send(router, form_request("POST", "/oauth/token", &body, None)).await;
-    assert_eq!(status, StatusCode::OK, "scopes={scopes} body={}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "scopes={scopes} body={}",
+        String::from_utf8_lossy(&bytes)
+    );
     json(&bytes)["access_token"].as_str().unwrap().to_string()
 }
 
@@ -141,9 +161,17 @@ async fn register_account(
         enc(username),
         enc(&format!("{username}@example.com")),
     );
-    let (status, _h, bytes) =
-        send(router, form_request("POST", "/api/v1/accounts", &body, Some(&app))).await;
-    assert_eq!(status, StatusCode::OK, "register: {}", String::from_utf8_lossy(&bytes));
+    let (status, _h, bytes) = send(
+        router,
+        form_request("POST", "/api/v1/accounts", &body, Some(&app)),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "register: {}",
+        String::from_utf8_lossy(&bytes)
+    );
     let body = json(&bytes);
     (body["access_token"].as_str().unwrap().to_string(), body)
 }
@@ -169,11 +197,24 @@ fn mint_user_token(store: &RedbStore, app: &serde_json::Value, account_id: Id) -
 }
 
 /// File a report through the public API.
-async fn file_report(router: &axum::Router, reporter: &str, target: Id, extra: &str) -> serde_json::Value {
+async fn file_report(
+    router: &axum::Router,
+    reporter: &str,
+    target: Id,
+    extra: &str,
+) -> serde_json::Value {
     let body = format!("account_id={target}&comment=spammy{extra}");
-    let (status, _h, bytes) =
-        send(router, form_request("POST", "/api/v1/reports", &body, Some(reporter))).await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    let (status, _h, bytes) = send(
+        router,
+        form_request("POST", "/api/v1/reports", &body, Some(reporter)),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
     json(&bytes)
 }
 
@@ -202,8 +243,7 @@ async fn d36_pending_queue_approve_reject() {
         .expect("account")
         .id;
     assert!(
-        !srv
-            .store
+        !srv.store
             .user_by_account_id(pending_id)
             .expect("user")
             .expect("credential")
@@ -233,7 +273,10 @@ async fn d36_pending_queue_approve_reject() {
         assert_eq!(status, StatusCode::OK, "{uri}");
         let rows = json(&bytes);
         assert!(
-            rows.as_array().unwrap().iter().any(|r| r["id"] == pending_id.to_string()),
+            rows.as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["id"] == pending_id.to_string()),
             "{uri}: {}",
             String::from_utf8_lossy(&bytes)
         );
@@ -251,19 +294,30 @@ async fn d36_pending_queue_approve_reject() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(json(&bytes)["error"], "Your login is currently pending approval");
+    assert_eq!(
+        json(&bytes)["error"],
+        "Your login is currently pending approval"
+    );
 
     // Lookup surfaces omit pending accounts (upstream `without_unapproved`
     // on multi-fetch, `check_account_approval` → 404 on show).
     let (status, _, _) = send(
         &srv.router,
-        get_request(&format!("/api/v1/accounts/{pending_id}"), Some(&admin_token), None),
+        get_request(
+            &format!("/api/v1/accounts/{pending_id}"),
+            Some(&admin_token),
+            None,
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _, bytes) = send(
         &srv.router,
-        get_request(&format!("/api/v1/accounts?id[]={pending_id}"), Some(&admin_token), None),
+        get_request(
+            &format!("/api/v1/accounts?id[]={pending_id}"),
+            Some(&admin_token),
+            None,
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -297,11 +351,20 @@ async fn d36_pending_queue_approve_reject() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
     assert_eq!(json(&bytes)["approved"], true);
     assert_eq!(json(&bytes)["disabled"], false);
     let entries = srv.store.admin_audit_entries(100).expect("audit");
-    assert!(entries.iter().any(|e| e.action == "approve" && e.target_id == pending_id.to_string()));
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.action == "approve" && e.target_id == pending_id.to_string())
+    );
 
     // The token works now.
     let (status, _, _) = send(
@@ -317,7 +380,11 @@ async fn d36_pending_queue_approve_reject() {
     // ... and the account is visible on lookup surfaces again.
     let (status, _, bytes) = send(
         &srv.router,
-        get_request(&format!("/api/v1/accounts/{pending_id}"), Some(&admin_token), None),
+        get_request(
+            &format!("/api/v1/accounts/{pending_id}"),
+            Some(&admin_token),
+            None,
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -354,7 +421,12 @@ async fn d36_pending_queue_approve_reject() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
     assert_eq!(json(&bytes), serde_json::json!({}));
     let (status, _, bytes) = send(
         &srv.router,
@@ -369,7 +441,11 @@ async fn d36_pending_queue_approve_reject() {
     assert_eq!(json(&bytes)["suspended"], true);
     assert_eq!(json(&bytes)["disabled"], true);
     let entries = srv.store.admin_audit_entries(100).expect("audit");
-    assert!(entries.iter().any(|e| e.action == "reject" && e.target_id == pending2_id.to_string()));
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.action == "reject" && e.target_id == pending2_id.to_string())
+    );
 
     // D24 interaction (owned by subagent B; asserted here for the
     // synthesis): the rejected account's token is killed → 401 on reuse.
@@ -419,7 +495,11 @@ async fn d36_approval_off_registers_approved() {
     // Nothing is pending.
     let (status, _, bytes) = send(
         &srv.router,
-        get_request("/api/v2/admin/accounts?status=pending", Some(&admin_token), None),
+        get_request(
+            "/api/v2/admin/accounts?status=pending",
+            Some(&admin_token),
+            None,
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -447,8 +527,12 @@ async fn d37_report_rules_populated_and_warnings() {
     let admin_id = account_id("boss");
     let mod_id = account_id("mod");
     let user_id = account_id("plain");
-    srv.store.set_user_role(admin_id, UserRole::Admin).expect("role");
-    srv.store.set_user_role(mod_id, UserRole::Moderator).expect("role");
+    srv.store
+        .set_user_role(admin_id, UserRole::Admin)
+        .expect("role");
+    srv.store
+        .set_user_role(mod_id, UserRole::Moderator)
+        .expect("role");
 
     // A server rule, created through the use case (CLI `create-rule` in prod).
     let infra: &dyn AdminInfraStore = &*srv.store;
@@ -459,12 +543,28 @@ async fn d37_report_rules_populated_and_warnings() {
     // The target posts; the reporter files a report naming the status.
     let (status, _, status_bytes) = send(
         &srv.router,
-        form_request("POST", "/api/v1/statuses", "status=hello+world&visibility=public", Some(&mod_token)),
+        form_request(
+            "POST",
+            "/api/v1/statuses",
+            "status=hello+world&visibility=public",
+            Some(&mod_token),
+        ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&status_bytes));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&status_bytes)
+    );
     let status_id = json(&status_bytes)["id"].as_str().unwrap().to_string();
-    let report = file_report(&srv.router, &user_token, mod_id, &format!("&status_ids[]={status_id}")).await;
+    let report = file_report(
+        &srv.router,
+        &user_token,
+        mod_id,
+        &format!("&status_ids[]={status_id}"),
+    )
+    .await;
     let report_id = report["id"].as_str().unwrap().to_string();
 
     // Attaching the rule renders it (no longer `[]`).
@@ -476,11 +576,19 @@ async fn d37_report_rules_populated_and_warnings() {
             .uri(uri.clone())
             .header("content-type", "application/x-www-form-urlencoded")
             .header("authorization", format!("Bearer {mod_token}"))
-            .body(Body::from(format!("category=violation&rule_ids[]={}", rule.id)))
+            .body(Body::from(format!(
+                "category=violation&rule_ids[]={}",
+                rule.id
+            )))
             .unwrap(),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
     let rules = json(&bytes)["rules"].clone();
     assert_eq!(rules.as_array().unwrap().len(), 1);
     assert_eq!(rules[0]["id"], rule.id.to_string());
@@ -512,18 +620,33 @@ async fn d37_report_rules_populated_and_warnings() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
-    let warnings = srv.store.admin_warnings_for_account(mod_id).expect("warnings");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let warnings = srv
+        .store
+        .admin_warnings_for_account(mod_id)
+        .expect("warnings");
     assert_eq!(warnings.len(), 1);
     assert_eq!(warnings[0].account_id, admin_id);
     assert_eq!(warnings[0].action, "none");
     assert_eq!(warnings[0].text, "final warning");
     assert_eq!(warnings[0].report_id, Some(report_id.parse().unwrap()));
-    assert_eq!(warnings[0].status_ids, vec![status_id.parse::<Id>().unwrap()]);
+    assert_eq!(
+        warnings[0].status_ids,
+        vec![status_id.parse::<Id>().unwrap()]
+    );
     // The warn-only action resolves its own report.
     let (status, _, bytes) = send(
         &srv.router,
-        get_request(&format!("/api/v1/admin/reports/{report_id}"), Some(&mod_token), None),
+        get_request(
+            &format!("/api/v1/admin/reports/{report_id}"),
+            Some(&mod_token),
+            None,
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -562,9 +685,16 @@ async fn d37_report_rules_populated_and_warnings() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let warnings = srv.store.admin_warnings_for_account(mod_id).expect("warnings");
+    let warnings = srv
+        .store
+        .admin_warnings_for_account(mod_id)
+        .expect("warnings");
     assert_eq!(warnings.len(), 2);
-    assert!(warnings.iter().any(|w| w.action == "silence" && w.text == "quiet please"));
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.action == "silence" && w.text == "quiet please")
+    );
 
     let _ = user_id;
 }
@@ -589,20 +719,36 @@ async fn d39_measures_served_and_refused() {
     };
     let admin_id = account_id("boss");
     let bob_id = account_id("bob");
-    srv.store.set_user_role(admin_id, UserRole::Admin).expect("role");
+    srv.store
+        .set_user_role(admin_id, UserRole::Admin)
+        .expect("role");
 
     // Real activity: a follow, a resolved report, a password sign-in.
     let (status, _, bytes) = send(
         &srv.router,
-        form_request("POST", &format!("/api/v1/accounts/{bob_id}/follow"), "", Some(&alice_token)),
+        form_request(
+            "POST",
+            &format!("/api/v1/accounts/{bob_id}/follow"),
+            "",
+            Some(&alice_token),
+        ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
     let report = file_report(&srv.router, &alice_token, bob_id, "").await;
     let report_id = report["id"].as_str().unwrap().to_string();
     let (status, _, _) = send(
         &srv.router,
-        post_admin(&format!("/api/v1/admin/reports/{report_id}/resolve"), "", Some(&admin_token)),
+        post_admin(
+            &format!("/api/v1/admin/reports/{report_id}/resolve"),
+            "",
+            Some(&admin_token),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -619,7 +765,10 @@ async fn d39_measures_served_and_refused() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(common::session_cookie(&headers).is_some(), "login must establish a session");
+    assert!(
+        common::session_cookie(&headers).is_some(),
+        "login must establish a session"
+    );
 
     // Served keys carry real values; refused keys stay omitted (never nulled
     // or fabricated), like upstream's `filter_map` drop.
@@ -629,25 +778,43 @@ async fn d39_measures_served_and_refused() {
         form_request("POST", "/api/v1/admin/measures", body, Some(&admin_token)),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
     let rows = json(&bytes);
     let by_key = |key: &str| {
-        rows.as_array().unwrap().iter().find(|r| r["key"] == key).cloned()
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["key"] == key)
+            .cloned()
     };
     for refused in ["tag_accounts", "tag_uses", "tag_servers", "bogus_key"] {
         assert!(by_key(refused).is_none(), "{refused} must stay omitted");
     }
     // Round 4 serves `interactions` from the unified journal.
     let interactions = by_key("interactions").expect("interactions served");
-    assert!(interactions.get("previous_total").is_some(), "in-window totals carry previous_total");
+    assert!(
+        interactions.get("previous_total").is_some(),
+        "in-window totals carry previous_total"
+    );
     let resolved = by_key("resolved_reports").expect("resolved_reports served");
     assert!(resolved["total"].as_str().unwrap().parse::<u64>().unwrap() >= 1);
-    assert!(resolved.get("previous_total").is_some(), "in-window totals carry previous_total");
+    assert!(
+        resolved.get("previous_total").is_some(),
+        "in-window totals carry previous_total"
+    );
     let active = by_key("active_users").expect("active_users served");
     assert!(active["total"].as_str().unwrap().parse::<u64>().unwrap() >= 1);
     let follows = by_key("instance_follows").expect("instance_follows served");
     assert_eq!(follows["total"], "1");
-    assert!(follows.get("previous_total").is_none(), "all-time totals omit previous_total");
+    assert!(
+        follows.get("previous_total").is_none(),
+        "all-time totals omit previous_total"
+    );
     let followers = by_key("instance_followers").expect("instance_followers served");
     assert_eq!(followers["total"], "1");
     assert!(followers.get("previous_total").is_none());
@@ -661,10 +828,19 @@ async fn d39_measures_served_and_refused() {
         form_request("POST", "/api/v1/admin/dimensions", body, Some(&admin_token)),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
     let rows = json(&bytes);
     let by_key = |key: &str| {
-        rows.as_array().unwrap().iter().find(|r| r["key"] == key).cloned()
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["key"] == key)
+            .cloned()
     };
     for refused in ["software_versions", "tag_servers", "tag_languages"] {
         assert!(by_key(refused).is_none(), "{refused} must stay omitted");
@@ -676,7 +852,10 @@ async fn d39_measures_served_and_refused() {
         .iter()
         .map(|r| r["key"].as_str().unwrap())
         .collect();
-    assert!(names.contains(&"bob"), "followed account tops the domain: {names:?}");
+    assert!(
+        names.contains(&"bob"),
+        "followed account tops the domain: {names:?}"
+    );
     assert!(by_key("instance_languages").is_some());
     assert!(by_key("space_usage").is_some());
 
@@ -692,7 +871,12 @@ async fn d39_measures_served_and_refused() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
     assert!(json(&bytes).as_array().is_some());
 
     let _ = bob_token;

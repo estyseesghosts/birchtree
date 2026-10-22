@@ -67,3 +67,29 @@ bash scripts/smoke-all.sh
 ```
 
 Plus: fill cache to 110% with concurrent jobs → stays ≤ cap; `rm` a blob file → reconciler re-fetches or marks missing; aggressive eviction → local uploads untouched. Paste real output into `state/logs/YYYY-MM-DD-storage-overhaul.md`, update `TODOs.md` + cache plan in place, never rewrite old logs. Then `git status --short` review + commit everything (this batch only — explicit instruction).
+
+## Prod-2 deltas (2026-10-22, schema v23)
+
+- `BlobStore::cache_root_path` (port addition): the public file route
+  streams `remote/…` keys from the cache pool after the durable root — no
+  full-object buffering; buffered `get()` remains only for rootless test
+  doubles. Evidence: `tests/fix_media_http_stream.rs`.
+- Eviction is durable-first everywhere (`evict_pressure_durable_first`,
+  shared by fetch-time admission and `CacheEvict`): victims unmapped
+  (rows + counters, one transaction) before any blob delete; durable
+  failure deletes nothing and the fetch does not proceed. Startup enforces
+  caps after restore, before listen. Evidence:
+  `tests/storage_cache_evict.rs`.
+- Fetch commits the durable byte row (`cache_mark_stored`) before the
+  ledger settlement, so admitted bytes are visible to every eviction pass;
+  attachments classify after the sniff (`class_for_fetch`) and audio/video
+  (`Stream`) is never persisted. Evidence: `tests/fix_media_class.rs`.
+- Remote emoji rows (`remote/emojis/`, variants `emoji`/`emoji_static`)
+  are durable byte rows under the reserved class: evictable, refetchable.
+- `DELIVERY_SEQ` table (`host -> next sequence`, schema v23): every
+  delivery enqueue mints its destination's monotonic `seq`; the send path
+  parks N+1 while N is unfinished. Evidence:
+  `tests/fix_delivery_order.rs`.
+- `prune_quarantined` (age-ordered, bounded, delete-only) rides the
+  maintenance tick; enqueue quarantines oversize payloads on insert.
+  Evidence: `tests/fix_quarantine_prune.rs`.

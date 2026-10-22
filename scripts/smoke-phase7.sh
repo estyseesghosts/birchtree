@@ -11,7 +11,7 @@ PID=""
 cleanup(){ [ -n "$PID" ] && { kill -TERM "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true; }; rm -rf "$DATA_DIR"; }
 trap cleanup EXIT
 cargo build --bin birchtree >/dev/null
-"$BIN" --data-dir="$DATA_DIR" --listen="127.0.0.1:$PORT" --public-url="$BASE" --registration-open --no-transcode >/tmp/opencode/phase7.log 2>&1 &
+"$BIN" --data-dir="$DATA_DIR" --listen="127.0.0.1:$PORT" --public-url="$BASE" --registration-open --no-transcode --smtp-url=smtp://127.0.0.1:25 --mail-from=noreply@example.social >/tmp/opencode/phase7.log 2>&1 &
 PID=$!
 for i in $(seq 1 100); do curl -fsS "$BASE/health" >/dev/null 2>&1 && break; sleep 0.2; done
 

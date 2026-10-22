@@ -23,7 +23,9 @@ trap cleanup EXIT
 cargo build --bin birchtree >/dev/null
 
 start_server() {
-  "$BIN" --data-dir="$DATA_DIR" --listen="127.0.0.1:${PORT}" --public-url="$BASE" --no-transcode &
+  # Dummy SMTP (shape-validated only): production refuses to serve signup
+  # without a mail provider, even in smoke.
+  "$BIN" --data-dir="$DATA_DIR" --listen="127.0.0.1:${PORT}" --public-url="$BASE" --no-transcode --smtp-url=smtp://127.0.0.1:25 --mail-from=noreply@example.social &
   PID=$!
   for _ in $(seq 1 100); do
     if curl -fsS "$BASE/health" >/dev/null 2>&1; then

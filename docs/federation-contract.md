@@ -43,6 +43,25 @@ emoji remain `[]` (open on both sides).
 
 Each destination host carries a `DeliveryDestState` (`failures`, `cooldown_until_ms`, table `delivery_dest`): consecutive failed attempts to one host move its cooldown out exponentially (`DEST_COOLDOWN_BASE_MS` 60 s, doubling, capped at `DEST_COOLDOWN_CAP_MS` 1 h). A job aimed at a host inside its cooldown is parked — completed now and re-enqueued as a deferred copy due when the cooldown ends — instead of hitting the down host again. Past `DEST_FAILURE_BUDGET` (10) consecutive failures, or `DEST_MAX_DEFERRALS` (25) parks, the job quarantines. A 2xx resets the host. Only a retryable send failure charges the host's budget: a permanent refusal (refused URL, missing key, unparseable payload) quarantines the job without cooling down its host, so one bad inbox never penalizes its neighbours. Inboxes on one host share the budget and the cooldown (the failure domain is the host, not the path). Evidence: `tests/phase6_gaps_round2_e.rs` (failing host parks with no second hit; unrelated delivery unaffected; success resets; budget and deferral cap quarantine).
 
+### Per-destination FIFO sequence (schema v23, prod-2 item 9)
+
+Concurrent workers must not reorder a `Follow`/`Undo` (or
+`Create`/`Delete`) pair to one inbox on the wire. Every `DeliverActivity`
+(and `RelayForward`) enqueue mints the destination host's next monotonic
+number (`DELIVERY_SEQ` table) into the payload as `seq` — in the same
+transaction for in-transaction planning, one call apart otherwise — so plan
+order and sequence order are identical and survive restarts. The send path
+holds the per-host lock and then parks sequence N+1 (deferred copy, no
+retry budget consumed, 5 s park delay) while any earlier sequence for the
+same host is still `Pending` or `Leased`. Terminal rows (`Succeeded`,
+`Quarantined`) never block: a permanently failed earlier send must not
+wedge its host. Different hosts proceed in parallel.
+
+Evidence: `tests/fix_delivery_order.rs` (second send parks while the first
+is leased and the pair arrives in order; order survives a mid-queue
+restart with the counter continuing; a quarantined earlier sequence does
+not wedge its host).
+
 ### Delete-beats-Create tombstones (`src/federation/tombstone.rs`, table `remote_tombstone`)
 
 Upstream files a `Tombstone` row when a `Delete` arrives, even for an object never seen, guarded by the same-host check (`delete.rb`: `Tombstone.find_or_create_by`, `non_matching_uri_hosts?`). Birchtree matches it (each store call is one short transaction; a `Create` that wins the race is caught the other way — the `Delete` then lands on the stored row):

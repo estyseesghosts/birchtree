@@ -131,3 +131,17 @@ and bundled into `Store`:
   accounts_by_ids`, `RelationshipStore::{account_stats_by_ids,
   batch_pair_states}`, `PollStore::{polls_by_ids, ballots}`,
   `QuoteStore::quotes_by_quoting_ids`.
+
+## Implementation status (prod-2, 2026-10-22)
+
+- `BlobStore::cache_root_path` — the evictable pool's filesystem root on
+  two-pool handles (file-backed remote reads stream; rootless doubles keep
+  the buffered `get()` fallback).
+- `JobQueue::prune_quarantined(older_than_ms, limit)` — age-ordered,
+  bounded, delete-only quarantine retention, wired into the maintenance
+  tick; enqueue quarantines oversize payloads on insert with a recorded
+  reason and a bounded marker.
+- `FederationStore::{delivery_seq_next, delivery_blocked_by}` — durable
+  per-host monotonic delivery sequences (schema v23 `DELIVERY_SEQ`) and
+  the FIFO send gate.
+- `RemoteEmojiRow::source_url` — origin URL for serve-miss refetch.

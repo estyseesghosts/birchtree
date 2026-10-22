@@ -38,7 +38,7 @@ Auth scopes are Mastodon conventions from the source/docs. They are enforced cen
 | GET | `/api/v1/instance/terms_of_service` | none | — | implemented (fix round, file authoring gaps G-A) | In | `{effective_date(mtime),effective:true,content,succeeded_by:null}` from `--site-terms-file` when configured, else honest 404 (upstream unconfigured behavior) |
 | GET | `/api/v1/instance/terms_of_service/:date` | none | — | implemented (fix round) | In | honest 404: every date is unknown with no terms rows (`src/api/mastodon/endpoints/instance.rs:414-416`, `src/api/mastodon/router.rs:56`) |
 | GET | `/api/v1/accounts` | optional | read \| read:accounts | implemented (Phase 7) | In | multi-fetch `id[]` (up to 40; above that `422 Mastodon::ValidationError`); unapproved and pending-deletion accounts omitted (upstream `set_accounts`) |
-| POST | `/api/v1/accounts` | app | write \| write:accounts | implemented (Phase 2) | In | registration; returns a user token |
+| POST | `/api/v1/accounts` | app | write \| write:accounts | implemented (Phase 2) | In | registration; returns a user token. Fail-closed without SMTP (prod-2): open registration, or a usable invite while closed, with no mail provider answers 403 before any user is created; production startup refuses the same configuration |
 | GET | `/api/v1/accounts/verify_credentials` | user | profile \| read \| read:accounts | implemented (Phase 2, source/role fix round) | In | `CredentialAccountSerializer` (real counters); `source` renders stored profile fields/discoverable/hide_collections/indexable/attribution (`null`/defaults when never set); `role` is real for staff (`Admin`/`Moderator` + permission bitmask), legacy `User` shape otherwise |
 | PATCH | `/api/v1/accounts/update_credentials` | user | write \| write:accounts | implemented (Phase 2, fields fix round) | In | incl. `source[quote_policy]`. Accepts `source[chosen_languages][]` (D21; birchtree extension — upstream has no API setter): replaces the stored preference, empty clears it, absent leaves it unchanged. `bot`/`fields_attributes[]`/`attribution_domains[]` parsed with upstream rules (max 4, blank-label 422, truncation) and persisted (absent leaves stored values); `source[display_media|expand_spoilers|autoplay_gifs]` stored as a birchtree extension (upstream: web-settings-only). `avatar`/`header` accept multipart file parts (still images jpeg/png/gif/webp only, 8 MB each, descriptions max 150 chars; magic bytes decide, served under `/system/media_attachments/files/` with `avatar_static`/`header_static` mirroring `avatar`/`header`); present-but-empty clears to the `missing.png` defaults; invalid uploads are 422s. Served actor documents carry `icon`/`image`, and every profile write commits a `profile_update` federation event (Update fanout, evidence `tests/avatar_upload.rs`). CORE-L: top-level `default_license` (Pixelfed ids; present-blank clears, absent unchanged; ignored when `license_policy=off`; out-of-enum → 422 when enabled); account wire renders `preferredLicense` (number/`null`) only when enabled |
 | GET | `/api/v1/accounts/lookup` | user | read | implemented (Phase 7, fix round) | In | leading-`@`-tolerant, domain-lowercased resolution incl. known remote accounts; suspended still returned; unknown remote → 404 (live webfinger = federation follow-up) |
@@ -369,7 +369,7 @@ New API surface (no upstream REST equivalent in v4.7.3 — upstream authoring is
 | Method | Path | Auth | Scope | Status | Profile | Notes |
 |---|---|---|---|---|---|---|
 | GET | `/api/v1/admin/custom_emojis` | user + role | admin:read | implemented (emoji round) | In | every local row, shortcode order, incl. disabled + picker-hidden; rows render with the shared serializer plus a `disabled` flag |
-| POST | `/api/v1/admin/custom_emojis` | user + role | admin:write | implemented (emoji round) | In | multipart `shortcode` + `image` (+ optional `category`, `visible_in_picker`); 200 + row; re-post replaces bytes and metadata; 422 on blank/bad shortcode, >256 KB, or non-PNG/GIF/WebP bytes |
+| POST | `/api/v1/admin/custom_emojis` | user + role | admin:write | implemented (emoji round) | In | multipart `shortcode` + `image` (+ optional `category`, `visible_in_picker`); 200 + row; re-post replaces bytes and metadata transactionally (fresh keys, old generation deleted after commit); 422 on blank/bad shortcode, >256 KB, or non-PNG/GIF/WebP bytes |
 | PUT | `/api/v1/admin/custom_emojis/:shortcode` | user + role | admin:write | implemented (emoji round) | In | JSON `category` (string-or-null) / `visible_in_picker` / `disabled`; 200 + row; 404 when missing; 422 on empty or wrong-typed body |
 | DELETE | `/api/v1/admin/custom_emojis/:shortcode` | user + role | admin:write | implemented (emoji round) | In | removes the row and its image bytes; 404 when missing; 200 `{}` |
 
@@ -464,6 +464,44 @@ Rowed since the 2026-10-17 re-scope (each has a row above with its phase): `annu
 - Async-refresh header: `Mastodon-Async-Refresh: id="…", retry=3[, result_count=N]` (Phase 6 remote thread completion; Phase 7 suggestions FASP path).
 - Idempotency: `Idempotency-Key` header on `POST /api/v1/statuses` only (1-hour retention, per-account scoping — matches Mastodon's `SETEX 3600` namespace). Other write endpoints are naturally idempotent (unique rows) instead.
 - Admin scope families: `admin:read` and `admin:write`, with per-resource sub-scopes (`admin:read:accounts`, `admin:write:reports`, and so on), as registered by the pinned Doorkeeper configuration. In birchtree's scope registry since Phase 7.3 (trends/tags/measures/dimensions/retention use the bare scopes upstream, with no sub-scopes).
+
+## Prod-2 hardening (2026-10-22)
+
+Shipped behavior deltas (evidence: `tests/fix_*.rs`, `tests/storage_cache_evict.rs`):
+
+- **Push SSRF:** production delivery uses the safe client (no proxy, no
+  automatic redirects, blocking-resolver DNS); cross-origin redirect hops
+  drop `Authorization` and `Unsubscribe-URL` together; same-origin hops
+  keep both. Lab loopback needs the explicit lab policy.
+- **Registration mail:** `POST /api/v1/accounts` (open and invite paths)
+  refuses 403 before creating the user when confirmation mail cannot send;
+  production startup exits rather than serve in that configuration (lab
+  warns; the mail job fails loudly, never `Ok`).
+- **Secrets:** a legacy-seal failure fails production startup (lab warns).
+- **Remote cache reads** stream from the cache pool (`206` ranges, no
+  full-object buffering); durable shadows still resolve first.
+- **Remote media class:** audio/video originals are `Stream` and are never
+  persisted (terminal non-persist refusal); images persist as `Full` with a
+  durable byte row for the eviction passes.
+- **Remote emoji** live under `remote/emojis/` (cache pool, evictable) and
+  serve at `GET /system/remote/emojis/{*path}` (miss queues one
+  `FetchRemoteEmoji` refetch, answers 404 — never 500). Local emoji URLs
+  follow the row's keys (replaced generations stay servable).
+- **Profile images** spool to capped temp files, decode on the bounded
+  media work gate, and stage under a guard (a later 422 leaves no blob).
+- **Quarantine retention:** `prune_quarantined` deletes old quarantined
+  rows (oldest-first, bounded) from the maintenance tick; oversize payloads
+  are quarantined on insert with a recorded reason. Prune is delete-only.
+- **Delivery order:** every delivery payload carries its destination
+  host's monotonic `seq` (schema v23 `DELIVERY_SEQ`); the send path parks
+  N+1 while N is unfinished (terminal rows never block).
+- **NAT64:** local-use `64:ff9b:1::/48` is denied outright (allowlist is
+  the only way through); well-known `64:ff9b::/96` keeps the embedded-v4
+  check.
+- **Signatures:** RSA-only remains (legacy Cavage via `aws-lc-rs`,
+  compatibility exception documented in `docs/birchtree-rsa-prod.md`);
+  unsigned stays refused; RFC 9421-shaped requests 401 (remaining work,
+  explicitly open).
 
 ## Known Phase 3 deviations / gaps (honesty list)
 
