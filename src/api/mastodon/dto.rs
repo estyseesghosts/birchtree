@@ -14,8 +14,8 @@ use serde_json::{Map, Value, json};
 use crate::api::mastodon::ServerInfo;
 use crate::application::ports::StatusViewFlags;
 use crate::domain::{
-    Account, AccountStats, AnnualReport, LocalUser, MediaAttachment, OAuthApplication, Poll, Status,
-    StatusApplication, TrendLink, TrendPublisher, TrendTagFlag,
+    Account, AccountStats, AnnualReport, LocalUser, MediaAttachment, OAuthApplication, Place, Poll,
+    Status, StatusApplication, TrendLink, TrendPublisher, TrendTagFlag,
 };
 
 /// Mastodon's default missing avatar/header asset path.
@@ -150,6 +150,16 @@ pub fn account_json_with_stats(
         // A full nested account is not available in Phase 2; expose the id-only
         // moving signal rather than fabricating a nested object.
         object.insert("moved".into(), json!({ "id": moved_to.to_string() }));
+    }
+    // Core extension CORE-L: `preferredLicense` renders only when the policy
+    // is enabled (`off` omits the key); enabled + `None` renders `null`.
+    if let Some(value) =
+        crate::application::license_policy::license_wire_value(
+            &server.license_policy,
+            account.default_license,
+        )
+    {
+        object.insert("preferredLicense".into(), value);
     }
     Value::Object(object)
 }
@@ -610,6 +620,9 @@ pub struct StatusView {
     pub filtered: Vec<Value>,
     /// Custom emoji referenced by the status text (batch-loaded per page).
     pub emojis: Vec<Value>,
+    /// Core extension CORE-P: the attached place (batched per page;
+    /// dangling ids read as no place).
+    pub place: Option<Place>,
 }
 
 /// Local file path of an attachment blob key under the media route.
@@ -648,7 +661,7 @@ pub fn media_attachment_json(server: &ServerInfo, media: &MediaAttachment) -> Va
         Some(key) if processed => Value::String(media_file_url(server, key)),
         _ => Value::Null,
     };
-    json!({
+    let mut value = json!({
         "id": media.id.to_string(),
         "type": media.r#type,
         "url": url,
@@ -659,7 +672,18 @@ pub fn media_attachment_json(server: &ServerInfo, media: &MediaAttachment) -> Va
         "meta": media_meta_json(media),
         "description": if media.description.is_empty() { Value::Null } else { json!(media.description) },
         "blurhash": media.blurhash.clone().map(Value::String).unwrap_or(Value::Null),
-    })
+    });
+    // Core extension CORE-L: `license` renders only when the policy is
+    // enabled (`off` omits the key); enabled + `None` renders `null`
+    // (all rights reserved).
+    if let Some(license) =
+        crate::application::license_policy::license_wire_value(&server.license_policy, media.license)
+    {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("license".into(), license);
+        }
+    }
+    value
 }
 
 /// The `meta` object: `original` (and `small` when a preview exists) plus
@@ -873,6 +897,22 @@ pub fn status_json(
     object.insert("tags".into(), json!(tags));
     object.insert("emojis".into(), json!(view.emojis.clone()));
     object.insert("tagged_collections".into(), json!([]));
+    // Core extension CORE-P: `location` renders only when the policy is
+    // enabled (`off` omits the key); enabled + placeless renders nothing.
+    if server.place_policy != "off"
+        && let Some(place) = &view.place
+    {
+        object.insert(
+            "location".into(),
+            json!({
+                "id": place.id.to_string(),
+                "name": place.name,
+                "longitude": place.lon,
+                "latitude": place.lat,
+                "country": place.country,
+            }),
+        );
+    }
 
     object.insert(
         "quote".into(),

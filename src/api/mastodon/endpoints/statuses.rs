@@ -112,6 +112,24 @@ fn apply_filter_results(
     Ok(())
 }
 
+/// Core extension CORE-T: `(type, description)` pairs for the nag signal.
+/// A lookup failure reads as no attachments (no nag), never a 500: the
+/// status already committed.
+fn alt_pairs(store: &dyn Store, media_ids: &[Id]) -> Vec<(String, String)> {
+    store
+        .media_by_ids(media_ids)
+        .map(|rows| {
+            media_ids
+                .iter()
+                .filter_map(|id| {
+                    rows.get(id)
+                        .map(|m| (m.r#type.clone(), m.description.clone()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Assemble and render one status as 200 JSON.
 fn status_response(
     state: &ApiState,
@@ -442,6 +460,20 @@ pub async fn create(
         .filter_map(|raw| raw.parse::<Id>().ok())
         .collect();
 
+    // Core extension CORE-P: optional `place_id` (unknown ids take the
+    // 422 path unless the policy is `off`, which ignores the param).
+    // A present-but-unparsable id behaves like an unknown one.
+    let place_id = match field("place_id") {
+        None => None,
+        Some(raw) => match raw.parse::<Id>() {
+            Ok(id) => Some(id),
+            Err(_) => {
+                return ApiError::unprocessable("Validation failed: Place not found")
+                    .into_response();
+            }
+        },
+    };
+
     let idempotency_key = headers
         .get("Idempotency-Key")
         .and_then(|value| value.to_str().ok())
@@ -489,6 +521,10 @@ pub async fn create(
             cmd,
             scheduled_at_ms,
             state.server.max_status_chars,
+            &state.server.license_policy,
+            &state.server.place_policy,
+            place_id,
+            &state.server.alt_text_policy,
         ) {
             Ok(row) => {
                 let media = store
@@ -509,7 +545,7 @@ pub async fn create(
         };
     }
 
-    match statuses::create_status(store, &state.server.public_url, state.context.now_ms(), cmd, state.server.max_status_chars) {
+    match statuses::create_status(store, &state.server.public_url, state.context.now_ms(), cmd, state.server.max_status_chars, &state.server.license_policy, &state.server.place_policy, place_id, &state.server.alt_text_policy) {
         Ok(created) => {
             // An idempotent replay committed nothing new, so nothing streams.
             if !created.replayed {
@@ -521,7 +557,13 @@ pub async fn create(
                     &created.status,
                 );
             }
-            status_response(&state, Some(viewer), created.status, StatusSourceMode::Content)
+            // Core extension CORE-T: nag header on success when enabled.
+            let attachments = alt_pairs(store, &created.status.media_ids);
+            crate::api::mastodon::with_alt_text_nag(
+                status_response(&state, Some(viewer), created.status, StatusSourceMode::Content),
+                &state.server.alt_text_policy,
+                &attachments,
+            )
         }
         Err(err) => match err {
             // Reply/quote misses keep their exact custom messages.
@@ -599,6 +641,25 @@ pub async fn update(
             .collect::<Vec<_>>()
     });
 
+    // Core extension CORE-P: `place_id` present replaces (blank clears),
+    // absent leaves unchanged. Present-but-unparsable is a 422 unless the
+    // policy is `off` (ignored).
+    let place_id = match field("place_id") {
+        None => None,
+        Some(raw) if raw.trim().is_empty() => Some(None),
+        Some(raw) => match raw.trim().parse::<Id>() {
+            Ok(id) => Some(Some(id)),
+            Err(_) => {
+                if state.server.place_policy == "off" {
+                    None
+                } else {
+                    return ApiError::unprocessable("Validation failed: Place not found")
+                        .into_response();
+                }
+            }
+        },
+    };
+
     let cmd = UpdateStatusCommand {
         account_id: viewer,
         status_id,
@@ -611,7 +672,7 @@ pub async fn update(
         quote_approval_policy: field("quote_approval_policy"),
     };
     let store: &dyn Store = &*state.context.store;
-    match statuses::update_status(store, state.context.now_ms(), cmd) {
+    match statuses::update_status(store, state.context.now_ms(), cmd, &state.server.license_policy, &state.server.place_policy, place_id, &state.server.alt_text_policy) {
         Ok(maybe_status) => {
             // No changes: reload and answer 200 with the unchanged status.
             let status = match maybe_status {
@@ -626,7 +687,13 @@ pub async fn update(
                     _ => return ApiError::not_found().into_response(),
                 },
             };
-            status_response(&state, Some(viewer), status, StatusSourceMode::Content)
+            // Core extension CORE-T: nag header on success when enabled.
+            let attachments = alt_pairs(store, &status.media_ids);
+            crate::api::mastodon::with_alt_text_nag(
+                status_response(&state, Some(viewer), status, StatusSourceMode::Content),
+                &state.server.alt_text_policy,
+                &attachments,
+            )
         }
         Err(err) => ApiError::from(err).into_response(),
     }

@@ -102,7 +102,7 @@ pub async fn update(
     let Ok(id) = raw.parse::<Id>() else {
         return ApiError::not_found().into_response();
     };
-    let (description, focus, thumbnail) =
+    let (description, focus, thumbnail, license) =
         match update_fields(&state, request, state.server.max_file_size).await {
             Ok(fields) => fields,
             Err(err) => return err.into_response(),
@@ -110,6 +110,24 @@ pub async fn update(
     let store = state.context.store.clone();
     let blobs = state.context.blobs.clone();
     let now_ms = state.context.now_ms();
+    // Core extension CORE-L: raw license param; blank clears, absent leaves
+    // unchanged; non-numeric is a 422 (the use case 422s out-of-enum, and
+    // ignores everything under `off`).
+    let license = match license {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(raw)) => match raw.parse::<i64>() {
+            Ok(value) => Some(Some(value)),
+            Err(_) => {
+                return ApiError::unprocessable(crate::domain::license::ERR_LICENSE_INVALID)
+                    .into_response()
+            }
+        },
+    };
+    // Owned policy snapshots: the gate closure is `'static`, so `state`
+    // must not be borrowed from inside it (nor used after the move).
+    let license_policy = state.server.license_policy.clone();
+    let alt_text_policy = state.server.alt_text_policy.clone();
     let outcome = upload_gate::media_work_gate()
         .run(move || {
             media::update_media(
@@ -121,12 +139,23 @@ pub async fn update(
                 focus.as_deref(),
                 thumbnail.as_deref(),
                 now_ms,
+                &license_policy,
+                license,
+                &alt_text_policy,
             )
         })
         .await
         .and_then(|inner| inner);
     match outcome {
-        Ok(media) => media_response(&state, media),
+        Ok(media) => {
+            // Core extension CORE-T: nag header on success when enabled.
+            let attachments = [(media.r#type.clone(), media.description.clone())];
+            crate::api::mastodon::with_alt_text_nag(
+                media_response(&state, media),
+                &state.server.alt_text_policy,
+                &attachments,
+            )
+        }
         Err(err) => ApiError::from(err).into_response(),
     }
 }
@@ -431,6 +460,9 @@ struct UploadFields {
     thumbnail: Option<Vec<u8>>,
     description: Option<String>,
     focus: Option<String>,
+    /// Core extension CORE-L: raw `license` param (validated in the use
+    /// case; ignored under `off`).
+    license: Option<String>,
 }
 
 /// Shared v1/v2 upload path. `delay` enables Mastodon's larger-format
@@ -472,6 +504,24 @@ async fn upload(state: &ApiState, auth: &Auth, request: Request, delay: bool) ->
     let store = state.context.store.clone();
     let blobs = state.context.blobs.clone();
     let now_ms = state.context.now_ms();
+    // Core extension CORE-L: raw license param; the use case validates
+    // (422 on out-of-enum) unless the policy is `off` (ignored entirely).
+    let license = match fields.license.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(value) => Some(value),
+            Err(_) => {
+                return crate::api::mastodon::errors::ApiError::unprocessable(
+                    crate::domain::license::ERR_LICENSE_INVALID,
+                )
+                .into_response()
+            }
+        },
+    };
+    // Owned policy snapshots: the gate closure is `'static`, so the
+    // borrowed `state` must not be captured by it.
+    let license_policy = state.server.license_policy.clone();
+    let alt_text_policy = state.server.alt_text_policy.clone();
     // Decode, resize and FFmpeg run on the bounded blocking pool; the slot
     // is awaited without holding a thread.
     let outcome = upload_gate::media_work_gate()
@@ -493,6 +543,9 @@ async fn upload(state: &ApiState, auth: &Auth, request: Request, delay: bool) ->
                     delay,
                     max_file_size,
                     transcode.as_ref(),
+                    &license_policy,
+                    license,
+                    &alt_text_policy,
                 ),
                 None => media::upload_media_with_config(
                     &*store,
@@ -506,6 +559,9 @@ async fn upload(state: &ApiState, auth: &Auth, request: Request, delay: bool) ->
                     delay,
                     max_file_size,
                     transcode.as_ref(),
+                    &license_policy,
+                    license,
+                    &alt_text_policy,
                 ),
             }
         })
@@ -518,11 +574,17 @@ async fn upload(state: &ApiState, auth: &Auth, request: Request, delay: bool) ->
             } else {
                 StatusCode::OK
             };
-            (
+            let response = (
                 status,
                 axum::Json(dto::media_attachment_json(&state.server, &media)),
             )
-                .into_response()
+                .into_response();
+            // Core extension CORE-T: nag header on success when enabled.
+            crate::api::mastodon::with_alt_text_nag(
+                response,
+                &state.server.alt_text_policy,
+                &[(media.r#type.clone(), media.description.clone())],
+            )
         }
         Err(err) => upload_error(err).into_response(),
     }
@@ -597,20 +659,31 @@ async fn upload_fields(
                 let value = capped_bytes(field, MAX_TEXT_FIELD_BYTES, FieldKind::Text).await?;
                 fields.focus = Some(String::from_utf8_lossy(&value).into_owned());
             }
+            Some("license") => {
+                let value = capped_bytes(field, MAX_TEXT_FIELD_BYTES, FieldKind::Text).await?;
+                fields.license = Some(String::from_utf8_lossy(&value).into_owned());
+            }
             _ => {}
         }
     }
     Ok(fields)
 }
 
-/// Parse the update fields: multipart (`thumbnail`/`description`/`focus`;
+/// Parse the update fields: multipart (`thumbnail`/`description`/`focus`/`license`;
 /// a `file` part is ignored — only the permitted params apply) or
-/// form-encoded (`description`/`focus`).
+/// form-encoded (`description`/`focus`/`license`). The license element is
+/// `Some(Some(raw))` when present, `Some(None)` when present-but-blank
+/// (clears), `None` when absent (unchanged).
 async fn update_fields(
     state: &ApiState,
     request: Request,
     max_file_size: u64,
-) -> ApiResult<(Option<String>, Option<String>, Option<Vec<u8>>)> {
+) -> ApiResult<(
+    Option<String>,
+    Option<String>,
+    Option<Vec<u8>>,
+    Option<Option<String>>,
+)> {
     if !is_multipart(&request) {
         let LenientForm(pairs) = LenientForm::from_request(request, state)
             .await
@@ -619,12 +692,17 @@ async fn update_fields(
             forms::get(&pairs, "description").map(str::to_string),
             forms::get(&pairs, "focus").map(str::to_string),
             None,
+            forms::get(&pairs, "license").map(|raw| {
+                let trimmed = raw.trim().to_string();
+                if trimmed.is_empty() { None } else { Some(trimmed) }
+            }),
         ));
     }
     let mut multipart = multipart(state, request).await?;
     let mut description = None;
     let mut focus = None;
     let mut thumbnail = None;
+    let mut license: Option<Option<String>> = None;
     while let Some(field) = next_field(&mut multipart).await? {
         let name = field.name().map(str::to_string);
         match name.as_deref() {
@@ -639,10 +717,15 @@ async fn update_fields(
                 let value = capped_bytes(field, MAX_TEXT_FIELD_BYTES, FieldKind::Text).await?;
                 focus = Some(String::from_utf8_lossy(&value).into_owned());
             }
+            Some("license") => {
+                let value = capped_bytes(field, MAX_TEXT_FIELD_BYTES, FieldKind::Text).await?;
+                let raw = String::from_utf8_lossy(&value).trim().to_string();
+                license = Some(if raw.is_empty() { None } else { Some(raw) });
+            }
             _ => {}
         }
     }
-    Ok((description, focus, thumbnail))
+    Ok((description, focus, thumbnail, license))
 }
 
 fn is_multipart(request: &Request) -> bool {

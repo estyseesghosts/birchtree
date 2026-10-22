@@ -42,13 +42,13 @@ impl Object for NoteRef {
         let poll = store.poll_by_status(self.status.id)?;
         match poll {
             Some(poll) => {
-                let value = outgoing::question_for_status(store, &data.public_url, &self.status, &poll, now)?;
+                let value = outgoing::question_for_status(store, &data.public_url, &self.status, &poll, now, &data.license_policy, &data.place_policy)?;
                 serde_json::from_value(value)
                     .map(|q| NoteOrQuestion::Question(Box::new(q)))
                     .map_err(|e| FedError::Refused(format!("question does not serialize: {e}")))
             }
             None => {
-                let value = outgoing::note_for_status(store, &data.public_url, &self.status, now)?;
+                let value = outgoing::note_for_status(store, &data.public_url, &self.status, now, &data.license_policy, &data.place_policy)?;
                 serde_json::from_value(value)
                     .map(|n| NoteOrQuestion::Note(Box::new(n)))
                     .map_err(|e| FedError::Refused(format!("note does not serialize: {e}")))

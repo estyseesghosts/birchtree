@@ -137,6 +137,8 @@ async fn fixture(sign: bool) -> Fixture {
         if sign { Some(&actor) } else { None },
         false,
         &[],
+        "off",
+        "off",
     )
     .await
     .expect("federation config");
@@ -174,6 +176,7 @@ fn attachment(fixture: &Fixture, path: &str) -> Job {
             account_id: fixture.account_id,
             r#type: "image".to_string(),
             description: String::new(),
+            license: None,
         })
         .expect("media row");
     fixture

@@ -172,6 +172,10 @@ pub fn create_status(
     now_ms: u64,
     cmd: CreateStatusCommand,
     max_chars: usize,
+    license_policy: &str,
+    place_policy: &str,
+    place_id: Option<Id>,
+    alt_text_policy: &str,
 ) -> Result<CreateStatusResult> {
     let CreateStatusCommand {
         account_id,
@@ -342,6 +346,71 @@ pub fn create_status(
 
     let poll = poll.map(|p| build_poll_spec(now_ms, p)).transpose()?;
 
+    // Core extension CORE-P: the place gate mirrors the license gate above.
+    // Under `off` the param is accepted-and-ignored (stored NULL); otherwise
+    // an unknown id takes the existing 422 path, and `enforced` additionally
+    // requires a resolvable place on top-level non-DM statuses. Replies and
+    // DMs are exempt.
+    let place_resolves = match place_id {
+        None => false,
+        Some(id) => store.place_by_id(id)?.is_some(),
+    };
+    let place_id = crate::application::place_policy::check_place_policy(
+        place_policy,
+        visibility == Visibility::Direct,
+        in_reply_to.is_some(),
+        place_id,
+        place_resolves,
+    )?;
+
+    // Core extension CORE-L: under `enforced`, a top-level non-DM status
+    // carrying media needs an effective license (per-attachment else author
+    // default) on every attachment. Replies and DMs are exempt; the media
+    // upload itself never gated. Missing rows are left to the store's
+    // attachability check below (same 422 family).
+    if license_policy == "enforced"
+        && visibility != Visibility::Direct
+        && in_reply_to.is_none()
+        && !media_ids.is_empty()
+    {
+        let attached = store.media_by_ids(&media_ids)?;
+        let mut effective = Vec::with_capacity(media_ids.len());
+        for id in &media_ids {
+            if let Some(media) = attached.get(id) {
+                effective.push(crate::application::license_policy::effective_license(
+                    media.license,
+                    account.default_license,
+                ));
+            }
+        }
+        if effective.len() == media_ids.len() {
+            crate::application::license_policy::check_status_licenses(
+                license_policy,
+                false,
+                false,
+                true,
+                &effective,
+            )?;
+        }
+    }
+
+    // Core extension CORE-T: under `block`, a top-level or reply write
+    // leaving an image/video/gifv attachment without a description is a
+    // 422 (local writes only; text-only posts unaffected). Missing rows
+    // are left to the store's attachability check (same 422 family).
+    if matches!(alt_text_policy, "nag" | "block") && !media_ids.is_empty() {
+        let attached = store.media_by_ids(&media_ids)?;
+        let mut pairs = Vec::with_capacity(media_ids.len());
+        for id in &media_ids {
+            if let Some(media) = attached.get(id) {
+                pairs.push((media.r#type.clone(), media.description.clone()));
+            }
+        }
+        if pairs.len() == media_ids.len() {
+            crate::application::alt_text_policy::check_block(alt_text_policy, &pairs)?;
+        }
+    }
+
     let base = base_url.trim_end_matches('/');
     let content_html = render_html(&text);
     let created = store.create_status(
@@ -364,6 +433,7 @@ pub fn create_status(
             silent_mentions: Vec::new(),
             tags,
             media_ids,
+            place_id,
             poll,
             quote,
             application: application_name.map(|name| StatusApplication {
@@ -653,6 +723,10 @@ pub fn update_status(
     store: &dyn Store,
     now_ms: u64,
     cmd: UpdateStatusCommand,
+    license_policy: &str,
+    place_policy: &str,
+    place_id: Option<Option<Id>>,
+    alt_text_policy: &str,
 ) -> Result<Option<Status>> {
     let status = store
         .status_by_id(cmd.status_id)?
@@ -683,7 +757,53 @@ pub fn update_status(
         }
         update.language = Some(language);
     }
+    // Core extension CORE-P: same place gate as creation (`None` leaves
+    // the stored place unchanged; independent of media edits). Replies
+    // and DMs exempt.
+    if let Some(raw_place) = place_id {
+        let resolves = match raw_place {
+            None => false,
+            Some(id) => store.place_by_id(id)?.is_some(),
+        };
+        update.place_id = Some(crate::application::place_policy::check_place_policy(
+            place_policy,
+            status.visibility == Visibility::Direct,
+            status.in_reply_to_id.is_some(),
+            raw_place,
+            resolves,
+        )?);
+    }
     if let Some(media_ids) = cmd.media_ids {
+        // Core extension CORE-L: same enforced gate as creation, evaluated
+        // against the resulting attachment set. Replies and DMs exempt.
+        if license_policy == "enforced"
+            && status.in_reply_to_id.is_none()
+            && status.visibility != Visibility::Direct
+            && !media_ids.is_empty()
+        {
+            let attached = store.media_by_ids(&media_ids)?;
+            let author = store
+                .account_by_id(cmd.account_id)?
+                .ok_or_else(|| Error::NotFound("account".into()))?;
+            let mut effective = Vec::with_capacity(media_ids.len());
+            for id in &media_ids {
+                if let Some(media) = attached.get(id) {
+                    effective.push(crate::application::license_policy::effective_license(
+                        media.license,
+                        author.default_license,
+                    ));
+                }
+            }
+            if effective.len() == media_ids.len() {
+                crate::application::license_policy::check_status_licenses(
+                    license_policy,
+                    false,
+                    false,
+                    true,
+                    &effective,
+                )?;
+            }
+        }
         update.media_ids = Some(media_ids);
     }
     if let Some(poll) = cmd.poll {
@@ -694,6 +814,28 @@ pub fn update_status(
             QuotePolicy::from_wire(&raw)
                 .ok_or_else(|| Error::InvalidInput(ERR_RECORD_INVALID.into()))?,
         );
+    }
+    // Core extension CORE-T: same block gate as creation, evaluated
+    // against the resulting attachment set (patched or stored). Replies
+    // are NOT exempt here (the rule covers every write leaving an
+    // undescribed image/video); text-only edits pass.
+    if matches!(alt_text_policy, "nag" | "block") {
+        let resulting: Vec<Id> = match &update.media_ids {
+            Some(ids) => ids.clone(),
+            None => status.media_ids.clone(),
+        };
+        if !resulting.is_empty() {
+            let attached = store.media_by_ids(&resulting)?;
+            let mut pairs = Vec::with_capacity(resulting.len());
+            for id in &resulting {
+                if let Some(media) = attached.get(id) {
+                    pairs.push((media.r#type.clone(), media.description.clone()));
+                }
+            }
+            if pairs.len() == resulting.len() {
+                crate::application::alt_text_policy::check_block(alt_text_policy, &pairs)?;
+            }
+        }
     }
     // Tags are re-derived on every edit (steady-state write path): the
     // effective text is the edited text, or the stored text when the edit

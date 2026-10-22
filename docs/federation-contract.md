@@ -17,6 +17,20 @@ Mastodon behavior cited here is verified against the pinned tag: `git -C ~/fedif
 
 Inbound failures never roll back committed local actions.
 
+### Remote custom emoji (federation tail, G-D; D32c)
+
+`Emoji` tags on Notes (`name` `:shortcode:`, `icon` image URL) parse in
+`note_input_for` to namespaced refs (`shortcode@domain` via
+`remote_emoji_shortcode`, so origins never collide and local rows win).
+Rows persist in the `REMOTE_EMOJI` table (schema v20) and stay enabled but
+picker-invisible: they never join the public index, and status-payload
+`emojis` arrays resolve them per author's domain. Bytes arrive post-commit
+through the durable `FetchRemoteEmoji` job (`fetch_remote_emoji_bytes`),
+under the same SSRF/size (256 KB)/PNG-GIF-WebP-sniff caps as remote media
+(`src/federation/media.rs`); refusals quarantine the job without failing the
+status. Evidence: `tests/gaps_federation_tail.rs` (19 tests). Account-payload
+emoji remain `[]` (open on both sides).
+
 ## Egress (durable per-destination delivery)
 
 - Commit delivery jobs before delivery.

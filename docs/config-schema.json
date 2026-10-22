@@ -74,6 +74,9 @@
     "secret_keyring_env": { "type": ["string", "null"], "description": "Env var holding the same keyring text; used only when secret_keyring_file is unset. CLI: --secret-keyring-env." },
     "site_terms_file": { "type": ["string", "null"], "description": "File with the terms-of-service text served by the instance sub-resources. Null = honest-absence 404. CLI: --site-terms-file." },
     "site_privacy_file": { "type": ["string", "null"], "description": "File with the privacy-policy text. Null = honest-absence 404. CLI: --site-privacy-file." },
-    "site_extended_file": { "type": ["string", "null"], "description": "File with the extended-description text. Null = honest-absence 404. CLI: --site-extended-file." }
+    "site_extended_file": { "type": ["string", "null"], "description": "File with the extended-description text. Null = honest-absence 404. CLI: --site-extended-file." },
+    "license_policy": { "type": "string", "enum": ["off", "unenforced", "enforced"], "description": "Core extension CORE-L: license policy. off = disabled (license params accepted-and-ignored). unenforced = enabled optional. enforced = enabled mandatory on top-level non-DM statuses with media. Default off." },
+    "place_policy": { "type": "string", "enum": ["off", "unenforced", "enforced"], "description": "Core extension CORE-P: place policy. off = disabled (place_id accepted-and-ignored). unenforced = enabled optional. enforced = enabled mandatory on top-level non-DM statuses. Default off." },
+    "alt_text_policy": { "type": "string", "enum": ["off", "nag", "block"], "description": "Core extension CORE-T: alt-text policy (local writes only). off = no change. nag = allow but return a documented nag signal. block = 422 when image/video lacks a description. Default off." }
   }
 }

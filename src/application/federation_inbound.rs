@@ -29,6 +29,20 @@ pub struct RemoteAttachment {
     /// The ActivityStreams media type (`image/png`, `video/mp4`, ...).
     pub media_type: String,
     pub description: String,
+    /// Core extension CORE-L: Pixelfed license id, when the sender's policy
+    /// is enabled (absent = all rights). Invalid values are dropped at parse
+    /// (never a 422 on ingest).
+    pub license: Option<u8>,
+}
+
+/// A remote place attached to a received Note (`location`), validated at
+/// ingest (invalid values dropped, never a refusal). Core extension CORE-P.
+#[derive(Debug, Clone)]
+pub struct RemotePlace {
+    pub name: String,
+    pub lon: f64,
+    pub lat: f64,
+    pub country: Option<String>,
 }
 
 /// A received Note, already verified and parsed by the adapter.
@@ -48,6 +62,9 @@ pub struct RemoteNote {
     pub mention_uris: Vec<String>,
     pub tags: Vec<String>,
     pub attachments: Vec<RemoteAttachment>,
+    /// Core extension CORE-P: the Note's `location`, when present and valid
+    /// (linked at ingest; same-name local rows win).
+    pub location: Option<RemotePlace>,
     /// Remote custom emoji carried in the Note's `Emoji` tags (federation
     /// tail, G-D): fetched through `FetchRemoteEmoji` at ingest.
     pub emojis: Vec<RemoteEmojiRef>,
@@ -160,11 +177,27 @@ pub fn ingest_note_with_config(
             account_id: note.author_id,
             r#type: media_kind(&attachment.media_type).into(),
             description: attachment.description.clone(),
+            license: attachment.license,
         })?;
         store.set_remote_media_source(media.id, &attachment.source_url)?;
         media_ids.push(media.id);
         pending_fetches.push((media.id, attachment.source_url.clone()));
     }
+    // Remote place: link value-by-value (same-name local rows win, so
+    // remote input can neither hijack nor duplicate local names).
+    let place_id = match &note.location {
+        None => None,
+        Some(remote) => {
+            let candidate = crate::domain::Place {
+                id: crate::domain::Id::new(0),
+                name: remote.name.clone(),
+                lon: remote.lon,
+                lat: remote.lat,
+                country: remote.country.clone(),
+            };
+            Some(store.link_remote_place(&candidate)?.id)
+        }
+    };
     let status = store.create_status(
         NewStatus {
             remote: Some(RemoteStatusIdentity {
@@ -181,6 +214,7 @@ pub fn ingest_note_with_config(
             in_reply_to_id: parent.as_ref().map(|p| p.id),
             in_reply_to_account_id: parent.as_ref().map(|p| p.account_id),
             media_ids,
+            place_id,
             mentions,
             // D25: inbound tags land normalized (same rule as local
             // writes), so remote `#café` and local `#cafe` are one tag.

@@ -36,6 +36,12 @@ pub struct FedContext {
     pub public_url: Arc<str>,
     /// Whether public registration is open (advertised in NodeInfo).
     pub registrations_open: bool,
+    /// Core extension CORE-L policy (`off`/`unenforced`/`enforced`): gates
+    /// `license` emission on outgoing attachments (omitted when `off`).
+    pub license_policy: Arc<str>,
+    /// Core extension CORE-P policy (`off`/`unenforced`/`enforced`): gates
+    /// `location` emission on outgoing Notes (omitted when `off`).
+    pub place_policy: Arc<str>,
     /// Instance title/description (advertised in NodeInfo `metadata`;
     /// upstream `NodeInfo::Serializer#metadata`).
     pub site_title: Arc<str>,
@@ -72,6 +78,8 @@ pub async fn build_config(
     instance: Option<&instance::InstanceActor>,
     authorized_fetch: bool,
     relays: &[String],
+    license_policy: &str,
+    place_policy: &str,
 ) -> Result<FederationConfig<FedContext>, String> {
     build_config_with_remote_cache(
         context,
@@ -85,6 +93,8 @@ pub async fn build_config(
         authorized_fetch,
         relays,
         &RemoteCacheConfig::default(),
+        license_policy,
+        place_policy,
     )
     .await
 }
@@ -105,6 +115,8 @@ pub async fn build_config_with_remote_cache(
     authorized_fetch: bool,
     relays: &[String],
     remote_cache: &RemoteCacheConfig,
+    license_policy: &str,
+    place_policy: &str,
 ) -> Result<FederationConfig<FedContext>, String> {
     let domain = host_of(public_url).ok_or_else(|| format!("public url has no host: {public_url}"))?;
     let client = net::middleware_client(http)?;
@@ -120,6 +132,8 @@ pub async fn build_config_with_remote_cache(
             app: context,
             public_url: Arc::from(public_url.trim_end_matches('/')),
             registrations_open,
+            license_policy: Arc::from(license_policy),
+            place_policy: Arc::from(place_policy),
             site_title: Arc::from(site_title),
             site_description: Arc::from(site_description),
             http: Arc::new(http.clone()),

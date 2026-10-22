@@ -6,6 +6,7 @@
 
 pub mod accounts;
 pub mod admin_accounts;
+pub mod admin_emoji;
 pub mod admin_infra;
 pub mod admin_reports;
 pub mod admin_trends;

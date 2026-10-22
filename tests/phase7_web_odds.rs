@@ -324,6 +324,7 @@ async fn web_embeds_local_remote_and_auth_paths() {
         mention_uris: Vec::new(),
         tags: Vec::new(),
         attachments: Vec::new(),
+        location: None,
         emojis: Vec::new(),
         quote_uri: None,
         poll: None,

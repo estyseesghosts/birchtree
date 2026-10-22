@@ -553,6 +553,13 @@ pub fn apply(db: &Database) -> Result<u64, StoreError> {
             let _ = write.open_table(schema::WEBAUTHN_CHALLENGES)?;
         }
 
+        // Step v22 (Stage 1 CORE-P, rebased: was v18).
+        if current < 22 {
+            let _ = write.open_table(schema::PLACES)?;
+            let _ = write.open_table(schema::PLACES_BY_NAME)?;
+            let _ = write.open_table(schema::STATUSES)?;
+        }
+
         {
             let mut meta = write.open_table(META)?;
             meta.insert(

@@ -381,6 +381,8 @@ pub fn build_router_with_probes(state: ApiState, probes: RuntimeProbes) -> Route
         .route("/api/v1/admin/reports/:id/unassign", post(endpoints::admin_reports::unassign))
         .route("/api/v1/admin/reports/:id/reopen", post(endpoints::admin_reports::reopen))
         .route("/api/v1/admin/reports/:id/resolve", post(endpoints::admin_reports::resolve))
+        .route("/api/v1/admin/custom_emojis", get(endpoints::admin_emoji::index).post(endpoints::admin_emoji::create))
+        .route("/api/v1/admin/custom_emojis/:shortcode", put(endpoints::admin_emoji::update).delete(endpoints::admin_emoji::destroy))
         .merge(endpoints::admin_infra::routes())
         // Trends (Phase 7.3): public approved-only reads.
         .route("/api/v1/trends", get(endpoints::trends::trends_alias))

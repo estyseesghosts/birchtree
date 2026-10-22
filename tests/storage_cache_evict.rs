@@ -369,6 +369,7 @@ fn metadata_first_records_source_without_bytes() {
             account_id: account.id,
             r#type: "image".to_string(),
             description: String::new(),
+            license: None,
         })
         .expect("media row");
 

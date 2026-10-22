@@ -163,6 +163,10 @@ pub struct AccountProfileUpdate {
     pub attribution_domains: Option<Vec<String>>,
     /// Automated account flag (`update_credentials[bot]`).
     pub bot: Option<bool>,
+    /// Core extension CORE-L: author's default license (`None` leaves it
+    /// unchanged; `Some(None)` clears; `Some(Some(id))` sets; validated
+    /// before the store call).
+    pub default_license: Option<Option<u8>>,
     /// Avatar slot: `None` = unchanged, `Some(None)` = clear back to the
     /// default, `Some(Some(data))` = reference the staged blob.
     pub avatar: Option<Option<ProfileImageData>>,
@@ -522,6 +526,8 @@ pub struct NewStatus {
     pub in_reply_to_account_id: Option<Id>,
     /// Attached media ids, in the author's order.
     pub media_ids: Vec<Id>,
+    /// Core extension CORE-P: attached place id (`None` = no place).
+    pub place_id: Option<Id>,
     /// Resolved mention account ids, in mention order (serialized).
     pub mentions: Vec<Id>,
     /// Resolved silent mentions (quote access grants): visibility only.
@@ -561,6 +567,9 @@ pub struct StatusUpdate {
     pub sensitive: Option<bool>,
     pub language: Option<String>,
     pub media_ids: Option<Vec<Id>>,
+    /// Core extension CORE-P: replace the attached place (`None` leaves it
+    /// unchanged; `Some(None)` clears; `Some(Some(id))` sets).
+    pub place_id: Option<Option<Id>>,
     /// Replace poll options/multiple (resets all votes, per Mastodon).
     pub poll: Option<NewPollSpec>,
     /// Extend poll expiry without resetting votes.
@@ -1650,6 +1659,10 @@ pub struct NewMedia {
     /// One of `unknown`/`image`/`gifv`/`video`/`audio`.
     pub r#type: String,
     pub description: String,
+    /// Core extension CORE-L: Pixelfed license id (validated before the
+    /// store call; `None` = all rights reserved). Already policy-gated by
+    /// the caller (`off` stores `None`).
+    pub license: Option<u8>,
 }
 
 /// An uploaded attachment whose bytes are already staged in the blob store.
@@ -1678,6 +1691,10 @@ pub struct NewMediaUpload {
     pub duration_ms: Option<u64>,
     pub frame_rate: Option<String>,
     pub bitrate: Option<u64>,
+    /// Core extension CORE-L: Pixelfed license id (validated before the
+    /// store call; `None` = all rights reserved). Already policy-gated by
+    /// the caller (`off` stores `None`).
+    pub license: Option<u8>,
 }
 
 /// Processing result committed by the `ProcessMedia` job (idempotent).
@@ -1707,6 +1724,27 @@ pub struct MediaPatch {
     pub focus: Option<Option<crate::domain::FocusPoint>>,
     /// Replace the cover image blob key (`None` leaves it unchanged).
     pub thumbnail_key: Option<Option<String>>,
+    /// Core extension CORE-L: replace the license (`None` leaves it
+    /// unchanged; `Some(None)` clears to all-rights).
+    pub license: Option<Option<u8>>,
+}
+
+/// Core extension CORE-P: the place registry (`places` / `places_by_name`,
+/// schema v22 — renumbered from v18). Places are seeded by tests/operators
+/// and remote ingest; there is no public proximity/discover/geo-search
+/// surface (stub).
+pub trait PlaceStore: Send + Sync {
+    /// Validate and upsert a place row + its name-index entry in ONE
+    /// transaction, returning the stored row.
+    fn upsert_place(&self, place: crate::domain::Place) -> Result<crate::domain::Place>;
+    /// Read a place row by id.
+    fn place_by_id(&self, id: Id) -> Result<Option<crate::domain::Place>>;
+    /// Places by id in ONE transaction (page loader; missing ids omitted).
+    fn places_by_ids(&self, ids: &[Id]) -> Result<HashMap<Id, crate::domain::Place>>;
+    /// Link a validated remote place: a same-name local row wins (returned
+    /// as-is, so remote input can neither hijack nor duplicate local
+    /// names); otherwise mint a local row in ONE transaction.
+    fn link_remote_place(&self, place: &crate::domain::Place) -> Result<crate::domain::Place>;
 }
 
 pub trait MediaStore: Send + Sync {
@@ -1960,6 +1998,8 @@ pub trait EmojiStore: Send + Sync {
     /// Listed emoji (index endpoint; local + enabled + picker-visible),
     /// shortcode order, bounded.
     fn listed_emojis(&self, cap: usize) -> Result<Vec<CustomEmoji>>;
+    /// Every emoji row (operator listing; shortcode order, bounded).
+    fn all_emojis(&self, cap: usize) -> Result<Vec<CustomEmoji>>;
     /// Emoji whose shortcode is in `shortcodes` (status/account payloads).
     fn emojis_by_shortcodes(&self, shortcodes: &[String]) -> Result<Vec<CustomEmoji>>;
     /// Upsert one remote emoji row (federation tail, G-D ingest).
@@ -2450,6 +2490,7 @@ pub trait Store:
     + QuoteStore
     + NotificationStore
     + MediaStore
+    + PlaceStore
     + ListStore
     + MarkerStore
     + SuggestionStore
@@ -2486,6 +2527,7 @@ impl<T> Store for T where
         + QuoteStore
         + NotificationStore
         + MediaStore
+        + PlaceStore
         + ListStore
         + MarkerStore
         + SuggestionStore

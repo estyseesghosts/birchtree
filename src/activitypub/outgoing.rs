@@ -60,8 +60,15 @@ fn mention_uris(store: &dyn Store, ids: &[Id]) -> Result<Vec<String>> {
 /// A local status as an ActivityStreams `Note`, with its audience, mentions,
 /// hashtags, attachments, quote and language. A status with a poll is a
 /// `Question` instead (Mastodon serves the poll in place of the Note).
-pub fn note_for_status(store: &dyn Store, public_url: &str, status: &Status, now_ms: u64) -> Result<Value> {
-    let mut note = note_inner(store, public_url, status)?;
+pub fn note_for_status(
+    store: &dyn Store,
+    public_url: &str,
+    status: &Status,
+    now_ms: u64,
+    license_policy: &str,
+    place_policy: &str,
+) -> Result<Value> {
+    let mut note = note_inner(store, public_url, status, license_policy, place_policy)?;
     if let Some(poll) = store.poll_by_status(status.id)? {
         apply_question(&mut note, &poll, now_ms);
     }
@@ -77,8 +84,10 @@ pub fn question_for_status(
     status: &Status,
     poll: &Poll,
     now_ms: u64,
+    license_policy: &str,
+    place_policy: &str,
 ) -> Result<Value> {
-    let mut note = note_inner(store, public_url, status)?;
+    let mut note = note_inner(store, public_url, status, license_policy, place_policy)?;
     apply_question(&mut note, poll, now_ms);
     Ok(note)
 }
@@ -112,7 +121,13 @@ fn apply_question(note: &mut Value, poll: &Poll, now_ms: u64) {
     }
 }
 
-fn note_inner(store: &dyn Store, public_url: &str, status: &Status) -> Result<Value> {
+fn note_inner(
+    store: &dyn Store,
+    public_url: &str,
+    status: &Status,
+    license_policy: &str,
+    place_policy: &str,
+) -> Result<Value> {
     let author = store
         .account_by_id(status.account_id)?
         .ok_or_else(|| Error::NotFound("status author".into()))?;
@@ -153,6 +168,13 @@ fn note_inner(store: &dyn Store, public_url: &str, status: &Status) -> Result<Va
                 doc["width"] = json!(w);
                 doc["height"] = json!(h);
             }
+            // Core extension CORE-L: `license` renders only when the
+            // policy is enabled (absent means all-rights).
+            if license_policy != "off"
+                && let Some(license) = m.license
+            {
+                doc["license"] = json!(license);
+            }
             doc
         })
         .collect();
@@ -183,6 +205,26 @@ fn note_inner(store: &dyn Store, public_url: &str, status: &Status) -> Result<Va
     if let Some(language) = &status.language {
         note["contentMap"] = json!({ language: status.content_html });
     }
+    // Core extension CORE-P: `location` renders only when the policy is
+    // enabled. `id` is the sender-local numeric id (opaque to receivers).
+    if place_policy != "off"
+        && let Some(place_id) = status.place_id
+        && let Some(place) = store.place_by_id(place_id)?
+    {
+        let mut location = json!({
+            "type": "Place",
+            "id": place.id.to_string(),
+            "name": place.name,
+            "longitude": place.lon,
+            "latitude": place.lat,
+        });
+        location["country"] = place
+            .country
+            .clone()
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null);
+        note["location"] = location;
+    }
     if let Some(quote) = store.quote_by_quoting(status.id)? {
         if let Some(quoted) = store.status_by_id(quote.quoted_status_id)? {
             if !matches!(quote.state, QuoteState::Rejected | QuoteState::Revoked | QuoteState::Deleted) {
@@ -208,8 +250,15 @@ fn mention_name(store: &dyn Store, actor_uri: &str) -> Result<String> {
 }
 
 /// `Create` of a local status (a `Question` when it has a poll).
-pub fn create(store: &dyn Store, public_url: &str, status: &Status, now_ms: u64) -> Result<Value> {
-    let note = note_for_status(store, public_url, status, now_ms)?;
+pub fn create(
+    store: &dyn Store,
+    public_url: &str,
+    status: &Status,
+    now_ms: u64,
+    license_policy: &str,
+    place_policy: &str,
+) -> Result<Value> {
+    let note = note_for_status(store, public_url, status, now_ms, license_policy, place_policy)?;
     Ok(json!({
         "@context": context(),
         "id": format!("{}/activity", status.uri),
@@ -222,8 +271,15 @@ pub fn create(store: &dyn Store, public_url: &str, status: &Status, now_ms: u64)
 }
 
 /// `Update` of a local status's Note.
-pub fn update(store: &dyn Store, public_url: &str, status: &Status, now_ms: u64) -> Result<Value> {
-    let note = note_for_status(store, public_url, status, now_ms)?;
+pub fn update(
+    store: &dyn Store,
+    public_url: &str,
+    status: &Status,
+    now_ms: u64,
+    license_policy: &str,
+    place_policy: &str,
+) -> Result<Value> {
+    let note = note_for_status(store, public_url, status, now_ms, license_policy, place_policy)?;
     let stamp = status.edited_at_ms.unwrap_or(status.created_at_ms);
     Ok(json!({
         "@context": context(),
@@ -239,11 +295,18 @@ pub fn update(store: &dyn Store, public_url: &str, status: &Status, now_ms: u64)
 /// `Update` of a local poll's Question, sent as votes arrive and at expiry.
 /// The id carries the send time (not the status edit time), so every new
 /// tally is a distinct activity for the origin's dedup.
-pub fn question_update(store: &dyn Store, public_url: &str, status: &Status, now_ms: u64) -> Result<Value> {
+pub fn question_update(
+    store: &dyn Store,
+    public_url: &str,
+    status: &Status,
+    now_ms: u64,
+    license_policy: &str,
+    place_policy: &str,
+) -> Result<Value> {
     let poll = store
         .poll_by_status(status.id)?
         .ok_or_else(|| Error::NotFound("poll of status".into()))?;
-    let question = question_for_status(store, public_url, status, &poll, now_ms)?;
+    let question = question_for_status(store, public_url, status, &poll, now_ms, license_policy, place_policy)?;
     Ok(json!({
         "@context": context(),
         "id": format!("{}#updates/{}", status.uri, now_ms),
@@ -420,11 +483,20 @@ pub fn flag(author: &Account, target: &Account, status_uris: &[String], comment:
 }
 
 /// The `QuoteRequest` of a quote of a remote status, sent to the quoted author.
-pub fn quote_request(store: &dyn Store, public_url: &str, quote_uri: &str, quoting: &Status, quoted: &Status, now_ms: u64) -> Result<Value> {
+pub fn quote_request(
+    store: &dyn Store,
+    public_url: &str,
+    quote_uri: &str,
+    quoting: &Status,
+    quoted: &Status,
+    now_ms: u64,
+    license_policy: &str,
+    place_policy: &str,
+) -> Result<Value> {
     let author = store
         .account_by_id(quoting.account_id)?
         .ok_or_else(|| Error::NotFound("quoting author".into()))?;
-    let instrument = note_for_status(store, public_url, quoting, now_ms)?;
+    let instrument = note_for_status(store, public_url, quoting, now_ms, license_policy, place_policy)?;
     Ok(json!({
         "@context": context(),
         "id": quote_uri,

@@ -77,6 +77,7 @@ fn stage_pending(
                 duration_ms: None,
                 frame_rate: None,
                 bitrate: None,
+                license: None,
             },
             T0,
         )
@@ -141,6 +142,9 @@ fn staging_sweep_clears_terminal_rows_and_spares_pending() {
         None,
         false,
         16 * 1024 * 1024,
+        "off",
+        None,
+        "off",
     )
     .expect("upload");
     assert_eq!(ready.state, MediaState::Ready);

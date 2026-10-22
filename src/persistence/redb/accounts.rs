@@ -181,6 +181,7 @@ impl AccountStore for RedbStore {
             header_key: None,
             header_content_type: None,
             header_description: String::new(),
+            default_license: None,
             created_at_ms: input.now_ms,
         };
         let user = LocalUser {
@@ -489,6 +490,9 @@ impl AccountStore for RedbStore {
         }
         if let Some(description) = update.header_description {
             account.header_description = description;
+        }
+        if let Some(license) = update.default_license {
+            account.default_license = license;
         }
         {
             let mut accounts = write.open_table(ACCOUNTS)?;

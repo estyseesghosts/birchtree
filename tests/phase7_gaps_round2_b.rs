@@ -268,6 +268,10 @@ fn post_direct(srv: &TestServer, author: Id, text: &str, language: Option<&str>,
             idempotency_key: None,
         },
         500,
+        "off",
+        "off",
+        None,
+        "off",
     )
     .expect("create status")
     .status

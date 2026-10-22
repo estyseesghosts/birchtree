@@ -138,6 +138,7 @@ fn upsert_remote_txn(
                 header_key: None,
                 header_content_type: None,
                 header_description: String::new(),
+                default_license: None,
                 created_at_ms: now_ms,
             }
         }

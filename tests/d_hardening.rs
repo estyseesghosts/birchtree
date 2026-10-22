@@ -348,6 +348,10 @@ fn post_status(store: &RedbStore, account: Id, text: &str) -> birchtree::domain:
             idempotency_key: None,
         },
         500,
+        "off",
+        "off",
+        None,
+        "off",
     )
     .map(|created| created.status.id)
 }

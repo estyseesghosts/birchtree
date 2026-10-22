@@ -84,6 +84,7 @@ fn remote_note(author: Id, uri: &str, visibility: Visibility) -> RemoteNote {
         mention_uris: Vec::new(),
         tags: Vec::new(),
         attachments: Vec::new(),
+        location: None,
         emojis: Vec::new(),
         quote_uri: None,
         poll: None,
@@ -184,6 +185,7 @@ fn remote_public_keeps_only_media_and_visibility_gating() {
         source_url: "https://remote.example/media/1.png".into(),
         media_type: "image/png".into(),
         description: String::new(),
+        license: None,
     });
     let with_media =
         inbound::ingest_note(&*store, with_media_note, None, now_ms()).expect("ingest").status;
@@ -407,6 +409,7 @@ async fn streaming_public_remote_media_variant_needs_an_attachment() {
         source_url: "https://remote.example/media/2.png".into(),
         media_type: "image/png".into(),
         description: String::new(),
+        license: None,
     });
     let with_media =
         inbound::ingest_note(&*store, media_note, None, now_ms()).expect("ingest").status;

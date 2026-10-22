@@ -603,6 +603,7 @@ impl StatusStore for RedbStore {
             in_reply_to_account_id: input.in_reply_to_account_id,
             reblog_of_id: None,
             media_ids: input.media_ids.clone(),
+            place_id: input.place_id,
             poll_id,
             // The use case normalizes a non-default policy through
             // `set_quote_policy` after creation; the store derives nothing.
@@ -815,6 +816,7 @@ impl StatusStore for RedbStore {
             .tags
             .as_ref()
             .is_some_and(|tags| *tags != status.tags);
+        let place_changed = update.place_id.is_some_and(|place| place != status.place_id);
         let changed = source_changed
             || html_changed
             || spoiler_changed
@@ -822,6 +824,7 @@ impl StatusStore for RedbStore {
             || language_changed
             || media_changed
             || tags_changed
+            || place_changed
             || poll_changed;
         if !changed {
             return Ok(None);
@@ -927,6 +930,9 @@ impl StatusStore for RedbStore {
         }
         if media_changed {
             status.media_ids = new_media;
+        }
+        if let Some(place) = update.place_id {
+            status.place_id = place;
         }
         // -- Tags: replace the stored list and move the hashtag-index keys
         // in this same transaction (bug 4: edits used to leave both stale).
@@ -1607,6 +1613,7 @@ impl StatusStore for RedbStore {
             in_reply_to_account_id: None,
             reblog_of_id: Some(target.id),
             media_ids: Vec::new(),
+            place_id: None,
             poll_id: None,
             quote_policy: QuotePolicy::Nobody,
             mentions: Vec::new(),

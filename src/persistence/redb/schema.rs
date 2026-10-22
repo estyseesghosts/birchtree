@@ -646,6 +646,13 @@ pub fn webauthn_account_key(account_id: u64, credential_id: &[u8]) -> Vec<u8> {
 pub const WEBAUTHN_CHALLENGES: TableDefinition<&str, &[u8]> =
     TableDefinition::new("webauthn_challenges");
 
+/// Core extensions (Stage 1): places stub (schema v22).
+/// Places by numeric place id -> JSON `Place`.
+pub const PLACES: TableDefinition<u64, &[u8]> = TableDefinition::new("places");
+
+/// Place lookup by name (unique): `name_utf8` -> place id.
+pub const PLACES_BY_NAME: TableDefinition<&str, u64> = TableDefinition::new("places_by_name");
+
 /// Fixed 16-byte membership key `(collection_id_be || item_id_be)`.
 pub fn collection_item_key(collection_id: u64, item_id: u64) -> [u8; 16] {
     pair_key(collection_id, item_id)
@@ -679,7 +686,7 @@ pub fn rule_translation_key(rule_id: u64, locale: &str) -> String {
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// Current schema version. Bump with a new migration step.
-pub const SCHEMA_VERSION: u64 = 21;
+pub const SCHEMA_VERSION: u64 = 22;
 
 /// All table names, for diagnostics and migration verification.
 pub const TABLE_NAMES: &[&str] = &[
@@ -793,6 +800,8 @@ pub const TABLE_NAMES: &[&str] = &[
     "webauthn_creds",
     "webauthn_by_account",
     "webauthn_challenges",
+    "places",
+    "places_by_name",
 ];
 
 /// Build the fixed 16-byte scheduling key used by [`JOBS_INDEX`].

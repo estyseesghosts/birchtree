@@ -89,6 +89,11 @@ pub struct MediaAttachment {
     /// Processing failure reason (surfaced as the Mastodon processing error).
     #[serde(default)]
     pub error: Option<String>,
+    /// Core extension CORE-L: Pixelfed license id (1,5,6,11-16);
+    /// `None` = all rights reserved / unspecified. Rides inline in the
+    /// `media` JSON blob (schema v17); pre-v17 rows decode as `None`.
+    #[serde(default)]
+    pub license: Option<u8>,
 }
 
 impl MediaAttachment {

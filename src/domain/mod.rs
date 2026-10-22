@@ -19,6 +19,8 @@ pub mod list;
 pub mod notification;
 pub mod poll;
 pub mod media;
+pub mod license;
+pub mod place;
 pub mod filter;
 pub mod marker;
 pub mod scheduled_status;
@@ -62,6 +64,8 @@ pub use notification::{
 pub use poll::{Poll, PollOption, PollVote};
 pub use quote::{QuoteRecord, QuoteState};
 pub use media::{FocusPoint, MediaAttachment, MediaState};
+pub use place::{Place, MAX_PLACE_NAME_CHARS};
+pub use license::{LicenseId, ERR_LICENSE_INVALID, VALID_LICENSES, is_valid_license, parse_license};
 pub use filter::{CustomFilter, FilterAction, FilterKeyword, FilterStatus};
 pub use list::{List, ListMembership, RepliesPolicy};
 pub use marker::Marker;

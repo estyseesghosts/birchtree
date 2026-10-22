@@ -364,6 +364,7 @@ mod tests {
             in_reply_to_account_id: None,
             reblog_of_id: None,
             media_ids: Vec::new(),
+            place_id: None,
             poll_id: None,
             quote_policy: QuotePolicy::default(),
             mentions: Vec::new(),

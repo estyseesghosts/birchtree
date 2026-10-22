@@ -35,7 +35,7 @@ fn cmd(account: Id, text: &str) -> CreateStatusCommand {
 }
 
 fn post(store: &RedbStore, account: Id, text: &str, max_chars: usize) -> Result<Id, String> {
-    statuses::create_status(store, BASE, T0, cmd(account, text), max_chars)
+    statuses::create_status(store, BASE, T0, cmd(account, text), max_chars, "off", "off", None, "off")
         .map(|r| r.status.id)
         .map_err(|e| e.to_string())
 }

@@ -295,7 +295,7 @@ pub async fn note(
     if !matches!(status.visibility, crate::domain::Visibility::Public | crate::domain::Visibility::Unlisted) {
         return Err(not_found("status"));
     }
-    let mut note = crate::activitypub::outgoing::note_for_status(&*data.app.store, &data.public_url, &status, data.app.now_ms())?;
+    let mut note = crate::activitypub::outgoing::note_for_status(&*data.app.store, &data.public_url, &status, data.app.now_ms(), &data.license_policy, &data.place_policy)?;
     note["@context"] = crate::activitypub::outgoing::context();
     Ok(FederationJson(note).into_response())
 }
@@ -561,7 +561,7 @@ pub async fn outbox(
         if let Some(status) = store.status_by_id(id)? {
             if status.visibility == crate::domain::Visibility::Public {
                 item_ids.push(status.id);
-                items.push(crate::activitypub::outgoing::create(store, &data.public_url, &status, data.app.now_ms())?);
+                items.push(crate::activitypub::outgoing::create(store, &data.public_url, &status, data.app.now_ms(), &data.license_policy, &data.place_policy)?);
             }
         }
     }

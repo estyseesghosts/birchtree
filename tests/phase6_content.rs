@@ -108,6 +108,7 @@ fn note(_author_uri: &str, id: &str, text: &str, _to: &str) -> RemoteNote {
         mention_uris: Vec::new(),
         tags: Vec::new(),
         attachments: Vec::new(),
+        location: None,
         emojis: Vec::new(),
         quote_uri: None,
         poll: None,
@@ -187,6 +188,7 @@ fn an_attachment_is_a_pending_row_that_stages_once() {
         source_url: "https://remote.example/media/1.png".into(),
         media_type: "image/png".into(),
         description: "a picture".into(),
+        license: None,
     }];
     let ingested = inbound::ingest_note(&*store, n, None, now_ms()).unwrap();
     let media_id = ingested.status.media_ids[0];
@@ -740,7 +742,7 @@ fn outgoing_create_of_a_poll_is_a_question() {
     let (_dir, store) = temp_store();
     let alice = mk_account(&store, "alice");
     let status = local_poll(&store, alice.id, "tea or coffee?", &["tea", "coffee"], now_ms() + 3_600_000);
-    let body = outgoing::create(&*store, TEST_PUBLIC_URL, &status, now_ms()).expect("create");
+    let body = outgoing::create(&*store, TEST_PUBLIC_URL, &status, now_ms(), "off", "off").expect("create");
     let object = &body["object"];
     assert_eq!(object["type"], "Question");
     assert_eq!(object["oneOf"].as_array().expect("oneOf").len(), 2);
@@ -774,6 +776,7 @@ fn outgoing_vote_names_the_choice_and_the_poll() {
             mention_uris: Vec::new(),
             tags: Vec::new(),
             attachments: Vec::new(),
+            location: None,
             emojis: Vec::new(),
             quote_uri: None,
             poll: None,
@@ -842,6 +845,7 @@ fn a_question_with_a_future_closed_time_is_not_expired() {
         mention_uris: Vec::new(),
         tags: Vec::new(),
         attachments: Vec::new(),
+        location: None,
         emojis: Vec::new(),
         quote_uri: None,
         poll: None,
@@ -879,6 +883,7 @@ fn a_reblog_wrapper_is_addressed_on_the_booster_domain() {
         mention_uris: Vec::new(),
         tags: Vec::new(),
         attachments: Vec::new(),
+        location: None,
         emojis: Vec::new(),
         quote_uri: None,
         poll: None,

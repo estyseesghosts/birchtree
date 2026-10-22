@@ -550,6 +550,7 @@ fn quoted_and_quoting(store: &RedbStore, tag: &str, now: u64) -> (Id, Id, bircht
         mention_uris: Vec::new(),
         tags: Vec::new(),
         attachments: Vec::new(),
+        location: None,
         emojis: Vec::new(),
         quote_uri: None,
         poll: None,

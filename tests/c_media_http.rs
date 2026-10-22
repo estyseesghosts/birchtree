@@ -598,6 +598,7 @@ async fn evicted_remote_cache_bytes_answer_404_and_queue_one_refetch() {
             account_id: account.id,
             r#type: "unknown".to_string(),
             description: String::new(),
+            license: None,
         })
         .expect("media row");
     h.store
