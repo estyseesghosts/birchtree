@@ -269,7 +269,7 @@ pub async fn fetch(
                         size: bytes.len() as u64,
                         last_use_ms: now,
                         expiry_ms: now.saturating_add(
-                            MediaClass::Full.retention_ms(&RemoteCacheConfig::default()),
+                            MediaClass::Full.retention_ms(&ctx.remote_cache),
                         ),
                         etag: None,
                         has_bytes: true,
@@ -463,6 +463,22 @@ pub async fn fetch(
                 ));
             }
         };
+        // Classify AFTER the sniff, never assume `Full`: audio/video
+        // originals are `Stream` — served on demand, never persisted. A
+        // Stream outcome releases the reservation, drops the download and
+        // fails the row with a clear non-persist reason (terminal): no
+        // cache blob is created and `stored_full` never moves.
+        // `reserve(Stream)` is never called (it refuses loudly by design).
+        let class = remote_cache::class_for_fetch(sniffed.mime_type, ATTACHMENT_VARIANT);
+        if class == MediaClass::Stream {
+            let _ = std::fs::remove_file(&tmp);
+            if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
+                release(&mut ledger, reserved);
+            }
+            let reason = "remote audio/video streams from its origin and is never cached";
+            let _ = store.mark_remote_media_failed(media_id, reason, ctx.app.now_ms());
+            return Err(DeliveryError::Quarantine(reason.into()));
+        }
         // Publish first, then settle the reservation into stored bytes: a
         // crash between leaves at most an uncounted orphan blob for the
         // reconciler, never counted bytes without a blob.
@@ -474,7 +490,15 @@ pub async fn fetch(
             DeliveryError::Retry(e.to_string())
         })?;
         // Settle the reservation into stored bytes, then stage the row (which
-        // enqueues `ProcessMedia`, preserving the existing chain).
+        // enqueues `ProcessMedia`, preserving the existing chain). The
+        // durable byte row lands BEFORE the ledger settlement (mapping +
+        // counters in one transaction): admission eviction and scheduled
+        // maintenance select victims from these rows, so bytes without a
+        // row could never be freed. A crash between the row and the ledger
+        // commit leaves a counted row the next restore adopts.
+        store
+            .cache_mark_stored(&source, ATTACHMENT_VARIANT, &key, staged, None, now)
+            .map_err(retry)?;
         let entry = remote_cache::RemoteCacheEntry::stored(
             &source,
             ATTACHMENT_VARIANT,
@@ -482,7 +506,7 @@ pub async fn fetch(
             &key,
             staged,
             now,
-            &RemoteCacheConfig::default(),
+            &ctx.remote_cache,
         );
         if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
             if let Err(err) = ledger.commit(MediaClass::Full, reserved, entry) {
@@ -562,6 +586,17 @@ pub async fn fetch(
             ));
         }
     };
+    // Same classification as the streamed path: audio/video originals are
+    // `Stream` and are never persisted (no reserve, no put, no commit).
+    if remote_cache::class_for_fetch(sniffed.mime_type, ATTACHMENT_VARIANT) == MediaClass::Stream
+    {
+        if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
+            release(&mut ledger, reserved);
+        }
+        let reason = "remote audio/video streams from its origin and is never cached";
+        let _ = store.mark_remote_media_failed(media_id, reason, ctx.app.now_ms());
+        return Err(DeliveryError::Quarantine(reason.into()));
+    }
 
     cache_store(ctx).put(&key, &body).map_err(|e| {
         if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
@@ -570,7 +605,18 @@ pub async fn fetch(
         DeliveryError::Retry(e.to_string())
     })?;
     // Settle the reservation into stored bytes, then stage the row (which
-    // enqueues `ProcessMedia`, preserving the existing chain).
+    // enqueues `ProcessMedia`, preserving the existing chain). Durable byte
+    // row first, ledger settlement second (see the streamed path above).
+    store
+        .cache_mark_stored(
+            &source,
+            ATTACHMENT_VARIANT,
+            &key,
+            body.len() as u64,
+            None,
+            now,
+        )
+        .map_err(retry)?;
     let entry = remote_cache::RemoteCacheEntry::stored(
         &source,
         ATTACHMENT_VARIANT,
@@ -578,7 +624,7 @@ pub async fn fetch(
         &key,
         body.len() as u64,
         now,
-        &RemoteCacheConfig::default(),
+        &ctx.remote_cache,
     );
     if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
         if let Err(err) = ledger.commit(MediaClass::Full, reserved, entry) {
