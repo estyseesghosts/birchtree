@@ -2,15 +2,19 @@
 //! HTTP client, and the federation job handlers (events, delivery, threads,
 //! remote media). Protocol shapes live in `activitypub/`; business rules live
 //! in `application/`.
+pub mod dedup;
 pub mod delivery;
+pub mod delivery_send;
 pub mod events;
+pub mod events_build;
 pub mod media;
+pub mod media_fetch;
 pub mod net;
 pub mod policy;
 pub mod preview;
-pub mod threads;
-pub mod tombstone;
+pub mod remote_media;
 pub mod resolver;
 pub mod retry;
-pub mod dedup;
-pub mod remote_media;
+pub mod threads;
+pub mod threads_auth;
+pub mod tombstone;
