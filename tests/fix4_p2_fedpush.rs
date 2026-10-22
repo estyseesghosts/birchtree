@@ -34,9 +34,10 @@ use birchtree::activitypub::wire::{
 };
 use birchtree::api::mastodon::endpoints::reports::report_category;
 use birchtree::application::push::{
-    build_push_request, classify_push_response, deliver_push, PushOutcome,
+    build_push_request, classify_push_response, deliver_push_with_policy, PushOutcome,
     VapidKeys, VAPID_JWT_LIFETIME_SECS,
 };
+use birchtree::application::push_client::PushClientConfig;
 use birchtree::domain::{Id, Visibility};
 use birchtree::federation::dedup::{entry_live, prune_cutoff_ms, DEDUP_TTL_MS};
 use birchtree::streaming::channels::{Channel, Params, StreamKind};
@@ -140,7 +141,6 @@ async fn push_unsubscribe_url_header_sent_when_set() {
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
 
-    let client = reqwest::Client::new();
     let keys = vapid_keys();
     let endpoint = format!("http://{addr}/push");
 
@@ -148,12 +148,16 @@ async fn push_unsubscribe_url_header_sent_when_set() {
     let mut request = build_push_request(&test_subscription(&endpoint), &keys, "mailto:a@b.c", 1_700_000_000_000)
         .expect("request");
     assert!(request.unsubscribe_url.is_none());
-    assert_eq!(deliver_push(&client, &request).await, PushOutcome::Delivered);
+    // Lab loopback policy (prod-2 item 1): production default-deny refuses
+    // `http://127.0.0.1`, so loopback delivery pins the lab policy explicitly.
+    let lab = PushClientConfig::lab_loopback();
+    let lab_client = birchtree::application::push_client::build_push_client(&lab).expect("lab client");
+    assert_eq!(deliver_push_with_policy(&lab_client, &request, &lab).await, PushOutcome::Delivered);
     assert_eq!(*seen.lock().unwrap(), Some(None));
 
     // Set: the header goes out verbatim.
     request.unsubscribe_url = Some("https://example.social/api/web/push_subscriptions/token123".into());
-    assert_eq!(deliver_push(&client, &request).await, PushOutcome::Delivered);
+    assert_eq!(deliver_push_with_policy(&lab_client, &request, &lab).await, PushOutcome::Delivered);
     assert_eq!(
         *seen.lock().unwrap(),
         Some(Some("https://example.social/api/web/push_subscriptions/token123".to_string()))

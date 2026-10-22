@@ -72,11 +72,26 @@ async fn user_token(srv: &TestServer, username: &str, scopes: &str) -> String {
 
 /// Run every pending durable job once (notifications are post-commit work).
 fn drain_jobs(srv: &TestServer) {
+    use birchtree::domain::JobKind;
     let mail = birchtree::mail::LoggingMailSender::default();
     // A far-future clock claims every due job (the lease math needs headroom).
     for job in srv.store.claim_due(4_000_000_000_000, 64).unwrap() {
-        handlers::handle(&job, &*srv.store, &mail, &*srv.blobs, &birchtree::application::ports::NoStreaming).unwrap();
-        srv.store.complete(job.id).unwrap();
+        match job.kind {
+            // Fail-closed mail (prod-2 item 4): without an SMTP provider the
+            // confirmation job must refuse (never `Ok`). Complete it here so
+            // unrelated notification jobs still run in the harness.
+            JobKind::SendConfirmationEmail | JobKind::SendPasswordResetEmail => {
+                assert!(
+                    handlers::handle(&job, &*srv.store, &mail, &*srv.blobs, &birchtree::application::ports::NoStreaming).is_err(),
+                    "mail without a provider must refuse"
+                );
+                srv.store.complete(job.id).unwrap();
+            }
+            _ => {
+                handlers::handle(&job, &*srv.store, &mail, &*srv.blobs, &birchtree::application::ports::NoStreaming).unwrap();
+                srv.store.complete(job.id).unwrap();
+            }
+        }
     }
 }
 

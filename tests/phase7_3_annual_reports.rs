@@ -146,18 +146,36 @@ async fn post_empty(router: &axum::Router, uri: &str, token: Option<&str>) -> (S
 /// Run every pending durable job once (the generation job included).
 fn run_jobs(h: &Harness) {
     use birchtree::domain::Clock;
+    use birchtree::domain::JobKind;
     let now = birchtree::domain::SystemClock.now_ms();
     let mail = birchtree::mail::LoggingMailSender::default();
     for job in h.srv.store.claim_due(now, 64).unwrap() {
-        birchtree::jobs::handlers::handle(
-            &job,
-            &*h.srv.store,
-            &mail,
-            &*h.srv.blobs,
-            &birchtree::application::ports::NoStreaming,
-        )
-        .unwrap();
-        h.srv.store.complete(job.id).unwrap();
+        match job.kind {
+            // Fail-closed mail (prod-2 item 4): without SMTP the job refuses;
+            // complete it so the generation job still runs.
+            JobKind::SendConfirmationEmail | JobKind::SendPasswordResetEmail => {
+                assert!(birchtree::jobs::handlers::handle(
+                    &job,
+                    &*h.srv.store,
+                    &mail,
+                    &*h.srv.blobs,
+                    &birchtree::application::ports::NoStreaming,
+                )
+                .is_err());
+                h.srv.store.complete(job.id).unwrap();
+            }
+            _ => {
+                birchtree::jobs::handlers::handle(
+                    &job,
+                    &*h.srv.store,
+                    &mail,
+                    &*h.srv.blobs,
+                    &birchtree::application::ports::NoStreaming,
+                )
+                .unwrap();
+                h.srv.store.complete(job.id).unwrap();
+            }
+        }
     }
 }
 

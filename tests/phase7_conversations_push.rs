@@ -665,7 +665,10 @@ async fn push_delivery_sends_vapid_tickle_and_classifies() {
     use birchtree::domain::WebPushSubscription;
 
     let keys = fake_vapid();
-    let client = reqwest::Client::new();
+    // Lab loopback policy (prod-2 item 1): production default-deny refuses
+    // `http://127.0.0.1`, so this loopback delivery pins the lab policy.
+    let lab = birchtree::application::push_client::PushClientConfig::lab_loopback();
+    let client = birchtree::application::push_client::build_push_client(&lab).expect("lab client");
 
     // 201: delivered; the request carries the VAPID headers and no body.
     let (addr, captured, handle) = fake_push_endpoint(201).await;
@@ -686,7 +689,7 @@ async fn push_delivery_sends_vapid_tickle_and_classifies() {
     };
     let request =
         push_app::build_push_request(&sub, &keys, "mailto:admin@example.social", T0).expect("request");
-    assert_eq!(push_app::deliver_push(&client, &request).await, push_app::PushOutcome::Delivered);
+    assert_eq!(push_app::deliver_push_with_policy(&client, &request, &lab).await, push_app::PushOutcome::Delivered);
     let seen = captured.lock().unwrap().clone().expect("captured");
     assert!(seen.authorization.starts_with("vapid t="), "{}", seen.authorization);
     assert!(seen.authorization.contains(", k="), "{}", seen.authorization);
@@ -706,29 +709,61 @@ async fn push_delivery_sends_vapid_tickle_and_classifies() {
 
 #[tokio::test]
 async fn push_job_end_to_end_through_fake_endpoint() {
+    use birchtree::application::push::PushSubscriptionStore;
     let srv = TestServer::new(true);
     let alice = token(&srv, "alice", "read write write:statuses");
     let bob = token(&srv, "bob", "read push read:notifications write:notifications");
+    let bob_account = srv
+        .store
+        .account_by_handle("bob", "example.social")
+        .expect("store")
+        .expect("bob");
     let (p256dh, auth_key) = test_push_keys();
 
     // Bob subscribes, pointed at a fake endpoint that answers 410 (gone).
+    // Direct store insert: the API's production SSRF validation refuses
+    // `http://127.0.0.1` (prod-2 item 1), so loopback delivery tests bypass
+    // it and pin the lab policy at delivery time instead.
     let (addr, _captured, handle) = fake_push_endpoint(410).await;
     let endpoint = format!("http://{addr}/sub");
-    let (status, created) = call(
-        &srv,
-        "POST",
-        "/api/v1/push/subscription",
-        Some(&bob),
-        &push_body(
-            &endpoint,
-            &p256dh,
-            &auth_key,
-            &format!("{}=true", enc("data[alerts][mention]")),
-        ),
+    // Resolve the token row behind `bob_token` via the auth store: the helper
+    // `token()` issues through `auth::issue_user_token`, so look it up by
+    // listing tokens is overkill — instead upsert against any token of bob's
+    // by creating a fresh app token row for the subscription binding.
+    let app = birchtree::application::auth::register_app(
+        &*srv.store,
+        "Phase7 push e2e".to_string(),
+        vec!["https://client.example/cb".into()],
+        vec!["read".into()],
+        None,
+        true,
+        T0,
     )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{created}");
-    let sub_id: u64 = created["id"].as_str().unwrap().parse().unwrap();
+    .expect("app");
+    let (_, token_row) = birchtree::application::auth::issue_user_token(
+        &*srv.store,
+        app.app.id,
+        bob_account.id,
+        vec!["read".to_string(), "push".to_string()],
+        T0,
+    )
+    .expect("token");
+    let sub = srv
+        .store
+        .upsert_push_subscription(
+            token_row.id,
+            bob_account.id,
+            endpoint,
+            p256dh,
+            auth_key,
+            false,
+            "all".to_string(),
+            HashMap::from([("mention".to_string(), true)]),
+            None,
+            T0,
+        )
+        .expect("subscribe");
+    let sub_id = sub.id.value();
 
     // Round 3 area C made the upstream-faithful `private_mentions=filter`
     // default real: a stranger-DM mention now files a notification request
@@ -740,17 +775,33 @@ async fn push_job_end_to_end_through_fake_endpoint() {
     // Alice mentions bob: a Mention notification row exists after the drain.
     let _ = dm(&srv, &alice, "bob", "job hello").await;
     {
+        use birchtree::domain::JobKind;
         let mail = birchtree::mail::LoggingMailSender::default();
         for job in srv.store.claim_due(4_000_000_000_000, 64).unwrap() {
-            birchtree::jobs::handlers::handle(
-                &job,
-                &*srv.store,
-                &mail,
-                &*srv.blobs,
-                &birchtree::application::ports::NoStreaming,
-            )
-            .unwrap();
-            srv.store.complete(job.id).unwrap();
+            match job.kind {
+                JobKind::SendConfirmationEmail | JobKind::SendPasswordResetEmail => {
+                    assert!(birchtree::jobs::handlers::handle(
+                        &job,
+                        &*srv.store,
+                        &mail,
+                        &*srv.blobs,
+                        &birchtree::application::ports::NoStreaming,
+                    )
+                    .is_err());
+                    srv.store.complete(job.id).unwrap();
+                }
+                _ => {
+                    birchtree::jobs::handlers::handle(
+                        &job,
+                        &*srv.store,
+                        &mail,
+                        &*srv.blobs,
+                        &birchtree::application::ports::NoStreaming,
+                    )
+                    .unwrap();
+                    srv.store.complete(job.id).unwrap();
+                }
+            }
         }
     }
     let notifications = srv
@@ -776,18 +827,24 @@ async fn push_job_end_to_end_through_fake_endpoint() {
     // The job sees a gone endpoint and asks for the subscription's deletion.
     // (`now` is the real clock: the store stamps rows with `SystemClock`, so
     // a far-future value would wrongly age the notification past its TTL.)
+    // Lab loopback policy (prod-2 item 1): the fake endpoint is `http://127.0.0.1`,
+    // refused by the production default-deny policy before dialing.
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_millis() as u64;
-    let outcome = push_app::handle_push_job(
+    let lab = birchtree::application::push_client::PushClientConfig::lab_loopback();
+    let lab_client =
+        birchtree::application::push_client::build_push_client(&lab).expect("lab client");
+    let outcome = push_app::handle_push_job_with_policy(
         &*srv.store,
-        &reqwest::Client::new(),
+        &lab_client,
         &fake_vapid(),
         "mailto:admin@example.social",
         birchtree::domain::Id::new(sub_id),
         mention.id,
         now_ms,
+        &lab,
     )
     .await
     .expect("job");

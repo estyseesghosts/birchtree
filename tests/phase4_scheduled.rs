@@ -75,10 +75,21 @@ async fn user_token(srv: &TestServer, username: &str) -> String {
 /// Run every pending durable job once (claiming at a far-future clock so
 /// scheduled rows due later are also claimable when the test wants them).
 fn run_jobs(srv: &TestServer, at_ms: u64) {
+    use birchtree::domain::JobKind;
     let mail = birchtree::mail::LoggingMailSender::default();
     for job in srv.store.claim_due(at_ms, 64).unwrap() {
-        birchtree::jobs::handlers::handle(&job, &*srv.store, &mail, &*srv.blobs, &birchtree::application::ports::NoStreaming).unwrap();
-        srv.store.complete(job.id).unwrap();
+        match job.kind {
+            // Fail-closed mail (prod-2 item 4): without SMTP the job refuses;
+            // complete it so scheduled jobs still run in the harness.
+            JobKind::SendConfirmationEmail | JobKind::SendPasswordResetEmail => {
+                assert!(birchtree::jobs::handlers::handle(&job, &*srv.store, &mail, &*srv.blobs, &birchtree::application::ports::NoStreaming).is_err());
+                srv.store.complete(job.id).unwrap();
+            }
+            _ => {
+                birchtree::jobs::handlers::handle(&job, &*srv.store, &mail, &*srv.blobs, &birchtree::application::ports::NoStreaming).unwrap();
+                srv.store.complete(job.id).unwrap();
+            }
+        }
     }
 }
 

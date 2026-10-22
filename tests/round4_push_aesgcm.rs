@@ -162,6 +162,7 @@ fn url_encode(value: &str) -> String {
 
 fn drain_jobs(srv: &TestServer) {
     use birchtree::application::ports::JobQueue;
+    use birchtree::domain::JobKind;
     let mail = birchtree::mail::LoggingMailSender;
     loop {
         let now = std::time::SystemTime::now()
@@ -174,9 +175,19 @@ fn drain_jobs(srv: &TestServer) {
             break;
         }
         for job in jobs {
-            birchtree::jobs::handlers::handle(&job, &*srv.store, &mail, &*srv.blobs, &srv.streams)
-                .expect("handle job");
-            srv.store.complete(job.id).expect("complete");
+            match job.kind {
+                // Fail-closed mail (prod-2 item 4): without SMTP the job
+                // refuses; complete it so notification jobs still run.
+                JobKind::SendConfirmationEmail | JobKind::SendPasswordResetEmail => {
+                    assert!(birchtree::jobs::handlers::handle(&job, &*srv.store, &mail, &*srv.blobs, &srv.streams).is_err());
+                    srv.store.complete(job.id).expect("complete");
+                }
+                _ => {
+                    birchtree::jobs::handlers::handle(&job, &*srv.store, &mail, &*srv.blobs, &srv.streams)
+                        .expect("handle job");
+                    srv.store.complete(job.id).expect("complete");
+                }
+            }
         }
     }
 }
@@ -513,8 +524,11 @@ async fn legacy_aesgcm_delivery_decrypts() {
     let notification = &notifications[0];
 
     let keys = test_vapid_keys();
-    let client = reqwest::Client::new();
-    let outcome = push_app::handle_push_job(
+    // Lab loopback policy (prod-2 item 1): `http://127.0.0.1` is refused by
+    // the production default-deny policy, so loopback delivery pins lab.
+    let lab = birchtree::application::push_client::PushClientConfig::lab_loopback();
+    let client = birchtree::application::push_client::build_push_client(&lab).expect("lab client");
+    let outcome = push_app::handle_push_job_with_policy(
         &*srv.store,
         &client,
         &keys,
@@ -522,6 +536,7 @@ async fn legacy_aesgcm_delivery_decrypts() {
         sub.id,
         notification.id,
         now_ms(),
+        &lab,
     )
     .await
     .expect("push job");
@@ -652,7 +667,9 @@ async fn corrupt_legacy_keys_drop_subscription() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tickle_for_keyless_legacy_preserved() {
     let keys = test_vapid_keys();
-    let client = reqwest::Client::new();
+    // Lab loopback policy (prod-2 item 1): production refuses loopback.
+    let lab = birchtree::application::push_client::PushClientConfig::lab_loopback();
+    let client = birchtree::application::push_client::build_push_client(&lab).expect("lab client");
     let (addr, captured, handle) = fake_push_endpoint(201).await;
     let sub = birchtree::domain::WebPushSubscription {
         id: birchtree::domain::Id::new(21),
@@ -675,7 +692,7 @@ async fn tickle_for_keyless_legacy_preserved() {
     assert!(request.encryption.is_none(), "tickle has no Encryption header");
     assert!(request.body.is_empty(), "tickle has no body");
     assert_eq!(
-        push_app::deliver_push(&client, &request).await,
+        push_app::deliver_push_with_policy(&client, &request, &lab).await,
         push_app::PushOutcome::Delivered
     );
     let seen = captured.lock().unwrap().clone().expect("captured");

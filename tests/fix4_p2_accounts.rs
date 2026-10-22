@@ -184,17 +184,35 @@ async fn get_ok(srv: &TestServer, path: &str, token: Option<&str>) -> Value {
 
 /// Run every pending durable job once (notifications are post-commit work).
 fn drain_jobs(srv: &TestServer) {
+    use birchtree::domain::JobKind;
     let mail = birchtree::mail::LoggingMailSender::default();
     for job in srv.store.claim_due(4_000_000_000_000, 64).unwrap() {
-        handlers::handle(
-            &job,
-            &*srv.store,
-            &mail,
-            &*srv.blobs,
-            &birchtree::application::ports::NoStreaming,
-        )
-        .unwrap();
-        srv.store.complete(job.id).unwrap();
+        match job.kind {
+            // Fail-closed mail (prod-2 item 4): without SMTP the job refuses;
+            // complete it so notification jobs still run.
+            JobKind::SendConfirmationEmail | JobKind::SendPasswordResetEmail => {
+                assert!(handlers::handle(
+                    &job,
+                    &*srv.store,
+                    &mail,
+                    &*srv.blobs,
+                    &birchtree::application::ports::NoStreaming,
+                )
+                .is_err());
+                srv.store.complete(job.id).unwrap();
+            }
+            _ => {
+                handlers::handle(
+                    &job,
+                    &*srv.store,
+                    &mail,
+                    &*srv.blobs,
+                    &birchtree::application::ports::NoStreaming,
+                )
+                .unwrap();
+                srv.store.complete(job.id).unwrap();
+            }
+        }
     }
 }
 
