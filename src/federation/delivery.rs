@@ -57,12 +57,23 @@ pub const DEST_COOLDOWN_CAP_MS: u64 = 3_600_000;
 pub const DEST_FAILURE_BUDGET: u32 = 10;
 /// Times a job may be parked for a cooling destination before quarantine.
 pub const DEST_MAX_DEFERRALS: u32 = 25;
+/// Times a job may be parked waiting for an earlier sequence before the
+/// ordering relaxes (adversarial-2 N4): past this cap the later send goes out
+/// even though an earlier sequence for the same host is still unfinished, and
+/// the relaxation is logged as `ordering-relaxed`. The operator chose RELAX
+/// AFTER CAP (a permanently failing head must not wedge its host).
+pub const SEQ_PARK_MAX: u32 = 25;
+/// Maximum age of a sequence-park chain before the ordering relaxes, even
+/// when the park count has not hit [`SEQ_PARK_MAX`]. The first park stamps
+/// `seq_park_first_at`; a later park past this age sends ordering-relaxed.
+pub const SEQ_PARK_MAX_AGE_MS: u64 = 600_000;
 /// Delay before a sequence-parked delivery is retried: long enough to let a
 /// just-finished earlier send settle, short enough that a genuinely slow
 /// earlier send only costs a few park cycles. Parking never consumes the
 /// job's retry budget and never quarantines: the blocker always settles
 /// terminally (success, quarantine, or retry-budget exhaustion), so a parked
-/// job always makes progress.
+/// job always makes progress — unless the park cap relaxes the ordering first
+/// (see [`SEQ_PARK_MAX`]).
 pub const SEQ_PARK_DELAY_MS: u64 = 5_000;
 
 /// The cooldown after `failures` consecutive failures: the base, doubled per
@@ -158,12 +169,13 @@ pub fn delivery_order_key(job: &Job) -> Option<(String, String)> {
     Some((host, activity))
 }
 
-/// Stamp a delivery payload with its destination's next monotonic sequence
-/// number (`seq`). Every `DeliverActivity` (and `RelayForward`) enqueue goes
-/// through here, so plan order and sequence order are identical: the counter
-/// mint and the job insert are one call apart at the plan site (or one
-/// transaction apart for in-transaction planning), and the worker never
-/// reorders on the wire (see the per-destination ordering note above).
+/// Legacy two-step sequence stamp (adversarial-2 C1): mints the destination's
+/// next monotonic sequence number (`seq`) in one transaction and returns the
+/// payload with it stamped in. New production paths must not use this —
+/// they enqueue through [`crate::application::federation_ports::FederationStore::enqueue_delivery`]
+/// (or the single-transaction mint in the job queue for `RelayForward`), so
+/// the mint and the insert commit together. Kept as a thin wrapper for
+/// callers that still stamp-then-enqueue in tests.
 pub fn stamp_delivery_seq(
     store: &dyn crate::application::ports::Store,
     inbox: &str,
@@ -283,7 +295,10 @@ pub async fn run(config: &FederationConfig<FedContext>, job: &Job) -> Result<(),
     // deferred copy due shortly, no retry budget consumed — so a `Follow`
     // and its `Undo` can never go out on the wire even when the worker runs
     // them concurrently or a restart reorders the claims. Terminal rows
-    // never block (see the ordering note above).
+    // never block (see the ordering note above). Past [`SEQ_PARK_MAX`] parks
+    // (or [`SEQ_PARK_MAX_AGE_MS`] since the first park) the ordering relaxes:
+    // the send goes out even though an earlier sequence is still unfinished,
+    // so a permanently failing head cannot wedge its host.
     let seq = payload.get("seq").and_then(Value::as_u64).unwrap_or(0);
     if store
         .delivery_blocked_by(&host, seq)
@@ -293,29 +308,51 @@ pub async fn run(config: &FederationConfig<FedContext>, job: &Job) -> Result<(),
             .get("seq_parks")
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        let mut parked = payload.clone();
-        if let Some(object) = parked.as_object_mut() {
-            object.insert("seq_parks".into(), Value::from(parks + 1));
+        let first_at = payload
+            .get("seq_park_first_at")
+            .and_then(Value::as_u64)
+            .unwrap_or(now);
+        let past_parks = parks >= u64::from(SEQ_PARK_MAX);
+        let past_age = now.saturating_sub(first_at) >= SEQ_PARK_MAX_AGE_MS;
+        if past_parks || past_age {
+            tracing::info!(
+                target: "birchtree::federation",
+                direction = "outbound",
+                inbox,
+                host = %host,
+                seq,
+                seq_parks = parks,
+                outcome = "ordering-relaxed: earlier sequence still unfinished past cap",
+                "delivery sent out of order"
+            );
+        } else {
+            let mut parked = payload.clone();
+            if let Some(object) = parked.as_object_mut() {
+                object.insert("seq_parks".into(), Value::from(parks + 1));
+                if payload.get("seq_park_first_at").is_none() {
+                    object.insert("seq_park_first_at".into(), Value::from(now));
+                }
+            }
+            store
+                .enqueue_at(
+                    JobKind::DeliverActivity,
+                    parked,
+                    now.saturating_add(SEQ_PARK_DELAY_MS),
+                    now,
+                )
+                .map_err(|e| DeliveryError::Retry(e.to_string()))?;
+            tracing::info!(
+                target: "birchtree::federation",
+                direction = "outbound",
+                inbox,
+                host = %host,
+                seq,
+                seq_parks = parks + 1,
+                outcome = "parked: earlier sequence unfinished",
+                "delivery deferred"
+            );
+            return Ok(());
         }
-        store
-            .enqueue_at(
-                JobKind::DeliverActivity,
-                parked,
-                now.saturating_add(SEQ_PARK_DELAY_MS),
-                now,
-            )
-            .map_err(|e| DeliveryError::Retry(e.to_string()))?;
-        tracing::info!(
-            target: "birchtree::federation",
-            direction = "outbound",
-            inbox,
-            host = %host,
-            seq,
-            seq_parks = parks + 1,
-            outcome = "parked: earlier sequence unfinished",
-            "delivery deferred"
-        );
-        return Ok(());
     }
     // A host inside its cooldown is not hit again: park this job as a
     // deferred copy due when the cooldown ends. The park does not consume
@@ -511,20 +548,17 @@ pub fn plan_inbox_forward(
     }
     inboxes.truncate(FORWARD_MAX_DESTINATIONS);
     for inbox in &inboxes {
-        // Plan order is sequence order (see [`stamp_delivery_seq`]).
-        let payload = stamp_delivery_seq(
-            store,
-            inbox,
-            serde_json::json!({
-                "sender_id": author.id.value(),
-                "inbox": inbox,
-                "activity_uri": activity_uri,
-                "body": body,
-            }),
-        )
-        .map_err(|e| e.to_string())?;
+        // Plan order is sequence order: the atomic enqueue mints the host
+        // sequence and inserts the job in one transaction, so a `Follow`
+        // planned before its `Undo` always carries the smaller number.
+        let delivery = crate::application::federation_ports::DeliverySpec {
+            sender_id: author.id,
+            inbox_uri: inbox.clone(),
+            activity_uri: activity_uri.to_string(),
+            body: body.clone(),
+        };
         store
-            .enqueue(JobKind::DeliverActivity, payload, now_ms)
+            .enqueue_delivery(delivery, now_ms)
             .map_err(|e| e.to_string())?;
     }
     Ok(inboxes.len())

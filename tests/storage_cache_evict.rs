@@ -42,7 +42,7 @@ fn test_cfg() -> RemoteCacheConfig {
         global_cap_bytes: 1024 * 1024,
         avatar_emoji_cap_bytes: 256 * 1024,
         preview_cap_bytes: 512 * 1024,
-        full_cap_bytes: 256 * 1024,
+        full_cap_bytes: 1024 * 1024,
         avatar_retention_days: 30,
         warming: false,
     }

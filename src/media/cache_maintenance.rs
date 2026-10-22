@@ -318,15 +318,24 @@ impl CacheMaintenance {
     }
 
     /// Register in-use blobs (a committed attachment row names them) that
-    /// the ledger has no byte-holding row for.
+    /// the ledger has no byte-holding row for. An existing row of any kind
+    /// for the blob key is an explicit decision (a shell after eviction):
+    /// the surviving file is residue and is deleted from the cache pool
+    /// instead of being adopted. A duplicate file for an already-counted
+    /// (source, variant) pair is likewise residue. Only a blob with no row
+    /// at all for its pair is adopted.
     fn adopt_referenced(&self, keys: &[String], now_ms: u64) -> Result<usize> {
         use crate::application::federation_ports::FederationContentStore;
 
         let mut adopted = 0;
         for key in keys {
-            if let Some((_, row)) = self.store.cache_row_by_blob_key(key)?
-                && row.has_bytes
-            {
+            if !remote_cache::is_cache_key(key) {
+                continue;
+            }
+            if self.store.cache_row_by_blob_key(key)?.is_some() {
+                if self.cache.exists(key)? {
+                    self.cache.delete(key)?;
+                }
                 continue;
             }
             let Some((media_id, variant)) = self.store.media_references_blob(key)? else {
@@ -335,6 +344,12 @@ impl CacheMaintenance {
             let Some(source) = self.store.remote_media_source(media_id)? else {
                 continue;
             };
+            if self.store.cache_get(&source, variant)?.is_some() {
+                if self.cache.exists(key)? {
+                    self.cache.delete(key)?;
+                }
+                continue;
+            }
             let Some(size) = self.cache.size_of(key)? else {
                 continue;
             };
@@ -398,14 +413,20 @@ impl CacheMaintenance {
                     continue;
                 };
                 let size: u64 = bytes.len() as u64;
-                // The row that owns these bytes, if any: a ledger row whose
-                // mapping names the key, else the media row that references
-                // it (its remote source feeds the ledger row).
+                // The row that owns these bytes, if any: a byte-holding
+                // ledger row whose mapping names the key, else the media row
+                // that references it (its remote source feeds the ledger
+                // row). An explicit shell (evicted) is not an owner: the
+                // durable copy is residue of deleted bytes and is removed.
                 let mut owner: Option<(String, String)> = None;
-                if let Some((_, row)) = self.store.cache_row_by_blob_key(key)?
-                    && !row.has_bytes
-                {
-                    owner = Some((row.source_url.clone(), row.variant.clone()));
+                if let Some((_, row)) = self.store.cache_row_by_blob_key(key)? {
+                    if row.has_bytes {
+                        owner = Some((row.source_url.clone(), row.variant.clone()));
+                    } else {
+                        durable.delete(key)?;
+                        report.orphans_removed += 1;
+                        continue;
+                    }
                 }
                 if owner.is_none()
                     && let Some((media_id, variant)) = self.store.media_references_blob(key)?
@@ -540,8 +561,12 @@ impl CacheMaintenance {
     /// ledger. Keys outside the cache namespace are refused. Any durable
     /// shadow of the key is deleted too: the public route checks the durable
     /// root first, so a surviving shadow would keep serving evicted bytes.
+    /// A file delete failure still syncs the ledger for the committed row;
+    /// the error is returned after the whole batch is synced so redb and
+    /// the ledger agree and the reconciler retries the orphan file.
     fn delete_cache_blobs(&self, keys: &[String]) -> Result<usize> {
         let mut deleted = 0;
+        let mut first_err: Option<Error> = None;
         for key in keys {
             if !remote_cache::is_cache_key(key) {
                 return Err(Error::InvalidInput(format!(
@@ -551,13 +576,28 @@ impl CacheMaintenance {
             if self.cache.exists(key)? {
                 deleted += 1;
             }
-            self.cache.delete(key)?;
+            if let Err(err) = self.cache.delete(key) {
+                tracing::warn!(blob_key = key.as_str(), error = %err, "expired blob delete failed");
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
             if let Some(durable) = &self.durable
                 && durable.exists(key)?
+                && let Err(err) = durable.delete(key)
             {
-                durable.delete(key)?;
+                tracing::warn!(blob_key = key.as_str(), error = %err, "expired shadow delete failed");
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
             }
-            self.lock_ledger()?.evict_by_blob_key(key);
+            if let Ok(mut guard) = self.lock_ledger() {
+                guard.evict_by_blob_key(key);
+                guard.evict_by_blob_key(key);
+            }
+        }
+        if let Some(err) = first_err {
+            return Err(err);
         }
         Ok(deleted)
     }
@@ -769,6 +809,10 @@ pub struct PressureEvictOutcome {
     /// Victim blobs actually removed from disk (a victim whose bytes were
     /// already gone still counts in `victims`, never here).
     pub blobs_deleted: usize,
+    /// Victims whose mapping committed but whose file delete failed. The
+    /// in-memory ledger is already synced for them; the reconciler retries
+    /// the file delete.
+    pub failed: Vec<String>,
 }
 
 /// Shared eviction primitive for fetch-time admission and scheduled
@@ -786,9 +830,10 @@ pub struct PressureEvictOutcome {
 ///
 /// Never deletes first: a crash between the transaction and the deletes
 /// leaves at most uncounted orphan blobs for the reconciler, never rows
-/// that claim bytes that are gone. A durable failure deletes nothing and
-/// the caller must not proceed (admission treats it as transient and
-/// retries without fetching).
+/// that claim bytes that are gone. A blob delete failure does not roll back
+/// the committed mapping: the ledger is still synced and the key is
+/// reported in [`PressureEvictOutcome::failed`] so the reconciler retries
+/// the file delete.
 pub fn evict_pressure_durable_first(
     store: &(impl CacheStore + ?Sized),
     blobs: &dyn BlobStore,
@@ -801,33 +846,50 @@ pub fn evict_pressure_durable_first(
 ) -> Result<PressureEvictOutcome> {
     // 1. Durable victim selection first: rows + counters in ONE transaction.
     let victims: Vec<String> = store.cache_evict_batch(need, bytes_to_free, now_ms, batch)?;
-    // 2. Then delete exactly the returned keys (own keys only).
+    // 2. Then delete exactly the returned keys (own keys only). A delete
+    // failure leaves an orphan blob: the mapping already committed, so the
+    // ledger still syncs and the key is reported for the reconciler.
     let mut blobs_deleted = 0;
+    let mut failed: Vec<String> = Vec::new();
     for key in &victims {
         if !remote_cache::is_cache_key(key) {
             return Err(Error::InvalidInput(format!(
                 "refusing to evict a non-cache key: {key}"
             )));
         }
-        if blobs.exists(key).unwrap_or(false) {
+        let existed = blobs.exists(key).unwrap_or(false);
+        if let Err(err) = blobs.delete(key) {
+            tracing::warn!(blob_key = key.as_str(), error = %err, "evicted blob delete failed");
+            failed.push(key.clone());
+            continue;
+        }
+        if existed {
             blobs_deleted += 1;
         }
-        blobs.delete(key)?;
         if let Some(durable) = durable_shadow
             && durable.exists(key).unwrap_or(false)
+            && let Err(err) = durable.delete(key)
         {
-            durable.delete(key)?;
+            tracing::warn!(blob_key = key.as_str(), error = %err, "evicted shadow delete failed");
+            failed.push(key.clone());
         }
     }
-    // 3. In-memory admission ledger follows.
-    if let Ok(mut ledger) = ledger.lock() {
+    // 3. In-memory admission ledger follows, even for failed deletes: it
+    // must match the committed redb rows. Shared rows hold one counted
+    // size for N refs; one `evict_by_blob_key` drops a single ref, so two
+    // calls clear the dedupe pair (2->1, then 1->0). Higher counts
+    // converge over later passes via `restore_ledger` in the reconcile
+    // sweep.
+    if let Ok(mut guard) = ledger.lock() {
         for key in &victims {
-            ledger.evict_by_blob_key(key);
+            guard.evict_by_blob_key(key);
+            guard.evict_by_blob_key(key);
         }
     }
     Ok(PressureEvictOutcome {
         victims,
         blobs_deleted,
+        failed,
     })
 }
 

@@ -384,9 +384,14 @@ fn remote_emoji_ingest_validates_namespaces_and_stages_bytes() {
     // magic-only prefixes.
     let png = png_bytes();
     let source = "https://remote.example/e.png";
+    let ledger = std::sync::Mutex::new(birchtree::media::remote_cache::CacheLedger::new(
+        birchtree::config::RemoteCacheConfig::default(),
+    ));
     let row = store_remote_emoji(
         &*store,
         &blobs,
+        &*store,
+        &ledger,
         &key,
         "remote.example",
         source,
@@ -438,6 +443,8 @@ fn remote_emoji_ingest_validates_namespaces_and_stages_bytes() {
         store_remote_emoji(
             &*store,
             &blobs,
+            &*store,
+            &ledger,
             &key,
             "remote.example",
             source,
@@ -452,6 +459,8 @@ fn remote_emoji_ingest_validates_namespaces_and_stages_bytes() {
         store_remote_emoji(
             &*store,
             &blobs,
+            &*store,
+            &ledger,
             &key,
             "remote.example",
             source,
@@ -467,6 +476,8 @@ fn remote_emoji_ingest_validates_namespaces_and_stages_bytes() {
         store_remote_emoji(
             &*store,
             &blobs,
+            &*store,
+            &ledger,
             "party@other.example",
             "remote.example",
             source,

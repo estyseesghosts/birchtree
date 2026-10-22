@@ -308,6 +308,8 @@ async fn process_one(
                 crate::federation::media::store_remote_emoji(
                     &*store,
                     &*blobs,
+                    &*store,
+                    crate::media::remote_cache::process_ledger(),
                     &key,
                     &domain,
                     url.as_str(),

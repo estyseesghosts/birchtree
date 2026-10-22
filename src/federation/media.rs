@@ -25,13 +25,15 @@
 //! abort, `ingest::sniff` + `validate`. `MAX_REMOTE_MEDIA_BYTES` stays the
 //! per-file ceiling inside the class/global budgets.
 
+use std::sync::Mutex;
+
 use axum::body::Bytes;
 use futures_util::StreamExt;
 use url::Url;
 
 use crate::activitypub::FedContext;
 use crate::application::federation_ports::FederationContentStore;
-use crate::application::ports::BlobStore;
+use crate::application::ports::{BlobStore, CacheStore};
 use crate::config::RemoteCacheConfig;
 use crate::domain::{Id, Job};
 use crate::federation::delivery::DeliveryError;
@@ -203,6 +205,218 @@ pub fn should_warm(cfg: &RemoteCacheConfig, is_relay: bool) -> bool {
     remote_cache::should_warm(cfg, is_relay)
 }
 
+/// The durable writes the fetch settle step needs: byte-row accounting plus
+/// the media-row staging. Blanket-implemented for every content store, so
+/// production passes the job store straight through while tests pass a
+/// fault-injecting wrapper through the same seams instead of a 300-method
+/// full-`Store` double.
+pub trait SettleStore: Send + Sync {
+    fn cache_mark_stored(
+        &self,
+        source_url: &str,
+        variant: &str,
+        blob_key: &str,
+        size: u64,
+        etag: Option<String>,
+        now_ms: u64,
+        cfg: &RemoteCacheConfig,
+    ) -> crate::domain::Result<()>;
+    fn cache_mark_evicted(
+        &self,
+        source_url: &str,
+        variant: &str,
+    ) -> crate::domain::Result<Option<String>>;
+    fn stage_remote_media(
+        &self,
+        media_id: Id,
+        file_key: &str,
+        mime_type: &str,
+        file_size: u64,
+        now_ms: u64,
+    ) -> crate::domain::Result<Option<crate::domain::MediaAttachment>>;
+    fn mark_remote_media_failed(
+        &self,
+        media_id: Id,
+        reason: &str,
+        now_ms: u64,
+    ) -> crate::domain::Result<()>;
+}
+
+impl<T> SettleStore for T
+where
+    T: CacheStore + FederationContentStore + ?Sized,
+{
+    fn cache_mark_stored(
+        &self,
+        source_url: &str,
+        variant: &str,
+        blob_key: &str,
+        size: u64,
+        etag: Option<String>,
+        now_ms: u64,
+        cfg: &RemoteCacheConfig,
+    ) -> crate::domain::Result<()> {
+        CacheStore::cache_mark_stored(self, source_url, variant, blob_key, size, etag, now_ms, cfg)
+    }
+
+    fn cache_mark_evicted(
+        &self,
+        source_url: &str,
+        variant: &str,
+    ) -> crate::domain::Result<Option<String>> {
+        CacheStore::cache_mark_evicted(self, source_url, variant)
+    }
+
+    fn stage_remote_media(
+        &self,
+        media_id: Id,
+        file_key: &str,
+        mime_type: &str,
+        file_size: u64,
+        now_ms: u64,
+    ) -> crate::domain::Result<Option<crate::domain::MediaAttachment>> {
+        FederationContentStore::stage_remote_media(
+            self, media_id, file_key, mime_type, file_size, now_ms,
+        )
+    }
+
+    fn mark_remote_media_failed(
+        &self,
+        media_id: Id,
+        reason: &str,
+        now_ms: u64,
+    ) -> crate::domain::Result<()> {
+        FederationContentStore::mark_remote_media_failed(self, media_id, reason, now_ms)
+    }
+}
+
+/// Undo a settle: blob, durable row and ledger mapping (all best-effort).
+#[allow(clippy::too_many_arguments)]
+fn rollback_settle<StoreT, BlobsT>(
+    store: &StoreT,
+    blobs: &BlobsT,
+    cache_key: &[u8],
+    reservation: &remote_cache::Reservation<'_>,
+    source_url: &str,
+    variant: &str,
+    blob_key: &str,
+) where
+    StoreT: SettleStore + ?Sized,
+    BlobsT: BlobStore + ?Sized,
+{
+    let _ = blobs.delete(blob_key);
+    let _ = store.cache_mark_evicted(source_url, variant);
+    reservation.evict_key(cache_key);
+}
+
+/// Settle staged bytes into stored state: N2 top-up, durable byte row (F6),
+/// ledger settlement (F6), then the media-row staging that enqueues
+/// `ProcessMedia`. Every failure rolls back what the earlier steps wrote —
+/// blob, durable row and ledger mapping — and frees the reservation through
+/// the guard, so a failed fetch leaves no orphan blob, no row claiming
+/// bytes and no in-flight budget behind.
+#[allow(clippy::too_many_arguments)]
+pub fn settle_staged<StoreT, BlobsT>(
+    store: &StoreT,
+    blobs: &BlobsT,
+    reservation: &mut remote_cache::Reservation<'_>,
+    source_url: &str,
+    variant: &str,
+    media_id: Id,
+    blob_key: &str,
+    staged: u64,
+    mime_type: &str,
+    now_ms: u64,
+    cfg: &RemoteCacheConfig,
+) -> std::result::Result<(), DeliveryError>
+where
+    StoreT: SettleStore + ?Sized,
+    BlobsT: BlobStore + ?Sized,
+{
+    // N2: the body stream was capped at the live reservation; a larger
+    // staged size tops the reservation back up, or fails loudly.
+    if staged > reservation.remaining() {
+        if let Err(err) = reservation.grow(staged - reservation.remaining()) {
+            let _ = blobs.delete(blob_key);
+            return Err(ledger_outcome(err));
+        }
+    }
+    // Durable byte row first (mapping + counters in one transaction):
+    // admission eviction selects victims from these rows, so bytes without
+    // a row could never be freed. On failure the published blob goes too.
+    if let Err(err) =
+        store.cache_mark_stored(source_url, variant, blob_key, staged, None, now_ms, cfg)
+    {
+        let _ = blobs.delete(blob_key);
+        return Err(DeliveryError::Retry(err.to_string()));
+    }
+    // Ledger settlement. On refusal the durable row goes too, not just the
+    // blob: a row claiming deleted bytes would never heal.
+    let entry = remote_cache::RemoteCacheEntry::stored(
+        source_url,
+        variant,
+        MediaClass::Full,
+        blob_key,
+        staged,
+        now_ms,
+        cfg,
+    );
+    let cache_key = entry.cache_key();
+    let reserved = reservation.remaining();
+    if let Err(err) = reservation.commit_entry(reserved, entry) {
+        rollback_settle(
+            store,
+            blobs,
+            &cache_key,
+            reservation,
+            source_url,
+            variant,
+            blob_key,
+        );
+        return Err(ledger_outcome(err));
+    }
+    // Stage the row (which enqueues `ProcessMedia`, preserving the existing
+    // chain). Any failure unwinds blob, durable row and ledger mapping.
+    let staged_row = match store.stage_remote_media(media_id, blob_key, mime_type, staged, now_ms) {
+        Ok(row) => row,
+        Err(err) => {
+            rollback_settle(
+                store,
+                blobs,
+                &cache_key,
+                reservation,
+                source_url,
+                variant,
+                blob_key,
+            );
+            return Err(DeliveryError::Retry(err.to_string()));
+        }
+    };
+    match staged_row {
+        Some(_) => {
+            tracing::info!(target: "birchtree::federation", direction = "inbound", kind = "FetchRemoteMedia", media = media_id.value(), bytes = staged, mime = mime_type, outcome = "staged", "media");
+            Ok(())
+        }
+        None => {
+            // Row gone after the bytes landed: drop the bytes (own key
+            // only) and the ledger mapping so no orphan survives uncounted.
+            rollback_settle(
+                store,
+                blobs,
+                &cache_key,
+                reservation,
+                source_url,
+                variant,
+                blob_key,
+            );
+            let _ = store.mark_remote_media_failed(media_id, "attachment row is missing", now_ms);
+            Err(DeliveryError::Quarantine(
+                "attachment row is missing".into(),
+            ))
+        }
+    }
+}
+
 /// Fetch and stage one remote attachment (the `FetchRemoteMedia` job).
 ///
 /// Metadata-first + fetch-on-first-request: a present blob is a hit (the
@@ -249,10 +463,17 @@ pub async fn fetch(
     let key = cache_key_for(media_id);
     let now = ctx.app.now_ms();
 
+    // Disabled mode refuses before any admission or eviction: there is
+    // nowhere to keep fetched bytes, so the fetch must not reserve budget,
+    // count cached bytes, or displace them (adversarial-2 F1).
+    let persist = remote_cache::process_ledger()
+        .lock()
+        .map(|ledger| ledger.persistence_allowed())
+        .unwrap_or(false);
     // Fast path: bytes already cached (first request won, or a retried job).
     // Count them if the ledger has not seen them (restart / pre-split rows),
     // refresh last-use, and make sure the row is staged.
-    if cache_store(ctx).get(&key).map_err(retry)?.is_some() {
+    if persist && cache_store(ctx).get(&key).map_err(retry)?.is_some() {
         {
             let mut ledger = lock_ledger()?;
             let cache_key =
@@ -261,6 +482,23 @@ pub async fn fetch(
             if !seen {
                 // Size is advisory here (already on disk); count, don't refuse.
                 if let Ok(Some(bytes)) = cache_store(ctx).get(&key).map_err(|_| ()) {
+                    // Classify AFTER the sniff, never assume `Full`:
+                    // audio/video originals stream from their origin and are
+                    // never persisted, so stale cached bytes are dropped,
+                    // counted nowhere and staged nowhere (adversarial-2 N5).
+                    let streams = ingest::sniff(&bytes)
+                        .filter(|sniffed| ingest::validate(*sniffed))
+                        .is_some_and(|sniffed| {
+                            remote_cache::class_for_fetch(sniffed.mime_type, ATTACHMENT_VARIANT)
+                                == MediaClass::Stream
+                        });
+                    if streams {
+                        let _ = cache_store(ctx).delete(&key);
+                        let reason =
+                            "remote audio/video streams from its origin and is never cached";
+                        let _ = store.mark_remote_media_failed(media_id, reason, ctx.app.now_ms());
+                        return Err(DeliveryError::Quarantine(reason.into()));
+                    }
                     let entry = remote_cache::RemoteCacheEntry::stored(
                         &source,
                         ATTACHMENT_VARIANT,
@@ -303,55 +541,56 @@ pub async fn fetch(
     }
 
     // Worst-case reservation first: concurrent fetches each hold their ceiling
-    // until headers shrink it, so the committed total never overshoots.
-    let mut reserved = MAX_REMOTE_MEDIA_BYTES;
-    if lock_ledger()?.reserve(MediaClass::Full, reserved).is_err() {
-        // Make room through the durable-first eviction shared with scheduled
-        // maintenance: victims are unmapped (rows + counters) in one redb
-        // transaction BEFORE any blob is deleted, then the blobs go, then
-        // the in-memory ledger catches up. A durable failure deletes nothing
-        // and the fetch does not proceed (transient retry, no download).
-        crate::media::cache_maintenance::evict_pressure_durable_first(
-            store,
-            cache_store(ctx),
-            None,
-            remote_cache::process_ledger(),
-            MediaClass::Full,
-            reserved,
-            now,
-            crate::media::cache_maintenance::MAINTENANCE_BATCH,
-        )
-        .map_err(|err| DeliveryError::Retry(err.to_string()))?;
-        lock_ledger()?
-            .reserve(MediaClass::Full, reserved)
-            .map_err(ledger_outcome)?;
-    }
-    let release = |ledger: &mut CacheLedger, amount: u64| {
-        ledger.release(MediaClass::Full, amount);
+    // until headers shrink it, so the committed total never overshoots. Only
+    // a budget exhaustion evicts (durable-first, shared with scheduled
+    // maintenance); any other refusal maps straight to its outcome with no
+    // eviction (adversarial-2 F1). The guard frees the holding on every
+    // return below, so no path needs a manual release.
+    let mut reservation = match remote_cache::Reservation::reserve(
+        remote_cache::process_ledger(),
+        MediaClass::Full,
+        MAX_REMOTE_MEDIA_BYTES,
+    ) {
+        Ok(guard) => guard,
+        Err(CacheError::BudgetExhausted { .. }) => {
+            // Make room through the durable-first eviction shared with
+            // scheduled maintenance: victims are unmapped (rows + counters)
+            // in one redb transaction BEFORE any blob is deleted, then the
+            // blobs go, then the in-memory ledger catches up. A durable
+            // failure deletes nothing and the fetch does not proceed
+            // (transient retry, no download).
+            crate::media::cache_maintenance::evict_pressure_durable_first(
+                store,
+                cache_store(ctx),
+                None,
+                remote_cache::process_ledger(),
+                MediaClass::Full,
+                MAX_REMOTE_MEDIA_BYTES,
+                now,
+                crate::media::cache_maintenance::MAINTENANCE_BATCH,
+            )
+            .map_err(|err| DeliveryError::Retry(err.to_string()))?;
+            remote_cache::Reservation::reserve(
+                remote_cache::process_ledger(),
+                MediaClass::Full,
+                MAX_REMOTE_MEDIA_BYTES,
+            )
+            .map_err(ledger_outcome)?
+        }
+        Err(other) => return Err(ledger_outcome(other)),
     };
 
-    let response = get_signed(config, url.clone()).await.map_err(|e| {
-        if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
-            release(&mut ledger, reserved);
-        }
-        e
-    })?;
+    let response = get_signed(config, url.clone()).await?;
     let status = response.status();
     if status.is_server_error()
         || status == reqwest::StatusCode::REQUEST_TIMEOUT
         || status == reqwest::StatusCode::TOO_MANY_REQUESTS
     {
-        if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
-            release(&mut ledger, reserved);
-        }
         return Err(DeliveryError::Retry(format!(
             "attachment server answered {status}"
         )));
     }
     if !status.is_success() {
-        if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
-            release(&mut ledger, reserved);
-        }
         let _ = store.mark_remote_media_failed(
             media_id,
             &format!("attachment server answered {status}"),
@@ -362,12 +601,10 @@ pub async fn fetch(
         )));
     }
     // `Content-Length` is advisory: shrink the reservation to the declared
-    // size, but keep the streaming abort below for dishonest lengths.
+    // size, but cap the body stream at the live reservation so a dishonest
+    // length cannot overshoot the budget (adversarial-2 N2).
     if let Some(declared) = response.content_length() {
         if declared > MAX_REMOTE_MEDIA_BYTES {
-            if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
-                release(&mut ledger, reserved);
-            }
             let _ = store.mark_remote_media_failed(
                 media_id,
                 "attachment is larger than the limit",
@@ -377,11 +614,9 @@ pub async fn fetch(
                 "attachment is larger than the limit".into(),
             ));
         }
-        if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
-            release(&mut ledger, reserved.saturating_sub(declared));
-        }
-        reserved = declared;
+        reservation.shrink(reservation.remaining().saturating_sub(declared));
     }
+    let stream_cap = reservation.remaining();
     // Stream-to-disk (storage overhaul, Agent C): when the blob handle
     // exposes its filesystem root, the body streams to `tmp/{rand}.part`
     // under the cap and renames onto the key — no `Vec` buffering. Handles
@@ -389,52 +624,33 @@ pub async fn fetch(
     if let Some(root) = cache_store(ctx).root_path() {
         use tokio::io::AsyncReadExt as _;
 
-        let tmp = crate::media::fetch_stream::tmp_path_for(&root).map_err(|e| {
-            if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
-                release(&mut ledger, reserved);
-            }
-            DeliveryError::Retry(e.to_string())
-        })?;
+        let tmp = crate::media::fetch_stream::tmp_path_for(&root)
+            .map_err(|e| DeliveryError::Retry(e.to_string()))?;
         let stream = response.bytes_stream();
-        let staged =
-            crate::media::fetch_stream::copy_stream_capped(stream, &tmp, MAX_REMOTE_MEDIA_BYTES)
-                .await
-                .map_err(|e| match e {
-                    crate::domain::Error::InvalidInput(_) => {
-                        if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
-                            release(&mut ledger, reserved);
-                        }
-                        let _ = store.mark_remote_media_failed(
-                            media_id,
-                            "attachment is larger than the limit",
-                            ctx.app.now_ms(),
-                        );
-                        DeliveryError::Quarantine("attachment is larger than the limit".into())
-                    }
-                    other => {
-                        if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
-                            release(&mut ledger, reserved);
-                        }
-                        DeliveryError::Retry(other.to_string())
-                    }
-                })?;
+        let staged = crate::media::fetch_stream::copy_stream_capped(stream, &tmp, stream_cap)
+            .await
+            .map_err(|e| match e {
+                crate::domain::Error::InvalidInput(_) => {
+                    let _ = store.mark_remote_media_failed(
+                        media_id,
+                        "attachment is larger than the limit",
+                        ctx.app.now_ms(),
+                    );
+                    DeliveryError::Quarantine("attachment is larger than the limit".into())
+                }
+                other => DeliveryError::Retry(other.to_string()),
+            })?;
         // Sniff from a bounded prefix: the classifier only reads leading
         // bytes (magic + `ftyp` brand), so 64 KiB classifies every accepted
         // format exactly like the full body did.
         let prefix = {
             let file = tokio::fs::File::open(&tmp).await.map_err(|e| {
                 let _ = std::fs::remove_file(&tmp);
-                if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
-                    release(&mut ledger, reserved);
-                }
                 DeliveryError::Retry(e.to_string())
             })?;
             let mut buf = Vec::new();
             file.take(65536).read_to_end(&mut buf).await.map_err(|e| {
                 let _ = std::fs::remove_file(&tmp);
-                if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
-                    release(&mut ledger, reserved);
-                }
                 DeliveryError::Retry(e.to_string())
             })?;
             buf
@@ -443,9 +659,6 @@ pub async fn fetch(
             Some(s) => s,
             None => {
                 let _ = std::fs::remove_file(&tmp);
-                if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
-                    release(&mut ledger, reserved);
-                }
                 let _ = store.mark_remote_media_failed(
                     media_id,
                     "attachment is not a supported media file",
@@ -458,108 +671,43 @@ pub async fn fetch(
         };
         // Classify AFTER the sniff, never assume `Full`: audio/video
         // originals are `Stream` — served on demand, never persisted. A
-        // Stream outcome releases the reservation, drops the download and
-        // fails the row with a clear non-persist reason (terminal): no
-        // cache blob is created and `stored_full` never moves.
-        // `reserve(Stream)` is never called (it refuses loudly by design).
+        // Stream outcome drops the download and fails the row with a clear
+        // non-persist reason (terminal): no cache blob is created and
+        // `stored_full` never moves. `reserve(Stream)` is never called (it
+        // refuses loudly by design). The guard frees the reservation.
         let class = remote_cache::class_for_fetch(sniffed.mime_type, ATTACHMENT_VARIANT);
         if class == MediaClass::Stream {
             let _ = std::fs::remove_file(&tmp);
-            if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
-                release(&mut ledger, reserved);
-            }
             let reason = "remote audio/video streams from its origin and is never cached";
             let _ = store.mark_remote_media_failed(media_id, reason, ctx.app.now_ms());
             return Err(DeliveryError::Quarantine(reason.into()));
         }
-        // Publish first, then settle the reservation into stored bytes: a
-        // crash between leaves at most an uncounted orphan blob for the
-        // reconciler, never counted bytes without a blob.
+        // Publish first, then settle into stored bytes: a crash between
+        // leaves at most an uncounted orphan blob for the reconciler, never
+        // counted bytes without a blob.
         cache_store(ctx).publish_tmp(&tmp, &key).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
-            if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
-                release(&mut ledger, reserved);
-            }
             DeliveryError::Retry(e.to_string())
         })?;
-        // Settle the reservation into stored bytes, then stage the row (which
-        // enqueues `ProcessMedia`, preserving the existing chain). The
-        // durable byte row lands BEFORE the ledger settlement (mapping +
-        // counters in one transaction): admission eviction and scheduled
-        // maintenance select victims from these rows, so bytes without a
-        // row could never be freed. A crash between the row and the ledger
-        // commit leaves a counted row the next restore adopts.
-        store
-            .cache_mark_stored(
-                &source,
-                ATTACHMENT_VARIANT,
-                &key,
-                staged,
-                None,
-                now,
-                &ctx.remote_cache,
-            )
-            .map_err(retry)?;
-        let entry = remote_cache::RemoteCacheEntry::stored(
+        return settle_staged(
+            store,
+            cache_store(ctx),
+            &mut reservation,
             &source,
             ATTACHMENT_VARIANT,
-            MediaClass::Full,
+            media_id,
             &key,
             staged,
+            sniffed.mime_type,
             now,
             &ctx.remote_cache,
         );
-        if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
-            if let Err(err) = ledger.commit(MediaClass::Full, reserved, entry) {
-                release(&mut ledger, 0);
-                let _ = cache_store(ctx).delete(&key);
-                return Err(ledger_outcome(err));
-            }
-        }
-        let now = ctx.app.now_ms();
-        match store
-            .stage_remote_media(media_id, &key, sniffed.mime_type, staged, now)
-            .map_err(retry)?
-        {
-            Some(_) => {
-                tracing::info!(target: "birchtree::federation", direction = "inbound", kind = "FetchRemoteMedia", media = media_id.value(), bytes = staged, mime = sniffed.mime_type, outcome = "staged", "media");
-                return Ok(());
-            }
-            None => {
-                // Row gone after the bytes landed: drop the bytes (own key
-                // only) and the ledger mapping so no orphan survives uncounted.
-                let _ = cache_store(ctx).delete(&key);
-                if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
-                    let cache_key = crate::persistence::redb::schema::remote_cache_key(
-                        &source,
-                        ATTACHMENT_VARIANT,
-                    );
-                    ledger.evict_one(&cache_key);
-                }
-                let _ = store.mark_remote_media_failed(
-                    media_id,
-                    "attachment row is missing",
-                    ctx.app.now_ms(),
-                );
-                return Err(DeliveryError::Quarantine(
-                    "attachment row is missing".into(),
-                ));
-            }
-        }
     }
     let mut body: Vec<u8> = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
-                release(&mut ledger, reserved);
-            }
-            DeliveryError::Retry(e.to_string())
-        })?;
-        if body.len() as u64 + chunk.len() as u64 > MAX_REMOTE_MEDIA_BYTES {
-            if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
-                release(&mut ledger, reserved);
-            }
+        let chunk = chunk.map_err(|e| DeliveryError::Retry(e.to_string()))?;
+        if body.len() as u64 + chunk.len() as u64 > stream_cap {
             let _ = store.mark_remote_media_failed(
                 media_id,
                 "attachment is larger than the limit",
@@ -574,9 +722,6 @@ pub async fn fetch(
     let sniffed = match ingest::sniff(&body).filter(|s| ingest::validate(*s)) {
         Some(s) => s,
         None => {
-            if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
-                release(&mut ledger, reserved);
-            }
             let _ = store.mark_remote_media_failed(
                 media_id,
                 "attachment is not a supported media file",
@@ -588,80 +733,30 @@ pub async fn fetch(
         }
     };
     // Same classification as the streamed path: audio/video originals are
-    // `Stream` and are never persisted (no reserve, no put, no commit).
+    // `Stream` and are never persisted (no put, no commit). The guard frees
+    // the reservation.
     if remote_cache::class_for_fetch(sniffed.mime_type, ATTACHMENT_VARIANT) == MediaClass::Stream {
-        if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
-            release(&mut ledger, reserved);
-        }
         let reason = "remote audio/video streams from its origin and is never cached";
         let _ = store.mark_remote_media_failed(media_id, reason, ctx.app.now_ms());
         return Err(DeliveryError::Quarantine(reason.into()));
     }
 
-    cache_store(ctx).put(&key, &body).map_err(|e| {
-        if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
-            release(&mut ledger, reserved);
-        }
-        DeliveryError::Retry(e.to_string())
-    })?;
-    // Settle the reservation into stored bytes, then stage the row (which
-    // enqueues `ProcessMedia`, preserving the existing chain). Durable byte
-    // row first, ledger settlement second (see the streamed path above).
-    store
-        .cache_mark_stored(
-            &source,
-            ATTACHMENT_VARIANT,
-            &key,
-            body.len() as u64,
-            None,
-            now,
-            &ctx.remote_cache,
-        )
-        .map_err(retry)?;
-    let entry = remote_cache::RemoteCacheEntry::stored(
+    cache_store(ctx)
+        .put(&key, &body)
+        .map_err(|e| DeliveryError::Retry(e.to_string()))?;
+    settle_staged(
+        store,
+        cache_store(ctx),
+        &mut reservation,
         &source,
         ATTACHMENT_VARIANT,
-        MediaClass::Full,
+        media_id,
         &key,
         body.len() as u64,
+        sniffed.mime_type,
         now,
         &ctx.remote_cache,
-    );
-    if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
-        if let Err(err) = ledger.commit(MediaClass::Full, reserved, entry) {
-            release(&mut ledger, 0);
-            let _ = cache_store(ctx).delete(&key);
-            return Err(ledger_outcome(err));
-        }
-    }
-    let now = ctx.app.now_ms();
-    match store
-        .stage_remote_media(media_id, &key, sniffed.mime_type, body.len() as u64, now)
-        .map_err(retry)?
-    {
-        Some(_) => {
-            tracing::info!(target: "birchtree::federation", direction = "inbound", kind = "FetchRemoteMedia", media = media_id.value(), bytes = body.len(), mime = sniffed.mime_type, outcome = "staged", "media");
-            Ok(())
-        }
-        None => {
-            // Row gone after the bytes landed: drop the bytes (own key only)
-            // and the ledger mapping so no orphan survives uncounted.
-            let _ = cache_store(ctx).delete(&key);
-            if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
-                let cache_key =
-                    crate::persistence::redb::schema::remote_cache_key(&source, ATTACHMENT_VARIANT);
-                ledger.evict_one(&cache_key);
-            }
-            let _ = store.mark_remote_media_failed(
-                media_id,
-                "attachment row is missing",
-                ctx.app.now_ms(),
-            );
-            Err(DeliveryError::Quarantine(
-                "attachment row is missing".into(),
-            ))
-        }
-    }
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -794,6 +889,32 @@ pub async fn fetch_remote_emoji_bytes(
     Ok((body, mime))
 }
 
+/// Undo an emoji settle: both blobs, both durable rows, and any ledger
+/// mapping a first commit already recorded (all best-effort).
+fn rollback_emoji(
+    cache: &dyn CacheStore,
+    blobs: &dyn BlobStore,
+    ledger: &Mutex<remote_cache::CacheLedger>,
+    source_url: &str,
+    image_key: &str,
+    static_key: &str,
+) {
+    let _ = blobs.delete(image_key);
+    let _ = blobs.delete(static_key);
+    let _ = cache.cache_mark_evicted(source_url, remote_cache::EMOJI_VARIANT);
+    let _ = cache.cache_mark_evicted(source_url, remote_cache::EMOJI_STATIC_VARIANT);
+    if let Ok(mut guard) = ledger.lock() {
+        guard.evict_one(&crate::persistence::redb::schema::remote_cache_key(
+            source_url,
+            remote_cache::EMOJI_VARIANT,
+        ));
+        guard.evict_one(&crate::persistence::redb::schema::remote_cache_key(
+            source_url,
+            remote_cache::EMOJI_STATIC_VARIANT,
+        ));
+    }
+}
+
 /// Stage fetched remote-emoji bytes: one blob key for the image and one for
 /// the static variant (same bytes; remote originals are served as-is, never
 /// transcoded), then upsert the row under the interim domain-namespaced key.
@@ -801,17 +922,27 @@ pub async fn fetch_remote_emoji_bytes(
 /// `CustomEmoji.listed` is local-only); renderers serve them through the
 /// `emojis` arrays only.
 ///
-/// Bytes land in the evictable [`remote_cache::remote_emoji_keys`] namespace
-/// — never under `custom_emojis/images/…`, which is the durable pool with no
+/// Admission runs before any byte is written: one reservation for both
+/// physical copies under the reserved avatar/emoji class (adversarial-2 F2).
+/// Disabled mode is honoured by the same refusal that gates every other
+/// remote persist. Bytes land in the evictable [`remote_cache::remote_emoji_keys`]
+/// namespace — never under `custom_emojis/images/…`, the durable pool with no
 /// eviction — through the pool-routed blob handle (the caller passes the
-/// runtime handle, so `remote/…` keys reach the cache pool). Both copies are
-/// registered as durable `REMOTE_CACHE` rows ([`EMOJI_VARIANT`] and
-/// [`EMOJI_STATIC_VARIANT` under the fetch `source_url`), so
-/// `cache_evict_batch` can reclaim them; eviction drops bytes but the shells
-/// (and the render row below) survive for refetch.
+/// runtime handle, so `remote/…` keys reach the cache pool). Every failure
+/// after staging rolls back what was written (blobs, durable rows, ledger
+/// mapping) and frees the reservation through the guard. `cache` is the
+/// durable accounting facet of `store`, passed separately so tests can fault
+/// it; `ledger` is the admission ledger (the process ledger in production).
+///
+/// Both copies are registered as durable `REMOTE_CACHE` rows
+/// ([`EMOJI_VARIANT`] and [`EMOJI_STATIC_VARIANT`] under the fetch
+/// `source_url`), so `cache_evict_batch` can reclaim them; eviction drops
+/// bytes but the shells (and the render row below) survive for refetch.
 pub fn store_remote_emoji(
     store: &dyn crate::application::ports::Store,
     blobs: &dyn BlobStore,
+    cache: &dyn CacheStore,
+    ledger: &Mutex<remote_cache::CacheLedger>,
     namespaced_shortcode: &str,
     origin_domain: &str,
     source_url: &str,
@@ -828,34 +959,80 @@ pub fn store_remote_emoji(
     }
     let (image_key, static_key) = remote_cache::remote_emoji_keys(origin_domain, shortcode)
         .ok_or_else(|| "remote emoji domain or shortcode is not a servable shape".to_string())?;
-    blobs.put(&image_key, bytes).map_err(|e| e.to_string())?;
-    blobs.put(&static_key, bytes).map_err(|e| e.to_string())?;
     let size = bytes.len() as u64;
-    // Durable byte rows first (one transaction each, mapping + counters
-    // together): a later failure leaves counted bytes the reconciler can
-    // see, never phantom blobs.
-    store
-        .cache_mark_stored(
-            source_url,
-            remote_cache::EMOJI_VARIANT,
-            &image_key,
-            size,
-            None,
-            now_ms,
-            cfg,
-        )
-        .map_err(|e| e.to_string())?;
-    store
-        .cache_mark_stored(
-            source_url,
-            remote_cache::EMOJI_STATIC_VARIANT,
-            &static_key,
-            size,
-            None,
-            now_ms,
-            cfg,
-        )
-        .map_err(|e| e.to_string())?;
+    // Admission first: one reservation for both physical copies under the
+    // reserved class. Disabled mode and the class cap refuse here, before
+    // any byte is written.
+    let mut reservation =
+        remote_cache::Reservation::reserve(ledger, MediaClass::AvatarEmoji, size.saturating_mul(2))
+            .map_err(|err| err.to_string())?;
+    // Stage both blobs; unwind what was written on any failure (the guard
+    // frees the reservation on every return below).
+    blobs
+        .put(&image_key, bytes)
+        .map_err(|err| err.to_string())?;
+    if let Err(err) = blobs.put(&static_key, bytes) {
+        let _ = blobs.delete(&image_key);
+        return Err(err.to_string());
+    }
+    // Durable byte rows first (mapping + counters together): a later failure
+    // leaves counted bytes the reconciler can see, never phantom blobs.
+    if let Err(err) = cache.cache_mark_stored(
+        source_url,
+        remote_cache::EMOJI_VARIANT,
+        &image_key,
+        size,
+        None,
+        now_ms,
+        cfg,
+    ) {
+        let _ = blobs.delete(&image_key);
+        let _ = blobs.delete(&static_key);
+        return Err(err.to_string());
+    }
+    if let Err(err) = cache.cache_mark_stored(
+        source_url,
+        remote_cache::EMOJI_STATIC_VARIANT,
+        &static_key,
+        size,
+        None,
+        now_ms,
+        cfg,
+    ) {
+        let _ = blobs.delete(&image_key);
+        let _ = blobs.delete(&static_key);
+        let _ = cache.cache_mark_evicted(source_url, remote_cache::EMOJI_VARIANT);
+        return Err(err.to_string());
+    }
+    // Ledger settlement consumes the reservation, one commit per copy. A
+    // refusal unwinds blobs, durable rows, and whatever the first commit
+    // already recorded.
+    let image_entry = remote_cache::RemoteCacheEntry::stored(
+        source_url,
+        remote_cache::EMOJI_VARIANT,
+        MediaClass::AvatarEmoji,
+        &image_key,
+        size,
+        now_ms,
+        cfg,
+    );
+    if let Err(err) = reservation.commit_entry(size, image_entry) {
+        rollback_emoji(cache, blobs, ledger, source_url, &image_key, &static_key);
+        return Err(err.to_string());
+    }
+    let static_entry = remote_cache::RemoteCacheEntry::stored(
+        source_url,
+        remote_cache::EMOJI_STATIC_VARIANT,
+        MediaClass::AvatarEmoji,
+        &static_key,
+        size,
+        now_ms,
+        cfg,
+    );
+    if let Err(err) = reservation.commit_entry(size, static_entry) {
+        rollback_emoji(cache, blobs, ledger, source_url, &image_key, &static_key);
+        return Err(err.to_string());
+    }
     let _ = mime_type;
     let row = store
         .upsert_emoji(crate::domain::CustomEmoji {

@@ -11,13 +11,59 @@ use crate::application::ports::JobQueue;
 use crate::domain::job::{LEASE_MS, backoff_ms};
 use crate::domain::{Error, Id, Job, JobKind, JobState, Result};
 
-use super::schema::{self, JOBS, JOBS_INDEX};
+use super::schema::{self, DELIVERY_ACTIVE, JOBS, JOBS_INDEX};
 use super::{RedbStore, StoreResult, decode, encode};
+
+/// Whether a job kind participates in the per-host FIFO gate.
+fn is_delivery_kind(kind: JobKind) -> bool {
+    matches!(kind, JobKind::DeliverActivity | JobKind::RelayForward)
+}
+
+/// The destination host of a delivery job, if it carries one.
+fn delivery_host_of(job: &Job) -> Option<String> {
+    let inbox = job
+        .payload
+        .get("inbox")
+        .or_else(|| job.payload.get("relay_inbox"))
+        .and_then(|v| v.as_str())?;
+    Some(super::federation::delivery_host_key(inbox))
+}
+
+/// The stamped sequence of a delivery job (0 when absent, i.e. pre-v23 rows).
+fn delivery_seq_of(job: &Job) -> u64 {
+    job.payload.get("seq").and_then(|v| v.as_u64()).unwrap_or(0)
+}
+
+fn insert_delivery_active(
+    write: &WriteTransaction,
+    host: &str,
+    seq: u64,
+    job_id: Id,
+) -> StoreResult<()> {
+    let mut active = write.open_table(DELIVERY_ACTIVE)?;
+    let key = schema::delivery_active_key(host, seq, job_id.value());
+    active.insert(key.as_slice(), job_id.value())?;
+    Ok(())
+}
+
+fn remove_delivery_active(
+    write: &WriteTransaction,
+    host: &str,
+    seq: u64,
+    job_id: Id,
+) -> StoreResult<()> {
+    let mut active = write.open_table(DELIVERY_ACTIVE)?;
+    let key = schema::delivery_active_key(host, seq, job_id.value());
+    active.remove(key.as_slice())?;
+    Ok(())
+}
 
 /// Insert a job and its scheduling index entry into an existing transaction.
 ///
 /// Used by other repositories so a mutation and its follow-up job commit
-/// together.
+/// together. For delivery kinds (`DeliverActivity`/`RelayForward`) the
+/// transactional `DELIVERY_ACTIVE` gate entry is maintained in the same
+/// transaction, so the FIFO gate never sees a half-committed plan.
 pub(super) fn insert_job(write: &WriteTransaction, job: &Job) -> StoreResult<()> {
     {
         let mut jobs = write.open_table(JOBS)?;
@@ -29,6 +75,11 @@ pub(super) fn insert_job(write: &WriteTransaction, job: &Job) -> StoreResult<()>
             schema::job_index_key(job.due_at_ms, job.id.value()).as_slice(),
             job.id.value(),
         )?;
+    }
+    if is_delivery_kind(job.kind) {
+        if let Some(host) = delivery_host_of(job) {
+            insert_delivery_active(&write, &host, delivery_seq_of(job), job.id)?;
+        }
     }
     Ok(())
 }
@@ -72,7 +123,7 @@ impl RedbStore {
     fn enqueue_inner(
         &self,
         kind: JobKind,
-        payload: serde_json::Value,
+        mut payload: serde_json::Value,
         due_at_ms: u64,
         now_ms: u64,
     ) -> Result<Job> {
@@ -98,6 +149,28 @@ impl RedbStore {
             store_job(&write, &job)?;
             write.commit()?;
             return Ok(job);
+        }
+        // Delivery kinds mint their per-host sequence in this same transaction
+        // when the caller did not stamp one (adversarial-2 C1): the mint, the
+        // job row and the `DELIVERY_ACTIVE` entry commit together, so a delayed
+        // insert can never let `N+1` become visible before `N`. Callers that
+        // already stamped a sequence (in-transaction planning via
+        // `delivery_job`, or a parked copy preserving its `seq`) keep it.
+        if is_delivery_kind(kind)
+            && payload.get("seq").and_then(|v| v.as_u64()).is_none()
+        {
+            let inbox = payload
+                .get("inbox")
+                .or_else(|| payload.get("relay_inbox"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            if let Some(inbox) = inbox {
+                let host = super::federation::delivery_host_key(&inbox);
+                let seq = super::federation::next_delivery_seq_txn(&write, &host)?;
+                if let Some(object) = payload.as_object_mut() {
+                    object.insert("seq".into(), serde_json::Value::from(seq));
+                }
+            }
         }
         let job = Job::new(self.next_id(), kind, payload, due_at_ms, now_ms);
         insert_job(&write, &job)?;
@@ -203,6 +276,9 @@ impl JobQueue for RedbStore {
                 continue;
             }
             // Move the index entry from the old timestamp to the lease expiry.
+            // A leased delivery stays in the `DELIVERY_ACTIVE` gate: its
+            // `(host, seq, job_id)` key does not involve the due time, so no
+            // gate write is needed here.
             remove_index(&write, index_ts, id)?;
             job.state = JobState::Leased;
             job.lease_until_ms = Some(now_ms + LEASE_MS);
@@ -225,7 +301,7 @@ impl JobQueue for RedbStore {
         // transaction: one `redb` txn per mutation, no network I/O inside.
         // Only `Succeeded` rows qualify; `Pending`/`Leased` rows are live
         // work and `Quarantined` rows age out through `prune_quarantined`.
-        let mut victims: Vec<(u64, Id)> = Vec::new();
+        let mut victims: Vec<Job> = Vec::new();
         {
             let write = self.begin_write()?;
             {
@@ -234,22 +310,30 @@ impl JobQueue for RedbStore {
                     let (_key, value) = entry?;
                     let job: Job = decode(value.value())?;
                     if job.state == JobState::Succeeded && job.due_at_ms < older_than_ms {
-                        victims.push((job.due_at_ms, job.id));
+                        victims.push(job);
                     }
                 }
             }
             // Oldest first so a capped pass always reaps the stalest rows.
-            victims.sort();
+            victims.sort_by_key(|job| (job.due_at_ms, job.id));
             victims.truncate(limit);
             {
                 let mut jobs = write.open_table(JOBS)?;
-                for (_due_at_ms, id) in &victims {
-                    jobs.remove(id.value())?;
+                for job in &victims {
+                    jobs.remove(job.id.value())?;
                 }
             }
             // `Succeeded` rows hold no scheduling-index entries
-            // (`complete` removed them at settlement), so there is nothing
-            // to unindex here.
+            // (`complete` removed them at settlement), and no gate entries
+            // (`complete` removed those too). A belt-and-braces sweep drops
+            // any stale gate entry a pre-index row may have left behind.
+            for job in &victims {
+                if is_delivery_kind(job.kind) {
+                    if let Some(host) = delivery_host_of(job) {
+                        remove_delivery_active(&write, &host, delivery_seq_of(job), job.id)?;
+                    }
+                }
+            }
             write.commit()?;
         }
         Ok(victims.len() as u64)
@@ -265,7 +349,7 @@ impl JobQueue for RedbStore {
         // settlement), so only the `JOBS` table entry is deleted. Prune is
         // delete-only: the row's `last_error` and redacted payload were the
         // diagnostics, and they age out with the row.
-        let mut victims: Vec<(u64, Id)> = Vec::new();
+        let mut victims: Vec<Job> = Vec::new();
         {
             let write = self.begin_write()?;
             {
@@ -274,17 +358,24 @@ impl JobQueue for RedbStore {
                     let (_key, value) = entry?;
                     let job: Job = decode(value.value())?;
                     if job.state == JobState::Quarantined && job.due_at_ms < older_than_ms {
-                        victims.push((job.due_at_ms, job.id));
+                        victims.push(job);
                     }
                 }
             }
             // Oldest first so a capped pass always reaps the stalest rows.
-            victims.sort();
+            victims.sort_by_key(|job| (job.due_at_ms, job.id));
             victims.truncate(limit);
             {
                 let mut jobs = write.open_table(JOBS)?;
-                for (_due_at_ms, id) in &victims {
-                    jobs.remove(id.value())?;
+                for job in &victims {
+                    jobs.remove(job.id.value())?;
+                }
+            }
+            for job in &victims {
+                if is_delivery_kind(job.kind) {
+                    if let Some(host) = delivery_host_of(job) {
+                        remove_delivery_active(&write, &host, delivery_seq_of(job), job.id)?;
+                    }
                 }
             }
             write.commit()?;
@@ -297,12 +388,18 @@ impl JobQueue for RedbStore {
         let Some(mut job) = read_job_txn(&write, id)? else {
             return Err(Error::NotFound(format!("job {id}")));
         };
+        let gate = is_delivery_kind(job.kind)
+            .then(|| delivery_host_of(&job).map(|host| (host, delivery_seq_of(&job))))
+            .flatten();
         remove_index(&write, job.due_at_ms, id)?;
         job.state = JobState::Succeeded;
         job.lease_until_ms = None;
         // A delivered mail job keeps no bearer or recipient (WP1 1.2).
         job.redact_sensitive_payload();
         store_job(&write, &job)?;
+        if let Some((host, seq)) = gate {
+            remove_delivery_active(&write, &host, seq, id)?;
+        }
         write.commit()?;
         Ok(())
     }
@@ -312,6 +409,9 @@ impl JobQueue for RedbStore {
         let Some(mut job) = read_job_txn(&write, id)? else {
             return Err(Error::NotFound(format!("job {id}")));
         };
+        let gate = is_delivery_kind(job.kind)
+            .then(|| delivery_host_of(&job).map(|host| (host, delivery_seq_of(&job))))
+            .flatten();
         remove_index(&write, job.due_at_ms, id)?;
         job.lease_until_ms = None;
         job.last_error = Some(error.to_string());
@@ -319,10 +419,17 @@ impl JobQueue for RedbStore {
         if job.attempts >= job.max_attempts {
             job.state = JobState::Quarantined;
             job.redact_sensitive_payload();
+            // A quarantined delivery leaves the gate: terminal rows never block.
+            if let Some((host, seq)) = gate {
+                remove_delivery_active(&write, &host, seq, id)?;
+            }
         } else {
             job.state = JobState::Pending;
             job.due_at_ms = now_ms + backoff_ms(job.attempts);
             add_index(&write, job.due_at_ms, id)?;
+            // A pending-with-backoff delivery stays in the gate: later
+            // sequences keep parking until it settles or the park cap
+            // relaxes the ordering (see `SEQ_PARK_MAX`).
         }
         store_job(&write, &job)?;
         write.commit()?;
@@ -334,12 +441,18 @@ impl JobQueue for RedbStore {
         let Some(mut job) = read_job_txn(&write, id)? else {
             return Err(Error::NotFound(format!("job {id}")));
         };
+        let gate = is_delivery_kind(job.kind)
+            .then(|| delivery_host_of(&job).map(|host| (host, delivery_seq_of(&job))))
+            .flatten();
         remove_index(&write, job.due_at_ms, id)?;
         job.state = JobState::Quarantined;
         job.lease_until_ms = None;
         job.last_error = Some(error.to_string());
         job.redact_sensitive_payload();
         store_job(&write, &job)?;
+        if let Some((host, seq)) = gate {
+            remove_delivery_active(&write, &host, seq, id)?;
+        }
         write.commit()?;
         Ok(())
     }

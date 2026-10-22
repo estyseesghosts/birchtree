@@ -9,13 +9,15 @@
 //! a Phase 4 concern, so these are stable placeholders rather than fabricated
 //! object data.
 
+use std::collections::HashMap;
+
 use serde_json::{Map, Value, json};
 
 use crate::api::mastodon::ServerInfo;
 use crate::application::ports::StatusViewFlags;
 use crate::domain::{
-    Account, AccountStats, AnnualReport, LocalUser, MediaAttachment, OAuthApplication, Place, Poll,
-    Status, StatusApplication, TrendLink, TrendPublisher, TrendTagFlag,
+    Account, AccountStats, AnnualReport, Id, LocalUser, MediaAttachment, OAuthApplication, Place,
+    Poll, Status, StatusApplication, TrendLink, TrendPublisher, TrendTagFlag,
 };
 
 /// Mastodon's default missing avatar/header asset path.
@@ -640,6 +642,12 @@ pub struct StatusView {
     pub filtered: Vec<Value>,
     /// Custom emoji referenced by the status text (batch-loaded per page).
     pub emojis: Vec<Value>,
+    /// Remote origin URLs by media id (batch-loaded per page from the
+    /// stored remote-media source; absent = local media). Rendered as
+    /// `remote_url`/`preview_remote_url` (adversarial-2 D1); never set
+    /// for local media. Mastodon exposes the origin URL regardless of
+    /// visibility, so there is no visibility gate here either.
+    pub remote_media_sources: HashMap<Id, String>,
     /// Core extension CORE-P: the attached place (batched per page;
     /// dangling ids read as no place).
     pub place: Option<Place>,
@@ -668,7 +676,24 @@ pub fn media_file_url(server: &ServerInfo, file_key: &str) -> String {
 /// from the derived WebM (`duration` only when the probe knew it, otherwise
 /// honestly absent); converted stills carry derived dimensions, a WebP
 /// `small` preview and a blurhash hashed from the derived pixels.
+/// `REST::MediaAttachmentSerializer` for local media (no remote source).
 pub fn media_attachment_json(server: &ServerInfo, media: &MediaAttachment) -> Value {
+    media_attachment_json_with_source(server, media, None)
+}
+
+/// `REST::MediaAttachmentSerializer` with the stored remote origin URL.
+///
+/// `remote_source` is `Some` exactly for remote attachments (threaded from
+/// the batch-loaded remote-media sources): both `remote_url` and
+/// `preview_remote_url` render the origin URL even while the cached bytes
+/// are still pending or have failed (Mastodon's serializer reads
+/// `object.remote_url` immediately; only `url` waits on `not_processed?`).
+/// Local media passes `None` and keeps both keys `null`.
+pub fn media_attachment_json_with_source(
+    server: &ServerInfo,
+    media: &MediaAttachment,
+    remote_source: Option<&str>,
+) -> Value {
     let processed = media.state == crate::domain::MediaState::Ready && !media.file_key.is_empty();
     let url = if processed {
         Value::String(media_file_url(server, &media.file_key))
@@ -679,13 +704,17 @@ pub fn media_attachment_json(server: &ServerInfo, media: &MediaAttachment) -> Va
         Some(key) if processed => Value::String(media_file_url(server, key)),
         _ => Value::Null,
     };
+    let remote_url = match remote_source.filter(|source| !source.is_empty()) {
+        Some(source) => Value::String(source.to_string()),
+        None => Value::Null,
+    };
     let mut value = json!({
         "id": media.id.to_string(),
         "type": media.r#type,
         "url": url,
         "preview_url": preview_url,
-        "remote_url": Value::Null,
-        "preview_remote_url": Value::Null,
+        "remote_url": remote_url.clone(),
+        "preview_remote_url": remote_url,
         "text_url": Value::Null,
         "meta": media_meta_json(media),
         "description": if media.description.is_empty() { Value::Null } else { json!(media.description) },
@@ -895,7 +924,13 @@ pub fn status_json(
     let media: Vec<Value> = view
         .media
         .iter()
-        .map(|attachment| media_attachment_json(server, attachment))
+        .map(|attachment| {
+            let source = view
+                .remote_media_sources
+                .get(&attachment.id)
+                .map(String::as_str);
+            media_attachment_json_with_source(server, attachment, source)
+        })
         .collect();
     object.insert("media_attachments".into(), json!(media));
     let mentions: Vec<Value> = view

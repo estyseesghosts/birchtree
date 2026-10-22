@@ -4,11 +4,20 @@
 
 **Purpose:** fix the verified correctness, security, storage, coupling, and operational risks before public production use. Keep the modular-monolith architecture and `redb`; do not turn this into a rewrite.
 
-## Status as of prod-2 (schema v23): RSA provider landed, RFC 9421 open
+## Current state (authoritative checklist) — as of 2026-10-22
 
-**Shipped (aws-lc-rs today):** the RSA migration in §4.3 is landed, not
-"not started". RustCrypto `rsa` is absent from the tree (`Cargo.toml`
-documents the removal; `cargo audit` is green on RUSTSEC-2023-0071).
+This section is authoritative. Where work packages below contradict it,
+this section wins. Work package 4 (`§4.1`–`§4.3`) described the
+pre-migration signer; that work landed in commit `7a8cd81`
+(`WP4: replace RustCrypto RSA with AWS-LC-RS for federation signatures`,
+2026-10-21) and is archived under `Archived (resolved)` inside Work
+package 4. The Ed25519 + RFC 9421 dual-stack is explicitly remaining work
+and a release gate (see `docs/ed25519-rfc9421-plan.md`).
+
+**Shipped (aws-lc-rs):** the RSA provider migration (formerly §4.3, now
+archived below) landed in `7a8cd81`.
+The old `rsa` crate was removed from the tree (`Cargo.toml` documents the
+removal; `cargo audit` is green on RUSTSEC-2023-0071).
 `vendor/activitypub_federation/src/rsa_provider.rs` is the single AWS-LC
 touchpoint: 2048-bit generation, PKCS#8 import, `sign_legacy_rsa_sha256`
 (blinded inside the AWS-LC operation — no unblinded path exists) and
@@ -18,6 +27,9 @@ and an OpenSSL-produced fixture signature verifies byte-identically
 (`tests/a_rsa_provider.rs`). Outbound stays legacy draft-Cavage
 `rsa-sha256`; inbound verifies legacy RSA and refuses unsigned requests
 (401, no state change — `tests/phase6_federation.rs`).
+Per-account single-flight key generation also landed in `7a8cd81`
+(`src/activitypub/key_generation.rs`): the atomic store insert decides
+the winner and discards losing generated keys.
 
 **Compatibility exception (deliberate, not a migration gap):** legacy RSA
 outbound is kept for RSA-only peers (older Mastodon, Misskey/Sharkey and
@@ -31,7 +43,7 @@ and no RFC 9421 `Signature-Input`/`Signature` path exists; an RFC
 9421-shaped request is refused (401), never accepted and never crashes
 (pinned by `rfc9421_shaped_request_is_refused_without_state_change`).
 The design, when it ships, is dual-stack per peer — never
-Ed25519-only-outbound:
+Ed25519-only-outbound (full plan in `docs/ed25519-rfc9421-plan.md`):
 
 1. Generate and publish an Ed25519 key alongside the existing RSA key
    (no key rotation: the RSA `keyId` stays).
@@ -44,6 +56,43 @@ Ed25519-only-outbound:
 5. Interop exit: one Mastodon 4.7-shaped RFC 9421 request accepted, one
    legacy draft-cavage request accepted, one bad signature rejected —
    proven by a live 4.7 lab run, not by unit fixtures alone.
+
+### Release checklist (single authoritative list)
+
+Do not call Birchtree production-ready until all of these are demonstrated
+on the release build:
+
+- [x] RSA provider migrated to AWS-LC-RS; legacy Cavage `rsa-sha256` wire
+  format preserved; `cargo audit` green on RUSTSEC-2023-0071 (landed in
+  `7a8cd81`; covered by `tests/a_rsa_provider.rs`).
+- [x] Per-account single-flight actor key generation; atomic store insert
+  decides the winner (`src/activitypub/key_generation.rs`, also `7a8cd81`).
+- [ ] Ed25519 + RFC 9421 dual-stack per `docs/ed25519-rfc9421-plan.md`
+  (release gate; until then
+  `rfc9421_shaped_request_is_refused_without_state_change` must keep
+  passing).
+- [ ] Confirmation/reset bearers are non-predictable, protected at rest and
+  removed/redacted after delivery; token consumption is atomic.
+- [ ] Rate-limit client identity cannot be spoofed through untrusted
+  forwarding headers.
+- [ ] Existing blobs survive failed replacement; data/database/media
+  directories have enforced permissions.
+- [ ] File size and decoded-image limits are enforced; uploads and downloads
+  are streamed; expensive processing is bounded and off the async executor.
+- [ ] Durable and cache roots are truly separate; cache accounting restores
+  after restart; eviction and reconciliation actually run.
+- [ ] No staging files are publicly served; upload/metadata failures clean up
+  or are reconciled.
+- [x] Background jobs have bounded class-specific concurrency, retention,
+  redaction and reliable crash recovery.
+- [ ] Authorized-fetch and ordinary federation tests both pass for the target
+  compatibility matrix.
+- [ ] Restart/clock rollback cannot duplicate IDs; MFA lookup has an account
+  index.
+- [ ] Full CI, relevant smoke suites, Mastodon 4.7.3 compatibility tests, and
+  backup/restore + realistic load tests pass.
+- [ ] README, architecture map, current-state docs and TODOs describe the
+  actual code and the remaining deviations accurately.
 
 ## Working rules
 
@@ -60,7 +109,7 @@ Ed25519-only-outbound:
 | **P0** | Replace predictable confirmation tokens; secure bearer storage | Account verification can rely on a guessable bearer; reset/confirmation secrets are retained in plaintext. |
 | **P0** | Fix blob atomic replacement and private storage permissions | A failed rename can remove the previous blob; sensitive data can be readable under permissive existing directories. |
 | **P0** | Fix rate-limit client-IP trust | `X-Forwarded-For` is accepted directly as the rate-limit identity and can be spoofed when the application is reachable. |
-| **P0** | Harden the RSA signing operation without accidentally breaking federation | The vendored signer calls RustCrypto `RsaPrivateKey::sign()` without blinding; the crate remains under an unpatched RustSec timing-side-channel advisory. |
+| **P0** | Harden the RSA signing operation without accidentally breaking federation — RESOLVED in `7a8cd81` (see Current state above and Archived in §4) | Was a vendored-signer side-channel hardening item; the provider migration has landed and `cargo audit` is green on RUSTSEC-2023-0071. |
 | **P0** | Enforce `max_file_size` correctly and bound media resource usage | The upload handler substitutes the overall request-body limit for the configured file limit; uploads and responses buffer whole files. |
 | **P1** | Finish cache-pool, eviction, and reconciliation runtime wiring | The cache store is opened and discarded; maintenance job arms are no-ops, and no production `ReconStore` implementation exists in the current source tree. |
 | **P1** | Make email-token redemption and state mutation atomic | A consumed token can be lost if the corresponding account update fails. |
@@ -193,79 +242,68 @@ Media uploads stage the original and optional thumbnail before creating the `red
 
 **Acceptance tests:** spoofed `X-Forwarded-For` cannot create arbitrary identities from an untrusted peer; the configured trusted proxy chain resolves correctly; flooding new identity strings cannot clear other users' windows; login/reset endpoints have independent thresholds and return the expected 429 behaviour.
 
-# Work package 4 — Harden the RSA federation signer (P0)
+# Work package 4 — Harden the RSA federation signer (P0) — RESOLVED in `7a8cd81`
 
 **Relevant files:**
 - `Cargo.toml`, `Cargo.lock`
 - `vendor/activitypub_federation/src/http_signatures.rs`
+- `vendor/activitypub_federation/src/rsa_provider.rs`
 - `src/activitypub/actor.rs`
+- `src/activitypub/key_generation.rs`
 - `src/persistence/redb/federation.rs`
 - `src/federation/net.rs`
 - `src/activitypub/` and the federation interoperability tests
 
-## 4.1 What is wrong in the current code
+**Resolved:** the provider migration landed in commit `7a8cd81`
+(`WP4: replace RustCrypto RSA with AWS-LC-RS for federation signatures`,
+2026-10-21). What changed there:
 
-The vendored `sign_request()` uses `RsaPrivateKey::sign(Pkcs1v15Sign::new::<Sha256>(), digest)` without supplying an RNG. RustCrypto's RSA API documents that `sign_with_rng()` uses the supplied RNG to blind the private-key operation for PKCS#1 v1.5 signatures. The current call therefore misses this side-channel mitigation.
+- The direct and vendored `rsa` dependency was removed; `aws-lc-rs`
+  (1.18.2 in `Cargo.toml`) is the RSA provider behind the narrow
+  `sign_legacy_rsa_sha256` / `verify_legacy_rsa_sha256` adapter in
+  `vendor/activitypub_federation/src/rsa_provider.rs`.
+- 2048-bit generation, PKCS#8 import, and SPKI PEM verification go through
+  AWS-LC with no hand-parsed DER; stored keys still load and key IDs are
+  stable (`tests/a_rsa_provider.rs`, including the OpenSSL fixture check).
+- Legacy Cavage `rsa-sha256` wire format was preserved; RSA-PSS was not
+  introduced as a drop-in.
+- Per-account single-flight key generation landed in the same commit
+  (`src/activitypub/key_generation.rs`); the atomic store insert returns
+  the winning stored key and discards losing generated keys.
+- `cargo audit` is green on RUSTSEC-2023-0071.
 
-Be precise about the finding: **PKCS#1 v1.5 here is a signature encoding, not an RSA decryption operation.** The classic Marvin padding-oracle scenario is associated with timing leakage from RSA private-key decryption and padding processing. The inspected signer does not itself decrypt remote ciphertext, so source inspection alone does not establish that Birchtree exposes that classic decryption oracle. However, it does perform network-facing private-key signing without blinding, and RustSec continues to flag the RustCrypto `rsa` crate for network-observable private-key timing leakage with no patched release. Treat the current operation as a P0 issue; do not claim the API substitution alone clears the advisory.
+Do not re-apply the pre-migration steps below. They are retained only as
+history in the `Archived (resolved)` subsection.
 
-References:
+## Archived (resolved) — pre-migration signer notes (superseded by `7a8cd81`)
+
+All verbs below describe the tree *before* `7a8cd81` and are preserved here
+only as history. The finding had been that the vendored signer had used an
+unblinded private-key operation, and the old tree had contained an
+unpatched advisory against that dependency. The interim blinding note and
+the provider-migration plan had been written before the migration; both
+were completed when `7a8cd81` removed the old dependency, added
+`vendor/activitypub_federation/src/rsa_provider.rs` on AWS-LC, and added
+`src/activitypub/key_generation.rs` for single-flight generation. The
+pre-migration acceptance checks had been: blinded private-key operation
+with no silent fallback to an unblinded call; legacy Cavage headers
+accepted by Mastodon 4.4/4.5/4.6/4.7 and Misskey/Sharkey targets; stored
+PKCS#8 keys loading with stable key IDs; key generation/import/signing/
+verification and malformed-key coverage; dependency review showing the old
+crate gone; and no key-generation storm on concurrent first fetches.
+
+Historical references for this archived finding:
+
 - RustSec advisory: https://rustsec.org/advisories/RUSTSEC-2023-0071.html
-- RustCrypto RSA private-key API and `sign_with_rng()` blinding semantics: https://github.com/RustCrypto/RSA/blob/master/src/key.rs
-- RustCrypto RSA security warning: https://github.com/RustCrypto/RSA
+- Pre-migration API note (superseded): https://github.com/RustCrypto/RSA/blob/master/src/key.rs
+- Pre-migration security note (superseded): https://github.com/RustCrypto/RSA
+- AWS-LC-RS RSA provider docs: https://docs.rs/aws-lc-rs/latest/aws_lc_rs/signature/index.html
 
-## 4.2 Immediate mitigation: blind the existing signature operation (only if provider migration is not immediate)
+Compatibility references (still current, also listed in Reference links):
 
-This is a short-lived mitigation, not the preferred end state. If the implementer can complete the provider migration below in the same focused change, skip this interim dependency-bound patch and move directly to AWS-LC-RS. Otherwise, implement it as a separately reviewable stopgap.
-
-**Implement in a small, isolated commit:**
-
-1. Replace the current `RsaPrivateKey::sign(...)` call with `sign_with_rng(...)`, using a cryptographically secure RNG that implements the exact `rand_core` traits expected by the resolved `rsa` 0.9 dependency. Do not assume the application's direct `rand` version is trait-compatible; verify the actual dependency versions and use an appropriate CSPRNG.
-2. Keep `Pkcs1v15Sign::new::<Sha256>()` for this immediate mitigation. Randomized blinding changes how the private operation is performed, not the required legacy signature format. This preserves the existing Cavage-style `rsa-sha256` wire protocol and should not require actors to rotate keys.
-3. Put the operation behind a narrow helper such as `sign_legacy_rsa_sha256()` so the implementation can be replaced behind one interface later. Do not add a fallback to the unblinded `sign()` method if RNG initialization or signing fails; fail the delivery and report a sanitized error.
-4. Add a regression test proving generated signatures verify under the existing RSA public key, and integration coverage showing the request still uses the expected legacy headers, signed components, digest, and RSA-SHA256 signature format.
-5. Label this commit as a **mitigation, not final advisory resolution**. `cargo audit` will still report the unpatched `rsa` crate while it remains in the dependency tree.
-
-## 4.3 Production fix: replace RustCrypto RSA with AWS-LC-RS
-
-**Use `aws-lc-rs` as the selected replacement. Do not leave the provider choice open to the implementer.** AWS-LC-RS is a maintained Rust interface to AWS-LC's cryptographic implementation and supports RSA key generation, RSA PKCS#1 v1.5/SHA-256 signing, and RSA signature verification. Its documented API provides the functions needed to retain Birchtree's existing legacy federation signature format. Pin the resolved version in `Cargo.lock` and keep it current with security releases.
-
-References:
-- Crate and API: https://docs.rs/aws-lc-rs/latest/aws_lc_rs/
-- RSA key generation, PKCS#8 import, and serialization: https://docs.rs/aws-lc-rs/latest/aws_lc_rs/rsa/struct.KeyPair.html
-- RSA PKCS#1 v1.5 signing/verification APIs and required public-key encoding: https://docs.rs/aws-lc-rs/latest/aws_lc_rs/signature/index.html
-- AWS-LC-RS source and build notes: https://github.com/aws/aws-lc-rs
-
-**Implement:**
-
-1. In `Cargo.toml`, replace the direct `rsa = { version = "0.9", ... }` dependency with `aws-lc-rs` (the current documented release at the time this guide was revised is 1.18.2; resolve and lock the current patched release rather than blindly freezing that version forever). Remove the old crate from the resolved production dependency tree after all direct and vendored usages have been migrated. Do not assume changing the top-level dependency is sufficient: `vendor/activitypub_federation/Cargo.toml` and its source currently use RustCrypto's `rsa` APIs and must be updated too.
-2. In `vendor/activitypub_federation/src/http_signatures.rs`, use `aws_lc_rs::rsa::KeyPair` for RSA generation and private-key import, and `aws_lc_rs::signature::RSA_PKCS1_SHA256` for signing the **full signing string**. AWS-LC-RS's `KeyPair::sign` hashes the message as part of the operation; do not pass the precomputed SHA-256 digest to that message-signing API, or the implementation will hash a digest again and produce incompatible signatures. Size the signature buffer to `key_pair.public_modulus_len()`.
-3. Generate 2048-bit actor RSA keys through `aws_lc_rs::rsa::KeyPair::generate(KeySize::Rsa2048)`. Serialize private keys to PKCS#8 DER via `AsDer<Pkcs8V1Der>` and retain the existing `-----BEGIN PRIVATE KEY-----` PEM representation in storage. On import, decode PEM to DER and load with `KeyPair::from_pkcs8`. Preserve the existing public-key `-----BEGIN PUBLIC KEY-----` SubjectPublicKeyInfo representation in actor documents. Use the existing ASN.1/SPKI tooling or AWS-LC's key parser for the public-key encoding conversion required by signature verification; **do not hand-parse ASN.1/DER**.
-4. Implement legacy inbound RSA verification using `aws_lc_rs::signature::RSA_PKCS1_2048_8192_SHA256`. Its documented signature-verification API expects an ASN.1 `RSAPublicKey` encoding, while Birchtree's ActivityPub actor documents store an X.509 `SubjectPublicKeyInfo` PEM (`BEGIN PUBLIC KEY`). Convert this with an existing, maintained ASN.1/SPKI parser or a supported AWS-LC key conversion. Add tests for real actor-document PEM inputs, rather than testing only with generated raw DER fixtures.
-5. Keep this change behind a small provider adapter. Do not expose AWS-LC types through domain/application traits. Preserve existing actor IDs, `keyId` values, stored private keys, and published public keys; changing the crypto implementation must not trigger key rotation. If an existing private key cannot be imported, fail safely and provide an explicit, tested migration path rather than silently generating a replacement identity.
-6. Preserve the existing PKCS#1 v1.5 / SHA-256 wire format for legacy HTTP Signatures. **Do not replace it with RSA-PSS as a drop-in fix.** Many receivers expect the old Cavage-style `rsa-sha256` signature format; Mastodon's RFC 9421 support uses `rsa-v1_5-sha256` for RSA compatibility, and not every older peer supports RFC 9421 at all.
-7. Check build and deployment implications of AWS-LC-RS's native cryptographic backend on every supported platform and in CI. Add the dependency's required native build tools to the documented build environment if needed. Keep the crate updated; choosing a different provider is not a substitute for dependency auditing.
-8. Keep Ed25519 + RFC 9421 as a separate federation-capability enhancement, not a prerequisite for the RSA security fix. Mastodon 4.7 supports Ed25519 through FEP-521a/RFC 9421, but older Mastodon releases and other Fediverse implementations have different support. If adding Ed25519, make per-peer behavior explicit. Do not silently downgrade a failed Ed25519 attempt to legacy RSA unless that fallback is an intentional, documented policy.
-
-Compatibility references:
 - Mastodon 4.7 release: https://blog.joinmastodon.org/2026/08/mastodon-4.7/
 - Mastodon version/signature compatibility table: https://github.com/mastodon/mastodon/blob/main/FEDERATION.md
 - RFC 9421 HTTP Message Signatures: https://www.rfc-editor.org/rfc/rfc9421.html
-
-## 4.4 Keep RSA key-generation races separate
-
-`keys_for_local()` checks for an actor key, generates a 2048-bit keypair on a blocking thread if missing, then stores it. Concurrent requests can all pass the initial check and trigger expensive generation simultaneously. This is a separate defect from the signature timing issue.
-
-**Implement:** use per-account single-flight generation or pre-create and persist keys before publishing the actor. The atomic store operation must return the winning stored key and discard losing generated keys. Do not use this work package as a reason to force immediate Ed25519-only actor migration.
-
-**Acceptance tests:**
-
-- The production signing helper uses a blinded RSA private-key operation; no code path silently falls back to the unblinded `sign()` call.
-- Legacy requests retain their existing Cavage-style RSA-SHA256 headers and are accepted by integration targets that support that profile, including Mastodon 4.4, 4.5/4.6, and 4.7, plus the selected Misskey/Sharkey test targets.
-- Existing stored PKCS#8 PEM keys still load, actor key IDs remain stable, and signatures verify with the already-published public key.
-- A provider-replacement test suite covers key generation/import, signing, public-key verification, malformed-key handling, and legacy interoperability.
-- The dependency review accounts for every remaining RustCrypto `rsa` use. The advisory is not considered resolved until the vulnerable dependency is removed or a documented security review supports a deliberate exception; a blinding-only interim patch is not enough.
-- Concurrent first fetches create one actor key and do not spawn a key-generation storm.
 
 # Work package 5 — Upload limits and bounded media processing (P0)
 
@@ -413,28 +451,16 @@ The latest pipeline runs `cargo check --all-targets --locked`, `cargo test --loc
 
 ## Production qualification gate
 
-Do not call Birchtree production-ready until all of these are demonstrated on the release build:
-
-- [ ] No untriaged high/critical security advisory; crypto plan documented and tested.
-- [ ] Confirmation/reset bearers are non-predictable, protected at rest and removed/redacted after delivery; token consumption is atomic.
-- [ ] Rate-limit client identity cannot be spoofed through untrusted forwarding headers.
-- [ ] Existing blobs survive failed replacement; data/database/media directories have enforced permissions.
-- [ ] File size and decoded-image limits are enforced; uploads and downloads are streamed; expensive processing is bounded and off the async executor.
-- [ ] Durable and cache roots are truly separate; cache accounting restores after restart; eviction and reconciliation actually run.
-- [ ] No staging files are publicly served; upload/metadata failures clean up or are reconciled.
-- [x] Background jobs have bounded class-specific concurrency, retention, redaction and reliable crash recovery.
-- [ ] No network-facing RSA signer uses an unblinded private-key operation. AWS-LC-RS is the selected and tested RSA provider; RustCrypto RSA is absent from production dependency paths, or any remaining use is explicitly justified and documented. Legacy wire compatibility and any Ed25519/RFC 9421 policy are tested rather than assumed.
-- [ ] Authorized-fetch and ordinary federation tests both pass for the target compatibility matrix.
-- [ ] Restart/clock rollback cannot duplicate IDs; MFA lookup has an account index.
-- [ ] Full CI, relevant smoke suites, Mastodon 4.7.3 compatibility tests, and backup/restore + realistic load tests pass.
-- [ ] README, architecture map, current-state docs and TODOs describe the actual code and the remaining deviations accurately.
+Superseded by the single authoritative list in `Current state
+(authoritative checklist)` at the top of this file. That section is the
+only checklist; this section is retained as a pointer so older links do
+not resolve to a stale duplicate.
 
 ## Reference links
 
 - Birchtree CI: https://github.com/estyseesghosts/birchtree/actions
 - Current repository tree: https://github.com/estyseesghosts/birchtree/tree/master/src
-- RustSec RSA/Marvin advisory: https://rustsec.org/advisories/RUSTSEC-2023-0071.html
-- RustCrypto RSA signing/blinding API (interim mitigation only): https://github.com/RustCrypto/RSA/blob/master/src/key.rs
+- RustSec RSA/Marvin advisory (historical context for the resolved item above): https://rustsec.org/advisories/RUSTSEC-2023-0071.html
 - AWS-LC-RS RSA provider docs: https://docs.rs/aws-lc-rs/latest/aws_lc_rs/signature/index.html
 - RustSec `blurhash` advisory: https://rustsec.org/advisories/RUSTSEC-2023-0083.html
 - RustSec `rustls-webpki` advisory: https://rustsec.org/advisories/RUSTSEC-2026-0382.html

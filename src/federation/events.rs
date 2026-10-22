@@ -352,20 +352,16 @@ pub async fn run(
         if relay_public {
             for relay in crate::federation::delivery::relay_inboxes(ctx.relays.as_slice()) {
                 for body in &bodies {
-                    // The relay send carries the relay host's sequence: the
-                    // in-memory delivery built from this job inherits it, so
-                    // relay traffic joins the same per-host FIFO.
-                    let payload = crate::federation::delivery::stamp_delivery_seq(
-                        store,
-                        relay.as_str(),
-                        serde_json::json!({
-                            "sender_id": author.id.value(),
-                            "relay_inbox": relay.as_str(),
-                            "activity_uri": body.get("id").and_then(Value::as_str).unwrap_or_default(),
-                            "body": body,
-                        }),
-                    )
-                    .map_err(quarantine)?;
+                    // The relay send carries the relay host's sequence, minted
+                    // in the same transaction as the insert (see the job
+                    // queue's delivery mint), so relay traffic joins the same
+                    // per-host FIFO without a stamp-then-enqueue race.
+                    let payload = serde_json::json!({
+                        "sender_id": author.id.value(),
+                        "relay_inbox": relay.as_str(),
+                        "activity_uri": body.get("id").and_then(Value::as_str).unwrap_or_default(),
+                        "body": body,
+                    });
                     store
                         .enqueue(JobKind::RelayForward, payload, now)
                         .map_err(retry)?;
@@ -382,23 +378,16 @@ pub async fn run(
             .to_string();
         tracing::debug!(target: "birchtree::federation", direction = "outbound", event = %event, activity = %activity_uri, destinations = inboxes.len(), "event planned");
         for inbox in &inboxes {
-            // Plan order is sequence order: the mint and the insert are one
-            // call apart per inbox, so a `Follow` planned before its `Undo`
-            // always carries the smaller number.
-            let payload = crate::federation::delivery::stamp_delivery_seq(
-                store,
-                inbox,
-                serde_json::json!({
-                    "sender_id": author.id.value(),
-                    "inbox": inbox,
-                    "activity_uri": activity_uri,
-                    "body": body,
-                }),
-            )
-            .map_err(quarantine)?;
-            store
-                .enqueue(JobKind::DeliverActivity, payload, now)
-                .map_err(retry)?;
+            // Plan order is sequence order: the atomic enqueue mints the host
+            // sequence and inserts the job in one transaction, so a `Follow`
+            // planned before its `Undo` always carries the smaller number.
+            let delivery = crate::application::federation_ports::DeliverySpec {
+                sender_id: author.id,
+                inbox_uri: inbox.clone(),
+                activity_uri: activity_uri.clone(),
+                body: body.clone(),
+            };
+            store.enqueue_delivery(delivery, now).map_err(retry)?;
         }
     }
     Ok(())

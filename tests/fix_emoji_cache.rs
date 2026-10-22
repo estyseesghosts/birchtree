@@ -215,10 +215,15 @@ fn remote_emoji_live_in_the_cache_pool_and_evict() {
     let pools = PooledBlobStores::new(durable, cache);
     let png = png_bytes(10, 20, 30);
     let source = "https://remote.example/e.png";
+    let ledger = std::sync::Mutex::new(birchtree::media::remote_cache::CacheLedger::new(
+        birchtree::config::RemoteCacheConfig::default(),
+    ));
 
     let row = store_remote_emoji(
         &*store,
         &pools,
+        &*store,
+        &ledger,
         "party@remote.example",
         "remote.example",
         source,
@@ -272,9 +277,14 @@ async fn remote_emoji_route_serves_and_refetches_on_miss() {
     let srv = TestServer::new(true);
     let png = png_bytes(10, 20, 30);
     let source = "https://remote.example/e.png";
+    let ledger = std::sync::Mutex::new(birchtree::media::remote_cache::CacheLedger::new(
+        birchtree::config::RemoteCacheConfig::default(),
+    ));
     let row = store_remote_emoji(
         &*srv.store,
         &*srv.blobs,
+        &*srv.store,
+        &ledger,
         "party@remote.example",
         "remote.example",
         source,

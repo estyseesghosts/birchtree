@@ -374,6 +374,7 @@ impl CacheStore for RedbStore {
                 blob_keys.push(entry.blob_key.clone());
                 entry.has_bytes = false;
                 entry.size = 0;
+                entry.refcount = 0;
                 cache.insert(key.as_slice(), super::encode(&entry)?.as_slice())?;
             }
             counters.insert(TOTAL_KEY, super::encode(&total)?.as_slice())?;
@@ -518,6 +519,7 @@ impl RedbStore {
                 blob_keys.push(entry.blob_key.clone());
                 entry.has_bytes = false;
                 entry.size = 0;
+                entry.refcount = 0;
                 cache.insert(key.as_slice(), super::encode(&entry)?.as_slice())?;
             }
             counters.insert(TOTAL_KEY, super::encode(&total)?.as_slice())?;
@@ -579,6 +581,7 @@ impl RedbStore {
             for (key, mut row) in detach {
                 row.has_bytes = false;
                 row.size = 0;
+                row.refcount = 0;
                 cache.insert(key.as_slice(), super::encode(&row)?.as_slice())?;
             }
             counters.insert(TOTAL_KEY, super::encode(&total)?.as_slice())?;
@@ -601,20 +604,49 @@ impl RedbStore {
     /// The ledger row that claims `blob_key`, with its table key.
     ///
     /// Attachment bytes use the deterministic key `remote/<media id>`, so the
-    /// fast path is two point lookups (media id -> source URL -> row); any
-    /// other key falls back to a scan of the ledger.
+    /// fast path is point lookups (media id -> source URL -> row for the
+    /// media's own variant). A deduped duplicate (same source and variant
+    /// already counted under a different key) and a missing row both return
+    /// `None` without scanning; any other key falls back to a scan.
     pub fn cache_row_by_blob_key(
         &self,
         blob_key: &str,
     ) -> Result<Option<(Vec<u8>, RemoteCacheEntry)>> {
-        if let Some(id) = blob_key
-            .strip_prefix("remote/")
-            .and_then(|digits| digits.parse::<u64>().ok())
-            && let Some(source) = self.remote_media_source(Id::new(id))?
-            && let Some(row) = self.cache_get(&source, "original")?
-            && row.blob_key == blob_key
+        if let Some(rest) = blob_key.strip_prefix("remote/")
+            && let Some(digits) = rest.split('.').next()
+            && let Ok(id) = digits.parse::<u64>()
         {
-            return Ok(Some((row.cache_key(), row)));
+            let media_id = Id::new(id);
+            if let Some(source) = self.remote_media_source(media_id)?
+                && let Some(media) = self.media_by_id(media_id)?
+            {
+                let variant: Option<&str> = if media.file_key == blob_key {
+                    Some("original")
+                } else if media.preview_key.as_deref() == Some(blob_key) {
+                    Some("preview")
+                } else if media.thumbnail_key.as_deref() == Some(blob_key) {
+                    Some("thumbnail")
+                } else {
+                    None
+                };
+                if let Some(variant) = variant
+                    && let Some(row) = self.cache_get(&source, variant)?
+                {
+                    if row.blob_key == blob_key {
+                        return Ok(Some((row.cache_key(), row)));
+                    }
+                    // The source already has a row for this variant: a
+                    // byte-holding row under a different key is a deduped
+                    // duplicate, and a shell is an explicit eviction. Either
+                    // way the requested key has no own row.
+                    return Ok(None);
+                }
+                if variant.is_some() {
+                    // The media names this blob but the ledger has no row for
+                    // its (source, variant): a lost row, not a hidden one.
+                    return Ok(None);
+                }
+            }
         }
         let read = self.begin_read()?;
         let table = read.open_table(REMOTE_CACHE)?;
@@ -632,6 +664,13 @@ impl RedbStore {
     /// The attachment row that references `blob_key` (as its file, preview
     /// or cover), with the ledger variant that key is accounted under: bytes
     /// that are in use even when the ledger lost track of them.
+    ///
+    /// A stale `file_key` is not proof of use: when the ledger already has a
+    /// row for the media's (source, variant), only a byte-holding row with
+    /// the same `blob_key` counts. An explicit shell (evicted) or a deduped
+    /// duplicate (same pair counted under a different key) returns `None`,
+    /// so the reconciler treats the surviving file as residue, not as
+    /// claimed bytes.
     pub fn media_references_blob(&self, blob_key: &str) -> Result<Option<(Id, &'static str)>> {
         let Some(rest) = blob_key.strip_prefix("remote/") else {
             return Ok(None);
@@ -652,7 +691,17 @@ impl RedbStore {
         } else {
             None
         };
-        Ok(variant.map(|variant| (media.id, variant)))
+        let Some(variant) = variant else {
+            return Ok(None);
+        };
+        let Some(source) = self.remote_media_source(media.id)? else {
+            return Ok(None);
+        };
+        match self.cache_get(&source, variant)? {
+            None => Ok(Some((media.id, variant))),
+            Some(row) if row.has_bytes && row.blob_key == blob_key => Ok(Some((media.id, variant))),
+            Some(_) => Ok(None),
+        }
     }
 
     fn recon_pool(&self) -> Result<&FsBlobStore> {

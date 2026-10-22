@@ -487,12 +487,26 @@ impl CacheLedger {
         self.entries.get(key)
     }
 
-    /// Shortfall in bytes if `size` more bytes of `class` were admitted now.
+    /// Shortfall in bytes if `size` more bytes of `class` were admitted now:
+    /// the larger of the global-cap overage and the class-cap overage, so an
+    /// eviction pass sized by this always frees enough for the `reserve`
+    /// retry that follows. Never understates: admission headroom must cover
+    /// what `evict_for` and `plan_eviction` assume.
     pub fn shortfall_for(&self, class: MediaClass, size: u64) -> u64 {
-        let _ = class;
-        self.committed_total()
+        let global = self
+            .committed_total()
             .saturating_add(size)
-            .saturating_sub(self.cfg.global_cap_bytes)
+            .saturating_sub(self.cfg.global_cap_bytes);
+        if class == MediaClass::Stream {
+            return global;
+        }
+        let class_committed =
+            self.stored[class_index(class)].saturating_add(self.inflight[class_index(class)]);
+        global.max(
+            class_committed
+                .saturating_add(size)
+                .saturating_sub(class.cap_bytes(&self.cfg)),
+        )
     }
 
     /// Order victims to free `bytes_to_free` for `need`: expired entries of
@@ -647,6 +661,12 @@ impl CacheLedger {
     /// Reserve `bytes` of in-flight budget for `class`. Call *before* reading
     /// the body (worst case first, shrink when `Content-Length` is known).
     /// Refusals never mutate.
+    ///
+    /// Every persistent class enforces its own ceiling here (avatar/emoji,
+    /// preview and full — adversarial-2 N3), plus the hard global cap, so
+    /// concurrent fetches cannot overshoot any budget. A class overage is a
+    /// `BudgetExhausted` against that class's cap (the fetch path evicts,
+    /// then retries exactly this call).
     pub fn reserve(&mut self, class: MediaClass, bytes: u64) -> Result<(), CacheError> {
         if !persistence_allowed(&self.cfg) {
             return Err(disabled_refusal());
@@ -662,15 +682,15 @@ impl CacheLedger {
                 "audio/video originals stream on demand and are never persisted".into(),
             ));
         }
-        if class == MediaClass::AvatarEmoji
-            && self
-                .stored_for(MediaClass::AvatarEmoji)
-                .saturating_add(bytes)
-                > self.cfg.avatar_emoji_cap_bytes
+        let class_cap = class.cap_bytes(&self.cfg);
+        if self.stored[class_index(class)]
+            .saturating_add(self.inflight[class_index(class)])
+            .saturating_add(bytes)
+            > class_cap
         {
             return Err(CacheError::BudgetExhausted {
                 need: bytes,
-                cap: self.cfg.avatar_emoji_cap_bytes,
+                cap: class_cap,
             });
         }
         if self.committed_total().saturating_add(bytes) > self.cfg.global_cap_bytes {
@@ -836,6 +856,120 @@ impl CacheLedger {
     }
 }
 
+/// RAII in-flight budget reservation (adversarial-2 F6).
+///
+/// `reserve` holds `bytes` of `class` budget; dropping the guard without
+/// settling releases whatever is still held, so every fetch early-return
+/// frees the budget exactly once with no manual `release` bookkeeping.
+/// Settlement goes through [`Reservation::commit_entry`], which consumes the
+/// held budget into stored bytes even when the commit itself is refused
+/// (the ledger releases the reservation on every commit path), so the
+/// guard never releases twice.
+#[must_use]
+#[derive(Debug)]
+pub struct Reservation<'a> {
+    ledger: &'a Mutex<CacheLedger>,
+    class: MediaClass,
+    remaining: u64,
+}
+
+impl<'a> Reservation<'a> {
+    /// Hold `bytes` of `class` budget (same refusals as
+    /// [`CacheLedger::reserve`], plus `Store` when the ledger is poisoned).
+    pub fn reserve(
+        ledger: &'a Mutex<CacheLedger>,
+        class: MediaClass,
+        bytes: u64,
+    ) -> Result<Self, CacheError> {
+        ledger
+            .lock()
+            .map_err(|_| CacheError::Store("cache ledger poisoned".into()))?
+            .reserve(class, bytes)?;
+        Ok(Self {
+            ledger,
+            class,
+            remaining: bytes,
+        })
+    }
+
+    /// The class this reservation holds budget for.
+    pub fn class(&self) -> MediaClass {
+        self.class
+    }
+
+    /// Budget still held (the live stream cap; shrinks with `Content-Length`).
+    pub fn remaining(&self) -> u64 {
+        self.remaining
+    }
+
+    /// Release `amount` of the held budget (clamped to what is held), e.g.
+    /// shrinking a worst-case reservation once `Content-Length` is known. A
+    /// poisoned ledger keeps the holding: the drop retries the release.
+    pub fn shrink(&mut self, amount: u64) {
+        let take = amount.min(self.remaining);
+        if take == 0 {
+            return;
+        }
+        if let Ok(mut ledger) = self.ledger.lock() {
+            ledger.release(self.class, take);
+            self.remaining -= take;
+        }
+    }
+
+    /// Hold `extra` more budget (the N2 top-up when staged bytes exceed the
+    /// shrunk reservation). On refusal nothing is held and the guard is
+    /// unchanged.
+    pub fn grow(&mut self, extra: u64) -> Result<(), CacheError> {
+        if extra == 0 {
+            return Ok(());
+        }
+        self.ledger
+            .lock()
+            .map_err(|_| CacheError::Store("cache ledger poisoned".into()))?
+            .reserve(self.class, extra)?;
+        self.remaining = self.remaining.saturating_add(extra);
+        Ok(())
+    }
+
+    /// Settle `reserved` of the held budget into `entry`'s stored bytes. The
+    /// held budget is consumed whether the commit lands or is refused (the
+    /// ledger releases the reservation on every commit path), so the guard
+    /// never releases twice.
+    pub fn commit_entry(
+        &mut self,
+        reserved: u64,
+        entry: RemoteCacheEntry,
+    ) -> Result<(), CacheError> {
+        let take = reserved.min(self.remaining);
+        let outcome = self
+            .ledger
+            .lock()
+            .map_err(|_| CacheError::Store("cache ledger poisoned".into()))?
+            .commit(self.class, take, entry);
+        self.remaining -= take;
+        outcome
+    }
+
+    /// Drop the ledger mapping for `key` without touching the budget (the
+    /// row-gone unwind after a settled commit).
+    pub fn evict_key(&self, key: &[u8]) {
+        if let Ok(mut ledger) = self.ledger.lock() {
+            ledger.evict_one(key);
+        }
+    }
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        if self.remaining == 0 {
+            return;
+        }
+        if let Ok(mut ledger) = self.ledger.lock() {
+            ledger.release(self.class, self.remaining);
+        }
+    }
+}
+
 /// Process-wide admission ledger for the fetch path. Budgets come from
 /// operator config via [`configure_process_ledger`] (parent wires it in
 /// `main.rs`); until then the plan defaults apply.
@@ -944,6 +1078,125 @@ mod tests {
             class_for_fetch("image/gif", "emoji"),
             MediaClass::AvatarEmoji
         );
+    }
+
+    #[test]
+    fn full_and_preview_caps_are_enforced_at_admission() {
+        let cfg = small_cfg();
+        let mut ledger = CacheLedger::new(cfg.clone());
+        // Each persistent class fits exactly its own cap ...
+        ledger
+            .reserve(MediaClass::Full, 256 * 1024)
+            .expect("full fits its cap");
+        ledger
+            .reserve(MediaClass::Preview, 512 * 1024)
+            .expect("preview fits its cap");
+        // ... and one byte more of either class is a class-capped refusal,
+        // even though the global cap (1 MiB) still has room.
+        let over_full = ledger.reserve(MediaClass::Full, 1);
+        assert!(
+            matches!(
+                over_full,
+                Err(CacheError::BudgetExhausted { need: 1, cap })
+                if cap == cfg.full_cap_bytes
+            ),
+            "full over cap refused against the full cap, got {over_full:?}"
+        );
+        let over_preview = ledger.reserve(MediaClass::Preview, 1);
+        assert!(
+            matches!(
+                over_preview,
+                Err(CacheError::BudgetExhausted { need: 1, cap })
+                if cap == cfg.preview_cap_bytes
+            ),
+            "preview over cap refused against the preview cap, got {over_preview:?}"
+        );
+        // Refusals never mutate: the two fitting reservations are all that
+        // is held.
+        assert_eq!(ledger.inflight_total(), (256 + 512) * 1024);
+    }
+
+    #[test]
+    fn shortfall_reports_the_larger_of_global_and_class_pressure() {
+        let cfg = small_cfg();
+        let mut ledger = CacheLedger::new(cfg.clone());
+        // 200 KiB of Full stored: under the 1 MiB global cap, near the
+        // 256 KiB class cap.
+        ledger.reserve(MediaClass::Full, 200 * 1024).unwrap();
+        ledger
+            .commit(
+                MediaClass::Full,
+                200 * 1024,
+                full_entry("https://cdn.example/a.png", 200 * 1024, T0_FIXTURE, &cfg),
+            )
+            .unwrap();
+        // Admitting 100 KiB more overflows the class (by 44 KiB) while the
+        // global cap still fits: the class overage must size the eviction.
+        assert_eq!(
+            ledger.shortfall_for(MediaClass::Full, 100 * 1024),
+            44 * 1024
+        );
+        // A request that overflows the global cap instead reports that.
+        assert_eq!(
+            ledger.shortfall_for(MediaClass::Full, 900 * 1024),
+            (200 + 900 - 256) * 1024
+        );
+        // Stream has no class cap: only the global overage counts.
+        assert_eq!(
+            ledger.shortfall_for(MediaClass::Stream, 900 * 1024),
+            (200 + 900 - 1024) * 1024
+        );
+    }
+
+    const T0_FIXTURE: u64 = 1_700_000_000_000;
+
+    #[test]
+    fn reservation_guard_releases_on_drop_and_settles_on_commit() {
+        use std::sync::Mutex;
+
+        use super::Reservation;
+
+        let cfg = small_cfg();
+        let ledger = Mutex::new(CacheLedger::new(cfg.clone()));
+        // Dropping an unsettled guard releases everything it held.
+        {
+            let _guard = Reservation::reserve(&ledger, MediaClass::Full, 1024).expect("reserve");
+            assert_eq!(ledger.lock().unwrap().inflight_total(), 1024);
+        }
+        assert_eq!(ledger.lock().unwrap().inflight_total(), 0);
+        // Shrink + grow move the holding; commit consumes it into stored.
+        {
+            let mut guard = Reservation::reserve(&ledger, MediaClass::Full, 1024).expect("reserve");
+            assert_eq!(guard.class(), MediaClass::Full);
+            guard.shrink(24);
+            assert_eq!(guard.remaining(), 1000);
+            assert_eq!(ledger.lock().unwrap().inflight_total(), 1000);
+            guard.grow(500).expect("grow");
+            assert_eq!(guard.remaining(), 1500);
+            let entry = full_entry("https://cdn.example/g.png", 1500, T0_FIXTURE, &cfg);
+            guard.commit_entry(1500, entry).expect("commit");
+            assert_eq!(guard.remaining(), 0);
+        }
+        let held = ledger.lock().unwrap();
+        assert_eq!(held.inflight_total(), 0);
+        assert_eq!(held.stored_for(MediaClass::Full), 1500);
+        drop(held);
+        // A refused commit still consumes the holding (no double release).
+        {
+            let mut guard = Reservation::reserve(&ledger, MediaClass::Full, 64).expect("reserve");
+            let mismatched = RemoteCacheEntry::stored(
+                "https://cdn.example/h.png",
+                "avatar",
+                MediaClass::AvatarEmoji,
+                "remote/9",
+                64,
+                T0_FIXTURE,
+                &cfg,
+            );
+            assert!(guard.commit_entry(64, mismatched).is_err());
+            assert_eq!(guard.remaining(), 0);
+        }
+        assert_eq!(ledger.lock().unwrap().inflight_total(), 0);
     }
 
     #[test]

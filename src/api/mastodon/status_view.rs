@@ -100,6 +100,9 @@ pub struct StatusViewContext<'a> {
     /// Statuses whose quote lookup already ran (so a round never repeats it).
     quote_probed: HashSet<Id>,
     media: HashMap<Id, MediaAttachment>,
+    /// Stored remote origin URLs by media id (page-batched; absent =
+    /// local media). Rendered as `remote_url`/`preview_remote_url`.
+    remote_sources: HashMap<Id, String>,
     polls: HashMap<Id, Poll>,
     ballots: HashMap<Id, Vec<u64>>,
     /// Core extension CORE-P: places by id, batch-loaded per page.
@@ -132,6 +135,7 @@ impl<'a> StatusViewContext<'a> {
             quotes: HashMap::new(),
             quote_probed: HashSet::new(),
             media: HashMap::new(),
+            remote_sources: HashMap::new(),
             polls: HashMap::new(),
             ballots: HashMap::new(),
             places: HashMap::new(),
@@ -236,6 +240,16 @@ impl<'a> StatusViewContext<'a> {
         poll_ids.sort_unstable();
         poll_ids.dedup();
         self.media.extend(self.store.media_by_ids(&media_ids)?);
+        // Remote origin URLs for the page's attachments, in one batched
+        // lookup (D1; missing ids are local media). Empty strings never
+        // count as a source (ingest stores the attachment URL verbatim).
+        if !media_ids.is_empty() {
+            for (id, source) in self.store.remote_media_sources_by_ids(&media_ids)? {
+                if !source.is_empty() {
+                    self.remote_sources.insert(id, source);
+                }
+            }
+        }
         self.polls.extend(self.store.polls_by_ids(&poll_ids)?);
         // Core extension CORE-P: places attached to the page's statuses,
         // batched once (missing rows read as no place at pack time).
@@ -394,6 +408,14 @@ impl<'a> StatusViewContext<'a> {
         // Core extension CORE-P: the attached place (batched above;
         // dangling ids read as no place).
         let place = status.place_id.and_then(|id| self.places.get(&id).cloned());
+        // Remote origin URLs for this status's attachments (batch-loaded
+        // above; point lookup only for chains beyond the prefetch rounds).
+        let mut remote_media_sources = HashMap::with_capacity(media.len());
+        for attachment in &media {
+            if let Some(source) = self.remote_source(attachment.id)? {
+                remote_media_sources.insert(attachment.id, source);
+            }
+        }
         Ok(dto::StatusView {
             status,
             account,
@@ -410,6 +432,7 @@ impl<'a> StatusViewContext<'a> {
             filtered: Vec::new(),
             emojis,
             place,
+            remote_media_sources,
         })
     }
 
@@ -465,6 +488,23 @@ impl<'a> StatusViewContext<'a> {
             self.media.insert(id, media.clone());
         }
         Ok(media)
+    }
+
+    /// Stored remote origin URL for one attachment, if any (empty strings
+    /// never count). Served from the page-batched cache; the point lookup
+    /// is only reachable for chains beyond the prefetch rounds.
+    fn remote_source(&mut self, id: Id) -> Result<Option<String>, ApiError> {
+        if let Some(source) = self.remote_sources.get(&id) {
+            return Ok(Some(source.clone()));
+        }
+        let fetched = self.store.remote_media_source(id)?;
+        match fetched.filter(|source| !source.is_empty()) {
+            Some(source) => {
+                self.remote_sources.insert(id, source.clone());
+                Ok(Some(source))
+            }
+            None => Ok(None),
+        }
     }
 
     fn poll(&mut self, id: Id) -> Result<Option<Poll>, ApiError> {

@@ -12,14 +12,14 @@ use crate::application::federation_ports::{
 };
 use crate::application::notifications::fan_out_payload;
 use crate::domain::{
-    Account, ActorKeys, DeliveryDestState, Error, Follow, FollowState, Id, Job, JobKind, JobState,
+    Account, ActorKeys, DeliveryDestState, Error, Follow, FollowState, Id, Job, JobKind,
     NotificationType, Result,
 };
 
 use super::relationships::{read_follow_txn, read_stats_txn, write_stats_txn};
 use super::schema::{
     self, ACCOUNT_BY_ACTOR_URI, ACCOUNTS, ACTIVITY_DEDUP, ACTOR_KEYS, DELIVERY_ACTIVE,
-    DELIVERY_DEST, DELIVERY_SEQ, FOLLOW_BY_URI, FOLLOWS, FOLLOWS_BY_FOLLOWED, HANDLE_INDEX, JOBS,
+    DELIVERY_DEST, DELIVERY_SEQ, FOLLOW_BY_URI, FOLLOWS, FOLLOWS_BY_FOLLOWED, HANDLE_INDEX,
 };
 use super::{RedbStore, StoreResult, decode, encode};
 
@@ -88,7 +88,7 @@ pub(super) fn delivery_job(
 /// explicit port when one is named. Mirrors
 /// `federation::delivery::dest_host` (which takes a parsed `Url`); kept
 /// local so persistence never depends on the send path.
-fn delivery_host_key(inbox_uri: &str) -> String {
+pub(super) fn delivery_host_key(inbox_uri: &str) -> String {
     let Ok(url) = url::Url::parse(inbox_uri) else {
         return inbox_uri.to_lowercase();
     };
@@ -103,7 +103,7 @@ fn delivery_host_key(inbox_uri: &str) -> String {
 /// transaction (starting at 1). Sharing the caller's transaction is what
 /// keeps plan order and sequence order identical for in-transaction
 /// delivery planning (`request_follow`, `undo_follow`, ...).
-fn next_delivery_seq_txn(write: &WriteTransaction, host: &str) -> StoreResult<u64> {
+pub(super) fn next_delivery_seq_txn(write: &WriteTransaction, host: &str) -> StoreResult<u64> {
     let mut table = write.open_table(DELIVERY_SEQ)?;
     let next = match table.get(host)? {
         Some(guard) => guard.value().saturating_add(1).max(1),
@@ -455,13 +455,9 @@ impl FederationStore for RedbStore {
         let job = {
             let job_id = self.next_id();
             let job = delivery_job(&write, job_id, &delivery, now_ms)?;
+            // `insert_job` maintains the `DELIVERY_ACTIVE` gate entry in the
+            // same transaction.
             super::jobs::insert_job(&write, &job)?;
-            // Index the outstanding delivery for the bounded FIFO gate.
-            let seq = job.payload.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
-            let host = delivery_host_key(&delivery.inbox_uri);
-            let mut active = write.open_table(DELIVERY_ACTIVE)?;
-            let key = schema::delivery_active_key(&host, seq, job.id.value());
-            active.insert(key.as_slice(), job.id.value())?;
             job
         };
         write.commit()?;
@@ -469,41 +465,19 @@ impl FederationStore for RedbStore {
     }
 
     fn delivery_blocked_by(&self, host: &str, seq: u64) -> Result<bool> {
+        // Bounded FIFO gate (adversarial-2 C2): any outstanding delivery for
+        // this host with a smaller sequence blocks `seq`. The
+        // `DELIVERY_ACTIVE` keys are `host || 0xFF || seq_be || job_id_be`, so
+        // the check is a prefix-bounded range scan over one host — independent
+        // of how many terminal rows `JOBS` holds. Terminal rows never block:
+        // `complete`/`retry`-to-quarantine/`quarantine` remove the gate entry
+        // at settlement.
         let read = self.begin_read()?;
-        let table = read.open_table(JOBS)?;
-        for entry in table.iter()? {
-            let (_, value) = entry?;
-            let job: Job = decode(value.value())?;
-            if job.state != JobState::Pending && job.state != JobState::Leased {
-                continue;
-            }
-            let (job_host, job_seq) = match job.kind {
-                JobKind::DeliverActivity => {
-                    let Some(inbox) = job.payload.get("inbox").and_then(|v| v.as_str()) else {
-                        continue;
-                    };
-                    let seq = job.payload.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
-                    (delivery_host_key(inbox), seq)
-                }
-                JobKind::RelayForward => {
-                    let Some(relay) = job
-                        .payload
-                        .get("relay_inbox")
-                        .or_else(|| job.payload.get("inbox"))
-                        .and_then(|v| v.as_str())
-                    else {
-                        continue;
-                    };
-                    let seq = job.payload.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
-                    (delivery_host_key(relay), seq)
-                }
-                _ => continue,
-            };
-            if job_host == host && job_seq < seq {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        let active = read.open_table(DELIVERY_ACTIVE)?;
+        let prefix = schema::delivery_active_prefix(host);
+        let upper = schema::delivery_active_key(host, seq, 0);
+        let mut range = active.range(prefix.as_slice()..upper.as_slice())?;
+        Ok(range.next().is_some())
     }
 
     fn commit_inbound(
