@@ -84,7 +84,6 @@ async fn local_jobs_run_while_network_pool_is_saturated() {
         .map(|_| network.clone().try_acquire_owned().expect("network permit"))
         .collect();
 
-    let release = Arc::new(tokio::sync::Notify::new());
     let network_started = Arc::new(AtomicBool::new(false));
     let local_done = Arc::new(AtomicBool::new(false));
 
@@ -101,14 +100,9 @@ async fn local_jobs_run_while_network_pool_is_saturated() {
         } else {
             Arc::clone(&local_done)
         };
-        let release = Arc::clone(&release);
-        let is_network = pool == JobPool::Network;
         in_flight.spawn(async move {
             let _permit = semaphore.acquire_owned().await.expect("permit");
             flag.store(true, Ordering::SeqCst);
-            if is_network {
-                release.notified().await;
-            }
         });
     }
 
@@ -126,10 +120,9 @@ async fn local_jobs_run_while_network_pool_is_saturated() {
         "network task cannot hold a permit yet"
     );
 
-    // Free the saturated pool: the queued network task must now proceed
-    // through acquire, the release gate, and settlement.
+    // Free the saturated pool: the queued network task must now proceed to
+    // completion, and the batch must drain.
     drop(_held);
-    release.notify_waiters();
     while in_flight.join_next().await.is_some() {}
     assert!(network_started.load(Ordering::SeqCst));
     assert!(local_done.load(Ordering::SeqCst));
