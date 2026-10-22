@@ -1,11 +1,13 @@
 //! Remote media class discipline (prod-2 item 6).
 //!
 //! The fetch path classifies AFTER the sniff with `class_for_fetch`, never
-//! assuming `Full`: audio/video originals are `Stream` — served on demand,
-//! never persisted. A `Stream` outcome releases the reservation, drops the
-//! download and fails the row with a clear non-persist reason (terminal):
-//! no cache blob is created and `stored_full` never moves. Images still
-//! persist as `Full`, with a durable byte row for the eviction passes.
+//! assuming `Full`: audio/video originals are `Stream` — never persisted by
+//! design (clients play them from the origin `remote_url`). A `Stream`
+//! outcome releases the reservation, drops the download and records the row
+//! as non-cached with a clear reason, then completes successfully
+//! (adversarial-2 D2 stage 1): no cache blob is created and `stored_full`
+//! never moves. Images still persist as `Full`, with a durable byte row for
+//! the eviction passes.
 
 mod common;
 
@@ -23,7 +25,6 @@ use birchtree::application::federation_ports::FederationContentStore;
 use birchtree::application::ports::{CacheStore, MediaStore, NewMedia};
 use birchtree::config::Config;
 use birchtree::domain::{Clock, Id, IdGenerator, Job, JobKind, SystemClock, TimestampIdGenerator};
-use birchtree::federation::delivery::DeliveryError;
 use birchtree::federation::media;
 use birchtree::federation::net::SafeHttpConfig;
 use birchtree::persistence::redb::RedbStore;
@@ -73,7 +74,12 @@ fn federation(
     store: &Arc<RedbStore>,
     dir: &std::path::Path,
 ) -> activitypub_federation::config::FederationConfig<FedContext> {
-    common::federation_config_with(context(store, dir), TEST_PUBLIC_URL, &loopback_policy(), true)
+    common::federation_config_with(
+        context(store, dir),
+        TEST_PUBLIC_URL,
+        &loopback_policy(),
+        true,
+    )
 }
 
 /// ISO-BMFF bytes that sniff as `video/mp4`.
@@ -143,8 +149,9 @@ fn fetch_media(store: &RedbStore, source: &str, now: u64) -> Id {
 }
 
 /// An audio/video fixture is never persisted: no cache blob, no
-/// `stored_full` movement, and the row fails with the clear non-persist
-/// reason (terminal — never a retry loop, never a silent `Full` persist).
+/// `stored_full` movement, and the row records the clear non-persist reason.
+/// The job completes successfully (adversarial-2 D2 stage 1) — never a retry
+/// loop, never a silent `Full` persist, never a quarantine error.
 #[tokio::test]
 async fn audio_fixture_is_never_persisted() {
     let (dir, store) = temp_store();
@@ -157,18 +164,14 @@ async fn audio_fixture_is_never_persisted() {
     let before = store.cache_accounting().expect("accounting").stored_full;
     let outcome = media::fetch(&config, &fetch_job(media_id, now)).await;
     assert!(
-        matches!(outcome, Err(DeliveryError::Quarantine(ref msg)) if msg.contains("never cached")),
-        "clear non-persist refusal, got {outcome:?}"
+        matches!(outcome, Ok(())),
+        "Stream completes as not-cached, got {outcome:?}"
     );
 
     // No blob under the row key, in either pool.
     let ctx: &FedContext = &config;
     assert!(
-        !ctx
-            .app
-            .blobs
-            .exists(&key)
-            .expect("exists"),
+        !ctx.app.blobs.exists(&key).expect("exists"),
         "no cache blob for audio"
     );
     let after = store.cache_accounting().expect("accounting").stored_full;
@@ -179,7 +182,9 @@ async fn audio_fixture_is_never_persisted() {
     let row = store.media_by_id(media_id).expect("row").expect("media");
     assert!(row.file_key.is_empty(), "nothing staged");
     assert!(
-        row.error.as_deref().is_some_and(|e| e.contains("never cached")),
+        row.error
+            .as_deref()
+            .is_some_and(|e| e.contains("never cached")),
         "clear reason recorded: {:?}",
         row.error
     );

@@ -85,11 +85,11 @@ fn drain_jobs(srv: &TestServer) {
                     handlers::handle(&job, &*srv.store, &mail, &*srv.blobs, &birchtree::application::ports::NoStreaming).is_err(),
                     "mail without a provider must refuse"
                 );
-                srv.store.complete(job.id).unwrap();
+                srv.store.complete(job.id, job.due_at_ms).unwrap();
             }
             _ => {
                 handlers::handle(&job, &*srv.store, &mail, &*srv.blobs, &birchtree::application::ports::NoStreaming).unwrap();
-                srv.store.complete(job.id).unwrap();
+                srv.store.complete(job.id, job.due_at_ms).unwrap();
             }
         }
     }

@@ -213,3 +213,22 @@ same policy concepts + store separation before its remote-media
 implementation lands. Do not gate Birchtree's Phase 6 exit on another
 repository — `birchtree.md` §7 Phase 6 exits on per-repo executed evidence
 (two-server interop, thread completion, SSRF/body-limit tests).
+
+## Adv2 update (2026-10-22, committed as Wave 1 + Wave 2)
+
+- `RemoteCacheMode::Disabled` is refused at startup until a non-persisting
+  streaming/proxy path exists (F1). The ledger refuses loudly; fetches evict
+  only on `BudgetExhausted`.
+- Cache identity is dedupe with refcounts (operator choice, B0): a second
+  blob for the same `(source_url, variant)` bumps `refcount` and shares the
+  first bytes (durable + ledger). Eviction frees only on the last reference.
+- `cache_mark_stored` threads the effective `RemoteCacheConfig` (B3), so
+  `avatar_retention_days` actually governs expiry.
+- Downloads stage on the cache filesystem via `BlobStore::staging_root`
+  (F11); `publish_tmp` stays a same-volume rename.
+- Audio/video originals are never persisted and complete successfully as
+  not-cached (D2 stage 1, operator choice); clients play from `remote_url`
+  (D1). The job no longer quarantines for intended behaviour.
+- Delivery is atomic per host (`enqueue_delivery`), gated by the
+  `DELIVERY_ACTIVE` index (schema v24), with park-cap relaxation (C3) and
+  terminal-age pruning (C4).

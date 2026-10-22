@@ -63,7 +63,7 @@ fn handle(store: &RedbStore, dir: &std::path::Path, job: &Job) {
         &birchtree::application::ports::NoStreaming,
     )
     .expect("handle job");
-    store.complete(job.id).expect("complete");
+    store.complete(job.id, job.due_at_ms).expect("complete");
 }
 
 /// Claim and handle only `AccountDeletionBatch` jobs (other jobs — search

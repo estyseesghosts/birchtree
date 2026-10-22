@@ -83,11 +83,11 @@ fn run_jobs(srv: &TestServer, at_ms: u64) {
             // complete it so scheduled jobs still run in the harness.
             JobKind::SendConfirmationEmail | JobKind::SendPasswordResetEmail => {
                 assert!(birchtree::jobs::handlers::handle(&job, &*srv.store, &mail, &*srv.blobs, &birchtree::application::ports::NoStreaming).is_err());
-                srv.store.complete(job.id).unwrap();
+                srv.store.complete(job.id, job.due_at_ms).unwrap();
             }
             _ => {
                 birchtree::jobs::handlers::handle(&job, &*srv.store, &mail, &*srv.blobs, &birchtree::application::ports::NoStreaming).unwrap();
-                srv.store.complete(job.id).unwrap();
+                srv.store.complete(job.id, job.due_at_ms).unwrap();
             }
         }
     }

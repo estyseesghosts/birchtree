@@ -127,7 +127,9 @@ impl RedbStore {
         due_at_ms: u64,
         now_ms: u64,
     ) -> Result<Job> {
-        let bytes: usize = serde_json::to_vec(&payload).map(|body| body.len()).unwrap_or(0);
+        let bytes: usize = serde_json::to_vec(&payload)
+            .map(|body| body.len())
+            .unwrap_or(0);
         let write = self.begin_write()?;
         if bytes > crate::jobs::worker::QUARANTINE_MAX_PAYLOAD_BYTES {
             let mut job = Job::new(
@@ -156,9 +158,7 @@ impl RedbStore {
         // insert can never let `N+1` become visible before `N`. Callers that
         // already stamped a sequence (in-transaction planning via
         // `delivery_job`, or a parked copy preserving its `seq`) keep it.
-        if is_delivery_kind(kind)
-            && payload.get("seq").and_then(|v| v.as_u64()).is_none()
-        {
+        if is_delivery_kind(kind) && payload.get("seq").and_then(|v| v.as_u64()).is_none() {
             let inbox = payload
                 .get("inbox")
                 .or_else(|| payload.get("relay_inbox"))
@@ -297,45 +297,50 @@ impl JobQueue for RedbStore {
         if limit == 0 {
             return Ok(0);
         }
-        // Collect the victims first, then delete them in the same write
-        // transaction: one `redb` txn per mutation, no network I/O inside.
-        // Only `Succeeded` rows qualify; `Pending`/`Leased` rows are live
-        // work and `Quarantined` rows age out through `prune_quarantined`.
-        let mut victims: Vec<Job> = Vec::new();
-        {
-            let write = self.begin_write()?;
-            {
-                let jobs = write.open_table(JOBS)?;
-                for entry in jobs.iter()? {
-                    let (_key, value) = entry?;
-                    let job: Job = decode(value.value())?;
-                    if job.state == JobState::Succeeded && job.due_at_ms < older_than_ms {
-                        victims.push(job);
-                    }
+        // Read-first (adversarial-2 C4): collect victims in a read
+        // transaction, then open the write transaction only when victims
+        // exist. Only `Succeeded` rows qualify, aged by `terminal_at_ms`
+        // (falling back to `due_at_ms` for pre-v24 rows).
+        let mut victims: Vec<Job> = {
+            let read = self.begin_read()?;
+            let jobs = read.open_table(JOBS)?;
+            let mut out = Vec::new();
+            for entry in jobs.iter()? {
+                let (_key, value) = entry?;
+                let job: Job = decode(value.value())?;
+                if job.state == JobState::Succeeded
+                    && job.terminal_at_ms.unwrap_or(job.due_at_ms) < older_than_ms
+                {
+                    out.push(job);
                 }
             }
-            // Oldest first so a capped pass always reaps the stalest rows.
-            victims.sort_by_key(|job| (job.due_at_ms, job.id));
-            victims.truncate(limit);
-            {
-                let mut jobs = write.open_table(JOBS)?;
-                for job in &victims {
-                    jobs.remove(job.id.value())?;
-                }
-            }
-            // `Succeeded` rows hold no scheduling-index entries
-            // (`complete` removed them at settlement), and no gate entries
-            // (`complete` removed those too). A belt-and-braces sweep drops
-            // any stale gate entry a pre-index row may have left behind.
-            for job in &victims {
-                if is_delivery_kind(job.kind) {
-                    if let Some(host) = delivery_host_of(job) {
-                        remove_delivery_active(&write, &host, delivery_seq_of(job), job.id)?;
-                    }
-                }
-            }
-            write.commit()?;
+            out
+        };
+        if victims.is_empty() {
+            return Ok(0);
         }
+        // Oldest terminal first so a capped pass always reaps the stalest.
+        victims.sort_by_key(|job| (job.terminal_at_ms.unwrap_or(job.due_at_ms), job.id));
+        victims.truncate(limit);
+        let write = self.begin_write()?;
+        {
+            let mut jobs = write.open_table(JOBS)?;
+            for job in &victims {
+                jobs.remove(job.id.value())?;
+            }
+        }
+        // `Succeeded` rows hold no scheduling-index entries (`complete`
+        // removed them at settlement), and no gate entries (`complete`
+        // removed those too). A belt-and-braces sweep drops any stale gate
+        // entry a pre-index row may have left behind.
+        for job in &victims {
+            if is_delivery_kind(job.kind) {
+                if let Some(host) = delivery_host_of(job) {
+                    remove_delivery_active(&write, &host, delivery_seq_of(job), job.id)?;
+                }
+            }
+        }
+        write.commit()?;
         Ok(victims.len() as u64)
     }
 
@@ -343,47 +348,48 @@ impl JobQueue for RedbStore {
         if limit == 0 {
             return Ok(0);
         }
-        // Mirror of `prune_succeeded` for the operator inspection surface:
-        // only `Quarantined` rows qualify. Quarantined rows hold no
-        // scheduling-index entries (`quarantine`/`retry` removed them at
-        // settlement), so only the `JOBS` table entry is deleted. Prune is
-        // delete-only: the row's `last_error` and redacted payload were the
-        // diagnostics, and they age out with the row.
-        let mut victims: Vec<Job> = Vec::new();
-        {
-            let write = self.begin_write()?;
-            {
-                let jobs = write.open_table(JOBS)?;
-                for entry in jobs.iter()? {
-                    let (_key, value) = entry?;
-                    let job: Job = decode(value.value())?;
-                    if job.state == JobState::Quarantined && job.due_at_ms < older_than_ms {
-                        victims.push(job);
-                    }
+        // Read-first (adversarial-2 C4): same shape as `prune_succeeded`,
+        // aged by `terminal_at_ms` (falling back to `due_at_ms` for pre-v24
+        // rows). Old rows without the field still prune by `due_at_ms`.
+        let mut victims: Vec<Job> = {
+            let read = self.begin_read()?;
+            let jobs = read.open_table(JOBS)?;
+            let mut out = Vec::new();
+            for entry in jobs.iter()? {
+                let (_key, value) = entry?;
+                let job: Job = decode(value.value())?;
+                if job.state == JobState::Quarantined
+                    && job.terminal_at_ms.unwrap_or(job.due_at_ms) < older_than_ms
+                {
+                    out.push(job);
                 }
             }
-            // Oldest first so a capped pass always reaps the stalest rows.
-            victims.sort_by_key(|job| (job.due_at_ms, job.id));
-            victims.truncate(limit);
-            {
-                let mut jobs = write.open_table(JOBS)?;
-                for job in &victims {
-                    jobs.remove(job.id.value())?;
-                }
-            }
-            for job in &victims {
-                if is_delivery_kind(job.kind) {
-                    if let Some(host) = delivery_host_of(job) {
-                        remove_delivery_active(&write, &host, delivery_seq_of(job), job.id)?;
-                    }
-                }
-            }
-            write.commit()?;
+            out
+        };
+        if victims.is_empty() {
+            return Ok(0);
         }
+        victims.sort_by_key(|job| (job.terminal_at_ms.unwrap_or(job.due_at_ms), job.id));
+        victims.truncate(limit);
+        let write = self.begin_write()?;
+        {
+            let mut jobs = write.open_table(JOBS)?;
+            for job in &victims {
+                jobs.remove(job.id.value())?;
+            }
+        }
+        for job in &victims {
+            if is_delivery_kind(job.kind) {
+                if let Some(host) = delivery_host_of(job) {
+                    remove_delivery_active(&write, &host, delivery_seq_of(job), job.id)?;
+                }
+            }
+        }
+        write.commit()?;
         Ok(victims.len() as u64)
     }
 
-    fn complete(&self, id: Id) -> Result<()> {
+    fn complete(&self, id: Id, now_ms: u64) -> Result<()> {
         let write = self.begin_write()?;
         let Some(mut job) = read_job_txn(&write, id)? else {
             return Err(Error::NotFound(format!("job {id}")));
@@ -394,6 +400,7 @@ impl JobQueue for RedbStore {
         remove_index(&write, job.due_at_ms, id)?;
         job.state = JobState::Succeeded;
         job.lease_until_ms = None;
+        job.terminal_at_ms = Some(now_ms);
         // A delivered mail job keeps no bearer or recipient (WP1 1.2).
         job.redact_sensitive_payload();
         store_job(&write, &job)?;
@@ -418,6 +425,7 @@ impl JobQueue for RedbStore {
 
         if job.attempts >= job.max_attempts {
             job.state = JobState::Quarantined;
+            job.terminal_at_ms = Some(now_ms);
             job.redact_sensitive_payload();
             // A quarantined delivery leaves the gate: terminal rows never block.
             if let Some((host, seq)) = gate {
@@ -436,7 +444,7 @@ impl JobQueue for RedbStore {
         Ok(job)
     }
 
-    fn quarantine(&self, id: Id, error: &str) -> Result<()> {
+    fn quarantine(&self, id: Id, error: &str, now_ms: u64) -> Result<()> {
         let write = self.begin_write()?;
         let Some(mut job) = read_job_txn(&write, id)? else {
             return Err(Error::NotFound(format!("job {id}")));
@@ -447,6 +455,7 @@ impl JobQueue for RedbStore {
         remove_index(&write, job.due_at_ms, id)?;
         job.state = JobState::Quarantined;
         job.lease_until_ms = None;
+        job.terminal_at_ms = Some(now_ms);
         job.last_error = Some(error.to_string());
         job.redact_sensitive_payload();
         store_job(&write, &job)?;

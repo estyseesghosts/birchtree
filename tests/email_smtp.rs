@@ -281,7 +281,7 @@ async fn confirmation_endpoint_enqueues_and_worker_delivers() {
         &birchtree::application::ports::NoStreaming,
     )
     .expect("handler delivers");
-    srv.store.complete(job.id).expect("complete");
+    srv.store.complete(job.id, job.due_at_ms).expect("complete");
     let got = unfold_qp(&last_data(&sink));
     assert!(
         got.contains(&format!("confirmation_token={token}")),

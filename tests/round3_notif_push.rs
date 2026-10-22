@@ -104,12 +104,12 @@ fn drain_jobs(srv: &TestServer) {
                 // refuses; complete it so notification jobs still run.
                 JobKind::SendConfirmationEmail | JobKind::SendPasswordResetEmail => {
                     assert!(birchtree::jobs::handlers::handle(&job, &*srv.store, &mail, &*srv.blobs, &srv.streams).is_err());
-                    srv.store.complete(job.id).expect("complete");
+                    srv.store.complete(job.id, job.due_at_ms).expect("complete");
                 }
                 _ => {
                     birchtree::jobs::handlers::handle(&job, &*srv.store, &mail, &*srv.blobs, &srv.streams)
                         .expect("handle job");
-                    srv.store.complete(job.id).expect("complete");
+                    srv.store.complete(job.id, job.due_at_ms).expect("complete");
                 }
             }
         }

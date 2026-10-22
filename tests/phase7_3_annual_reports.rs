@@ -162,7 +162,7 @@ fn run_jobs(h: &Harness) {
                     &birchtree::application::ports::NoStreaming,
                 )
                 .is_err());
-                h.srv.store.complete(job.id).unwrap();
+                h.srv.store.complete(job.id, job.due_at_ms).unwrap();
             }
             _ => {
                 birchtree::jobs::handlers::handle(
@@ -173,7 +173,7 @@ fn run_jobs(h: &Harness) {
                     &birchtree::application::ports::NoStreaming,
                 )
                 .unwrap();
-                h.srv.store.complete(job.id).unwrap();
+                h.srv.store.complete(job.id, job.due_at_ms).unwrap();
             }
         }
     }

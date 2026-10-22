@@ -74,7 +74,12 @@ fn federation(
     store: &Arc<RedbStore>,
     dir: &std::path::Path,
 ) -> activitypub_federation::config::FederationConfig<FedContext> {
-    common::federation_config_with(context(store, dir), TEST_PUBLIC_URL, &loopback_policy(), true)
+    common::federation_config_with(
+        context(store, dir),
+        TEST_PUBLIC_URL,
+        &loopback_policy(),
+        true,
+    )
 }
 
 /// A local sender with signing keys (no fetch is made for it).
@@ -94,9 +99,7 @@ fn sender_with_keys(store: &RedbStore, name: &str) -> Id {
 }
 
 /// An inbox server recording activity ids in arrival order.
-async fn recording_inbox(
-    arrivals: Arc<std::sync::Mutex<Vec<String>>>,
-) -> String {
+async fn recording_inbox(arrivals: Arc<std::sync::Mutex<Vec<String>>>) -> String {
     let app = Router::new().route(
         "/inbox",
         post(move |body: axum::body::Bytes| {
@@ -232,14 +235,22 @@ async fn undo_waits_for_follow_on_one_inbox() {
     assert_eq!(parked[0].payload["seq"], undo_job.payload["seq"]);
 
     // The first send goes out; only then does the parked copy follow.
-    delivery::run(&config, &follow_job).await.expect("follow sends");
-    store.complete(follow_job.id).expect("settle follow");
-    store.complete(undo_job.id).expect("retire parked original");
+    delivery::run(&config, &follow_job)
+        .await
+        .expect("follow sends");
+    store
+        .complete(follow_job.id, follow_job.due_at_ms)
+        .expect("settle follow");
+    store
+        .complete(undo_job.id, undo_job.due_at_ms)
+        .expect("retire parked original");
     let copy = parked[0].clone();
     let claimed = store.claim_due(now + 30_000, 10).expect("claim copy");
     assert!(claimed.iter().any(|job| job.id == copy.id));
     delivery::run(&config, &copy).await.expect("undo sends");
-    store.complete(copy.id).expect("settle undo");
+    store
+        .complete(copy.id, copy.due_at_ms)
+        .expect("settle undo");
 
     let arrivals = arrivals.lock().expect("arrivals").clone();
     assert_eq!(arrivals.len(), 2);
@@ -289,23 +300,29 @@ async fn order_survives_restart_mid_queue() {
         "restarted queue still holds the second send"
     );
 
-    delivery::run(&config, &follow_job).await.expect("follow sends");
-    store.complete(follow_job.id).expect("settle follow");
-    store.complete(undo_job.id).expect("retire parked original");
+    delivery::run(&config, &follow_job)
+        .await
+        .expect("follow sends");
+    store
+        .complete(follow_job.id, follow_job.due_at_ms)
+        .expect("settle follow");
+    store
+        .complete(undo_job.id, undo_job.due_at_ms)
+        .expect("retire parked original");
     let parked: Vec<Job> = store
         .all_jobs()
         .expect("jobs")
         .into_iter()
         .filter(|job| {
-            job.kind == JobKind::DeliverActivity
-                && job.id != undo_job.id
-                && job.id != follow_job.id
+            job.kind == JobKind::DeliverActivity && job.id != undo_job.id && job.id != follow_job.id
         })
         .collect();
     assert_eq!(parked.len(), 1);
     let claimed = store.claim_due(now + 30_000, 10).expect("claim copy");
     assert!(claimed.iter().any(|job| job.id == parked[0].id));
-    delivery::run(&config, &parked[0]).await.expect("undo sends");
+    delivery::run(&config, &parked[0])
+        .await
+        .expect("undo sends");
 
     let arrivals = arrivals.lock().expect("arrivals").clone();
     assert_eq!(arrivals.len(), 2);
@@ -313,9 +330,7 @@ async fn order_survives_restart_mid_queue() {
     assert!(arrivals[1].ends_with("/undo-1"), "{arrivals:?}");
 
     // The counter survived too: the next mint continues the sequence.
-    let host = delivery::dest_host(
-        &url::Url::parse(&inbox).expect("inbox parses"),
-    );
+    let host = delivery::dest_host(&url::Url::parse(&inbox).expect("inbox parses"));
     let next = store.delivery_seq_next(&host).expect("counter");
     assert_eq!(next, 3, "two mints before the restart, third after");
 }
@@ -334,7 +349,7 @@ async fn quarantined_earlier_sequence_does_not_wedge_host() {
     let (follow, undo) = enqueue_pair(&store, sender, &inbox, now);
     // The first send fails terminally (quarantined, never to be sent).
     store
-        .quarantine(follow.id, "inbox gone for good")
+        .quarantine(follow.id, "inbox gone for good", follow.due_at_ms)
         .expect("quarantine");
     let claimed = store.claim_due(now + 1, 10).expect("claim");
     let undo_job = claimed

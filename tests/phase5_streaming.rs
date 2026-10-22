@@ -128,7 +128,7 @@ fn drain_jobs(srv: &TestServer) {
         for job in jobs {
             birchtree::jobs::handlers::handle(&job, &*srv.store, &mail, &*srv.blobs, &srv.streams)
                 .expect("handle job");
-            srv.store.complete(job.id).expect("complete");
+            srv.store.complete(job.id, job.due_at_ms).expect("complete");
         }
     }
 }

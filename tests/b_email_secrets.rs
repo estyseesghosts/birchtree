@@ -217,7 +217,7 @@ fn mail_job_sends_then_completion_leaves_no_bearer() {
     assert_eq!(sent[0].0, "fay@example.com");
     let token: String = sent[0].1.clone();
 
-    store.complete(job.id).expect("complete");
+    store.complete(job.id, job.due_at_ms).expect("complete");
     let done: Job = store.get(job.id).expect("get").expect("job");
     assert_eq!(done.state, JobState::Succeeded);
     assert!(done.payload.get("token").is_none());

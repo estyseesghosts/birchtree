@@ -487,15 +487,17 @@ pub trait JobQueue: Send + Sync {
     ) -> Result<Job>;
     /// Claim up to `limit` due jobs under a lease.
     fn claim_due(&self, now_ms: u64, limit: usize) -> Result<Vec<Job>>;
-    /// Delete up to `limit` `Succeeded` jobs whose `due_at_ms` is older than
-    /// `older_than_ms`, returning how many rows were removed. Only
+    /// Delete up to `limit` `Succeeded` jobs whose terminal time
+    /// (`terminal_at_ms`, falling back to `due_at_ms` for pre-v24 rows) is
+    /// older than `older_than_ms`, returning how many rows were removed. Only
     /// `Succeeded` rows are eligible: `Pending`/`Leased` rows are live work;
     /// `Quarantined` rows age out separately through `prune_quarantined`.
     /// `complete()` keeps the row `Succeeded` (callers prune separately
     /// through this method).
     fn prune_succeeded(&self, older_than_ms: u64, limit: usize) -> Result<u64>;
-    /// Delete up to `limit` `Quarantined` jobs whose `due_at_ms` is older
-    /// than `older_than_ms`, returning how many rows were removed. Only
+    /// Delete up to `limit` `Quarantined` jobs whose terminal time
+    /// (`terminal_at_ms`, falling back to `due_at_ms` for pre-v24 rows) is
+    /// older than `older_than_ms`, returning how many rows were removed. Only
     /// `Quarantined` rows are eligible: `Pending`/`Leased` rows are live
     /// work and `Succeeded` rows age out separately through
     /// `prune_succeeded`. Oldest first, so a capped pass always reaps the
@@ -504,10 +506,14 @@ pub trait JobQueue: Send + Sync {
     /// delete-only (no archive export — the row's `last_error` and redacted
     /// payload are the diagnostics).
     fn prune_quarantined(&self, older_than_ms: u64, limit: usize) -> Result<u64>;
-    fn complete(&self, id: Id) -> Result<()>;
+    /// Mark a job terminally succeeded, stamping `terminal_at_ms` for
+    /// retention aging (adversarial-2 C4).
+    fn complete(&self, id: Id, now_ms: u64) -> Result<()>;
     /// Record a failed attempt; schedules a retry or quarantines.
     fn retry(&self, id: Id, error: &str, now_ms: u64) -> Result<Job>;
-    fn quarantine(&self, id: Id, error: &str) -> Result<()>;
+    /// Mark a job terminally quarantined, stamping `terminal_at_ms` for
+    /// retention aging (adversarial-2 C4).
+    fn quarantine(&self, id: Id, error: &str, now_ms: u64) -> Result<()>;
     fn get(&self, id: Id) -> Result<Option<Job>>;
 }
 

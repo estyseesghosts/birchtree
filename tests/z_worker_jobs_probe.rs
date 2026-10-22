@@ -29,7 +29,9 @@ fn complete_at(
         claimed.iter().any(|claimed| claimed.id == job.id),
         "probe job must be claimable at enqueue time"
     );
-    store.complete(job.id).expect("complete probe job");
+    store
+        .complete(job.id, job.due_at_ms)
+        .expect("complete probe job");
     store
         .get(job.id)
         .expect("get probe job")
@@ -49,7 +51,11 @@ fn prune_deletes_only_old_succeeded_rows() {
         .enqueue(JobKind::UserCreated, serde_json::json!({}), T0)
         .expect("enqueue quarantined probe job");
     store
-        .quarantine(quarantined.id, "operator looks at this")
+        .quarantine(
+            quarantined.id,
+            "operator looks at this",
+            quarantined.due_at_ms,
+        )
         .expect("quarantine probe job");
 
     let removed = store

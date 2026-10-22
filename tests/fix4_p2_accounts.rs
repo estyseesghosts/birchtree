@@ -199,7 +199,7 @@ fn drain_jobs(srv: &TestServer) {
                     &birchtree::application::ports::NoStreaming,
                 )
                 .is_err());
-                srv.store.complete(job.id).unwrap();
+                srv.store.complete(job.id, job.due_at_ms).unwrap();
             }
             _ => {
                 handlers::handle(
@@ -210,7 +210,7 @@ fn drain_jobs(srv: &TestServer) {
                     &birchtree::application::ports::NoStreaming,
                 )
                 .unwrap();
-                srv.store.complete(job.id).unwrap();
+                srv.store.complete(job.id, job.due_at_ms).unwrap();
             }
         }
     }

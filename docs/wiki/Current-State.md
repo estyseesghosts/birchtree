@@ -72,3 +72,5 @@ Status: late October 2026. Everything planned through Phase 7.3 is built and gre
 Every phase shipped with executed evidence, not reasoning: warning-free checks, full test suites green, live HTTP smokes, and two-server interop runs against real Mastodon 4.7.3 where applicable. The detailed receipts live in `docs/logs/` (dated verification notes) and `state/logs/` (session notes). Anything unimplemented answers an explicit error, never a fake success.
 
 <!-- docs/logs/2026-10-20-fix-plan-verification.md; docs/logs/2026-10-20-phase-7-3-verification.md -->
+
+Adv2 (2026-10-22): disabled cache mode is refused at startup; remote downloads stage on the cache volume; shared CDN URLs share one stored copy (refcounted); audio/video completes as not-cached and plays from its origin URL; delivery keeps per-host order with a bounded wait and ages finished jobs by finish time.

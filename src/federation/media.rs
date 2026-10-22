@@ -617,11 +617,14 @@ pub async fn fetch(
         reservation.shrink(reservation.remaining().saturating_sub(declared));
     }
     let stream_cap = reservation.remaining();
-    // Stream-to-disk (storage overhaul, Agent C): when the blob handle
-    // exposes its filesystem root, the body streams to `tmp/{rand}.part`
-    // under the cap and renames onto the key — no `Vec` buffering. Handles
-    // without a root (in-memory doubles) keep the legacy buffered path.
-    if let Some(root) = cache_store(ctx).root_path() {
+    // Stream-to-disk on the cache filesystem (adversarial-2 F11): when the
+    // blob handle exposes a staging root, the body streams to
+    // `tmp/{rand}.part` under the cap and renames onto the key — no `Vec`
+    // buffering. The pooled handle stages under the cache root so
+    // `publish_tmp` stays a same-volume rename and bursty fetches never
+    // consume durable volume space. Handles without a root (in-memory
+    // doubles) keep the legacy buffered path.
+    if let Some(root) = cache_store(ctx).staging_root() {
         use tokio::io::AsyncReadExt as _;
 
         let tmp = crate::media::fetch_stream::tmp_path_for(&root)
@@ -670,17 +673,19 @@ pub async fn fetch(
             }
         };
         // Classify AFTER the sniff, never assume `Full`: audio/video
-        // originals are `Stream` — served on demand, never persisted. A
-        // Stream outcome drops the download and fails the row with a clear
-        // non-persist reason (terminal): no cache blob is created and
-        // `stored_full` never moves. `reserve(Stream)` is never called (it
-        // refuses loudly by design). The guard frees the reservation.
+        // originals are `Stream` — never persisted by design (not a working
+        // delivery mode on its own; clients play them from the origin URL
+        // in `remote_url`). A Stream outcome drops the download and records
+        // the row as non-cached with a clear reason, then completes the job
+        // successfully (adversarial-2 D2 stage 1): no cache blob is created
+        // and `stored_full` never moves. `reserve(Stream)` is never called
+        // (it refuses loudly by design). The guard frees the reservation.
         let class = remote_cache::class_for_fetch(sniffed.mime_type, ATTACHMENT_VARIANT);
         if class == MediaClass::Stream {
             let _ = std::fs::remove_file(&tmp);
             let reason = "remote audio/video streams from its origin and is never cached";
             let _ = store.mark_remote_media_failed(media_id, reason, ctx.app.now_ms());
-            return Err(DeliveryError::Quarantine(reason.into()));
+            return Ok(());
         }
         // Publish first, then settle into stored bytes: a crash between
         // leaves at most an uncounted orphan blob for the reconciler, never
@@ -734,11 +739,12 @@ pub async fn fetch(
     };
     // Same classification as the streamed path: audio/video originals are
     // `Stream` and are never persisted (no put, no commit). The guard frees
-    // the reservation.
+    // the reservation. The job completes successfully with the row marked
+    // non-cached (adversarial-2 D2 stage 1); clients use `remote_url`.
     if remote_cache::class_for_fetch(sniffed.mime_type, ATTACHMENT_VARIANT) == MediaClass::Stream {
         let reason = "remote audio/video streams from its origin and is never cached";
         let _ = store.mark_remote_media_failed(media_id, reason, ctx.app.now_ms());
-        return Err(DeliveryError::Quarantine(reason.into()));
+        return Ok(());
     }
 
     cache_store(ctx)

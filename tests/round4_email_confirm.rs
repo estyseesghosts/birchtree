@@ -532,7 +532,7 @@ async fn resend_stores_token_before_enqueue_and_confirms() {
     assert_eq!(record.account_id, account.id);
     assert_eq!(record.kind, EmailTokenKind::Confirmation);
     for job in &jobs {
-        srv.store.complete(job.id).expect("complete");
+        srv.store.complete(job.id, job.due_at_ms).expect("complete");
     }
 
     // Redeem through the application layer, then the check endpoint reads
@@ -716,7 +716,7 @@ async fn public_reset_known_queues_unknown_does_not() {
         .expect("token row stored");
     assert_eq!(record.kind, EmailTokenKind::PasswordReset);
     for job in &jobs {
-        srv.store.complete(job.id).expect("complete");
+        srv.store.complete(job.id, job.due_at_ms).expect("complete");
     }
 
     // Unknown address: the same 200, nothing queued (no oracle).

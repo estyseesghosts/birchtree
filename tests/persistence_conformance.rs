@@ -189,7 +189,7 @@ fn job_claim_complete_retry_and_quarantine() {
     assert_eq!(claimed[0].state, JobState::Leased);
     assert_eq!(claimed[0].attempts, 1);
     assert_eq!(claimed[0].lease_until_ms, Some(T0 + LEASE_MS));
-    store.complete(job.id).unwrap();
+    store.complete(job.id, job.due_at_ms).unwrap();
     assert_eq!(store.get(job.id).unwrap().unwrap().state, JobState::Succeeded);
     assert_eq!(store.schedule_index_len().unwrap(), 0);
 
@@ -204,7 +204,7 @@ fn job_claim_complete_retry_and_quarantine() {
     assert!(retried.due_at_ms > T0);
     assert!(store.claim_due(T0, 10).unwrap().is_empty(), "not due yet");
     assert_eq!(store.claim_due(retried.due_at_ms, 10).unwrap().len(), 1);
-    store.complete(job2.id).unwrap();
+    store.complete(job2.id, job2.due_at_ms).unwrap();
 
     // Exhaust the retry budget -> quarantined.
     let job3 = store
@@ -729,7 +729,7 @@ fn interaction_and_job_survive_store_reopen() {
     let blob_dir = tempfile::tempdir().unwrap();
     let blobs = birchtree::media::blob_store::FsBlobStore::open(blob_dir.path()).unwrap();
     handlers::handle(&job, &store, &mail, &blobs, &birchtree::application::ports::NoStreaming).unwrap();
-    store.complete(job.id).unwrap();
+    store.complete(job.id, job.due_at_ms).unwrap();
     handlers::handle(&job, &store, &mail, &blobs, &birchtree::application::ports::NoStreaming).unwrap();
     assert_eq!(store.get(job.id).unwrap().unwrap().state, JobState::Succeeded);
 

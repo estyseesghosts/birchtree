@@ -656,7 +656,11 @@ impl CacheMaintenance {
     // ReconcileStorage.
     // -----------------------------------------------------------------
 
-    /// One resumable reconcile page starting at `cursor`.
+    /// One resumable reconcile page starting at `cursor`. Accounting is
+    /// rebuilt only when the page changed something (orphans, stale rows,
+    /// adoptions, residue, missing flags or repairs); the admission ledger
+    /// is restored only when the rebuild reports a repair, so a concurrent
+    /// reservation made during a no-op page is never lost (adversarial-2 N6).
     pub fn run_reconcile(&self, now_ms: u64, cursor: &ReconCursor) -> Result<ReconcileOutcome> {
         let residue_removed: usize = self.sweep_residue(self.settings.residue_min_age)?;
 
@@ -672,8 +676,27 @@ impl CacheMaintenance {
         };
 
         let page = reconciler::reconcile_page(&*self.store, now_ms, self.batch(), cursor)?;
-        let accounting = self.store.cache_accounting_rebuild()?;
-        self.restore_ledger()?;
+        let changed = residue_removed > 0
+            || adopted > 0
+            || !page.report.missing_keys.is_empty()
+            || !page.report.converged();
+        let accounting = if changed {
+            self.store.cache_accounting_rebuild()?
+        } else {
+            crate::persistence::redb::remote_cache::AccountingRepair {
+                before_total: self.store.cache_accounting()?.stored_total,
+                after_total: self.store.cache_accounting()?.stored_total,
+                ..Default::default()
+            }
+        };
+        // Restore the ledger only when the rebuild repaired something; a
+        // no-op page leaves in-flight reservations untouched.
+        let repaired = accounting.before_total != accounting.after_total
+            || accounting.corrupt_rows_removed > 0
+            || accounting.foreign_rows_detached > 0;
+        if repaired {
+            self.restore_ledger()?;
+        }
         Ok(ReconcileOutcome {
             report: page.report,
             adopted,

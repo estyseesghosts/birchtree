@@ -48,3 +48,15 @@ Representative green lines are in the wave1-test log
   three shared test files above. No `ports`/`schema`/`config`/`domain`
   edits beyond groundwork. `FEDERATION.md` committed separately (`8c54bc4`)
   per operator request, not part of this wave.
+
+
+## Wave 2 + final gate (2026-10-22)
+
+- Base: Wave1 commit cee8368 + FEDERATION.md 8c54bc4.
+- cargo check --all-targets: green (only pre-existing warnings).
+- New tests green: adv2_a_staging 3/3 (F11 cache-volume staging), adv2_b_reconcile 1/1 (N6 no-op preserves reservation), adv2_c_prune 3/3 (C4 terminal aging + read-first), adv2_d_stream 1/1 (D2 success-as-not-cached), fix_media_class 2/2 (updated Stream expectation).
+- Full cargo test --no-fail-fast: 105 suites ok, 1 FAILED (c_media_http concurrent_uploads gate, flaky timing; passes 10/10 in isolation retry-cmedia.log and passed Wave1 baseline; not attributed to Wave2).
+- cargo build --release: success (4m42s, wave2-release.log).
+- Restart-recovery: crash_recovery + adv2_b_recovery + storage_reconcile green in full run; B2 crash-window + TTL tests cover metadata-commit/file-delete kill points, restore_at_startup + enforce_caps agreement.
+- Cross-workstream: fetch-under-pressure (adv2_a_fetch concurrent + storage_cache_evict agreement), disabled-mode (adv2_a_emoji disabled + Config::validate), shared-URL dedupe (adv2_b_cache refcount=2 + reopen), delivery ordering (adv2_c_ordering + fix_delivery_order + fix_worker_sched), migration v24 (fresh migrate + z_schema probe + backfill), API compat (adv2_d_* + fix_media_class + phase4_1_json_parity in full run).
+- Every finding F1-F11,N1-N6 has red-to-green in adv2_* or deliberate defer (F3 stage2 proxy separate design, F12 plan only); F13 resolved (rsa-prod rewrite), F12 plan written (ed25519-rfc9421-plan.md), F14 reported (branch protection, see state log).

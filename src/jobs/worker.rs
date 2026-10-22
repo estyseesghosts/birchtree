@@ -454,13 +454,15 @@ async fn process_one(
     });
     match outcome {
         Ok(()) => {
-            if let Err(err) = store.complete(job.id) {
+            if let Err(err) = store.complete(job.id, clock.now_ms()) {
                 tracing::error!(job = %job.id, error = %err, "complete failed");
             }
         }
         Err((true, msg)) => {
             tracing::warn!(job = %job.id, error = %msg, "job quarantined");
-            if let Err(err) = store.quarantine(job.id, &truncate_quarantine_error(&msg)) {
+            if let Err(err) =
+                store.quarantine(job.id, &truncate_quarantine_error(&msg), clock.now_ms())
+            {
                 tracing::error!(job = %job.id, error = %err, "quarantine failed");
             }
         }

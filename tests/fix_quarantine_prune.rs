@@ -34,12 +34,12 @@ fn prune_quarantined_is_oldest_first_bounded_and_terminal_only() {
         let job = store
             .enqueue_at(JobKind::DeliverActivity, serde_json::json!({}), due, now)
             .expect("enqueue");
-        store.quarantine(job.id, "refused").expect("quarantine");
+        store.quarantine(job.id, "refused", job.due_at_ms).expect("quarantine");
     }
     let fresh = store
         .enqueue(JobKind::DeliverActivity, serde_json::json!({}), now)
         .expect("enqueue");
-    store.quarantine(fresh.id, "fresh").expect("quarantine");
+    store.quarantine(fresh.id, "fresh", fresh.due_at_ms).expect("quarantine");
     // Live rows: pending + leased + succeeded.
     let pending = store
         .enqueue(JobKind::DeliverActivity, serde_json::json!({}), now)
@@ -52,7 +52,7 @@ fn prune_quarantined_is_oldest_first_bounded_and_terminal_only() {
     let done = store
         .enqueue(JobKind::DeliverActivity, serde_json::json!({}), now)
         .expect("done");
-    store.complete(done.id).expect("complete");
+    store.complete(done.id, done.due_at_ms).expect("complete");
 
     // Bounded pass of two reaps the two oldest; nothing else moves.
     let removed = store.prune_quarantined(6000, 2).expect("prune");
@@ -103,7 +103,7 @@ fn maintenance_pass_prunes_one_batch_and_keeps_pending() {
         let job = store
             .enqueue_at(JobKind::DeliverActivity, serde_json::json!({}), 1, now)
             .expect("enqueue");
-        store.quarantine(job.id, "stale").expect("quarantine");
+        store.quarantine(job.id, "stale", job.due_at_ms).expect("quarantine");
     }
     // Pending work plus a fresh succeeded row.
     for _ in 0..5 {
@@ -114,7 +114,7 @@ fn maintenance_pass_prunes_one_batch_and_keeps_pending() {
     let done = store
         .enqueue(JobKind::DeliverActivity, serde_json::json!({}), now)
         .expect("done");
-    store.complete(done.id).expect("complete");
+    store.complete(done.id, done.due_at_ms).expect("complete");
 
     run_table_prunes(&*store, now, 6 * 3_600_000);
 

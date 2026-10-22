@@ -230,7 +230,7 @@ fn c2_complete_removes_delivery_active() {
             .expect("gate"),
         "live head blocks the next sequence"
     );
-    store.complete(job.id).expect("complete");
+    store.complete(job.id, job.due_at_ms).expect("complete");
     assert!(
         !store
             .delivery_blocked_by("gone.example", job_seq + 1)
@@ -313,9 +313,9 @@ fn c2_blocked_by_matches_scan_oracle() {
     // Settle a deterministic subset terminally: even indices succeed.
     for (i, id) in ids.iter().enumerate() {
         if i % 3 == 0 {
-            store.complete(*id).expect("complete");
+            store.complete(*id, now).expect("complete");
         } else if i % 3 == 1 {
-            store.quarantine(*id, "stuck").expect("quarantine");
+            store.quarantine(*id, "stuck", now).expect("quarantine");
         }
     }
     // One retry-backoff row stays Pending (still blocks).
@@ -336,7 +336,7 @@ fn c2_blocked_by_matches_scan_oracle() {
     // Terminal rows never block: completing everything clears the gate.
     for job in store.all_jobs().expect("jobs") {
         if !job.state.is_terminal() {
-            store.complete(job.id).expect("complete");
+            store.complete(job.id, job.due_at_ms).expect("complete");
         }
     }
     assert!(
@@ -371,7 +371,7 @@ fn c2_blocked_check_is_independent_of_terminal_rows() {
                 now,
             )
             .expect("terminal seed");
-        store.complete(job.id).expect("complete");
+        store.complete(job.id, job.due_at_ms).expect("complete");
     }
     let start = std::time::Instant::now();
     for _ in 0..50 {
