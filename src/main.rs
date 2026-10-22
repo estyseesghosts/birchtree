@@ -6,9 +6,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use birchtree::api::mastodon::router::build_router_with_probes;
-use birchtree::api::mastodon::{ApiState, ServerInfo};
 use birchtree::application::accounts::{CreateAccountCommand, create_account};
-use birchtree::application::context::Context;
 use birchtree::application::ports::MailSender;
 use birchtree::config::Config;
 use birchtree::domain::id::{SystemClock, TimestampIdGenerator};
@@ -18,212 +16,10 @@ use birchtree::mail::LoggingMailSender;
 use birchtree::observability;
 use birchtree::persistence::redb::RedbStore;
 
-/// Parsed command-line arguments.
-#[derive(Default)]
-struct Args {
-    positional: Vec<String>,
-    username: Option<String>,
-    password: Option<String>,
-    email: Option<String>,
-    display_name: Option<String>,
-    role: Option<String>,
-    harness_mode: Option<String>,
-    text: Option<String>,
-    hint: Option<String>,
-    id: Option<String>,
-    name: Option<String>,
-    file: Option<String>,
-    locale: Option<String>,
-    shortcode: Option<String>,
-    category: Option<String>,
-    hidden: bool,
-}
+mod bootstrap;
+mod cli;
 
-fn parse_args(cfg: &mut Config) -> Args {
-    let mut args = Args::default();
-    for arg in std::env::args().skip(1) {
-        if let Some(_path) = arg.strip_prefix("--config=") {
-            // Consumed before parsing (sets the base config this call
-            // overrides); see main().
-        } else if let Some(v) = arg.strip_prefix("--public-url=") {
-            cfg.public_url = v.to_string();
-        } else if let Some(v) = arg.strip_prefix("--data-dir=") {
-            cfg.data_dir = v.into();
-        } else if let Some(v) = arg.strip_prefix("--listen=") {
-            cfg.listen = v.parse().unwrap_or_else(|_| {
-                eprintln!("invalid --listen address: {v}");
-                std::process::exit(2);
-            });
-        } else if let Some(v) = arg.strip_prefix("--trusted-proxy=") {
-            cfg.trusted_proxies.push(v.parse().unwrap_or_else(|_| {
-                eprintln!("invalid --trusted-proxy address: {v}");
-                std::process::exit(2);
-            }));
-        } else if let Some(v) = arg.strip_prefix("--max-body-size=") {
-            cfg.max_body_size = v.parse().unwrap_or_else(|_| {
-                eprintln!("invalid --max-body-size: {v}");
-                std::process::exit(2);
-            });
-        } else if let Some(v) = arg.strip_prefix("--max-status-chars=") {
-            cfg.max_status_chars = v.parse().ok().filter(|m| *m >= 1).unwrap_or_else(|| {
-                eprintln!("invalid --max-status-chars (want an integer 1..=3000): {v}");
-                std::process::exit(2);
-            });
-        } else if let Some(v) = arg.strip_prefix("--username=") {
-            args.username = Some(v.to_string());
-        } else if let Some(v) = arg.strip_prefix("--password=") {
-            args.password = Some(v.to_string());
-        } else if let Some(v) = arg.strip_prefix("--email=") {
-            args.email = Some(v.to_string());
-        } else if let Some(v) = arg.strip_prefix("--display-name=") {
-            args.display_name = Some(v.to_string());
-        } else if let Some(v) = arg.strip_prefix("--role=") {
-            args.role = Some(v.to_string());
-        } else if let Some(v) = arg.strip_prefix("--text=") {
-            args.text = Some(v.to_string());
-        } else if let Some(v) = arg.strip_prefix("--hint=") {
-            args.hint = Some(v.to_string());
-        } else if let Some(v) = arg.strip_prefix("--id=") {
-            args.id = Some(v.to_string());
-        } else if let Some(v) = arg.strip_prefix("--name=") {
-            args.name = Some(v.to_string());
-        } else if let Some(v) = arg.strip_prefix("--file=") {
-            args.file = Some(v.to_string());
-        } else if let Some(v) = arg.strip_prefix("--shortcode=") {
-            args.shortcode = Some(v.to_string());
-        } else if let Some(v) = arg.strip_prefix("--category=") {
-            args.category = Some(v.to_string());
-        } else if arg == "--hidden" {
-            args.hidden = true;
-        } else if let Some(v) = arg.strip_prefix("--locale=") {
-            args.locale = Some(v.to_string());
-        } else if let Some(v) = arg.strip_prefix("--site-title=") {
-            cfg.site_title = v.to_string();
-        } else if let Some(v) = arg.strip_prefix("--site-description=") {
-            cfg.site_description = v.to_string();
-        } else if let Some(v) = arg.strip_prefix("--site-contact-email=") {
-            cfg.site_contact_email = v.to_string();
-        } else if let Some(v) = arg.strip_prefix("--streaming-url=") {
-            cfg.streaming_api_base_url = Some(v.trim_end_matches('/').to_string());
-        } else if let Some(v) = arg.strip_prefix("--site-contact-username=") {
-            cfg.site_contact_username = Some(v.trim_start_matches('@').to_string());
-        } else if arg == "--federation-allow-http" {
-            cfg.federation_allow_http = true;
-        } else if arg == "--federation-authorized-fetch" {
-            cfg.federation_authorized_fetch = true;
-        } else if let Some(v) = arg.strip_prefix("--federation-extra-ca=") {
-            cfg.federation_extra_ca = Some(std::path::PathBuf::from(v));
-        } else if let Some(v) = arg.strip_prefix("--federation-allow-private=") {
-            cfg.federation_allowlist = birchtree::federation::policy::parse_allowlist(v)
-                .unwrap_or_else(|err| {
-                    eprintln!("invalid --federation-allow-private: {err}");
-                    std::process::exit(2);
-                });
-        } else if arg == "--debug-weak-rate-limits" {
-            cfg.rate_limit_multiplier = 10;
-        } else if let Some(v) = arg.strip_prefix("--rate-limit-multiplier=") {
-            cfg.rate_limit_multiplier = v.parse().ok().filter(|m| *m >= 1).unwrap_or_else(|| {
-                eprintln!("invalid --rate-limit-multiplier (want an integer >= 1): {v}");
-                std::process::exit(2);
-            });
-        } else if arg == "--lab" {
-            cfg.mode = birchtree::config::RuntimeMode::Lab;
-        } else if let Some(v) = arg.strip_prefix("--unsafe-production-override=") {
-            cfg.unsafe_production_override = Some(v.to_string());
-        } else if let Some(v) = arg.strip_prefix("--secret-keyring-file=") {
-            cfg.secret_keyring_file = Some(std::path::PathBuf::from(v));
-        } else if let Some(v) = arg.strip_prefix("--secret-keyring-env=") {
-            cfg.secret_keyring_env = Some(v.to_string());
-        } else if arg == "--registration-open" {
-            cfg.registration_open = true;
-        } else if arg == "--registration-closed" {
-            cfg.registration_open = false;
-        } else if arg == "--registration-require-approval" {
-            cfg.registration_requires_approval = true;
-        } else if let Some(v) = arg.strip_prefix("--search-mode=") {
-            cfg.search_mode = birchtree::search::SearchMode::parse(v).unwrap_or_else(|| {
-                eprintln!("invalid --search-mode (want embedded|database|off): {v}");
-                std::process::exit(2);
-            });
-        } else if arg == "--no-transcode" {
-            cfg.transcoding_enabled = false;
-        } else if let Some(v) = arg.strip_prefix("--ffmpeg-path=") {
-            cfg.ffmpeg_path = v.to_string();
-        } else if let Some(v) = arg.strip_prefix("--webp-quality=") {
-            cfg.webp_quality = v.parse().unwrap_or_else(|_| {
-                eprintln!("invalid --webp-quality (want 0-100): {v}");
-                std::process::exit(2);
-            });
-        } else if let Some(v) = arg.strip_prefix("--vp9-crf=") {
-            cfg.vp9_crf = v.parse().unwrap_or_else(|_| {
-                eprintln!("invalid --vp9-crf (want 0-63): {v}");
-                std::process::exit(2);
-            });
-        } else if let Some(v) = arg.strip_prefix("--vp9-cpu-used=") {
-            cfg.vp9_cpu_used = v.parse().unwrap_or_else(|_| {
-                eprintln!("invalid --vp9-cpu-used (want 0-5): {v}");
-                std::process::exit(2);
-            });
-        } else if let Some(v) = arg.strip_prefix("--opus-bitrate-kbps=") {
-            cfg.opus_bitrate_kbps = v.parse().unwrap_or_else(|_| {
-                eprintln!("invalid --opus-bitrate-kbps (want an integer > 0): {v}");
-                std::process::exit(2);
-            });
-        } else if let Some(v) = arg.strip_prefix("--transcode-wall-time-secs=") {
-            cfg.transcode_wall_time_secs = v.parse().unwrap_or_else(|_| {
-                eprintln!("invalid --transcode-wall-time-secs: {v}");
-                std::process::exit(2);
-            });
-        } else if let Some(v) = arg.strip_prefix("--transcode-max-output-bytes=") {
-            cfg.transcode_max_output_bytes = v.parse().unwrap_or_else(|_| {
-                eprintln!("invalid --transcode-max-output-bytes: {v}");
-                std::process::exit(2);
-            });
-        } else if let Some(v) = arg.strip_prefix("--transcode-max-memory-bytes=") {
-            cfg.transcode_max_memory_bytes = v.parse().unwrap_or_else(|_| {
-                eprintln!("invalid --transcode-max-memory-bytes: {v}");
-                std::process::exit(2);
-            });
-        } else if let Some(v) = arg.strip_prefix("--vapid-public-key=") {
-            cfg.vapid_public_key = v.to_string();
-        } else if let Some(v) = arg.strip_prefix("--vapid-private-key=") {
-            cfg.vapid_private_key = v.to_string();
-        } else if let Some(v) = arg.strip_prefix("--smtp-url=") {
-            cfg.smtp_url = Some(v.to_string());
-        } else if let Some(v) = arg.strip_prefix("--mail-from=") {
-            cfg.mail_from = Some(v.to_string());
-        } else if let Some(v) = arg.strip_prefix("--relay-inbox=") {
-            cfg.relay_inboxes.push(v.to_string());
-        } else if let Some(v) = arg.strip_prefix("--password-reset-ttl-hours=") {
-            cfg.password_reset_ttl_hours = v.parse().unwrap_or_else(|_| {
-                eprintln!("invalid --password-reset-ttl-hours (want an integer 1..=72): {v}");
-                std::process::exit(2);
-            });
-        } else if let Some(v) = arg.strip_prefix("--site-terms-file=") {
-            cfg.site_terms_file = Some(std::path::PathBuf::from(v));
-        } else if let Some(v) = arg.strip_prefix("--site-privacy-file=") {
-            cfg.site_privacy_file = Some(std::path::PathBuf::from(v));
-        } else if let Some(v) = arg.strip_prefix("--site-extended-file=") {
-            cfg.site_extended_file = Some(std::path::PathBuf::from(v));
-        } else if let Some(v) = arg.strip_prefix("--web-client-dir=") {
-            cfg.web_client_dir = Some(std::path::PathBuf::from(v));
-        } else if let Some(v) = arg.strip_prefix("--license-policy=") {
-            cfg.license_policy = v.to_string();
-        } else if let Some(v) = arg.strip_prefix("--place-policy=") {
-            cfg.place_policy = v.to_string();
-        } else if let Some(v) = arg.strip_prefix("--alt-text-policy=") {
-            cfg.alt_text_policy = v.to_string();
-        } else if let Some(v) = arg.strip_prefix("--mode=") {
-            args.harness_mode = Some(v.to_string());
-        } else if arg.starts_with("--") {
-            eprintln!("unknown flag: {arg}");
-            std::process::exit(2);
-        } else {
-            args.positional.push(arg);
-        }
-    }
-    args
-}
+use cli::{Args, parse_args};
 
 fn build_store(cfg: &Config) -> (Arc<RedbStore>, Arc<dyn Clock>, Arc<TimestampIdGenerator>) {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -423,25 +219,6 @@ fn run_crash_harness(cfg: &Config, args: &Args) -> ! {
     }
 }
 
-/// Load the secret-encryption keyring from the configured source (setting
-/// both sources is rejected by [`Config::validate`], so at most one
-/// applies). The value is key material: it is never logged, only its load
-/// outcome.
-fn load_secret_box(
-    cfg: &Config,
-) -> Result<birchtree::persistence::redb::secrets::SecretBox, String> {
-    use birchtree::persistence::redb::secrets::SecretBox;
-    if let Some(path) = &cfg.secret_keyring_file {
-        return SecretBox::from_keyring_file(path)
-            .map_err(|err| format!("secret keyring file {}: {err}", path.display()));
-    }
-    if let Some(variable) = &cfg.secret_keyring_env {
-        return SecretBox::from_keyring_env(variable)
-            .map_err(|err| format!("secret keyring env {variable}: {err}"));
-    }
-    Err("no secret keyring configured (secret_keyring_file or secret_keyring_env)".to_string())
-}
-
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c().await.ok();
@@ -469,23 +246,7 @@ async fn serve(cfg: Config) {
     // Secrets first: TOTP seeds, local signing keys and mail-outbox bearers
     // seal under this keyring. Production refuses to start without one; lab
     // runs keep long-lived secrets in plaintext with a warning.
-    let secret_box = match load_secret_box(&cfg) {
-        Ok(secret_box) => secret_box,
-        Err(err) => {
-            if cfg.mode == birchtree::config::RuntimeMode::Lab
-                || cfg.unsafe_production_override_active()
-            {
-                tracing::warn!(
-                    error = %err,
-                    "starting without a secret keyring: secrets stay in plaintext (lab only)"
-                );
-                birchtree::persistence::redb::secrets::SecretBox::disabled()
-            } else {
-                eprintln!("secret keyring: {err}; refusing to start in production mode");
-                std::process::exit(1);
-            }
-        }
-    };
+    let secret_box = bootstrap::load_secret_box_or_exit(&cfg);
     store.install_secret_box(secret_box.clone());
     if secret_box.is_enabled() {
         match store.seal_legacy_secrets() {
@@ -509,193 +270,11 @@ async fn serve(cfg: Config) {
             }
         }
     }
-    // Physical layout before anything is opened: the durable pool (local
-    // uploads, never evicted) and the cache pool (remote bytes, evictable)
-    // must be disjoint trees that exclude the database file, resolved
-    // through symlinks. String comparison is not enough.
-    if let Err(err) = birchtree::media::storage_roots::validate_layout(
-        &cfg.durable_dir_resolved(),
-        &cfg.cache_dir_resolved(),
-        &cfg.database_path(),
-    ) {
-        eprintln!("storage layout: {err}");
-        std::process::exit(1);
-    }
-    let (durable_blobs, cache_blobs) = birchtree::media::blob_store::FsBlobStore::open_pair(
-        cfg.durable_dir_resolved(),
-        cfg.cache_dir_resolved(),
-    )
-    .unwrap_or_else(|err| {
-        eprintln!("open blob stores: {err}");
-        std::process::exit(1);
-    });
-    // One routing handle: local keys land in the durable pool, `remote/…`
-    // keys in the cache pool (pre-split durable `remote/` bytes stay
-    // readable).
-    let pools = birchtree::media::pooled_blob_stores::PooledBlobStores::new(
-        durable_blobs.clone(),
-        cache_blobs.clone(),
-    );
+    let (durable_blobs, cache_blobs, pools) = bootstrap::open_blob_pools(&cfg);
     let blobs: Arc<dyn birchtree::application::ports::BlobStore> = Arc::new(pools);
-    // Storage overhaul (Agent B): install the operator budgets into the
-    // process-wide cache admission ledger (in-flight reservations gate the
-    // fetch path before any byte is read).
-    birchtree::media::remote_cache::configure_process_ledger(cfg.remote_cache.clone());
-    // The cache lifecycle service owns eviction + reconciliation. Restore
-    // rehydrates the ledger from the durable rows and the cache pool before
-    // traffic is accepted; the seed starts the bounded maintenance chains.
-    let maint = Arc::new(
-        birchtree::media::cache_maintenance::CacheMaintenance::new(
-            store.clone(),
-            cache_blobs.clone(),
-            cfg.remote_cache.clone(),
-        )
-        .with_durable_residue_sweep(durable_blobs.clone()),
-    );
-    match maint.restore_at_startup(clock.now_ms()) {
-        Ok(report) => tracing::info!(
-            adopted = report.adopted,
-            missing = report.missing,
-            residue_removed = report.residue_removed,
-            "cache restore at startup"
-        ),
-        Err(err) => {
-            eprintln!("cache restore at startup: {err}");
-            std::process::exit(1);
-        }
-    }
-    // Over-cap after restore (or after a shadow migration that adopted more
-    // bytes than the caps allow) is evicted with the same durable-first
-    // primitive as admission and maintenance, before the listener binds:
-    // redb and disk agree before traffic is accepted.
-    match maint.enforce_caps_at_startup(clock.now_ms()) {
-        Ok(report) => {
-            if report.pressure > 0 || report.expired > 0 {
-                tracing::info!(
-                    expired = report.expired,
-                    pressure = report.pressure,
-                    blobs_deleted = report.blobs_deleted,
-                    "cache startup cap enforcement"
-                );
-            }
-        }
-        Err(err) => {
-            eprintln!("cache startup cap enforcement: {err}");
-            std::process::exit(1);
-        }
-    }
-    if let Err(err) = maint.seed_jobs(&*store, clock.now_ms()) {
-        tracing::warn!(error = %err, "maintenance seed failed");
-    }
-    let server = Arc::new(ServerInfo::from_config(&cfg));
-    // Phase 7.2/7.3 startup seeds: the search index is in-memory derived
-    // state, so a restart re-seeds its backfill chain when empty; the tag
-    // backfill re-scans until a pass plans nothing (idempotent, bounded).
-    // Seed failures only degrade reads until the next restart.
-    {
-        use birchtree::application::ports::JobQueue;
-        use birchtree::domain::JobKind;
-        if birchtree::search::global().is_empty()
-            && cfg.search_mode == birchtree::search::SearchMode::Embedded
-        {
-            if let Err(err) = store.enqueue(
-                JobKind::SearchBackfill,
-                birchtree::jobs::search_index::backfill_payload(
-                    None,
-                    birchtree::search::BACKFILL_DEFAULT_BATCH,
-                ),
-                clock.now_ms(),
-            ) {
-                tracing::warn!(error = %err, "search backfill seed failed");
-            }
-        }
-        if let Err(err) = store.enqueue(
-            JobKind::TagBackfill,
-            birchtree::jobs::search_index::backfill_payload(
-                None,
-                birchtree::jobs::tag_backfill::BACKFILL_BATCH_CAP,
-            ),
-            clock.now_ms(),
-        ) {
-            tracing::warn!(error = %err, "tag backfill seed failed");
-        }
-    }
-    let streams = birchtree::streaming::Hub::new(
-        store.clone(),
-        clock.clone(),
-        server.clone(),
-        birchtree::streaming::Limits::default(),
-    );
-    let streaming: Arc<dyn birchtree::application::ports::StreamingSink> =
-        Arc::new(streams.clone());
-    let context = Arc::new(Context::new(
-        clock.clone(),
-        ids,
-        store.clone(),
-        blobs.clone(),
-        streaming.clone(),
-    ));
-    // Federation (Phase 6). Lab mode permits plain-HTTP targets and
-    // private-network allowlists; production refuses them in
-    // `check_runtime_mode` unless the explicit override is set (see the
-    // startup summary logged in `main`).
-    let lab = cfg.mode == birchtree::config::RuntimeMode::Lab;
-    let extra_roots = match &cfg.federation_extra_ca {
-        Some(path) => {
-            let pem = std::fs::read(path).unwrap_or_else(|err| {
-                eprintln!("read --federation-extra-ca {}: {err}", path.display());
-                std::process::exit(2);
-            });
-            reqwest::Certificate::from_pem_bundle(&pem).unwrap_or_else(|err| {
-                eprintln!("parse --federation-extra-ca {}: {err}", path.display());
-                std::process::exit(2);
-            })
-        }
-        None => Vec::new(),
-    };
-    let http_policy = birchtree::federation::net::SafeHttpConfig {
-        allow_http: cfg.federation_allow_http,
-        allowlist: cfg.federation_allowlist.clone(),
-        extra_roots,
-        ..Default::default()
-    };
-    let instance = birchtree::activitypub::instance::ensure(&*store, &cfg.normalized_public_url())
-        .await
-        .unwrap_or_else(|err| {
-            eprintln!("instance actor: {err}");
-            std::process::exit(1);
-        });
-    let federation = birchtree::activitypub::build_config_with_remote_cache(
-        context.clone(),
-        &cfg.normalized_public_url(),
-        cfg.registration_open,
-        &cfg.site_title,
-        &cfg.site_description,
-        &http_policy,
-        lab,
-        Some(&instance),
-        cfg.federation_authorized_fetch,
-        &cfg.relay_inboxes,
-        &cfg.remote_cache,
-        &cfg.license_policy,
-        &cfg.place_policy,
-    )
-    .await
-    .unwrap_or_else(|err| {
-        eprintln!("start federation: {err}");
-        std::process::exit(1);
-    });
-    let state = ApiState {
-        context,
-        trusted_proxies: Arc::new(cfg.trusted_proxies.clone()),
-        max_body_size: cfg.max_body_size,
-        server,
-        streams,
-        federation: federation.clone(),
-        rate_limit_multiplier: cfg.rate_limit_multiplier,
-        mail_env: Arc::new(birchtree::mailer::MailEnv::from_config(&cfg)),
-        invites: store.clone() as std::sync::Arc<dyn birchtree::application::accounts::InviteStore>,
-    };
+    let maint = bootstrap::restore_cache_ledger(&store, &cache_blobs, &durable_blobs, &cfg, &clock);
+    let state =
+        bootstrap::build_app_state(&cfg, store.clone(), clock.clone(), ids, blobs.clone()).await;
     // Readiness + metrics: storage writability, worker progress, pool
     // writability, queue health, cache accounting and media latency. The
     // heartbeat is beaten every worker loop iteration (idle or busy).
@@ -800,6 +379,9 @@ async fn serve(cfg: Config) {
             })
             .with_gauge("worker_heartbeat_age_ms", move || beat_age.age_ms())
     };
+    let streaming: Arc<dyn birchtree::application::ports::StreamingSink> =
+        Arc::new(state.streams.clone());
+    let federation = state.federation.clone();
     let app = build_router_with_probes(state, probes);
     // Outbound mail: real SMTP delivery through the worker when configured,
     // the explicit logging adapter otherwise (registration jobs then log
@@ -872,11 +454,12 @@ async fn serve(cfg: Config) {
         tracing::info!(swept, "removed stale transcode temp files at startup");
     }
     let worker_extra = jobs::worker::WorkerExtra {
-        push_client: birchtree::application::push_client::production_push_client()
-            .unwrap_or_else(|err| {
+        push_client: birchtree::application::push_client::production_push_client().unwrap_or_else(
+            |err| {
                 eprintln!("build push http client: {err}");
                 std::process::exit(1);
-            }),
+            },
+        ),
         vapid: birchtree::application::push::VapidKeys {
             public_b64: cfg.vapid_public_key.clone(),
             private_b64: cfg.vapid_private_key.clone(),
