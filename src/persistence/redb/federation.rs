@@ -18,8 +18,8 @@ use crate::domain::{
 
 use super::relationships::{read_follow_txn, read_stats_txn, write_stats_txn};
 use super::schema::{
-    self, ACCOUNT_BY_ACTOR_URI, ACCOUNTS, ACTIVITY_DEDUP, ACTOR_KEYS, DELIVERY_DEST, DELIVERY_SEQ,
-    FOLLOW_BY_URI, FOLLOWS, FOLLOWS_BY_FOLLOWED, HANDLE_INDEX, JOBS,
+    self, ACCOUNT_BY_ACTOR_URI, ACCOUNTS, ACTIVITY_DEDUP, ACTOR_KEYS, DELIVERY_ACTIVE,
+    DELIVERY_DEST, DELIVERY_SEQ, FOLLOW_BY_URI, FOLLOWS, FOLLOWS_BY_FOLLOWED, HANDLE_INDEX, JOBS,
 };
 use super::{RedbStore, StoreResult, decode, encode};
 
@@ -443,6 +443,29 @@ impl FederationStore for RedbStore {
         };
         write.commit()?;
         Ok(next)
+    }
+
+    /// Atomic delivery enqueue (adversarial-2 C1 groundwork): the host
+    /// sequence and the job row (plus the `DELIVERY_ACTIVE` index entry)
+    /// commit in one transaction, so a delayed insert can never let `N+1`
+    /// become visible before `N`. Workstream C fills the gate query and the
+    /// remaining index maintenance.
+    fn enqueue_delivery(&self, delivery: DeliverySpec, now_ms: u64) -> Result<Job> {
+        let write = self.begin_write()?;
+        let job = {
+            let job_id = self.next_id();
+            let job = delivery_job(&write, job_id, &delivery, now_ms)?;
+            super::jobs::insert_job(&write, &job)?;
+            // Index the outstanding delivery for the bounded FIFO gate.
+            let seq = job.payload.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+            let host = delivery_host_key(&delivery.inbox_uri);
+            let mut active = write.open_table(DELIVERY_ACTIVE)?;
+            let key = schema::delivery_active_key(&host, seq, job.id.value());
+            active.insert(key.as_slice(), job.id.value())?;
+            job
+        };
+        write.commit()?;
+        Ok(job)
     }
 
     fn delivery_blocked_by(&self, host: &str, seq: u64) -> Result<bool> {

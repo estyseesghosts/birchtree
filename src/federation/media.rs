@@ -261,19 +261,15 @@ pub async fn fetch(
             if !seen {
                 // Size is advisory here (already on disk); count, don't refuse.
                 if let Ok(Some(bytes)) = cache_store(ctx).get(&key).map_err(|_| ()) {
-                    let entry = remote_cache::RemoteCacheEntry {
-                        source_url: source.clone(),
-                        variant: ATTACHMENT_VARIANT.to_string(),
-                        blob_key: key.clone(),
-                        class: MediaClass::Full,
-                        size: bytes.len() as u64,
-                        last_use_ms: now,
-                        expiry_ms: now.saturating_add(
-                            MediaClass::Full.retention_ms(&ctx.remote_cache),
-                        ),
-                        etag: None,
-                        has_bytes: true,
-                    };
+                    let entry = remote_cache::RemoteCacheEntry::stored(
+                        &source,
+                        ATTACHMENT_VARIANT,
+                        MediaClass::Full,
+                        &key,
+                        bytes.len() as u64,
+                        now,
+                        &ctx.remote_cache,
+                    );
                     let _ = ledger.commit(MediaClass::Full, 0, entry);
                 }
             } else {
@@ -309,10 +305,7 @@ pub async fn fetch(
     // Worst-case reservation first: concurrent fetches each hold their ceiling
     // until headers shrink it, so the committed total never overshoots.
     let mut reserved = MAX_REMOTE_MEDIA_BYTES;
-    if lock_ledger()?
-        .reserve(MediaClass::Full, reserved)
-        .is_err()
-    {
+    if lock_ledger()?.reserve(MediaClass::Full, reserved).is_err() {
         // Make room through the durable-first eviction shared with scheduled
         // maintenance: victims are unmapped (rows + counters) in one redb
         // transaction BEFORE any blob is deleted, then the blobs go, then
@@ -497,7 +490,15 @@ pub async fn fetch(
         // row could never be freed. A crash between the row and the ledger
         // commit leaves a counted row the next restore adopts.
         store
-            .cache_mark_stored(&source, ATTACHMENT_VARIANT, &key, staged, None, now)
+            .cache_mark_stored(
+                &source,
+                ATTACHMENT_VARIANT,
+                &key,
+                staged,
+                None,
+                now,
+                &ctx.remote_cache,
+            )
             .map_err(retry)?;
         let entry = remote_cache::RemoteCacheEntry::stored(
             &source,
@@ -588,8 +589,7 @@ pub async fn fetch(
     };
     // Same classification as the streamed path: audio/video originals are
     // `Stream` and are never persisted (no reserve, no put, no commit).
-    if remote_cache::class_for_fetch(sniffed.mime_type, ATTACHMENT_VARIANT) == MediaClass::Stream
-    {
+    if remote_cache::class_for_fetch(sniffed.mime_type, ATTACHMENT_VARIANT) == MediaClass::Stream {
         if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
             release(&mut ledger, reserved);
         }
@@ -615,6 +615,7 @@ pub async fn fetch(
             body.len() as u64,
             None,
             now,
+            &ctx.remote_cache,
         )
         .map_err(retry)?;
     let entry = remote_cache::RemoteCacheEntry::stored(
@@ -816,6 +817,7 @@ pub fn store_remote_emoji(
     source_url: &str,
     bytes: &[u8],
     now_ms: u64,
+    cfg: &RemoteCacheConfig,
 ) -> std::result::Result<crate::domain::CustomEmoji, String> {
     let mime_type = crate::application::emoji::validate_remote_emoji_bytes(bytes)
         .map_err(|err| err.to_string())?;
@@ -824,10 +826,8 @@ pub fn store_remote_emoji(
     if namespaced_domain != origin_domain.to_ascii_lowercase() {
         return Err("remote emoji domain does not match its key".into());
     }
-    let (image_key, static_key) =
-        remote_cache::remote_emoji_keys(origin_domain, shortcode).ok_or_else(|| {
-            "remote emoji domain or shortcode is not a servable shape".to_string()
-        })?;
+    let (image_key, static_key) = remote_cache::remote_emoji_keys(origin_domain, shortcode)
+        .ok_or_else(|| "remote emoji domain or shortcode is not a servable shape".to_string())?;
     blobs.put(&image_key, bytes).map_err(|e| e.to_string())?;
     blobs.put(&static_key, bytes).map_err(|e| e.to_string())?;
     let size = bytes.len() as u64;
@@ -842,6 +842,7 @@ pub fn store_remote_emoji(
             size,
             None,
             now_ms,
+            cfg,
         )
         .map_err(|e| e.to_string())?;
     store
@@ -852,6 +853,7 @@ pub fn store_remote_emoji(
             size,
             None,
             now_ms,
+            cfg,
         )
         .map_err(|e| e.to_string())?;
     let _ = mime_type;

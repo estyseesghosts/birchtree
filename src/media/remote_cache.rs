@@ -159,6 +159,8 @@ fn disabled_refusal() -> CacheError {
 
 /// One cache entry: the durable metadata row in miniature. Metadata survives
 /// byte eviction (`has_bytes == false` keeps `source_url` for re-fetch).
+/// `refcount` counts the attachments sharing these bytes (adversarial-2 B0
+/// dedupe): eviction clears bytes only when the last reference goes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteCacheEntry {
     pub source_url: String,
@@ -170,6 +172,15 @@ pub struct RemoteCacheEntry {
     pub expiry_ms: u64,
     pub etag: Option<String>,
     pub has_bytes: bool,
+    /// Sharing references for these bytes. Old rows without the field decode
+    /// as 1 when they hold bytes, else 0 (schema v24 migration backfills it).
+    #[serde(default = "default_entry_refcount")]
+    pub refcount: u32,
+}
+
+/// Default `refcount` for rows written before schema v24.
+fn default_entry_refcount() -> u32 {
+    1
 }
 
 impl RemoteCacheEntry {
@@ -192,6 +203,7 @@ impl RemoteCacheEntry {
             expiry_ms: now_ms.saturating_add(class.retention_ms(cfg)),
             etag: None,
             has_bytes: false,
+            refcount: 0,
         }
     }
 
@@ -208,6 +220,7 @@ impl RemoteCacheEntry {
         let mut entry = Self::metadata_only(source_url, variant, class, blob_key, now_ms, cfg);
         entry.size = size;
         entry.has_bytes = true;
+        entry.refcount = 1;
         entry
     }
 
@@ -535,20 +548,26 @@ impl CacheLedger {
         victims
     }
 
-    /// Apply a planned victim list: remove the byte mapping and update
-    /// accounting, keeping the metadata shell (`source_url`) for re-fetch.
-    /// Returns the blob keys the caller must now delete (mapping first, then
-    /// the key — a crash between leaves an orphan blob, never a dangling
-    /// mapping).
+    /// Apply a planned victim list: drop one reference per victim and update
+    /// accounting only when the last reference goes, keeping the metadata
+    /// shell (`source_url`) for re-fetch. Returns the blob keys the caller
+    /// must now delete (mapping first, then the key — a crash between leaves
+    /// an orphan blob, never a dangling mapping).
     pub fn evict_planned(&mut self, victims: &[Vec<u8>]) -> Vec<String> {
         let mut blob_keys = Vec::new();
         for key in victims {
             if let Some(entry) = self.entries.get_mut(key) {
                 if entry.has_bytes {
+                    let refs = entry.refcount.max(1);
+                    if refs > 1 {
+                        entry.refcount = refs - 1;
+                        continue;
+                    }
                     let idx = class_index(entry.class);
                     self.stored[idx] = self.stored[idx].saturating_sub(entry.size);
                     entry.has_bytes = false;
                     entry.size = 0;
+                    entry.refcount = 0;
                     blob_keys.push(entry.blob_key.clone());
                 }
             }
@@ -673,7 +692,9 @@ impl CacheLedger {
 
     /// Settle a reservation into stored bytes: drop `reserved_bytes` of
     /// in-flight budget and count `entry.size` as stored. Re-commits replace
-    /// the previous mapping (sizes adjusted, no double count). Refuses
+    /// the previous mapping (sizes adjusted, no double count). Dedupe
+    /// (adversarial-2 B0): a second blob for the same pair bumps `refcount`
+    /// and keeps the first bytes, without moving the counters. Refuses
     /// non-cache keys, so durable local uploads can never enter the ledger.
     pub fn commit(
         &mut self,
@@ -701,14 +722,34 @@ impl CacheLedger {
         }
         self.release(class, reserved_bytes);
         let key = entry.cache_key();
-        if let Some(old) = self.entries.get(&key) {
+        if let Some(old) = self.entries.get_mut(&key) {
+            if old.has_bytes && old.blob_key != entry.blob_key {
+                old.refcount = old.refcount.max(1).saturating_add(1);
+                old.last_use_ms = old.last_use_ms.max(entry.last_use_ms);
+                if entry.etag.is_some() {
+                    old.etag = entry.etag;
+                }
+                return Ok(());
+            }
             if old.has_bytes {
                 let idx = class_index(old.class);
                 self.stored[idx] = self.stored[idx].saturating_sub(old.size);
             }
+            let mut entry = entry;
+            entry.has_bytes = true;
+            entry.refcount = old.refcount.max(1);
+            // Same-key rewrite keeps the sharing count.
+            if !old.has_bytes {
+                entry.refcount = 1;
+            }
+            let idx = class_index(entry.class);
+            self.stored[idx] = self.stored[idx].saturating_add(entry.size);
+            self.entries.insert(key, entry);
+            return Ok(());
         }
         let mut entry = entry;
         entry.has_bytes = true;
+        entry.refcount = 1;
         let idx = class_index(entry.class);
         self.stored[idx] = self.stored[idx].saturating_add(entry.size);
         self.entries.insert(key, entry);

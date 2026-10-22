@@ -686,6 +686,12 @@ impl BlobStore for FsBlobStore {
         Some(self.root.clone())
     }
 
+    /// Single-pool staging uses the same root, so `publish_tmp` is still a
+    /// same-volume rename (adversarial-2 F11).
+    fn staging_root(&self) -> Option<PathBuf> {
+        Some(self.root.clone())
+    }
+
     fn publish_tmp(&self, tmp: &Path, key: &str) -> Result<()> {
         let dest: PathBuf = self.resolve(key)?;
         if let Some(parent) = dest.parent() {

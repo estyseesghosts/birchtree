@@ -96,16 +96,28 @@ fn failed_second_variant_keeps_previous_generation() {
     let old_image = first.image_key.clone();
     let old_static = first.static_image_key.clone();
 
-    let failing = FailSecondPut::new(
-        FsBlobStore::open(blobs_dir.path().join("media")).expect("reopen"),
-    );
-    let err = add_emoji(&*store, &failing, "party", &png_bytes(200, 10, 10), None, true)
-        .expect_err("second variant fails");
+    let failing =
+        FailSecondPut::new(FsBlobStore::open(blobs_dir.path().join("media")).expect("reopen"));
+    let err = add_emoji(
+        &*store,
+        &failing,
+        "party",
+        &png_bytes(200, 10, 10),
+        None,
+        true,
+    )
+    .expect_err("second variant fails");
     assert!(matches!(err, Error::Storage(_)), "{err:?}");
 
     // Previous bytes byte-identical, row untouched.
-    assert_eq!(blobs.get(&old_image).unwrap().as_deref(), Some(old_png.as_slice()));
-    assert_eq!(blobs.get(&old_static).unwrap().as_deref(), Some(old_png.as_slice()));
+    assert_eq!(
+        blobs.get(&old_image).unwrap().as_deref(),
+        Some(old_png.as_slice())
+    );
+    assert_eq!(
+        blobs.get(&old_static).unwrap().as_deref(),
+        Some(old_png.as_slice())
+    );
     let row = store.emoji_by_shortcode("party").unwrap().expect("row");
     assert_eq!(row.image_key, old_image);
     assert_eq!(row.static_image_key, old_static);
@@ -127,7 +139,10 @@ fn uncommitted_staging_never_touches_live_keys() {
         guard.put("staged/b.png", b"new").unwrap();
         // Metadata commit fails here: the guard drops uncommitted.
     }
-    assert_eq!(blobs.get("live/a.png").unwrap().as_deref(), Some(b"live".as_slice()));
+    assert_eq!(
+        blobs.get("live/a.png").unwrap().as_deref(),
+        Some(b"live".as_slice())
+    );
     assert_eq!(blobs.get("staged/b.png").unwrap(), None);
 }
 
@@ -146,13 +161,22 @@ fn successful_replace_serves_new_bytes_and_drops_old_keys() {
     let second = add_emoji(&*store, &blobs, "party", &new_png, None, true).expect("replace");
     assert_ne!(second.image_key, first.image_key);
     assert_ne!(second.static_image_key, first.static_image_key);
-    assert_eq!(blobs.get(&second.image_key).unwrap().as_deref(), Some(new_png.as_slice()));
+    assert_eq!(
+        blobs.get(&second.image_key).unwrap().as_deref(),
+        Some(new_png.as_slice())
+    );
     assert_eq!(
         blobs.get(&second.static_image_key).unwrap().as_deref(),
         Some(new_png.as_slice())
     );
-    assert!(!blobs.exists(&first.image_key).unwrap(), "old image deleted");
-    assert!(!blobs.exists(&first.static_image_key).unwrap(), "old static deleted");
+    assert!(
+        !blobs.exists(&first.image_key).unwrap(),
+        "old image deleted"
+    );
+    assert!(
+        !blobs.exists(&first.static_image_key).unwrap(),
+        "old static deleted"
+    );
 
     // The DTO serves the row's keys (the fresh generation is servable).
     let server = common::server_info();
@@ -168,7 +192,11 @@ fn successful_replace_serves_new_bytes_and_drops_old_keys() {
         fresh_body["url"]
             .as_str()
             .expect("url")
-            .ends_with("70/61/fresh/original/fresh.png") || fresh_body["url"].as_str().expect("url").contains("original/fresh.png"),
+            .ends_with("70/61/fresh/original/fresh.png")
+            || fresh_body["url"]
+                .as_str()
+                .expect("url")
+                .contains("original/fresh.png"),
         "{}",
         fresh_body["url"]
     );
@@ -196,13 +224,24 @@ fn remote_emoji_live_in_the_cache_pool_and_evict() {
         source,
         &png,
         T0,
+        &birchtree::config::RemoteCacheConfig::default(),
     )
     .expect("staged");
-    assert_eq!(row.image_key, "remote/emojis/remote.example/party/original.png");
-    assert_eq!(row.static_image_key, "remote/emojis/remote.example/party/static.png");
+    assert_eq!(
+        row.image_key,
+        "remote/emojis/remote.example/party/original.png"
+    );
+    assert_eq!(
+        row.static_image_key,
+        "remote/emojis/remote.example/party/static.png"
+    );
     assert!(remote_cache::is_cache_key(&row.image_key));
     // Pool routing put both copies in the cache pool only.
-    assert!(dir.path().join(format!("media_cache/{}", row.image_key)).exists());
+    assert!(
+        dir.path()
+            .join(format!("media_cache/{}", row.image_key))
+            .exists()
+    );
     assert!(!dir.path().join(format!("media/{}", row.image_key)).exists());
 
     // Both copies are durable byte rows under the reserved class.
@@ -217,7 +256,13 @@ fn remote_emoji_live_in_the_cache_pool_and_evict() {
     for victim in &victims {
         pools.delete(victim).expect("delete");
     }
-    assert_eq!(store.cache_accounting().expect("accounting").stored_avatar_emoji, 0);
+    assert_eq!(
+        store
+            .cache_accounting()
+            .expect("accounting")
+            .stored_avatar_emoji,
+        0
+    );
 }
 
 /// The `/system/remote/emojis/` route serves staged bytes, answers 404
@@ -235,6 +280,7 @@ async fn remote_emoji_route_serves_and_refetches_on_miss() {
         source,
         &png,
         T0,
+        &birchtree::config::RemoteCacheConfig::default(),
     )
     .expect("staged");
 
@@ -251,15 +297,21 @@ async fn remote_emoji_route_serves_and_refetches_on_miss() {
     // Wrong shapes 404 before the filesystem (no job, no 500).
     let (status, _, _) = send(
         &srv.router,
-        get_request("/system/remote/emojis/remote.example/party/derived.png", None, None),
-        )
-        .await;
+        get_request(
+            "/system/remote/emojis/remote.example/party/derived.png",
+            None,
+            None,
+        ),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     // Evict the bytes (rows survive): the route 404s and queues one refetch
     // carrying the origin URL.
     srv.blobs.delete(&row.image_key).expect("evict image");
-    srv.blobs.delete(&row.static_image_key).expect("evict static");
+    srv.blobs
+        .delete(&row.static_image_key)
+        .expect("evict static");
     let (status, _, _) = send(
         &srv.router,
         get_request(&format!("/system/{}", row.image_key), None, None),

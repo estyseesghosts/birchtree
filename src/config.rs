@@ -22,7 +22,9 @@ mod serde_millis {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteCacheMode {
-    /// No persistence; direct/streaming proxy delivery (no proxy design yet).
+    /// No persistence: startup refuses this mode until a non-persisting
+    /// streaming/proxy delivery path exists (adversarial-2 F1). The ledger
+    /// refuses every reservation and commit loudly while disabled.
     Disabled,
     /// Fetch on first request, cache, auto-evict (default).
     OnDemand,
@@ -222,7 +224,8 @@ pub struct Config {
     /// Whether the ffmpeg transcode pipeline runs (Phase 7.1). On by
     /// default; `--no-transcode` disables it (uploads keep the Phase 4
     /// passthrough behavior).
-    pub transcoding_enabled: bool,    /// ffmpeg binary path (Phase 7.1).
+    pub transcoding_enabled: bool,
+    /// ffmpeg binary path (Phase 7.1).
     pub ffmpeg_path: String,
     /// libwebp `-quality` 0–100 (Phase 7.1; still-image pipeline).
     pub webp_quality: u8,
@@ -252,7 +255,8 @@ pub struct Config {
     /// Whether invite tokens are honored (round 3, area A). When false, a
     /// supplied `invite_code` is refused with reason and invites never open
     /// closed registrations. On by default (upstream always models invites).
-    pub invites_enabled: bool,    /// SMTP provider URL (`smtp://` or `smtps://`). `None` (default) means
+    pub invites_enabled: bool,
+    /// SMTP provider URL (`smtp://` or `smtps://`). `None` (default) means
     /// outbound mail is explicitly disabled: confirmation/reset sends fail
     /// with `503 Email delivery is not configured`, never a silent success.
     pub smtp_url: Option<String>,
@@ -474,9 +478,7 @@ impl Config {
             }
         }
         if !["public", "authenticated"].contains(&self.local_topic_feed_access.as_str()) {
-            return Err(
-                "local_topic_feed_access must be one of public, authenticated".to_string(),
-            );
+            return Err("local_topic_feed_access must be one of public, authenticated".to_string());
         }
         // Core extension policies (Stage 1): strict three-state enums.
         if !["off", "unenforced", "enforced"].contains(&self.license_policy.as_str()) {
@@ -494,7 +496,8 @@ impl Config {
                 .any(|scheme| base.starts_with(scheme) && base.len() > scheme.len());
             if !valid {
                 return Err(
-                    "--streaming-url must start with ws://, wss://, http:// or https://".to_string(),
+                    "--streaming-url must start with ws://, wss://, http:// or https://"
+                        .to_string(),
                 );
             }
         }
@@ -530,6 +533,15 @@ impl Config {
         // distinct roots, global covers the reserved classes. The 40 MiB
         // per-file ceiling (`federation::media::MAX_REMOTE_MEDIA_BYTES`)
         // stays inside the class/global budgets (not a config key).
+        // Disabled mode is refused at startup until a non-persisting
+        // streaming/proxy path exists (adversarial-2 F1): accepting it would
+        // let fetches evict cached bytes and still fail to deliver.
+        if self.remote_cache.mode == RemoteCacheMode::Disabled {
+            return Err(
+                "remote_cache.mode = disabled is not supported yet: no non-persisting delivery path"
+                    .to_string(),
+            );
+        }
         if self.remote_cache.global_cap_bytes == 0 {
             return Err("remote_cache.global_cap_bytes must be > 0".to_string());
         }
@@ -551,7 +563,9 @@ impl Config {
             .saturating_add(self.remote_cache.preview_cap_bytes)
             .saturating_add(self.remote_cache.full_cap_bytes);
         if self.remote_cache.global_cap_bytes < reserved {
-            return Err("remote_cache.global_cap_bytes must cover the reserved class caps".to_string());
+            return Err(
+                "remote_cache.global_cap_bytes must cover the reserved class caps".to_string(),
+            );
         }
         if self.cache_dir_resolved() == self.durable_dir_resolved() {
             return Err("cache_dir and durable_dir must be different directories".to_string());
@@ -704,10 +718,9 @@ impl Config {
     /// files and malformed JSON are hard errors naming the path. Call
     /// [`Config::resolve_env_indirect`] afterwards (CLI flags first).
     pub fn load_from_file(path: &std::path::Path) -> Result<Self, String> {
-        let bytes = std::fs::read(path)
-            .map_err(|err| format!("--config {}: {err}", path.display()))?;
-        serde_json::from_slice(&bytes)
-            .map_err(|err| format!("--config {}: {err}", path.display()))
+        let bytes =
+            std::fs::read(path).map_err(|err| format!("--config {}: {err}", path.display()))?;
+        serde_json::from_slice(&bytes).map_err(|err| format!("--config {}: {err}", path.display()))
     }
 
     /// Resolve `env:VAR_NAME` indirections on the secret-carrying fields
@@ -721,8 +734,9 @@ impl Config {
             .and_then(|url| url.strip_prefix("env:"))
             .map(str::to_string);
         if let Some(name) = smtp_indirect {
-            let value = std::env::var(&name)
-                .map_err(|_| format!("config: env var {name} is not set (referenced by smtp_url)"))?;
+            let value = std::env::var(&name).map_err(|_| {
+                format!("config: env var {name} is not set (referenced by smtp_url)")
+            })?;
             self.smtp_url = Some(value);
         }
         let vapid_indirect = self
@@ -730,8 +744,9 @@ impl Config {
             .strip_prefix("env:")
             .map(str::to_string);
         if let Some(name) = vapid_indirect {
-            let value = std::env::var(&name)
-                .map_err(|_| format!("config: env var {name} is not set (referenced by vapid_private_key)"))?;
+            let value = std::env::var(&name).map_err(|_| {
+                format!("config: env var {name} is not set (referenced by vapid_private_key)")
+            })?;
             self.vapid_private_key = value;
         }
         Ok(())
@@ -760,9 +775,7 @@ impl Config {
             max_file_size: self.max_file_size,
         };
         if self.transcoding_enabled {
-            config
-                .validate()
-                .map_err(|e| format!("transcoding: {e}"))?;
+            config.validate().map_err(|e| format!("transcoding: {e}"))?;
         }
         Ok(config)
     }
@@ -820,11 +833,14 @@ mod tests {
             ..base.clone()
         };
         let private = Config {
-            federation_allowlist: crate::federation::policy::parse_allowlist("10.0.0.0/8").expect("cidr"),
+            federation_allowlist: crate::federation::policy::parse_allowlist("10.0.0.0/8")
+                .expect("cidr"),
             ..base.clone()
         };
         for cfg in [http, slow, private] {
-            let err = cfg.check_runtime_mode().expect_err("production must refuse");
+            let err = cfg
+                .check_runtime_mode()
+                .expect_err("production must refuse");
             assert!(err.contains("production"), "{err}");
         }
     }
@@ -870,7 +886,10 @@ mod tests {
         for secret in ["hunter2", "mailuser", "PRIVATE-SCALAR-MATERIAL", "x=1"] {
             assert!(!json.contains(secret), "{secret} leaked into {json}");
         }
-        assert_eq!(summary.smtp_endpoint.as_deref(), Some("smtps://mail.example:465"));
+        assert_eq!(
+            summary.smtp_endpoint.as_deref(),
+            Some("smtps://mail.example:465")
+        );
         assert!(summary.vapid_private_key_configured);
         assert!(summary.mail_enabled);
     }

@@ -18,9 +18,9 @@ use super::schema::{
     MEDIA, MEDIA_BY_OWNER, MEMBERSHIPS_BY_ACCOUNT, MENTIONS_BY_ACCOUNT, META, MUTES,
     MUTES_BY_MUTED, NOTIFICATION_DEDUP, NOTIFICATIONS, NOTIFICATIONS_BY_RECIPIENT, OAUTH_APPS,
     POLL_BY_STATUS, POLL_VOTES, POLLS, QUOTES, QUOTES_BY_QUOTED, QUOTES_BY_QUOTING,
-    REBLOGS_BY_ACCOUNT, SCHEDULED_BY_ACCOUNT, SCHEDULED_STATUSES, SESSIONS, STATUS_AUTHOR_INDEX,
-    STATUS_PARENT_INDEX, STATUS_PINS, STATUS_REBLOG_INDEX, STATUS_VERSIONS, STATUSES,
-    TIMELINE_LOCAL, TIMELINE_PUBLIC,
+    REBLOGS_BY_ACCOUNT, REMOTE_CACHE, SCHEDULED_BY_ACCOUNT, SCHEDULED_STATUSES, SESSIONS,
+    STATUS_AUTHOR_INDEX, STATUS_PARENT_INDEX, STATUS_PINS, STATUS_REBLOG_INDEX, STATUS_VERSIONS,
+    STATUSES, TIMELINE_LOCAL, TIMELINE_PUBLIC,
 };
 
 /// Desired schema version for this build.
@@ -563,6 +563,95 @@ pub fn apply(db: &Database) -> Result<u64, StoreError> {
         // `seq` and read as sequence 0, i.e. oldest).
         if current < 23 {
             let _ = write.open_table(schema::DELIVERY_SEQ)?;
+        }
+
+        // Step v24 (adversarial-2 groundwork): transactional delivery index
+        // plus cache dedupe backfill. `DELIVERY_ACTIVE` is created and
+        // backfilled from pending/leased `DeliverActivity`/`RelayForward`
+        // rows; `REMOTE_CACHE` rows written before v24 decode without a
+        // `refcount` and are normalized to 1 when they hold bytes (else 0).
+        if current < 24 {
+            let _ = write.open_table(schema::DELIVERY_ACTIVE)?;
+            let _ = write.open_table(REMOTE_CACHE)?;
+            // Normalize cache rows: old JSON without `refcount` must still
+            // decode (serde default) and must count once when byte-holding.
+            {
+                let mut cache = write.open_table(REMOTE_CACHE)?;
+                let mut fixes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                for entry in cache.iter()? {
+                    let (key, value) = entry?;
+                    let raw = value.value();
+                    // Rows that already decode with the new shape are left
+                    // alone; only legacy rows are rewritten.
+                    if super::decode::<crate::media::remote_cache::RemoteCacheEntry>(raw).is_ok() {
+                        continue;
+                    }
+                    // Legacy shape: same fields minus `refcount`. Decode as
+                    // generic JSON, insert the missing count, re-encode.
+                    if let Ok(mut object) = serde_json::from_slice::<serde_json::Value>(raw) {
+                        if object.get("refcount").is_none() {
+                            let holds = object
+                                .get("has_bytes")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false);
+                            object["refcount"] = serde_json::Value::from(if holds { 1 } else { 0 });
+                            if let Ok(bytes) = serde_json::to_vec(&object)
+                                && let Ok(row) = super::decode::<
+                                    crate::media::remote_cache::RemoteCacheEntry,
+                                >(&bytes)
+                                && super::encode(&row).is_ok()
+                            {
+                                fixes.push((key.value().to_vec(), super::encode(&row).unwrap()));
+                            }
+                        }
+                    }
+                }
+                for (key, bytes) in fixes {
+                    cache.insert(key.as_slice(), bytes.as_slice())?;
+                }
+            }
+            // Backfill the delivery index from live delivery rows. The
+            // per-row host/seq decode reuses the same normalization as the
+            // runtime gate (lowercase host, missing `seq` reads 0); the
+            // backfill runs in the migration transaction, so it is bounded
+            // by the existing job count and idempotent on re-run.
+            {
+                let jobs = write.open_table(JOBS)?;
+                let mut active = write.open_table(schema::DELIVERY_ACTIVE)?;
+                for entry in jobs.iter()? {
+                    let (_, value) = entry?;
+                    let Ok(job) = super::decode::<crate::domain::Job>(value.value()) else {
+                        continue;
+                    };
+                    if job.state.is_terminal() {
+                        continue;
+                    }
+                    let kind = job.kind.as_str();
+                    if kind != "deliver_activity" && kind != "relay_forward" {
+                        continue;
+                    }
+                    let inbox = job
+                        .payload
+                        .get("inbox")
+                        .or_else(|| job.payload.get("relay_inbox"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    if inbox.is_empty() {
+                        continue;
+                    }
+                    let host = inbox
+                        .split("://")
+                        .nth(1)
+                        .unwrap_or(inbox)
+                        .split('/')
+                        .next()
+                        .unwrap_or(inbox)
+                        .to_lowercase();
+                    let seq = job.payload.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let key = schema::delivery_active_key(&host, seq, job.id.value());
+                    active.insert(key.as_slice(), job.id.value())?;
+                }
+            }
         }
 
         {

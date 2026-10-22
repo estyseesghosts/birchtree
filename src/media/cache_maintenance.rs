@@ -274,6 +274,7 @@ impl CacheMaintenance {
                             actual,
                             row.etag.clone(),
                             now_ms,
+                            &self.config,
                         )?;
                         report.resized += 1;
                     }
@@ -337,8 +338,15 @@ impl CacheMaintenance {
             let Some(size) = self.cache.size_of(key)? else {
                 continue;
             };
-            self.store
-                .cache_mark_stored(&source, variant, key, size, None, now_ms)?;
+            self.store.cache_mark_stored(
+                &source,
+                variant,
+                key,
+                size,
+                None,
+                now_ms,
+                &self.config,
+            )?;
             adopted += 1;
         }
         Ok(adopted)
@@ -417,8 +425,15 @@ impl CacheMaintenance {
                         "shadow copy of {key} failed verification"
                     )));
                 }
-                self.store
-                    .cache_mark_stored(&source, &variant, key, size, None, now_ms)?;
+                self.store.cache_mark_stored(
+                    &source,
+                    &variant,
+                    key,
+                    size,
+                    None,
+                    now_ms,
+                    &self.config,
+                )?;
                 durable.delete(key)?;
                 report.migrated += 1;
                 report.bytes = report.bytes.saturating_add(size);
@@ -463,7 +478,9 @@ impl CacheMaintenance {
         let outcome = evict_pressure_durable_first(
             &*self.store,
             &self.cache,
-            self.durable.as_ref().map(|durable| durable as &dyn BlobStore),
+            self.durable
+                .as_ref()
+                .map(|durable| durable as &dyn BlobStore),
             self.ledger,
             need,
             bytes_to_free,

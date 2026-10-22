@@ -178,7 +178,10 @@ impl JobState {
 ///
 /// `due_at_ms` is the time the job becomes claimable. While leased, the queue
 /// index is keyed by `lease_until_ms` so a crashed worker's job becomes
-/// claimable again automatically after the lease elapses.
+/// claimable again automatically after the lease elapses. `terminal_at_ms`
+/// records when the row entered its terminal state (`Succeeded` or
+/// `Quarantined`); prunes age from it (falling back to `due_at_ms` for rows
+/// written before schema v24).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Job {
     pub id: Id,
@@ -195,6 +198,10 @@ pub struct Job {
     pub max_attempts: u32,
     pub last_error: Option<String>,
     pub created_at_ms: u64,
+    /// When the job became terminal (`None` for live rows and for rows
+    /// written before the field existed).
+    #[serde(default)]
+    pub terminal_at_ms: Option<u64>,
 }
 
 impl Job {
@@ -219,6 +226,7 @@ impl Job {
             max_attempts: Self::DEFAULT_MAX_ATTEMPTS,
             last_error: None,
             created_at_ms,
+            terminal_at_ms: None,
         }
     }
 }

@@ -43,8 +43,8 @@ Parent Step 0 lands skeletons only:
   "remote_cache": {"mode": "on_demand", "global_cap_bytes": 536870912, "avatar_emoji_cap_bytes": 134217728, "preview_cap_bytes": 268435456, "full_cap_bytes": 134217728, "avatar_retention_days": 30, "warming": false}
 }
 ```
-Defaults: `mode=on_demand`, 512 MiB global, warming off. `validate()`: caps > 0, `cache_dir != durable_dir`, global >= sum reserved, `MAX_REMOTE_MEDIA_BYTES` (40 MiB) stays per-file ceiling inside class/global budgets.
-2. New redb tables (names only, no logic): `REMOTE_CACHE{source_url,variant -> blob_key,class,size,last_use,expiry,etag}` + `CACHE_ACCOUNTING{singleton: total, per-class, in-flight}`. `REMOTE_CACHE` key = `(source_url, variant)`; value holds per-row store-key — index ≠ bytes. No refcount table in v1.
+Defaults: `mode=on_demand`, 512 MiB global, warming off. `validate()`: caps > 0, `cache_dir != durable_dir`, global >= sum reserved, `MAX_REMOTE_MEDIA_BYTES` (40 MiB) stays per-file ceiling inside class/global budgets. `mode = disabled` is rejected at startup (adversarial-2 F1) until a non-persisting delivery path exists.
+2. New redb tables (names only, no logic): `REMOTE_CACHE{source_url,variant -> blob_key,class,size,last_use,expiry,etag,refcount}` + `CACHE_ACCOUNTING{singleton: total, per-class, in-flight}`. `REMOTE_CACHE` key = `(source_url, variant)`; value holds per-row store-key — index ≠ bytes. Dedupe with refcounts (adversarial-2 B0, operator choice): a second blob for the same pair bumps `refcount` and shares the first bytes. Schema v24 adds `DELIVERY_ACTIVE{(host, seq, job_id) -> job id}` (adversarial-2 C2) plus the cache `refcount` backfill.
 3. `JobKind`: `CacheEvict`, `ReconcileStorage`. Payloads < 64 KiB, bounded batches 500, no blobs in txn. `FetchRemoteMedia` is reused (trigger conversion), not duplicated.
 
 ## Agent partition (disjoint writes, no collisions)

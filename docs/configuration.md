@@ -72,7 +72,8 @@ from the database.
 ## Cache and media policy keys
 
 `remote_cache` budgets the remote-media cache (`mode`: `on_demand`
-default, `warm`, or `disabled`; per-class caps plus a global cap;
+default or `warm`; `disabled` is rejected at startup until a non-persisting
+delivery path exists; per-class caps plus a global cap;
 `avatar_retention_days`; scoped `warming` reuse of `FetchRemoteMedia`,
 relay-excluded). On demand is the effective policy: ingest records
 metadata only and enqueues no fetch unless the policy opts into warming;

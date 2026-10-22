@@ -10,8 +10,8 @@
 
 use crate::domain::federation::RefreshRecord;
 use crate::domain::{
-    Account, ActorKeys, DeliveryDestState, Follow, Id, MediaAttachment, QuoteRecord, QuoteState,
-    Report, Result, Status,
+    Account, ActorKeys, DeliveryDestState, Follow, Id, Job, MediaAttachment, QuoteRecord,
+    QuoteState, Report, Result, Status,
 };
 
 /// The payload of one outbound delivery: which local actor signs it, where it
@@ -109,6 +109,13 @@ pub trait FederationStore: Send + Sync {
     /// number into its payload as `seq`, so the send path can park a job
     /// while an earlier sequence for the same host is still unfinished.
     fn delivery_seq_next(&self, host: &str) -> Result<u64>;
+
+    /// Enqueue a delivery job atomically: mint the host sequence and insert
+    /// the job (with `seq` stamped into its payload) in one `redb`
+    /// transaction (adversarial-2 C1). Callers that today call
+    /// `delivery_seq_next` then `enqueue` must use this instead, so a delayed
+    /// insert can never let `N+1` become visible before `N`.
+    fn enqueue_delivery(&self, delivery: DeliverySpec, now_ms: u64) -> Result<Job>;
 
     /// Whether sending sequence `seq` to `host` must wait: true when another
     /// `DeliverActivity` (or `RelayForward`) job for the same host with a
@@ -263,6 +270,22 @@ pub trait FederationContentStore: Send + Sync {
 
     /// The source URL of a remote attachment.
     fn remote_media_source(&self, media_id: Id) -> Result<Option<String>>;
+
+    /// Source URLs for many remote attachments in one transaction (page
+    /// loader for the Mastodon `remote_url` rendering; adversarial-2 D1).
+    /// Missing ids are omitted.
+    fn remote_media_sources_by_ids(
+        &self,
+        ids: &[Id],
+    ) -> Result<std::collections::HashMap<Id, String>> {
+        let mut out = std::collections::HashMap::new();
+        for id in ids {
+            if let Some(url) = self.remote_media_source(*id)? {
+                out.insert(*id, url);
+            }
+        }
+        Ok(out)
+    }
 
     /// Attach fetched bytes to a remote attachment and enqueue its processing,
     /// in one transaction. Returns the row, or `None` if it does not exist.

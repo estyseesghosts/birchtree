@@ -313,6 +313,7 @@ async fn process_one(
                     url.as_str(),
                     &bytes,
                     clock.now_ms(),
+                    &ctx.remote_cache,
                 )
                 .map_err(DeliveryError::Quarantine)?;
                 Ok::<(), DeliveryError>(())

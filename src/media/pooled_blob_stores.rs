@@ -258,6 +258,13 @@ impl BlobStore for PooledBlobStores {
         Some(self.cache.root().to_path_buf())
     }
 
+    /// Remote-download staging lives on the cache filesystem so `publish_tmp`
+    /// stays a same-volume rename and bursty fetches never consume durable
+    /// volume space (adversarial-2 F11).
+    fn staging_root(&self) -> Option<PathBuf> {
+        Some(self.cache.root().to_path_buf())
+    }
+
     fn publish_tmp(&self, tmp: &Path, key: &str) -> Result<()> {
         self.pool_for(key).publish_tmp(tmp, key)
     }

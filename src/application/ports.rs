@@ -385,6 +385,14 @@ pub trait BlobStore: Send + Sync {
         None
     }
 
+    /// Filesystem root that remote-download staging must use (adversarial-2
+    /// F11). The pooled handle answers with the cache root so `publish_tmp`
+    /// is a same-volume rename; single-pool handles answer with their own
+    /// root. `None` keeps the legacy buffered path (in-memory doubles).
+    fn staging_root(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
     /// Publish an already-staged tmp file onto `key` (atomic rename; storage
     /// overhaul, Agent C). The default refuses; `FsBlobStore` resolves the
     /// key under its root and renames.
@@ -432,6 +440,11 @@ pub trait CacheStore: Send + Sync {
     ) -> Result<Option<crate::media::remote_cache::RemoteCacheEntry>>;
     fn cache_put_metadata(&self, entry: crate::media::remote_cache::RemoteCacheEntry)
     -> Result<()>;
+    /// Store bytes for `(source_url, variant)` with dedupe sharing
+    /// (adversarial-2 B0): a second `blob_key` for the same pair bumps the
+    /// row's `refcount` and keeps the first bytes instead of overwriting the
+    /// mapping. `cfg` supplies the effective retention (adversarial-2 B3);
+    /// callers must thread the operator config, never `default()`.
     fn cache_mark_stored(
         &self,
         source_url: &str,
@@ -440,6 +453,7 @@ pub trait CacheStore: Send + Sync {
         size: u64,
         etag: Option<String>,
         now_ms: u64,
+        cfg: &crate::config::RemoteCacheConfig,
     ) -> Result<()>;
     /// Drop the byte mapping, keep the metadata shell; returns the blob key
     /// the caller must delete. `None` when already shell-only / missing.

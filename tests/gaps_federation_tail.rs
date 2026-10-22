@@ -384,8 +384,17 @@ fn remote_emoji_ingest_validates_namespaces_and_stages_bytes() {
     // magic-only prefixes.
     let png = png_bytes();
     let source = "https://remote.example/e.png";
-    let row = store_remote_emoji(&*store, &blobs, &key, "remote.example", source, &png, now)
-        .expect("staged");
+    let row = store_remote_emoji(
+        &*store,
+        &blobs,
+        &key,
+        "remote.example",
+        source,
+        &png,
+        now,
+        &birchtree::config::RemoteCacheConfig::default(),
+    )
+    .expect("staged");
     assert!(!row.visible_in_picker, "never picker-visible");
     assert!(!row.listed(), "never listed");
     assert_eq!(row.category.as_deref(), Some("remote:remote.example"));
@@ -407,9 +416,7 @@ fn remote_emoji_ingest_validates_namespaces_and_stages_bytes() {
         Some(png.as_slice())
     );
     assert!(
-        !dir.path()
-            .join("media/custom_emojis")
-            .exists(),
+        !dir.path().join("media/custom_emojis").exists(),
         "no durable emoji bytes for remote rows"
     );
     // Durable byte rows make both copies evictable; the render row serves
@@ -435,7 +442,8 @@ fn remote_emoji_ingest_validates_namespaces_and_stages_bytes() {
             "remote.example",
             source,
             &vec![0u8; 300 * 1024],
-            now
+            now,
+            &birchtree::config::RemoteCacheConfig::default(),
         )
         .is_err(),
         "oversize refused"
@@ -448,7 +456,8 @@ fn remote_emoji_ingest_validates_namespaces_and_stages_bytes() {
             "remote.example",
             source,
             b"plain text not an image at all!!!!!!!!",
-            now
+            now,
+            &birchtree::config::RemoteCacheConfig::default(),
         )
         .is_err(),
         "non-image refused"
@@ -462,7 +471,8 @@ fn remote_emoji_ingest_validates_namespaces_and_stages_bytes() {
             "remote.example",
             source,
             &png,
-            now
+            now,
+            &birchtree::config::RemoteCacheConfig::default(),
         )
         .is_err(),
         "domain mismatch refused"

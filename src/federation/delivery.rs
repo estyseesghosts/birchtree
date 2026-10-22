@@ -289,7 +289,10 @@ pub async fn run(config: &FederationConfig<FedContext>, job: &Job) -> Result<(),
         .delivery_blocked_by(&host, seq)
         .map_err(|e| DeliveryError::Retry(e.to_string()))?
     {
-        let parks = payload.get("seq_parks").and_then(Value::as_u64).unwrap_or(0);
+        let parks = payload
+            .get("seq_parks")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         let mut parked = payload.clone();
         if let Some(object) = parked.as_object_mut() {
             object.insert("seq_parks".into(), Value::from(parks + 1));
@@ -594,6 +597,7 @@ pub async fn run_relay_forward(
         max_attempts: job.max_attempts,
         last_error: job.last_error.clone(),
         created_at_ms: job.created_at_ms,
+        terminal_at_ms: job.terminal_at_ms,
     };
     run(config, &forwarded).await
 }

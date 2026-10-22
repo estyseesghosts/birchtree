@@ -23,8 +23,8 @@ use crate::media::blob_store::FsBlobStore;
 use crate::media::reconciler::ReconStore;
 use crate::media::remote_cache::{self, CacheUsage, MediaClass, RemoteCacheEntry};
 
-use super::schema::{self, CACHE_ACCOUNTING, REMOTE_CACHE};
 use super::RedbStore;
+use super::schema::{self, CACHE_ACCOUNTING, REMOTE_CACHE};
 
 /// Accounting key for the stored-byte total.
 const TOTAL_KEY: &str = "total";
@@ -95,6 +95,7 @@ impl CacheStore for RedbStore {
         size: u64,
         etag: Option<String>,
         now_ms: u64,
+        cfg: &crate::config::RemoteCacheConfig,
     ) -> Result<()> {
         // Durable local media must never enter the evictable ledger.
         if !remote_cache::is_cache_key(blob_key) {
@@ -107,35 +108,83 @@ impl CacheStore for RedbStore {
             let mut cache = write.open_table(REMOTE_CACHE)?;
             let mut counters = write.open_table(CACHE_ACCOUNTING)?;
             let key = schema::remote_cache_key(source_url, variant);
-            let old_size = match cache.get(key.as_slice())? {
-                Some(guard) => {
-                    let old: RemoteCacheEntry = super::decode(guard.value())?;
-                    if old.has_bytes { old.size } else { 0 }
-                }
-                None => 0,
+            let existing: Option<RemoteCacheEntry> = match cache.get(key.as_slice())? {
+                Some(guard) => Some(super::decode(guard.value())?),
+                None => None,
             };
             let class = crate::media::remote_cache::class_for_variant(variant);
-            let mut entry = RemoteCacheEntry::stored(
-                source_url,
-                variant,
-                class,
-                blob_key,
-                size,
-                now_ms,
-                &crate::config::RemoteCacheConfig::default(),
-            );
+            // Dedupe (adversarial-2 B0): a second blob for the same
+            // `(source_url, variant)` shares the first bytes. Bump the row's
+            // reference count and keep the original mapping; the caller drops
+            // its duplicate bytes (orphan-swept when the race loses).
+            if let Some(mut row) = existing {
+                if row.has_bytes && row.blob_key != blob_key {
+                    row.refcount = row.refcount.max(1).saturating_add(1);
+                    row.last_use_ms = row.last_use_ms.max(now_ms);
+                    if let Some(tag) = etag {
+                        row.etag = Some(tag);
+                    }
+                    cache.insert(key.as_slice(), super::encode(&row)?.as_slice())?;
+                    drop(cache);
+                    drop(counters);
+                    write.commit()?;
+                    return Ok(());
+                }
+                let old_size = if row.has_bytes { row.size } else { 0 };
+                let old_class = row.class;
+                let mut entry = RemoteCacheEntry::stored(
+                    source_url, variant, class, blob_key, size, now_ms, cfg,
+                );
+                entry.etag = etag;
+                // Preserve the sharing count on same-key rewrites (resize
+                // checks, heals); fresh shells start at one reference.
+                entry.refcount = if row.has_bytes {
+                    row.refcount.max(1)
+                } else {
+                    1
+                };
+                cache.insert(key.as_slice(), super::encode(&entry)?.as_slice())?;
+                // Counters move with the mapping, saturating both ways.
+                let total = decode_counter(counters.get(TOTAL_KEY)?)?;
+                let total = total.saturating_add(size).saturating_sub(old_size);
+                counters.insert(TOTAL_KEY, super::encode(&total)?.as_slice())?;
+                if old_class == class {
+                    let class_total = decode_counter(counters.get(class_key(class))?)?;
+                    let class_total = if size >= old_size {
+                        class_total.saturating_add(size - old_size)
+                    } else {
+                        class_total.saturating_sub(old_size - size)
+                    };
+                    counters.insert(class_key(class), super::encode(&class_total)?.as_slice())?;
+                } else {
+                    // Class changed across a rewrite: move the delta across.
+                    if old_size > 0 {
+                        let old_total = decode_counter(counters.get(class_key(old_class))?)?;
+                        counters.insert(
+                            class_key(old_class),
+                            super::encode(&old_total.saturating_sub(old_size))?.as_slice(),
+                        )?;
+                    }
+                    let class_total = decode_counter(counters.get(class_key(class))?)?;
+                    counters.insert(
+                        class_key(class),
+                        super::encode(&class_total.saturating_add(size))?.as_slice(),
+                    )?;
+                }
+                drop(cache);
+                drop(counters);
+                write.commit()?;
+                return Ok(());
+            }
+            let mut entry =
+                RemoteCacheEntry::stored(source_url, variant, class, blob_key, size, now_ms, cfg);
             entry.etag = etag;
             cache.insert(key.as_slice(), super::encode(&entry)?.as_slice())?;
             // Counters move with the mapping, saturating both ways.
             let total = decode_counter(counters.get(TOTAL_KEY)?)?;
             let class_total = decode_counter(counters.get(class_key(class))?)?;
-            let total = total.saturating_add(size).saturating_sub(old_size);
-            // Recompute the class counter from the same delta (never negative).
-            let class_total = if size >= old_size {
-                class_total.saturating_add(size - old_size)
-            } else {
-                class_total.saturating_sub(old_size - size)
-            };
+            let total = total.saturating_add(size);
+            let class_total = class_total.saturating_add(size);
             counters.insert(TOTAL_KEY, super::encode(&total)?.as_slice())?;
             counters.insert(class_key(class), super::encode(&class_total)?.as_slice())?;
         }
@@ -155,22 +204,33 @@ impl CacheStore for RedbStore {
             };
             match existing {
                 Some(mut entry) if entry.has_bytes => {
-                    let blob_key = entry.blob_key.clone();
-                    let freed = entry.size;
-                    entry.has_bytes = false;
-                    entry.size = 0;
-                    cache.insert(key.as_slice(), super::encode(&entry)?.as_slice())?;
-                    let total = decode_counter(counters.get(TOTAL_KEY)?)?;
-                    let class_total = decode_counter(counters.get(class_key(entry.class))?)?;
-                    counters.insert(
-                        TOTAL_KEY,
-                        super::encode(&total.saturating_sub(freed))?.as_slice(),
-                    )?;
-                    counters.insert(
-                        class_key(entry.class),
-                        super::encode(&class_total.saturating_sub(freed))?.as_slice(),
-                    )?;
-                    Some(blob_key)
+                    // Shared bytes (adversarial-2 B0): drop one reference;
+                    // only the last eviction frees the blob and the counters.
+                    let refs = entry.refcount.max(1);
+                    if refs > 1 {
+                        entry.refcount = refs - 1;
+                        entry.last_use_ms = entry.last_use_ms.max(0);
+                        cache.insert(key.as_slice(), super::encode(&entry)?.as_slice())?;
+                        None
+                    } else {
+                        let blob_key = entry.blob_key.clone();
+                        let freed = entry.size;
+                        entry.has_bytes = false;
+                        entry.size = 0;
+                        entry.refcount = 0;
+                        cache.insert(key.as_slice(), super::encode(&entry)?.as_slice())?;
+                        let total = decode_counter(counters.get(TOTAL_KEY)?)?;
+                        let class_total = decode_counter(counters.get(class_key(entry.class))?)?;
+                        counters.insert(
+                            TOTAL_KEY,
+                            super::encode(&total.saturating_sub(freed))?.as_slice(),
+                        )?;
+                        counters.insert(
+                            class_key(entry.class),
+                            super::encode(&class_total.saturating_sub(freed))?.as_slice(),
+                        )?;
+                        Some(blob_key)
+                    }
                 }
                 _ => None,
             }
@@ -335,7 +395,6 @@ impl CacheStore for RedbStore {
     }
 }
 
-
 /// Decode one stored row; a corrupted row is `None` (callers skip it, and
 /// [`RedbStore::cache_accounting_rebuild`] removes it).
 fn decode_row(bytes: &[u8]) -> Option<RemoteCacheEntry> {
@@ -462,7 +521,11 @@ impl RedbStore {
                 cache.insert(key.as_slice(), super::encode(&entry)?.as_slice())?;
             }
             counters.insert(TOTAL_KEY, super::encode(&total)?.as_slice())?;
-            for class in [MediaClass::AvatarEmoji, MediaClass::Preview, MediaClass::Full] {
+            for class in [
+                MediaClass::AvatarEmoji,
+                MediaClass::Preview,
+                MediaClass::Full,
+            ] {
                 counters.insert(
                     class_key(class),
                     super::encode(&per_class[class_slot(class)])?.as_slice(),
@@ -479,7 +542,10 @@ impl RedbStore {
     /// namespace are detached first. Idempotent; one write transaction.
     pub fn cache_accounting_rebuild(&self) -> Result<AccountingRepair> {
         let mut repair = AccountingRepair {
-            before_total: self.cache_accounting().map(|usage| usage.stored_total).unwrap_or(0),
+            before_total: self
+                .cache_accounting()
+                .map(|usage| usage.stored_total)
+                .unwrap_or(0),
             ..AccountingRepair::default()
         };
         let write = self.begin_write()?;
@@ -516,7 +582,11 @@ impl RedbStore {
                 cache.insert(key.as_slice(), super::encode(&row)?.as_slice())?;
             }
             counters.insert(TOTAL_KEY, super::encode(&total)?.as_slice())?;
-            for class in [MediaClass::AvatarEmoji, MediaClass::Preview, MediaClass::Full] {
+            for class in [
+                MediaClass::AvatarEmoji,
+                MediaClass::Preview,
+                MediaClass::Full,
+            ] {
                 counters.insert(
                     class_key(class),
                     super::encode(&per_class[class_slot(class)])?.as_slice(),
@@ -601,7 +671,8 @@ impl RedbStore {
 /// younger than the store's orphan grace period are not listed at all.
 impl ReconStore for RedbStore {
     fn list_blob_keys(&self, after: Option<&str>, limit: usize) -> Result<Vec<String>> {
-        self.recon_pool()?.list_keys(after, limit, self.orphan_grace())
+        self.recon_pool()?
+            .list_keys(after, limit, self.orphan_grace())
     }
 
     fn list_meta_keys(&self, after: Option<&str>, limit: usize) -> Result<Vec<String>> {

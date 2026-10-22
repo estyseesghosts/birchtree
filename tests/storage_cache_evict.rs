@@ -343,7 +343,7 @@ fn admission_eviction_keeps_redb_and_disk_in_agreement() {
             let blob_key = format!("remote/{}", 1000 + i);
             cache.put(&blob_key, &vec![i as u8; 4096]).unwrap();
             store
-                .cache_mark_stored(&source, "original", &blob_key, 4096, None, T0)
+                .cache_mark_stored(&source, "original", &blob_key, 4096, None, T0, &cfg)
                 .unwrap();
             let mut guard = ledger.lock().unwrap();
             guard.reserve(MediaClass::Full, 4096).unwrap();
@@ -411,7 +411,10 @@ fn admission_eviction_keeps_redb_and_disk_in_agreement() {
     )
     .expect("reopen store");
     let cache = FsBlobStore::open(&cache_dir).expect("cache pool");
-    assert_eq!(store.cache_accounting().unwrap().stored_total, disk_bytes(&cache));
+    assert_eq!(
+        store.cache_accounting().unwrap().stored_total,
+        disk_bytes(&cache)
+    );
     for victim in &victims {
         assert!(!cache.exists(victim).unwrap(), "{victim} stays deleted");
     }
@@ -442,7 +445,7 @@ fn startup_enforcement_brings_over_cap_pool_within_caps() {
         let blob_key = format!("remote/{}", 2000 + i);
         cache.put(&blob_key, &vec![i as u8; 4096]).unwrap();
         store
-            .cache_mark_stored(&source, "original", &blob_key, 4096, None, T0)
+            .cache_mark_stored(&source, "original", &blob_key, 4096, None, T0, &cfg)
             .unwrap();
     }
     assert_eq!(store.cache_accounting().unwrap().stored_full, 20 * 1024);

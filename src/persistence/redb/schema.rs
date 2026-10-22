@@ -396,6 +396,34 @@ pub const DELIVERY_DEST: TableDefinition<&str, &[u8]> = TableDefinition::new("de
 /// pairs to one inbox cannot go out on the wire (schema v23).
 pub const DELIVERY_SEQ: TableDefinition<&str, u64> = TableDefinition::new("delivery_seq");
 
+/// Transactional index of outstanding deliveries, keyed by
+/// `(host_utf8 || 0xFF || seq_be || job_id_be) -> job id` (adversarial-2 C2,
+/// schema v24). Maintained in the same transaction as the job write
+/// (`insert`, `complete`, `retry`, `quarantine`, `claim_due`, prunes); the
+/// FIFO gate becomes a bounded range scan over one host instead of a
+/// full-table scan over `JOBS`.
+pub const DELIVERY_ACTIVE: TableDefinition<&[u8], u64> = TableDefinition::new("delivery_active");
+
+/// Key for [`DELIVERY_ACTIVE`]: `host_utf8 || 0xFF || seq_be || job_id_be`.
+/// The `0xFF` separator cannot appear in a normalized host (lowercase host
+/// with optional explicit port), so the host prefix scan stays exact.
+pub fn delivery_active_key(host: &str, seq: u64, job_id: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(host.len() + 17);
+    key.extend_from_slice(host.as_bytes());
+    key.push(0xFF);
+    key.extend_from_slice(&seq.to_be_bytes());
+    key.extend_from_slice(&job_id.to_be_bytes());
+    key
+}
+
+/// Prefix of [`DELIVERY_ACTIVE`] keys for one host.
+pub fn delivery_active_prefix(host: &str) -> Vec<u8> {
+    let mut prefix = Vec::with_capacity(host.len() + 1);
+    prefix.extend_from_slice(host.as_bytes());
+    prefix.push(0xFF);
+    prefix
+}
+
 // ---------------------------------------------------------------------------
 // Phase 7.3 (schema v11): server rules, account warnings, sign-in telemetry
 // (D37 rules/warnings, D39 `active_users`).
@@ -690,7 +718,7 @@ pub fn rule_translation_key(rule_id: u64, locale: &str) -> String {
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// Current schema version. Bump with a new migration step.
-pub const SCHEMA_VERSION: u64 = 23;
+pub const SCHEMA_VERSION: u64 = 24;
 
 /// All table names, for diagnostics and migration verification.
 pub const TABLE_NAMES: &[&str] = &[
@@ -710,6 +738,7 @@ pub const TABLE_NAMES: &[&str] = &[
     "remote_tombstone",
     "delivery_dest",
     "delivery_seq",
+    "delivery_active",
     "reports",
     "rules",
     "rule_translations",
