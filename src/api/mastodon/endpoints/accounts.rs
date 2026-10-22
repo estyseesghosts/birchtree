@@ -9,6 +9,8 @@
 use axum::extract::{
     ConnectInfo, Extension, FromRequest, Multipart, Path, RawQuery, Request, State,
 };
+use axum::body::Body;
+use axum::extract::multipart::Field;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
@@ -28,6 +30,9 @@ use crate::application::relationships;
 use crate::domain::EmailTokenKind;
 use crate::domain::Error as DomainError;
 use crate::mailer::{MailEnv, MailError};
+use crate::media::staging::StagingGuard;
+use crate::media::upload_gate;
+use crate::media::upload_spool::{SpoolError, UploadSpool};
 
 /// Scope alternatives accepted by the write endpoints.
 const WRITE_SCOPES: &[&str] = &["write", "write:accounts"];
@@ -277,8 +282,8 @@ async fn apply_credentials_update(
     state: &ApiState,
     account_id: crate::domain::Id,
     pairs: &[(String, String)],
-    avatar_upload: Option<Vec<u8>>,
-    header_upload: Option<Vec<u8>>,
+    avatar_upload: Option<UploadSpool>,
+    header_upload: Option<UploadSpool>,
 ) -> Response {
     let field = |key: &str| forms::get(&pairs, key);
 
@@ -344,10 +349,14 @@ async fn apply_credentials_update(
         });
 
     let store: &dyn Store = &*state.context.store;
+    // Avatar/header images stage through a [`StagingGuard`]: the guard owns
+    // every new blob key until the profile commit succeeds, so a later field
+    // validation or a failed account update drops the new keys instead of
+    // orphaning `{aa}/{bb}/{rand}/avatar.*` bytes on a 422.
+    let mut staging = StagingGuard::new(&*state.context.blobs);
     // Avatar/header images: multipart file parts and present urlencoded/JSON
     // fields share one pipeline. Staging happens BEFORE the profile commit
-    // (blob storage cannot join `redb`); a failed commit leaves only a
-    // bounded orphan, exactly like media uploads (`birchtree.md` §5).
+    // (blob storage cannot join `redb`).
     let avatar = match profile_image_slot(
         state,
         "Avatar",
@@ -355,7 +364,10 @@ async fn apply_credentials_update(
         "avatar",
         avatar_upload,
         field("avatar"),
-    ) {
+        &mut staging,
+    )
+    .await
+    {
         Ok(slot) => slot,
         Err(err) => return err,
     };
@@ -366,7 +378,10 @@ async fn apply_credentials_update(
         "header",
         header_upload,
         field("header"),
-    ) {
+        &mut staging,
+    )
+    .await
+    {
         Ok(slot) => slot,
         Err(err) => return err,
     };
@@ -438,6 +453,9 @@ async fn apply_credentials_update(
     if let Err(err) = store.update_account_profile(account_id, profile, state.context.now_ms()) {
         return ApiError::from(err).into_response();
     }
+    // The row commits first: the staged keys are live now, so the guard
+    // must not clean them. Stale keys are dropped after, never before.
+    staging.commit();
     if let Some((old_avatar, old_header)) = previous
         && let Ok(Some(account)) = store.account_by_id(account_id)
     {
@@ -749,21 +767,32 @@ fn validation_error(message: impl Into<String>, details: Value) -> Response {
 /// Multipart fields of an `update_credentials` body: every text part flattens
 /// into the same pairs the urlencoded path parses (order preserved, so the
 /// `fields_attributes[][name]` sequencing keeps working); `avatar`/`header`
-/// file parts are captured as bytes (`Some(vec![])` when the part is present
-/// but empty — the clearing signal).
+/// file parts stream into capped spool files (`Some` spool when the part is
+/// present — empty spool when it is present but empty, the clearing
+/// signal). Dropping the fields removes the spool files.
 struct CredentialMultipart {
     pairs: Vec<(String, String)>,
-    avatar: Option<Vec<u8>>,
-    header: Option<Vec<u8>>,
+    avatar: Option<UploadSpool>,
+    header: Option<UploadSpool>,
 }
 
 /// Parse a `multipart/form-data` credentials body. A malformed frame is a
 /// `400` (like the media upload path); content problems inside a well-formed
 /// part are `422`s from the image pipeline below, never here.
+///
+/// File parts stream into a spool capped at the same ceiling the image
+/// pipeline enforces (`max_file_size` and the per-image limit, whichever is
+/// smaller — the media-ingest ceiling), so an oversized part is rejected
+/// before it is resident. The body is paced one frame per task wake (the
+/// media upload path's `PacedBody`), so a fast sender cannot make the whole
+/// part resident before the spool cap trips.
 async fn credential_multipart(
     state: &ApiState,
     request: Request,
 ) -> ApiResult<CredentialMultipart> {
+    let (parts, body) = request.into_parts();
+    let paced = Body::from_stream(super::media::PacedBody::new(body.into_data_stream()));
+    let request = Request::from_parts(parts, paced);
     let mut multipart = Multipart::from_request(request, state)
         .await
         .map_err(|err| ApiError::bad_request(format!("Invalid multipart body: {err}")))?;
@@ -778,15 +807,25 @@ async fn credential_multipart(
         .map_err(|err| ApiError::bad_request(format!("Invalid multipart body: {err}")))?
     {
         let name = field.name().map(str::to_string);
-        let bytes = field
-            .bytes()
-            .await
-            .map_err(|err| ApiError::bad_request(format!("Invalid multipart body: {err}")))?
-            .to_vec();
         match name.as_deref() {
-            Some("avatar") => fields.avatar = Some(bytes),
-            Some("header") => fields.header = Some(bytes),
+            Some("avatar") => {
+                fields.avatar = Some(
+                    spool_field(state, field, "Avatar", state.server.max_file_size.min(AVATAR_LIMIT))
+                        .await?,
+                );
+            }
+            Some("header") => {
+                fields.header = Some(
+                    spool_field(state, field, "Header", state.server.max_file_size.min(HEADER_LIMIT))
+                        .await?,
+                );
+            }
             Some(name) => {
+                let bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|err| ApiError::bad_request(format!("Invalid multipart body: {err}")))?
+                    .to_vec();
                 fields.pairs.push((
                     name.to_string(),
                     String::from_utf8_lossy(&bytes).into_owned(),
@@ -796,6 +835,46 @@ async fn credential_multipart(
         }
     }
     Ok(fields)
+}
+
+/// Stream one avatar/header part into a capped spool file. The cap is
+/// enforced as the bytes arrive, so an oversized part is rejected before it
+/// is resident, and every failure path drops the spool (which deletes its
+/// file).
+async fn spool_field(
+    state: &ApiState,
+    mut field: Field<'_>,
+    label: &str,
+    limit: u64,
+) -> ApiResult<UploadSpool> {
+    let root = state.context.blobs.root_path();
+    let mut spool = UploadSpool::create(root.as_deref(), limit)
+        .await
+        .map_err(|err| spool_error(label, err))?;
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|err| ApiError::bad_request(format!("Invalid multipart body: {err}")))?
+    {
+        spool
+            .write_chunk(&chunk)
+            .await
+            .map_err(|err| spool_error(label, err))?;
+    }
+    spool.finish().await.map_err(|err| spool_error(label, err))?;
+    Ok(spool)
+}
+
+/// Map a spool failure onto the file's existing 422 shape (never 415/500):
+/// an over-cap part reports the same size message the image pipeline would.
+fn spool_error(label: &str, err: SpoolError) -> ApiError {
+    match err {
+        SpoolError::TooLarge { limit } => ApiError::unprocessable(format!(
+            "Validation failed: {label} file size must be less than {}",
+            human_size(limit)
+        )),
+        SpoolError::Storage(err) => ApiError::from(err),
+    }
 }
 
 fn is_multipart(request: &Request) -> bool {
@@ -813,25 +892,46 @@ fn is_multipart(request: &Request) -> bool {
 /// A present-but-non-empty urlencoded/JSON value carries no bytes and can
 /// never become an image, so it 422s instead of silently ignoring the intent
 /// (upstream Paperclip likewise refuses a string where a file belongs).
+///
+/// The spool is read back bounded (never more than the cap it was created
+/// with); sniff/decode runs on the bounded media work gate, never on the
+/// async worker; bytes stage through `staging`, so dropping it (a later
+/// field validation or a failed account update) deletes the new keys.
 #[allow(clippy::too_many_arguments)]
-fn profile_image_slot(
+async fn profile_image_slot(
     state: &ApiState,
     label: &str,
     limit: u64,
     kind: &str,
-    upload: Option<Vec<u8>>,
+    upload: Option<UploadSpool>,
     field: Option<&str>,
+    staging: &mut StagingGuard<'_>,
 ) -> Result<Option<Option<ProfileImageData>>, Response> {
     match upload {
-        Some(bytes) if !bytes.is_empty() => {
-            let (mime_type, extension) = validate_profile_image(
-                bytes.len(),
-                &bytes,
-                label,
-                limit,
-                state.server.max_file_size,
-            )?;
-            let key = stage_profile_image(&*state.context.blobs, kind, &bytes, extension)?;
+        Some(spool) if !spool.is_empty() => {
+            let bytes = spool
+                .read_all()
+                .map_err(|_| ApiError::internal().into_response())?;
+            let max_file_size = state.server.max_file_size;
+            let owned_label = label.to_string();
+            let (bytes, mime_type, extension) = upload_gate::media_work_gate()
+                .run(move || {
+                    validate_profile_image(
+                        bytes.len(),
+                        &bytes,
+                        &owned_label,
+                        limit,
+                        max_file_size,
+                    )
+                    .map(|(mime_type, extension)| (bytes, mime_type, extension))
+                })
+                .await
+                .map_err(|err| ApiError::from(err).into_response())??;
+            let hex = crate::application::crypto::random_token_hex(8);
+            let key = format!("{}/{}/{}/{}.{extension}", &hex[0..2], &hex[2..4], hex, kind);
+            staging
+                .put(&key, &bytes)
+                .map_err(|err| ApiError::from(err).into_response())?;
             Ok(Some(Some(ProfileImageData {
                 key,
                 content_type: mime_type.to_string(),
@@ -888,22 +988,6 @@ fn validate_profile_image(
             json!({}),
         )),
         Err(_) => Err(ApiError::internal().into_response()),
-    }
-}
-
-/// Stage validated bytes under the blob store (`{aa}/{bb}/{rand}/{kind}.{ext}`,
-/// the media shard layout) and return the key the account row references.
-fn stage_profile_image(
-    blobs: &dyn crate::application::ports::BlobStore,
-    kind: &str,
-    bytes: &[u8],
-    extension: &str,
-) -> Result<String, Response> {
-    let hex = crate::application::crypto::random_token_hex(8);
-    let key = format!("{}/{}/{}/{}.{extension}", &hex[0..2], &hex[2..4], hex, kind);
-    match blobs.put(&key, bytes) {
-        Ok(()) => Ok(key),
-        Err(err) => Err(ApiError::from(err).into_response()),
     }
 }
 

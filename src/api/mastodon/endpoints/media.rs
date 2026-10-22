@@ -777,14 +777,15 @@ async fn multipart(state: &ApiState, request: Request) -> ApiResult<Multipart> {
 
 /// A body-frame stream that yields `Pending` (after re-waking) between
 /// frames, so a greedy downstream parser cannot drain an always-ready
-/// stream in a single poll. See [`multipart`].
-struct PacedBody<S> {
+/// stream in a single poll. See [`multipart`]. Shared with the credentials
+/// endpoints, whose avatar/header parts need the same incremental delivery.
+pub(crate) struct PacedBody<S> {
     inner: std::pin::Pin<Box<S>>,
     pause: bool,
 }
 
 impl<S> PacedBody<S> {
-    fn new(stream: S) -> Self {
+    pub(crate) fn new(stream: S) -> Self {
         Self {
             inner: Box::pin(stream),
             pause: false,
