@@ -41,7 +41,7 @@ use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::RemoteCacheConfig;
+use crate::config::{RemoteCacheConfig, RemoteCacheMode};
 use crate::domain::Error;
 
 /// Per-file ceiling for one remote fetch. Mirrors
@@ -113,6 +113,48 @@ pub fn class_for_variant(variant: &str) -> MediaClass {
         "stream" | "segment" => MediaClass::Stream,
         _ => MediaClass::Full,
     }
+}
+
+/// Map a sniffed content type to its class: audio/video originals are
+/// `Stream` (served on demand, never persisted — 0 MiB persistent), every
+/// other attachment original is `Full`.
+pub fn class_for_mime(mime_type: &str) -> MediaClass {
+    let top: &str = mime_type.split_once('/').map_or(mime_type, |(top, _)| top);
+    match top {
+        "audio" | "video" => MediaClass::Stream,
+        _ => MediaClass::Full,
+    }
+}
+
+/// The class for a fetched remote object: variant-specific classes
+/// (avatars, previews, emoji, segments) win; attachment originals (and
+/// anything unknown) are classified by sniffed content type, so audio/video
+/// originals land in `Stream` instead of being silently persisted as `Full`.
+///
+/// The fetch path must call this with the sniffed MIME — never assume
+/// `MediaClass::Full` — and must thread the operator-configured
+/// [`RemoteCacheConfig`] (not `RemoteCacheConfig::default()`) into the
+/// ledger entry, so expiry and budgets follow configuration.
+pub fn class_for_fetch(mime_type: &str, variant: &str) -> MediaClass {
+    match variant {
+        "avatar" | "header" | "emoji" => MediaClass::AvatarEmoji,
+        "preview" | "thumbnail" | "small" | "card" => MediaClass::Preview,
+        "stream" | "segment" => MediaClass::Stream,
+        _ => class_for_mime(mime_type),
+    }
+}
+
+/// Whether the configured mode allows persisting remote bytes at all.
+/// `Disabled` means no persistence: the ledger refuses every reservation
+/// and commit loudly (never a silent persist), and startup config validation
+/// rejects the mode until the non-persisting streaming design exists (see
+/// the proposed `Config::validate` snippet in the parent merge notes).
+pub fn persistence_allowed(cfg: &RemoteCacheConfig) -> bool {
+    cfg.mode != RemoteCacheMode::Disabled
+}
+
+fn disabled_refusal() -> CacheError {
+    CacheError::Unsupported("remote cache is disabled: refusing to persist bytes".into())
 }
 
 /// One cache entry: the durable metadata row in miniature. Metadata survives
@@ -264,6 +306,55 @@ pub fn is_cache_key(key: &str) -> bool {
     key.starts_with("remote/")
 }
 
+/// Variant name for remote custom-emoji bytes in the evictable namespace.
+pub const EMOJI_VARIANT: &str = "emoji";
+
+/// Blob keys for a remote custom emoji in the evictable namespace:
+/// `remote/emojis/{domain}/{shortcode}/original.png` (served bytes) and
+/// `remote/emojis/{domain}/{shortcode}/static.png` (static variant).
+///
+/// Remote emoji must live here — never under `custom_emojis/images/…`,
+/// which is the durable pool with no eviction. Both keys satisfy
+/// [`is_cache_key`], so the ledger, `CacheEvict` and the reconciler cover
+/// them; the ledger row keeps the origin `source_url`, so eviction drops
+/// bytes but the shell survives for refetch. `None` when the domain or
+/// shortcode is not a strict shape (never serve or store a guessed key).
+pub fn remote_emoji_keys(domain: &str, shortcode: &str) -> Option<(String, String)> {
+    let domain: String = domain.to_lowercase();
+    if !is_remote_emoji_domain(&domain) {
+        return None;
+    }
+    if !crate::domain::CustomEmoji::shortcode_valid(shortcode) {
+        return None;
+    }
+    let base: String = format!("remote/emojis/{domain}/{shortcode}");
+    let image_key: String = format!("{base}/original.png");
+    let static_key: String = format!("{base}/static.png");
+    if crate::media::blob_store::validate_key(&image_key).is_err()
+        || crate::media::blob_store::validate_key(&static_key).is_err()
+    {
+        return None;
+    }
+    Some((image_key, static_key))
+}
+
+/// A remote-emoji origin domain: dot/dash separated lowercase labels, never
+/// empty, never leading/trailing punctuation, no `..`.
+fn is_remote_emoji_domain(domain: &str) -> bool {
+    if domain.is_empty() || domain.len() > 253 {
+        return false;
+    }
+    if domain.starts_with(['.', '-']) || domain.ends_with(['.', '-']) {
+        return false;
+    }
+    if domain.contains("..") {
+        return false;
+    }
+    domain
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
+}
+
 /// Warming reuses `FetchRemoteMedia` behind scoped opt-in and never covers
 /// relay-originated media (there is no relay path yet; the exclusion is
 /// enforced at the call site signature so it cannot be added later without
@@ -321,6 +412,14 @@ impl CacheLedger {
     /// Replace the budgets (operator reconfig / parent wiring); counters stay.
     pub fn set_caps(&mut self, cfg: RemoteCacheConfig) {
         self.cfg = cfg;
+    }
+
+    /// Whether the installed budgets allow persisting bytes at all.
+    /// `Disabled` mode refuses every reservation and commit loudly (never a
+    /// silent persist); callers that would fetch-then-store (miss refetch,
+    /// warming) must check this first and stand down.
+    pub fn persistence_allowed(&self) -> bool {
+        persistence_allowed(&self.cfg)
     }
 
     pub fn stored_for(&self, class: MediaClass) -> u64 {
@@ -383,12 +482,7 @@ impl CacheLedger {
     /// non-avatar need (the reserve); an avatar need may displace image
     /// bytes. Metadata-only shells are never victims (nothing to free).
     /// Pure: no mutation, so the caller can check the freed sum first.
-    pub fn plan_eviction(
-        &self,
-        need: MediaClass,
-        bytes_to_free: u64,
-        now_ms: u64,
-    ) -> Vec<Vec<u8>> {
+    pub fn plan_eviction(&self, need: MediaClass, bytes_to_free: u64, now_ms: u64) -> Vec<Vec<u8>> {
         if bytes_to_free == 0 {
             return Vec::new();
         }
@@ -494,8 +588,7 @@ impl CacheLedger {
                 .saturating_add(size)
                 .saturating_sub(cap);
             if over > 0 {
-                let victims =
-                    self.collect_victims(&[MediaClass::AvatarEmoji], over, now_ms);
+                let victims = self.collect_victims(&[MediaClass::AvatarEmoji], over, now_ms);
                 let freed: u64 = victims
                     .iter()
                     .filter_map(|k| self.entries.get(k))
@@ -530,6 +623,9 @@ impl CacheLedger {
     /// the body (worst case first, shrink when `Content-Length` is known).
     /// Refusals never mutate.
     pub fn reserve(&mut self, class: MediaClass, bytes: u64) -> Result<(), CacheError> {
+        if !persistence_allowed(&self.cfg) {
+            return Err(disabled_refusal());
+        }
         if bytes > PER_FILE_CEILING_BYTES {
             return Err(CacheError::Oversize {
                 size: bytes,
@@ -586,6 +682,10 @@ impl CacheLedger {
                 entry.blob_key
             )));
         }
+        if !persistence_allowed(&self.cfg) {
+            self.release(class, reserved_bytes);
+            return Err(disabled_refusal());
+        }
         if entry.class != class {
             self.release(class, reserved_bytes);
             return Err(CacheError::Unsupported(format!(
@@ -631,13 +731,17 @@ impl CacheLedger {
     /// Re-insert a durable ledger row after a restart, without a prior
     /// reservation: byte-holding rows count as stored bytes. Refuses rows
     /// outside the cache namespace so durable media can never enter the
-    /// ledger. A row already present is replaced (no double count).
+    /// ledger, and refuses everything while persistence is disabled. A row
+    /// already present is replaced (no double count).
     pub fn restore_entry(&mut self, entry: RemoteCacheEntry) -> Result<(), CacheError> {
         if !is_cache_key(&entry.blob_key) {
             return Err(CacheError::Unsupported(format!(
                 "refusing non-cache key in the remote ledger: {}",
                 entry.blob_key
             )));
+        }
+        if !persistence_allowed(&self.cfg) {
+            return Err(disabled_refusal());
         }
         let key = entry.cache_key();
         if let Some(old) = self.entries.get(&key) {
@@ -754,7 +858,9 @@ mod tests {
             1000,
             &cfg,
         );
-        ledger.commit(MediaClass::AvatarEmoji, 64 * 1024, avatar).unwrap();
+        ledger
+            .commit(MediaClass::AvatarEmoji, 64 * 1024, avatar)
+            .unwrap();
         // Image pressure for more than the whole global cap: every image byte
         // must go before refusal, avatars stay.
         let victims = ledger.plan_eviction(MediaClass::Full, 4 * 1024 * 1024, 2000);
@@ -775,19 +881,99 @@ mod tests {
     }
 
     #[test]
+    fn fetch_class_comes_from_the_sniffed_mime() {
+        assert_eq!(class_for_fetch("video/mp4", "original"), MediaClass::Stream);
+        assert_eq!(
+            class_for_fetch("audio/mpeg", "original"),
+            MediaClass::Stream
+        );
+        assert_eq!(class_for_fetch("image/png", "original"), MediaClass::Full);
+        assert_eq!(class_for_fetch("video/mp4", "preview"), MediaClass::Preview);
+        assert_eq!(
+            class_for_fetch("image/png", "avatar"),
+            MediaClass::AvatarEmoji
+        );
+        assert_eq!(
+            class_for_fetch("image/gif", "emoji"),
+            MediaClass::AvatarEmoji
+        );
+    }
+
+    #[test]
+    fn disabled_mode_refuses_to_persist_loudly() {
+        let cfg = RemoteCacheConfig {
+            mode: crate::config::RemoteCacheMode::Disabled,
+            ..small_cfg()
+        };
+        assert!(!persistence_allowed(&cfg));
+        assert!(persistence_allowed(&small_cfg()));
+        let mut ledger = CacheLedger::new(cfg.clone());
+        assert!(matches!(
+            ledger.reserve(MediaClass::Full, 64),
+            Err(CacheError::Unsupported(_))
+        ));
+        let entry = RemoteCacheEntry::stored(
+            "https://cdn.example/a.png",
+            "original",
+            MediaClass::Full,
+            "remote/1",
+            64,
+            1000,
+            &cfg,
+        );
+        assert!(matches!(
+            ledger.commit(MediaClass::Full, 0, entry),
+            Err(CacheError::Unsupported(_))
+        ));
+        let shell = RemoteCacheEntry::stored(
+            "https://cdn.example/b.png",
+            "original",
+            MediaClass::Full,
+            "remote/2",
+            64,
+            1000,
+            &cfg,
+        );
+        assert!(ledger.restore_entry(shell).is_err());
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn remote_emoji_keys_live_in_the_evictable_namespace() {
+        let (image, static_key) =
+            remote_emoji_keys("remote.example", "party").expect("valid remote emoji shape");
+        assert_eq!(image, "remote/emojis/remote.example/party/original.png");
+        assert_eq!(static_key, "remote/emojis/remote.example/party/static.png");
+        assert!(is_cache_key(&image));
+        assert!(is_cache_key(&static_key));
+        // Domains canonicalize to lowercase.
+        let (lower, _) = remote_emoji_keys("REMOTE.EXAMPLE", "party").expect("case folds");
+        assert!(lower.starts_with("remote/emojis/remote.example/"));
+        for bad_domain in ["", "a..b", ".lead", "trail.", "UP PER", "x/y", "a:b"] {
+            assert!(
+                remote_emoji_keys(bad_domain, "party").is_none(),
+                "refuse domain {bad_domain:?}"
+            );
+        }
+        assert!(remote_emoji_keys("remote.example", "x").is_none());
+        assert!(remote_emoji_keys("remote.example", "has space").is_none());
+        assert_eq!(class_for_variant(EMOJI_VARIANT), MediaClass::AvatarEmoji);
+    }
+
+    #[test]
     fn error_shapes_are_mastodon_never_drive() {
         let cases = [
             (
-                CacheError::Oversize { size: 9, ceiling: 8 },
+                CacheError::Oversize {
+                    size: 9,
+                    ceiling: 8,
+                },
                 422u16,
             ),
             (CacheError::Unsupported("no".into()), 422),
             (CacheError::Missing("gone".into()), 404),
             (CacheError::OriginDown("down".into()), 503),
-            (
-                CacheError::BudgetExhausted { need: 1, cap: 1 },
-                503,
-            ),
+            (CacheError::BudgetExhausted { need: 1, cap: 1 }, 503),
             (CacheError::Store("io".into()), 503),
         ];
         for (err, status) in cases {

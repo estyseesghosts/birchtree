@@ -23,6 +23,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::media::remote_cache;
+
 /// Styles a published attachment or profile image may carry.
 const PUBLISHED_STYLES: [&str; 5] = ["original", "small", "thumbnail", "avatar", "header"];
 
@@ -83,7 +85,8 @@ pub fn classify_key(path: &str) -> Option<PublicMediaKind> {
             Some(PublicMediaKind::RemoteCache { media_id })
         }
         [first, second, shard, file] => {
-            let sharded = is_lower_hex(first, 2) && is_lower_hex(second, 2) && is_lower_hex(shard, 16);
+            let sharded =
+                is_lower_hex(first, 2) && is_lower_hex(second, 2) && is_lower_hex(shard, 16);
             if sharded && is_published_file(file) {
                 return Some(PublicMediaKind::Local);
             }
@@ -156,6 +159,44 @@ pub fn emoji_blob_key(path: &str) -> Option<String> {
     Some(key)
 }
 
+/// The full blob key for a requested remote-emoji image, or `None` when the
+/// path is not a published remote-emoji image. `None` must be answered with
+/// 404 without touching the filesystem.
+///
+/// Accepted shapes are exactly the ones the fetch path writes (see
+/// [`remote_cache::remote_emoji_keys`]): `remote/emojis/{domain}/{shortcode}/`
+/// `{original|static}.png`, with a strictly validated lowercase domain and
+/// shortcode. Guessed names, traversal, backslashes, staging siblings and
+/// other namespaces are all refused by shape — exactly like the attachment
+/// route ([`classify_key`]) and the local-emoji gate ([`emoji_blob_key`]).
+///
+/// Remote-emoji bytes live in the evictable cache namespace, so a missing
+/// blob whose ledger shell survives must enqueue a refetch (same miss path
+/// as cached attachments) rather than answer a bare 404; the route owner
+/// wires that (the attachment route's `recover_missing` is the pattern).
+pub fn remote_emoji_blob_key(path: &str) -> Option<String> {
+    if path.is_empty() || path.len() > 255 || !path.is_ascii() {
+        return None;
+    }
+    let parts: Vec<&str> = path.split('/').collect();
+    let ["remote", "emojis", domain, shortcode, file] = parts.as_slice() else {
+        return None;
+    };
+    let style: &str = file.strip_suffix(".png")?;
+    if !matches!(style, "original" | "static") {
+        return None;
+    }
+    let (image_key, static_image_key) = remote_cache::remote_emoji_keys(domain, shortcode)?;
+    let key: String = format!("remote/emojis/{domain}/{shortcode}/{style}.png");
+    if key != image_key && key != static_image_key {
+        return None;
+    }
+    if crate::media::blob_store::validate_key(&key).is_err() {
+        return None;
+    }
+    Some(key)
+}
+
 /// An origin domain in a remote-emoji file name: dot/dash separated labels,
 /// never empty, never leading/trailing punctuation.
 fn is_emoji_domain(domain: &str) -> bool {
@@ -181,7 +222,10 @@ fn parse_digits(text: &str) -> Option<u64> {
 }
 
 fn is_lower_hex(text: &str, len: usize) -> bool {
-    text.len() == len && text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    text.len() == len
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// `{style}.{ext}` with a published style and a short alphanumeric extension.
@@ -206,7 +250,10 @@ fn is_plain_file_name(file: &str) -> bool {
 }
 
 fn is_extension(ext: &str) -> bool {
-    (1..=8).contains(&ext.len()) && ext.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    (1..=8).contains(&ext.len())
+        && ext
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
 /// Outcome of evaluating a `Range` header against a representation length.
@@ -392,12 +439,54 @@ mod tests {
             evaluate_range(Some("bytes=50-500"), 100),
             RangeOutcome::Partial { start: 50, end: 99 }
         );
-        assert_eq!(evaluate_range(Some("bytes=100-"), 100), RangeOutcome::Unsatisfiable);
-        assert_eq!(evaluate_range(Some("bytes=-0"), 100), RangeOutcome::Unsatisfiable);
-        assert_eq!(evaluate_range(Some("bytes=0-1,5-6"), 100), RangeOutcome::Full);
+        assert_eq!(
+            evaluate_range(Some("bytes=100-"), 100),
+            RangeOutcome::Unsatisfiable
+        );
+        assert_eq!(
+            evaluate_range(Some("bytes=-0"), 100),
+            RangeOutcome::Unsatisfiable
+        );
+        assert_eq!(
+            evaluate_range(Some("bytes=0-1,5-6"), 100),
+            RangeOutcome::Full
+        );
         assert_eq!(evaluate_range(Some("items=0-1"), 100), RangeOutcome::Full);
         assert_eq!(evaluate_range(Some("bytes=9-3"), 100), RangeOutcome::Full);
-        assert_eq!(evaluate_range(Some("bytes=-5"), 3), RangeOutcome::Partial { start: 0, end: 2 });
+        assert_eq!(
+            evaluate_range(Some("bytes=-5"), 3),
+            RangeOutcome::Partial { start: 0, end: 2 }
+        );
+    }
+
+    #[test]
+    fn only_published_remote_emoji_shapes_have_keys() {
+        for ok in [
+            "remote/emojis/remote.example/party/original.png",
+            "remote/emojis/remote.example/party/static.png",
+            "remote/emojis/a.b-c.example/p4rty_2/original.png",
+        ] {
+            assert_eq!(remote_emoji_blob_key(ok).as_deref(), Some(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "remote/emojis/remote.example/party/derived.png",
+            "remote/emojis/remote.example/party/original.jpg",
+            "remote/emojis/remote.example/party/original.png.part",
+            "remote/emojis/REMOTE.EXAMPLE/party/original.png",
+            "remote/emojis/remote.example/../party/original.png",
+            "remote/emojis/remote..example/party/original.png",
+            "remote/emojis/.lead/party/original.png",
+            "remote/emojis/ok/x/original.png",
+            "custom_emojis/images/70/61/party/original/party.png",
+            "remote/42",
+            "remote/emojis/remote.example/party",
+            "remote/emojis/remote.example",
+            "tmp/remote/emojis/remote.example/party/original.png",
+            "remote/emojis/remote.example/party/.original.png.part-1-2",
+        ] {
+            assert_eq!(remote_emoji_blob_key(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

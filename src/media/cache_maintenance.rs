@@ -36,9 +36,7 @@ use crate::media::blob_store::FsBlobStore;
 use crate::media::fetch_stream;
 use crate::media::public_media;
 use crate::media::reconciler::{self, ReconCursor, ReconReport};
-use crate::media::remote_cache::{
-    self, CacheLedger, CacheUsage, MediaClass, RemoteCacheEntry,
-};
+use crate::media::remote_cache::{self, CacheLedger, CacheUsage, MediaClass, RemoteCacheEntry};
 use crate::persistence::redb::RedbStore;
 use crate::persistence::redb::remote_cache::AccountingRepair;
 
@@ -119,6 +117,30 @@ pub struct RestoreReport {
     pub stored_bytes: u64,
     /// Abandoned staging files removed.
     pub residue_removed: usize,
+    /// Pre-split durable `remote/` shadows moved into the cache pool (with
+    /// their ledger rows and accounting); the durable copies are gone.
+    pub shadows_migrated: usize,
+    /// Migrated shadow bytes now counted in the cache pool.
+    pub shadow_bytes: u64,
+    /// Stale durable duplicates deleted (the cache pool already held the
+    /// authoritative copy).
+    pub shadow_duplicates_removed: usize,
+    /// Unreferenced durable shadows deleted (no ledger row and no media
+    /// row names them; the cache-side equivalent is reconciler-deleted).
+    pub shadow_orphans_removed: usize,
+}
+
+/// Outcome of one durable-shadow migration pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShadowMigrateReport {
+    /// Shadows moved into the cache pool with rows + accounting.
+    pub migrated: usize,
+    /// Migrated bytes now counted in the cache pool.
+    pub bytes: u64,
+    /// Stale durable duplicates deleted (cache copy authoritative).
+    pub duplicates_removed: usize,
+    /// Unreferenced durable shadows deleted.
+    pub orphans_removed: usize,
 }
 
 /// The cache lifecycle service. Cheap to share behind an `Arc`.
@@ -205,7 +227,9 @@ impl CacheMaintenance {
         // 1. Adopt in-use bytes the ledger lost track of.
         let mut after: Option<String> = None;
         loop {
-            let keys = self.cache.list_keys(after.as_deref(), self.batch(), Duration::ZERO)?;
+            let keys = self
+                .cache
+                .list_keys(after.as_deref(), self.batch(), Duration::ZERO)?;
             let Some(last) = keys.last().cloned() else {
                 break;
             };
@@ -213,10 +237,22 @@ impl CacheMaintenance {
             after = Some(last);
         }
 
-        // 2. Check every byte-holding row against the file system.
+        // 2. Move pre-split durable `remote/` shadows into the cache pool
+        // (copy, verify, account, delete the durable copy): after this pass
+        // no `remote/` byte lives outside the evictable pool, so eviction
+        // and deletes can never be shadowed by a stale durable copy.
+        let shadows = self.migrate_durable_shadows(now_ms)?;
+        report.shadows_migrated = shadows.migrated;
+        report.shadow_bytes = shadows.bytes;
+        report.shadow_duplicates_removed = shadows.duplicates_removed;
+        report.shadow_orphans_removed = shadows.orphans_removed;
+
+        // 3. Check every byte-holding row against the file system.
         let mut cursor: Option<Vec<u8>> = None;
         loop {
-            let page = self.store.cache_rows_page(cursor.as_deref(), self.batch())?;
+            let page = self
+                .store
+                .cache_rows_page(cursor.as_deref(), self.batch())?;
             let Some((last_key, _)) = page.last().cloned() else {
                 break;
             };
@@ -227,11 +263,7 @@ impl CacheMaintenance {
                 }
                 match self.cache.size_of(&row.blob_key)? {
                     None => {
-                        reconciler::ReconStore::flag_missing(
-                            &*self.store,
-                            &row.blob_key,
-                            now_ms,
-                        )?;
+                        reconciler::ReconStore::flag_missing(&*self.store, &row.blob_key, now_ms)?;
                         report.missing += 1;
                     }
                     Some(actual) if actual != row.size => {
@@ -264,7 +296,9 @@ impl CacheMaintenance {
         let mut rows: Vec<RemoteCacheEntry> = Vec::new();
         let mut cursor: Option<Vec<u8>> = None;
         loop {
-            let page = self.store.cache_rows_page(cursor.as_deref(), self.batch())?;
+            let page = self
+                .store
+                .cache_rows_page(cursor.as_deref(), self.batch())?;
             let Some((last_key, _)) = page.last().cloned() else {
                 break;
             };
@@ -310,6 +344,90 @@ impl CacheMaintenance {
         Ok(adopted)
     }
 
+    /// Move pre-split durable `remote/` shadows into the cache pool.
+    ///
+    /// Deliberate migration (not lazy): every `remote/` key under the
+    /// durable root is resolved once, at startup, in pages:
+    ///
+    /// - cache pool already holds the key → the durable copy is a stale
+    ///   duplicate (the post-split cache copy is authoritative; cache writes
+    ///   are atomic so it cannot be torn) and is deleted;
+    /// - only the durable pool holds it and a ledger row or media row names
+    ///   it → bytes copy to the cache pool, the copy is verified by size,
+    ///   the row/accounting updates via `cache_mark_stored`, then the
+    ///   durable copy is deleted (a crash between leaves the durable copy
+    ///   for the next pass, never an uncounted cache blob);
+    /// - nothing names it → it is crash-window residue (remote avatars are
+    ///   never blob-cached, so `remote/` keys are attachments only) and the
+    ///   durable copy is deleted, exactly as the reconciler deletes the
+    ///   identical cache-side state.
+    ///
+    /// No-op without a durable handle (unit tests). After this pass no
+    /// `remote/` byte lives outside the evictable pool.
+    pub fn migrate_durable_shadows(&self, now_ms: u64) -> Result<ShadowMigrateReport> {
+        use crate::application::federation_ports::FederationContentStore;
+
+        let mut report = ShadowMigrateReport::default();
+        let Some(durable) = &self.durable else {
+            return Ok(report);
+        };
+        let mut after: Option<String> = None;
+        loop {
+            let keys = durable.list_keys(after.as_deref(), self.batch(), Duration::ZERO)?;
+            let Some(last) = keys.last().cloned() else {
+                break;
+            };
+            for key in &keys {
+                if !remote_cache::is_cache_key(key) {
+                    continue;
+                }
+                if self.cache.exists(key)? {
+                    durable.delete(key)?;
+                    report.duplicates_removed += 1;
+                    continue;
+                }
+                let Some(bytes) = durable.get(key)? else {
+                    continue;
+                };
+                let size: u64 = bytes.len() as u64;
+                // The row that owns these bytes, if any: a ledger row whose
+                // mapping names the key, else the media row that references
+                // it (its remote source feeds the ledger row).
+                let mut owner: Option<(String, String)> = None;
+                if let Some((_, row)) = self.store.cache_row_by_blob_key(key)?
+                    && !row.has_bytes
+                {
+                    owner = Some((row.source_url.clone(), row.variant.clone()));
+                }
+                if owner.is_none()
+                    && let Some((media_id, variant)) = self.store.media_references_blob(key)?
+                    && let Some(source) = self.store.remote_media_source(media_id)?
+                {
+                    owner = Some((source, variant.to_string()));
+                }
+                let Some((source, variant)) = owner else {
+                    durable.delete(key)?;
+                    report.orphans_removed += 1;
+                    continue;
+                };
+                self.cache.put(key, &bytes)?;
+                if self.cache.size_of(key)? != Some(size) {
+                    let _ = self.cache.delete(key);
+                    return Err(Error::Storage(format!(
+                        "shadow copy of {key} failed verification"
+                    )));
+                }
+                self.store
+                    .cache_mark_stored(&source, &variant, key, size, None, now_ms)?;
+                durable.delete(key)?;
+                report.migrated += 1;
+                report.bytes = report.bytes.saturating_add(size);
+            }
+            after = Some(last);
+        }
+        Ok(report)
+    }
+
     fn sweep_residue(&self, min_age: Duration) -> Result<usize> {
         let mut removed =
             fetch_stream::sweep_stale_residue(self.cache.root(), min_age, MAINTENANCE_BATCH)?;
@@ -348,15 +466,16 @@ impl CacheMaintenance {
                 pressure.push((class, over));
             }
         }
-        let global_over: u64 = usage.stored_total.saturating_sub(self.config.global_cap_bytes);
+        let global_over: u64 = usage
+            .stored_total
+            .saturating_sub(self.config.global_cap_bytes);
         if global_over > 0 && pressure.is_empty() {
             // Over the global cap with every class inside its own cap:
             // image pressure (the avatar reserve is never offered).
             pressure.push((MediaClass::Full, global_over));
         }
         for (class, bytes) in pressure {
-            let evicted: Vec<String> =
-                self.store.cache_evict_batch(class, bytes, now_ms, batch)?;
+            let evicted: Vec<String> = self.store.cache_evict_batch(class, bytes, now_ms, batch)?;
             report.pressure += evicted.len();
             report.more_work |= evicted.len() >= batch;
             report.blobs_deleted += self.delete_cache_blobs(&evicted)?;
@@ -365,7 +484,9 @@ impl CacheMaintenance {
     }
 
     /// Delete the given cache-pool keys and drop them from the admission
-    /// ledger. Keys outside the cache namespace are refused.
+    /// ledger. Keys outside the cache namespace are refused. Any durable
+    /// shadow of the key is deleted too: the public route checks the durable
+    /// root first, so a surviving shadow would keep serving evicted bytes.
     fn delete_cache_blobs(&self, keys: &[String]) -> Result<usize> {
         let mut deleted = 0;
         for key in keys {
@@ -378,6 +499,11 @@ impl CacheMaintenance {
                 deleted += 1;
             }
             self.cache.delete(key)?;
+            if let Some(durable) = &self.durable
+                && durable.exists(key)?
+            {
+                durable.delete(key)?;
+            }
             self.lock_ledger()?.evict_by_blob_key(key);
         }
         Ok(deleted)
@@ -556,8 +682,17 @@ pub fn fetch_at_ingest(config: &RemoteCacheConfig, is_relay: bool) -> bool {
 /// gone (evicted, reconciled away or never fetched). Single-flight: at most
 /// one job per media row per suppression window in this process, and only
 /// for rows that still know their source URL. Returns whether a job was
-/// enqueued.
+/// enqueued. Never enqueues while persistence is disabled (there would be
+/// nowhere to keep the fetched bytes).
 pub fn enqueue_fetch_on_miss(store: &dyn Store, media_id: Id, now_ms: u64) -> Result<bool> {
+    // The process ledger carries the operator budgets (wired at startup):
+    // while persistence is disabled there is nowhere to keep fetched bytes,
+    // so the miss stays a 404 instead of enqueueing doomed work.
+    if let Ok(ledger) = remote_cache::process_ledger().lock()
+        && !ledger.persistence_allowed()
+    {
+        return Ok(false);
+    }
     if !public_media::refetch_gate().should_enqueue(media_id.value()) {
         return Ok(false);
     }

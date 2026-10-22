@@ -20,20 +20,31 @@
 //! quarantined. A success resets the host. Permanent (quarantine-class)
 //! failures never touch the host's budget: one bad inbox must not cool down
 //! its host.
+//!
+//! Ordering note (Mastodon baseline): a remote server applies `Follow`/`Undo`,
+//! `Create`/`Delete` and `Announce`/`Undo Announce` in arrival order per
+//! sender. Each destination is its own job and the worker executes a claimed
+//! batch concurrently, so two jobs for the same inbox would race on the wire
+//! without per-destination serialization. [`run`] therefore holds the
+//! per-host lock ([`destination_lock`]) across the cooldown check and the
+//! send: same-host deliveries never interleave, while different hosts proceed
+//! in parallel and global concurrency is kept.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use activitypub_federation::{
-    activity_sending::SendActivityTask,
-    config::FederationConfig,
-    error::Error as ProtocolError,
+    activity_sending::SendActivityTask, config::FederationConfig, error::Error as ProtocolError,
     traits::ActivityHandler,
 };
 use serde::Serialize;
 use serde_json::Value;
+use tokio::sync::Mutex as AsyncMutex;
 use url::Url;
 
+use crate::activitypub::FedContext;
 use crate::activitypub::actor::ActorRecord;
 use crate::activitypub::error::FedError;
-use crate::activitypub::FedContext;
 use crate::domain::{DeliveryDestState, Id, Job, JobKind};
 
 /// First cooldown after one failed attempt to a host.
@@ -49,7 +60,9 @@ pub const DEST_MAX_DEFERRALS: u32 = 25;
 /// failure past the first, capped.
 pub fn dest_cooldown_ms(failures: u32) -> u64 {
     let shift = failures.saturating_sub(1).min(16);
-    DEST_COOLDOWN_BASE_MS.saturating_mul(1 << shift).min(DEST_COOLDOWN_CAP_MS)
+    DEST_COOLDOWN_BASE_MS
+        .saturating_mul(1 << shift)
+        .min(DEST_COOLDOWN_CAP_MS)
 }
 
 /// The failure domain of an inbox URL: its lowercased host, with the explicit
@@ -69,6 +82,67 @@ pub enum DeliveryError {
     Retry(String),
     /// Stop: quarantine the job for an operator.
     Quarantine(String),
+}
+
+// ---------------------------------------------------------------------------
+// Per-destination ordering: the worker fans a claimed batch out concurrently,
+// so without serialization two jobs for the same inbox (a `Follow` and its
+// `Undo`, a `Create` and its `Delete`) could interleave on the wire and the
+// remote would apply them out of order. One async mutex per destination host
+// (see [`dest_host`]) serializes same-host sends; different hosts take
+// different locks, so global concurrency is kept.
+//
+// Ordering model: the worker spawns a claimed batch in claim order and each
+// task takes its host lock immediately, so same-host jobs normally execute in
+// claim order. That is best-effort, not a FIFO guarantee across worker
+// restarts: what makes it safe is that every payload is fixed at plan time,
+// so a retry resends identical bytes and the remote dedups by activity id.
+// Strict cross-restart sequencing would need plan-time sequence numbers in the
+// payload (out of scope: the queue schema is frozen to this change; see the
+// parent-owned `persistence/*`).
+// ---------------------------------------------------------------------------
+
+/// Registry of per-destination-host serialization locks, keyed by
+/// [`dest_host`]. Entries are `Weak`: a host with no in-flight or waiting
+/// delivery releases its lock instead of growing the map without bound.
+static DESTINATION_LOCKS: OnceLock<Mutex<HashMap<String, Weak<AsyncMutex<()>>>>> = OnceLock::new();
+
+fn destination_locks() -> &'static Mutex<HashMap<String, Weak<AsyncMutex<()>>>> {
+    DESTINATION_LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The serialization lock for one destination host.
+///
+/// Same-host deliveries hold this across the cooldown check and the send (see
+/// [`run`]), so they never interleave; different hosts hold different locks.
+/// The registry evicts dead entries on lookup, so idle hosts leave no trace.
+pub fn destination_lock(host: &str) -> Arc<AsyncMutex<()>> {
+    let registry = destination_locks();
+    let mut locks = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(live) = locks.get(host).and_then(Weak::upgrade) {
+        return live;
+    }
+    // Evict dead entries while a write lock is already held: keeps the map
+    // proportional to the live destination set.
+    locks.retain(|_, weak| weak.upgrade().is_some());
+    let fresh = Arc::new(AsyncMutex::new(()));
+    locks.insert(host.to_string(), Arc::downgrade(&fresh));
+    fresh
+}
+
+/// Ordering key for one delivery job: the destination host plus the activity
+/// id being sent. A `Follow` and its `Undo` (or a `Create` and its `Delete`)
+/// to the same inbox share the host half and differ in the activity half, so
+/// an operator (or the ordering harness in `tests/fix_worker_sched.rs`) can
+/// audit that the pair stayed serialized. Returns `None` when the job has no
+/// parseable inbox or no activity id.
+pub fn delivery_order_key(job: &Job) -> Option<(String, String)> {
+    let inbox = job.payload.get("inbox")?.as_str()?;
+    let host = Url::parse(inbox).ok().map(|url| dest_host(&url))?;
+    let activity = job.payload.get("body")?.get("id")?.as_str()?.to_string();
+    Some((host, activity))
 }
 
 /// An outbound activity: the stored JSON, as sent. The crate needs its ID and
@@ -118,12 +192,20 @@ impl ActivityHandler for OutboundActivity {
         &self.actor
     }
 
-    async fn verify(&self, _data: &activitypub_federation::config::Data<FedContext>) -> Result<(), FedError> {
+    async fn verify(
+        &self,
+        _data: &activitypub_federation::config::Data<FedContext>,
+    ) -> Result<(), FedError> {
         Ok(())
     }
 
-    async fn receive(self, _data: &activitypub_federation::config::Data<FedContext>) -> Result<(), FedError> {
-        Err(FedError::Refused("an outbound activity is not received here".into()))
+    async fn receive(
+        self,
+        _data: &activitypub_federation::config::Data<FedContext>,
+    ) -> Result<(), FedError> {
+        Err(FedError::Refused(
+            "an outbound activity is not received here".into(),
+        ))
     }
 }
 
@@ -142,17 +224,25 @@ pub async fn run(config: &FederationConfig<FedContext>, job: &Job) -> Result<(),
         .get("inbox")
         .and_then(Value::as_str)
         .ok_or_else(|| DeliveryError::Quarantine("delivery has no inbox".into()))?;
-    let inbox_url = Url::parse(inbox).map_err(|_| DeliveryError::Quarantine("delivery inbox is not a URL".into()))?;
+    let inbox_url = Url::parse(inbox)
+        .map_err(|_| DeliveryError::Quarantine("delivery inbox is not a URL".into()))?;
     let body = payload
         .get("body")
         .cloned()
         .ok_or_else(|| DeliveryError::Quarantine("delivery has no body".into()))?;
-    let activity = OutboundActivity::from_body(body).map_err(|e| DeliveryError::Quarantine(format!("delivery body is not an activity: {e}")))?;
+    let activity = OutboundActivity::from_body(body)
+        .map_err(|e| DeliveryError::Quarantine(format!("delivery body is not an activity: {e}")))?;
 
     let ctx: &FedContext = config;
     let store = &*ctx.app.store;
     let now = ctx.app.now_ms();
     let host = dest_host(&inbox_url);
+    // Serialize with the other in-flight deliveries to this host (see the
+    // per-destination ordering note above): the guard spans the cooldown
+    // check and the send, so a `Follow`/`Undo` pair to one inbox cannot
+    // interleave. Other hosts take other locks and proceed in parallel.
+    let destination_guard_lock = destination_lock(&host);
+    let _destination_guard = destination_guard_lock.lock().await;
     // A host inside its cooldown is not hit again: park this job as a
     // deferred copy due when the cooldown ends. The park does not consume
     // the job's retry budget; past the deferral cap the job quarantines.
@@ -161,7 +251,10 @@ pub async fn run(config: &FederationConfig<FedContext>, job: &Job) -> Result<(),
         .map_err(|e| DeliveryError::Retry(e.to_string()))?
         && now < state.cooldown_until_ms
     {
-        let deferrals = payload.get("deferrals").and_then(Value::as_u64).unwrap_or(0);
+        let deferrals = payload
+            .get("deferrals")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         if deferrals >= u64::from(DEST_MAX_DEFERRALS) {
             return Err(DeliveryError::Quarantine(format!(
                 "destination {host} still cooling down after {deferrals} deferrals"
@@ -172,7 +265,12 @@ pub async fn run(config: &FederationConfig<FedContext>, job: &Job) -> Result<(),
             object.insert("deferrals".into(), Value::from(deferrals + 1));
         }
         store
-            .enqueue_at(JobKind::DeliverActivity, parked, state.cooldown_until_ms, now)
+            .enqueue_at(
+                JobKind::DeliverActivity,
+                parked,
+                state.cooldown_until_ms,
+                now,
+            )
             .map_err(|e| DeliveryError::Retry(e.to_string()))?;
         tracing::info!(
             target: "birchtree::federation",
@@ -195,22 +293,35 @@ pub async fn run(config: &FederationConfig<FedContext>, job: &Job) -> Result<(),
         .map_err(|e| DeliveryError::Retry(e.to_string()))?
         .filter(|keys| keys.private_key_pem.is_some())
         .ok_or_else(|| DeliveryError::Quarantine("sender has no local signing key".into()))?;
-    let sender_actor = ActorRecord::new(account, keys).map_err(|e| DeliveryError::Quarantine(e.to_string()))?;
+    let sender_actor =
+        ActorRecord::new(account, keys).map_err(|e| DeliveryError::Quarantine(e.to_string()))?;
 
     let data = config.to_request_data();
     let tasks = SendActivityTask::prepare(&activity, &sender_actor, vec![inbox_url], &data)
         .await
         .map_err(classify)?;
     if tasks.is_empty() {
-        return Err(DeliveryError::Quarantine(format!("inbox {inbox} refused by federation policy")));
+        return Err(DeliveryError::Quarantine(format!(
+            "inbox {inbox} refused by federation policy"
+        )));
     }
     for task in tasks {
         match task.sign_and_send(&data).await {
             Ok(()) => {
                 // A success resets the host: the outage, if any, is over.
-                if store.delivery_dest(&host).map_err(|e| DeliveryError::Retry(e.to_string()))?.is_some() {
+                if store
+                    .delivery_dest(&host)
+                    .map_err(|e| DeliveryError::Retry(e.to_string()))?
+                    .is_some()
+                {
                     store
-                        .set_delivery_dest(&host, DeliveryDestState { failures: 0, cooldown_until_ms: 0 })
+                        .set_delivery_dest(
+                            &host,
+                            DeliveryDestState {
+                                failures: 0,
+                                cooldown_until_ms: 0,
+                            },
+                        )
                         .map_err(|e| DeliveryError::Retry(e.to_string()))?;
                 }
                 tracing::info!(
@@ -363,9 +474,12 @@ pub async fn run_relay_forward(
         .or_else(|| payload.get("inbox"))
         .and_then(Value::as_str)
         .ok_or_else(|| DeliveryError::Quarantine("relay forward has no relay inbox".into()))?;
-    let relay_url = Url::parse(relay).map_err(|_| DeliveryError::Quarantine("relay inbox is not a URL".into()))?;
+    let relay_url = Url::parse(relay)
+        .map_err(|_| DeliveryError::Quarantine("relay inbox is not a URL".into()))?;
     if !matches!(relay_url.scheme(), "http" | "https") || relay_url.host_str().is_none() {
-        return Err(DeliveryError::Quarantine("relay inbox is not an http(s) URL".into()));
+        return Err(DeliveryError::Quarantine(
+            "relay inbox is not an http(s) URL".into(),
+        ));
     }
     let body = payload
         .get("body")
@@ -374,7 +488,9 @@ pub async fn run_relay_forward(
     let body_bytes = serde_json::to_vec(&body)
         .map_err(|e| DeliveryError::Quarantine(format!("relay body is not JSON: {e}")))?;
     if body_bytes.len() as u64 > RELAY_MAX_BODY_BYTES {
-        return Err(DeliveryError::Quarantine("relay body is larger than the limit".into()));
+        return Err(DeliveryError::Quarantine(
+            "relay body is larger than the limit".into(),
+        ));
     }
     // The activity must be sendable (an id + actor to sign with); anything
     // else quarantines before any host state is touched.

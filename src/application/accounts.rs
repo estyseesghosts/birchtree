@@ -31,20 +31,18 @@ use std::sync::Mutex;
 use crate::application::admin_infra as admin_infra_uc;
 use crate::application::auth;
 use crate::application::crypto;
-use crate::application::ports::{
-    AccountStore, AdminInfraStore, NewLocalAccount, OAuthStore,
-};
+use crate::application::ports::{AccountStore, AdminInfraStore, NewLocalAccount, OAuthStore};
 use crate::domain::account::{normalize_username, validate_username};
 use crate::domain::admin_infra::AdminEmailDomainBlock;
 use crate::domain::user::{
-    BACKUP_CODE_BYTES, BACKUP_CODE_COUNT, MAX_WEBAUTHN_CREDENTIALS_PER_ACCOUNT, INVITE_COMMENT_LIMIT, TOTP_SECRET_LEN, EmailTokenKind,
-    Invite, InviteRefusal, TotpRecord, WebauthnChallenge, WebauthnCredential, WebauthnPurpose,
-    base32_decode, base32_encode, check_date_of_birth_with_min_age, consume_backup_code_hash,
-    invite_code_from_seed, validate_time_zone, verify_totp_at, verify_webauthn_assertion,
-    verify_webauthn_registration,
+    BACKUP_CODE_BYTES, BACKUP_CODE_COUNT, EmailTokenKind, INVITE_COMMENT_LIMIT, Invite,
+    InviteRefusal, MAX_WEBAUTHN_CREDENTIALS_PER_ACCOUNT, TOTP_SECRET_LEN, TotpRecord,
+    WebauthnChallenge, WebauthnCredential, WebauthnPurpose, base32_decode, base32_encode,
+    check_date_of_birth_with_min_age, consume_backup_code_hash, invite_code_from_seed,
+    validate_time_zone, verify_totp_at, verify_webauthn_assertion, verify_webauthn_registration,
 };
 use crate::domain::{AccessToken, Account, Error, Id, LocalUser, OAuthApplication, Result};
-use crate::mailer::{MailError, Mailer};
+use crate::mailer::{MailEnv, MailError, Mailer};
 
 /// Minimum password length (Mastodon requires at least 8 characters).
 pub const MIN_PASSWORD_LEN: usize = 8;
@@ -168,9 +166,7 @@ pub fn register_account(
         return Err(Error::Forbidden("Registrations are closed".into()));
     }
     if !cmd.agreement {
-        return Err(Error::InvalidInput(
-            "agreement must be accepted".into(),
-        ));
+        return Err(Error::InvalidInput("agreement must be accepted".into()));
     }
     if cmd.email.trim().is_empty() || !cmd.email.contains('@') {
         return Err(Error::InvalidInput("email is invalid".into()));
@@ -271,7 +267,12 @@ impl InviteStore for MemoryInviteStore {
     }
 
     fn invite_by_code(&self, code: &str) -> Result<Option<Invite>> {
-        Ok(self.by_code.lock().expect("invite store").get(code).cloned())
+        Ok(self
+            .by_code
+            .lock()
+            .expect("invite store")
+            .get(code)
+            .cloned())
     }
 
     fn redeem_invite(&self, code: &str, now_ms: u64) -> Result<Invite> {
@@ -313,7 +314,11 @@ pub fn create_invite(
     now_ms: u64,
     cmd: CreateInviteCommand,
 ) -> Result<Invite> {
-    if cmd.comment.as_deref().is_some_and(|c| c.chars().count() > INVITE_COMMENT_LIMIT) {
+    if cmd
+        .comment
+        .as_deref()
+        .is_some_and(|c| c.chars().count() > INVITE_COMMENT_LIMIT)
+    {
         return Err(Error::InvalidInput(format!(
             "comment is too long (maximum is {INVITE_COMMENT_LIMIT} characters)"
         )));
@@ -344,7 +349,9 @@ pub fn create_invite(
             Err(err) => return Err(err),
         }
     }
-    Err(Error::Internal("could not mint a unique invite code".into()))
+    Err(Error::Internal(
+        "could not mint a unique invite code".into(),
+    ))
 }
 
 /// Read an invite's status: `NotFound("invite not found")` for an unknown
@@ -512,6 +519,25 @@ pub fn register_account_with_invite(
 // Email send paths (round 3, area A)
 // ---------------------------------------------------------------------------
 
+/// Registration-time mail guard: refuse public signup when confirmation mail
+/// cannot deliver.
+///
+/// Registration always enqueues a `SendConfirmationEmail` job for the new
+/// account; without a provider the job can never deliver and the user can
+/// never receive their token. Failing here (the endpoint maps this to the
+/// same explicit `503` as the resend endpoints) keeps the failure at the
+/// front door instead of stranding an unconfirmable account. Takes the mail
+/// environment rather than a bare boolean so call sites stay readable.
+pub fn check_registration_mail(env: &MailEnv) -> Result<()> {
+    if env.enabled {
+        Ok(())
+    } else {
+        Err(Error::Forbidden(
+            "Email delivery is not configured; registration is unavailable".into(),
+        ))
+    }
+}
+
 /// Queue a confirmation mail through the mailer port (called after commit,
 /// never inside the request transaction).
 pub fn request_confirmation_email(
@@ -594,17 +620,12 @@ pub trait SecondFactorStore: Send + Sync {
     fn put_totp(&self, record: TotpRecord) -> Result<TotpRecord>;
     fn delete_totp(&self, account_id: Id) -> Result<bool>;
     fn webauthn_for_account(&self, account_id: Id) -> Result<Vec<WebauthnCredential>>;
-    fn webauthn_by_credential_id(
-        &self,
-        credential_id: &[u8],
-    ) -> Result<Option<WebauthnCredential>>;
+    fn webauthn_by_credential_id(&self, credential_id: &[u8])
+    -> Result<Option<WebauthnCredential>>;
     fn put_webauthn(&self, credential: WebauthnCredential) -> Result<WebauthnCredential>;
     fn delete_webauthn(&self, account_id: Id, credential_id: &[u8]) -> Result<bool>;
     fn store_webauthn_challenge(&self, challenge: WebauthnChallenge) -> Result<()>;
-    fn take_webauthn_challenge(
-        &self,
-        challenge_b64: &str,
-    ) -> Result<Option<WebauthnChallenge>>;
+    fn take_webauthn_challenge(&self, challenge_b64: &str) -> Result<Option<WebauthnChallenge>>;
 
     // -- Email-token and mail-outbox secrets (work package 1) -------------
     //
@@ -624,7 +645,9 @@ pub trait SecondFactorStore: Send + Sync {
         _kind: EmailTokenKind,
         _now_ms: u64,
     ) -> Result<()> {
-        Err(Error::Internal("issue_email_token is not implemented".into()))
+        Err(Error::Internal(
+            "issue_email_token is not implemented".into(),
+        ))
     }
 
     /// Recover the bearer from a mail job's stored `token` field. The default
@@ -636,7 +659,9 @@ pub trait SecondFactorStore: Send + Sync {
     /// Atomically consume a confirmation bearer and mark the owner's email
     /// verified (one transaction: a failed update leaves the bearer intact).
     fn confirm_email_token(&self, _token: &str, _now_ms: u64) -> Result<LocalUser> {
-        Err(Error::Internal("confirm_email_token is not implemented".into()))
+        Err(Error::Internal(
+            "confirm_email_token is not implemented".into(),
+        ))
     }
 
     /// Atomically validate kind and lifetime, consume a reset bearer and set
@@ -648,15 +673,24 @@ pub trait SecondFactorStore: Send + Sync {
         _now_ms: u64,
         _ttl_ms: u64,
     ) -> Result<LocalUser> {
-        Err(Error::Internal("reset_password_with_token is not implemented".into()))
+        Err(Error::Internal(
+            "reset_password_with_token is not implemented".into(),
+        ))
     }
 
     /// Bounded maintenance: delete up to `limit` stale email-token rows
     /// (expired resets, bearers of accounts that no longer exist, and
     /// confirmation bearers of already-verified accounts) and redact finished
     /// mail jobs that still carry a bearer. Returns rows changed.
-    fn prune_email_secrets(&self, _now_ms: u64, _reset_ttl_ms: u64, _limit: usize) -> Result<usize> {
-        Err(Error::Internal("prune_email_secrets is not implemented".into()))
+    fn prune_email_secrets(
+        &self,
+        _now_ms: u64,
+        _reset_ttl_ms: u64,
+        _limit: usize,
+    ) -> Result<usize> {
+        Err(Error::Internal(
+            "prune_email_secrets is not implemented".into(),
+        ))
     }
 }
 
@@ -799,10 +833,7 @@ impl SecondFactorStore for MemorySecondFactorStore {
         Ok(())
     }
 
-    fn take_webauthn_challenge(
-        &self,
-        challenge_b64: &str,
-    ) -> Result<Option<WebauthnChallenge>> {
+    fn take_webauthn_challenge(&self, challenge_b64: &str) -> Result<Option<WebauthnChallenge>> {
         Ok(self
             .inner
             .lock()
@@ -884,9 +915,8 @@ pub fn confirm_totp(
     }
     let secret = base32_decode(&record.secret_base32)
         .map_err(|_| Error::InvalidInput("second-factor enrollment is corrupt".into()))?;
-    let counter = verify_totp_at(&secret, code, now_ms, record.last_counter).ok_or_else(|| {
-        Error::InvalidInput(INVALID_2FA_MESSAGE.into())
-    })?;
+    let counter = verify_totp_at(&secret, code, now_ms, record.last_counter)
+        .ok_or_else(|| Error::InvalidInput(INVALID_2FA_MESSAGE.into()))?;
     record.confirmed = true;
     record.last_counter = counter;
     let codes = mint_backup_codes();
@@ -969,8 +999,7 @@ pub fn login_with_mfa(
     now_ms: u64,
 ) -> Result<LoginOutcome> {
     let invalid_password = || Error::Unauthorized("Invalid username or password".into());
-    let Some(user) = auth::authenticate_password(accounts, username, domain, password)?
-    else {
+    let Some(user) = auth::authenticate_password(accounts, username, domain, password)? else {
         dummy_mfa_verify(now_ms);
         return Err(invalid_password());
     };
@@ -1022,9 +1051,7 @@ pub fn finish_webauthn_registration(
     let challenge = store
         .take_webauthn_challenge(challenge_b64)?
         .ok_or_else(|| {
-            Error::InvalidInput(
-                "WebAuthn challenge is unknown, expired, or already used".into(),
-            )
+            Error::InvalidInput("WebAuthn challenge is unknown, expired, or already used".into())
         })?;
     let parsed = verify_webauthn_registration(
         rp_id,
@@ -1088,9 +1115,7 @@ pub fn finish_webauthn_authentication(
     let challenge = store
         .take_webauthn_challenge(challenge_b64)?
         .ok_or_else(|| {
-            Error::InvalidInput(
-                "WebAuthn challenge is unknown, expired, or already used".into(),
-            )
+            Error::InvalidInput("WebAuthn challenge is unknown, expired, or already used".into())
         })?;
     let mut credential = store
         .webauthn_by_credential_id(credential_id)?
@@ -1210,7 +1235,12 @@ pub fn register_account_with_profile(
     profile: &RegistrationProfile,
     cmd: RegisterAccountCommand,
 ) -> Result<RegisteredAccount> {
-    if let Some(time_zone) = profile.time_zone.as_deref().map(str::trim).filter(|tz| !tz.is_empty()) {
+    if let Some(time_zone) = profile
+        .time_zone
+        .as_deref()
+        .map(str::trim)
+        .filter(|tz| !tz.is_empty())
+    {
         validate_time_zone(time_zone)?;
     }
     if let Some(date_of_birth) = profile
@@ -1243,10 +1273,11 @@ pub fn register_account_with_profile(
             .collect()
     };
     let canonical_hash = admin_infra_uc::canonical_email_hash(&cmd.email);
-    let canonical_blocked = !infra.admin_canonical_blocks_for_hash(&canonical_hash)?.is_empty();
-    let force_approval =
-        check_registration_email(&domain_blocks, canonical_blocked, &cmd.email)?
-            == EmailPolicyOutcome::RequireApproval;
+    let canonical_blocked = !infra
+        .admin_canonical_blocks_for_hash(&canonical_hash)?
+        .is_empty();
+    let force_approval = check_registration_email(&domain_blocks, canonical_blocked, &cmd.email)?
+        == EmailPolicyOutcome::RequireApproval;
     register_account_with_invite(
         accounts,
         oauth,

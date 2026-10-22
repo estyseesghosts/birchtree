@@ -36,9 +36,36 @@ use std::io::Cursor;
 use image::imageops::FilterType;
 use image::{GenericImageView, ImageFormat};
 
+use crate::media::upload_gate::media_work_gate;
+
 /// Bounding box of the generated `small` preview (Mastodon: "resize to fit
 /// 460x460").
 const PREVIEW_BOUND: u32 = 460;
+
+/// Largest number of concurrent blocking media jobs on the shared pool: the
+/// same gate the HTTP upload path uses
+/// ([`crate::media::upload_gate::MediaWorkGate`]), so a burst of remote
+/// fetches enqueueing `ProcessMedia` rows shares one global bound with local
+/// uploads instead of each path bursting the blocking pool on its own.
+pub const MAX_MEDIA_BLOCKING_JOBS: usize = crate::media::upload_gate::DEFAULT_MEDIA_WORK_LIMIT;
+
+/// Run CPU-bound media work (the decode/resize/encode in [`process`]) on the
+/// shared bounded blocking pool.
+///
+/// Image decode, Lanczos resize and BlurHash are blocking work: running them
+/// on the async executor would stall every other task, and spawning them
+/// unbounded would let a burst of remote fetches starve Tokio. The gate
+/// queues async callers (no thread is held while waiting) and runs the
+/// closure on the blocking pool, at most [`MAX_MEDIA_BLOCKING_JOBS`] at a
+/// time — the same bound the HTTP upload path takes, so remote influx and
+/// local uploads cannot each saturate the pool independently.
+pub async fn run_bounded_blocking<T, F>(work: F) -> crate::domain::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    media_work_gate().run(work).await
+}
 
 /// A processing failure, classified the way Mastodon's upload rescues are.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -281,7 +308,9 @@ pub fn mp4_dimensions(bytes: &[u8]) -> (Option<u32>, Option<u32>) {
 /// Walk the ISO-BMFF box tree for a `tkhd` box with a positive size.
 fn find_tkhd_size(bytes: &[u8]) -> Option<(Option<u32>, Option<u32>)> {
     // Container boxes a `tkhd` can live in (`moov/trak/...`).
-    const CONTAINERS: [&[u8; 4]; 7] = [b"moov", b"trak", b"mdia", b"minf", b"stbl", b"edts", b"udta"];
+    const CONTAINERS: [&[u8; 4]; 7] = [
+        b"moov", b"trak", b"mdia", b"minf", b"stbl", b"edts", b"udta",
+    ];
     let mut offset = 0usize;
     while offset + 8 <= bytes.len() {
         let size = u32::from_be_bytes(bytes[offset..offset + 4].try_into().ok()?) as u64;
@@ -338,10 +367,7 @@ fn tkhd_size(content: &[u8]) -> (Option<u32>, Option<u32>) {
     let tail = &content[content.len() - 8..];
     let width = u32::from_be_bytes(tail[0..4].try_into().ok().unwrap()) >> 16;
     let height = u32::from_be_bytes(tail[4..8].try_into().ok().unwrap()) >> 16;
-    (
-        (width > 0).then_some(width),
-        (height > 0).then_some(height),
-    )
+    ((width > 0).then_some(width), (height > 0).then_some(height))
 }
 
 #[cfg(test)]
@@ -355,11 +381,9 @@ mod tests {
     }
 
     fn fixture(format: ImageFormat) -> Vec<u8> {
-        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(
-            24,
-            12,
-            |x, y| image::Rgba([(x * 10) as u8, (y * 20) as u8, 128, 255]),
-        ));
+        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(24, 12, |x, y| {
+            image::Rgba([(x * 10) as u8, (y * 20) as u8, 128, 255])
+        }));
         let img = if format == ImageFormat::Jpeg {
             image::DynamicImage::ImageRgb8(img.to_rgb8())
         } else {
@@ -392,10 +416,7 @@ mod tests {
         let webp = process("image/webp", &fixture(ImageFormat::WebP)).expect("webp");
         assert_eq!(webp.preview.as_ref().unwrap().mime_type, "image/webp");
         // Small images are not upscaled.
-        assert_eq!(
-            (jpeg.width, jpeg.height),
-            (Some(24), Some(12))
-        );
+        assert_eq!((jpeg.width, jpeg.height), (Some(24), Some(12)));
     }
 
     #[test]
@@ -434,11 +455,7 @@ mod tests {
     fn mp4_dimensions_from_tkhd_box() {
         // moov > trak > tkhd; payload ends with 16.16 width/height.
         let mut tkhd = vec![0u8; 84];
-        let tail = [
-            (640u32 << 16).to_be_bytes(),
-            (480u32 << 16).to_be_bytes(),
-        ]
-        .concat();
+        let tail = [(640u32 << 16).to_be_bytes(), (480u32 << 16).to_be_bytes()].concat();
         tkhd[76..84].copy_from_slice(&tail);
         let mut trak = Vec::new();
         trak.extend_from_slice(&((tkhd.len() + 8) as u32).to_be_bytes());
@@ -468,8 +485,11 @@ mod tests {
         let ogg = process("audio/ogg", b"OggS some audio bytes here").expect("ogg");
         assert_eq!((ogg.width, ogg.height), (None, None));
         assert!(ogg.preview.is_none());
-        let webm = process("video/webm", &[0x1A, 0x45, 0xDF, 0xA3, 0, 0, 0, 0, 0, 0, 0, 0])
-            .expect("webm");
+        let webm = process(
+            "video/webm",
+            &[0x1A, 0x45, 0xDF, 0xA3, 0, 0, 0, 0, 0, 0, 0, 0],
+        )
+        .expect("webm");
         assert_eq!((webm.width, webm.height), (None, None));
     }
 

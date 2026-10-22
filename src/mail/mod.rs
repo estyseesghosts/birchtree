@@ -5,41 +5,54 @@
 //! worker delivers the message after commit. No network I/O happens inside the
 //! request transaction.
 //!
-//! Phase 2 ships a logging adapter. A real SMTP provider is configured by
-//! swapping this adapter; the port and job envelope stay the same.
+//! When no SMTP provider is configured, sending is explicitly refused: the
+//! worker maps the error to retry-then-quarantine (operator-visible), never a
+//! silent fake success. Production startup additionally refuses open
+//! registrations without a provider (see
+//! [`crate::mailer::require_mail_for_open_registration`]); the proposed
+//! `main.rs` wiring is in the area report.
 
 use crate::application::ports::MailSender;
-use crate::domain::{Id, Result};
+use crate::domain::{Error, Id, Result};
 use crate::mailer::{MailError, Mailer};
 
-/// A `MailSender` that records messages in the log without sending them.
+/// Development-only [`MailSender`] that refuses every send.
 ///
-/// This is the default Phase 2 adapter (no SMTP transport is configured). It is
-/// deliberately explicit rather than a silent no-op: the message body is logged
-/// so an operator can complete the confirmation out of band.
+/// There is deliberately no logging-success path: when no SMTP provider is
+/// configured, the confirmation job must stay retryable (the worker maps the
+/// error to retry, then quarantine) rather than complete as if the user had
+/// been mailed. Production startup additionally refuses open registrations
+/// without a provider, so this adapter only ever fires on a misconfigured or
+/// lab node — loudly.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LoggingMailSender;
 
+impl LoggingMailSender {
+    /// Recipient domain for log lines (never the full address: PII).
+    fn recipient_domain(to: &str) -> &str {
+        to.rsplit('@').next().unwrap_or("")
+    }
+}
+
+/// Refuse a send: warn (domain only, no token, no address) and return a
+/// retryable error for the worker.
+fn refused(reason: &str, account_id: Id, to: &str) -> Error {
+    tracing::warn!(
+        account_id = %account_id,
+        recipient_domain = %LoggingMailSender::recipient_domain(to),
+        reason = %reason,
+        "mail not sent: no SMTP provider configured",
+    );
+    Error::Internal("email delivery is not configured (no SMTP provider)".to_string())
+}
+
 impl MailSender for LoggingMailSender {
-    fn send_confirmation(&self, to: &str, account_id: Id, token: &str) -> Result<()> {
-        tracing::info!(
-            account_id = %account_id,
-            recipient = %to,
-            // The token is a one-time secret; log only that one was issued.
-            token_issued = !token.is_empty(),
-            "confirmation email queued (logging adapter; no SMTP configured)"
-        );
-        Ok(())
+    fn send_confirmation(&self, to: &str, account_id: Id, _token: &str) -> Result<()> {
+        Err(refused("confirmation", account_id, to))
     }
 
-    fn send_password_reset(&self, to: &str, account_id: Id, token: &str) -> Result<()> {
-        tracing::info!(
-            account_id = %account_id,
-            recipient = %to,
-            token_issued = !token.is_empty(),
-            "password-reset email queued (logging adapter; no SMTP configured)"
-        );
-        Ok(())
+    fn send_password_reset(&self, to: &str, account_id: Id, _token: &str) -> Result<()> {
+        Err(refused("password-reset", account_id, to))
     }
 }
 
@@ -79,4 +92,34 @@ impl MailSender for SmtpJobSender {
 
 fn domain_mail_error(err: MailError) -> crate::domain::Error {
     err.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logging_adapter_never_reports_success() {
+        let sender = LoggingMailSender;
+        let err = sender
+            .send_confirmation("user@example.com", Id::new(1), "secret-token")
+            .expect_err("no provider must fail, never fake success");
+        assert!(matches!(err, Error::Internal(_)));
+        let err = sender
+            .send_password_reset("user@example.com", Id::new(1), "secret-token")
+            .expect_err("no provider must fail, never fake success");
+        assert!(matches!(err, Error::Internal(_)));
+    }
+
+    #[test]
+    fn recipient_domain_never_carries_the_local_part() {
+        assert_eq!(
+            LoggingMailSender::recipient_domain("user@example.com"),
+            "example.com"
+        );
+        assert_eq!(
+            LoggingMailSender::recipient_domain("no-at-sign"),
+            "no-at-sign"
+        );
+    }
 }

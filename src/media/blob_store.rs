@@ -149,7 +149,12 @@ impl FsBlobStore {
         let seq: u64 = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let name: String = dest
             .file_name()
-            .map(|n| n.to_string_lossy().chars().take(MAX_STAGING_STEM_LEN).collect())
+            .map(|n| {
+                n.to_string_lossy()
+                    .chars()
+                    .take(MAX_STAGING_STEM_LEN)
+                    .collect()
+            })
             .unwrap_or_else(|| "blob".to_string());
         dest.with_file_name(format!(".{name}.part-{}-{seq}", std::process::id()))
     }
@@ -191,9 +196,8 @@ impl FsBlobStore {
         } else {
             file.write_all(bytes)
         };
-        written.map_err(|err| {
-            Error::Storage(format!("write tmp blob {}: {err}", tmp.display()))
-        })?;
+        written
+            .map_err(|err| Error::Storage(format!("write tmp blob {}: {err}", tmp.display())))?;
 
         self.check_fault(StageFault::AtSync)?;
         file.sync_all()
@@ -261,6 +265,41 @@ impl FsBlobStore {
     /// or not a regular file.
     pub fn open_read(&self, key: &str) -> Result<Option<File>> {
         open_read_in_root(&self.root, key)
+    }
+
+    /// Open a blob for reading plus its length (`None` when missing or not
+    /// a regular file). The streaming serve path uses this so a `Range`
+    /// seeks instead of buffering the whole blob.
+    pub fn open_at(&self, key: &str) -> Result<Option<(File, u64)>> {
+        let Some(file) = self.open_read(key)? else {
+            return Ok(None);
+        };
+        let len: u64 = file
+            .metadata()
+            .map_err(|err| Error::Storage(format!("stat blob {key}: {err}")))?
+            .len();
+        Ok(Some((file, len)))
+    }
+
+    /// Read at most `len` bytes starting at `offset`, plus the total blob
+    /// length for `Content-Range` (`None` when missing). Seeks instead of
+    /// buffering: serving a 64 KiB range of a 40 MiB remote allocates ~64
+    /// KiB, never 40 MiB. Offsets past the end read zero bytes.
+    pub fn read_range(&self, key: &str, offset: u64, len: u64) -> Result<Option<(Vec<u8>, u64)>> {
+        use std::io::{Read as _, Seek as _};
+
+        let Some((mut file, total)) = self.open_at(key)? else {
+            return Ok(None);
+        };
+        let start: u64 = offset.min(total);
+        let count: u64 = total.saturating_sub(start).min(len);
+        file.seek(std::io::SeekFrom::Start(start))
+            .map_err(|err| Error::Storage(format!("seek blob {key}: {err}")))?;
+        let mut bytes: Vec<u8> = Vec::new();
+        file.take(count)
+            .read_to_end(&mut bytes)
+            .map_err(|err| Error::Storage(format!("read blob range {key}: {err}")))?;
+        Ok(Some((bytes, total)))
     }
 
     /// Size in bytes of a stored blob (`None` when missing).
@@ -715,6 +754,27 @@ mod tests {
         assert!(validate_key("ab/cd/0123456789abcdef/original.jpg").is_ok());
         assert!(validate_key("remote/42").is_ok());
         assert!(validate_key("custom_emojis/images/6b/65/key@host.example/a.png").is_ok());
+    }
+
+    #[test]
+    fn range_reads_seek_without_buffering_the_blob() {
+        let (_dir, store) = open_store();
+        let bytes: Vec<u8> = (0..1024u32).map(|i| (i % 251) as u8).collect();
+        store.put("remote/42", &bytes).unwrap();
+        let (head, total) = store.read_range("remote/42", 0, 64).unwrap().unwrap();
+        assert_eq!(total, 1024);
+        assert_eq!(head, bytes[..64]);
+        let (mid, total) = store.read_range("remote/42", 100, 10).unwrap().unwrap();
+        assert_eq!(total, 1024);
+        assert_eq!(mid, bytes[100..110]);
+        // Clamped at the end, and past-the-end reads zero bytes.
+        let (tail, _) = store.read_range("remote/42", 1000, 4096).unwrap().unwrap();
+        assert_eq!(tail, bytes[1000..]);
+        let (empty, total) = store.read_range("remote/42", 2048, 64).unwrap().unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(total, 1024);
+        assert!(store.read_range("remote/missing", 0, 64).unwrap().is_none());
+        assert!(store.read_range("../escape", 0, 64).is_err());
     }
 
     #[test]

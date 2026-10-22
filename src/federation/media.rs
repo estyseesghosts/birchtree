@@ -9,12 +9,15 @@
 //! deletes the row's own `remote/{media_id}` key (per-row keys retained, no
 //! sharing, no refcount; durable local media is never touched).
 //!
-//! The fetch is instance-actor-signed on every hop ([`get_signed`]): when an
-//! instance actor is configured each `GET` (initial URL and each redirect
-//! target) carries its HTTP signature, so authorized-fetch peers accept the
-//! dereference; without a configured actor the fetch is an unsigned `GET`
-//! with `Accept: */*`. Every hop is revalidated against the SSRF URL policy
-//! before it is requested.
+//! The fetch is instance-actor-signed on same-origin hops ([`get_signed`]):
+//! when an instance actor is configured each `GET` whose URL shares the
+//! initial URL's origin carries its HTTP signature, so authorized-fetch peers
+//! accept the dereference; without a configured actor the fetch is an unsigned
+//! `GET` with `Accept: */*`. A redirect that leaves the initial origin is
+//! still followed while the SSRF URL policy allows it, but unsigned (the
+//! strip is logged): the signature authenticates us to the media's own host,
+//! and an unrelated third party must never receive it. Every hop is
+//! revalidated against the SSRF URL policy before it is requested.
 //!
 //! The enforcement shape is unchanged: SSRF URL policy, the resolver's
 //! connect checks, `redirect(Policy::none)` with 5s/10s timeouts
@@ -46,26 +49,58 @@ const ATTACHMENT_VARIANT: &str = "original";
 /// Redirect hops followed for one attachment (each hop is revalidated).
 pub const MAX_REDIRECT_HOPS: usize = 5;
 
-/// `GET` a remote attachment, signed with the instance actor when one is
-/// configured, following redirects manually under the URL policy.
+/// Whether a redirect hop keeps the instance-actor HTTP signature.
+///
+/// Policy: sign only same-origin hops, where same-origin means the hop's URL
+/// shares the initial URL's origin (scheme, host, port). A hop that leaves
+/// the origin is still fetched when the SSRF URL policy allows it — it is
+/// public, just unrelated — but without the `Signature` header, so a
+/// third-party host never receives an authentication token minted for someone
+/// else. There is no opt-in to re-sign cross-origin hops.
+///
+/// This is distinct from SSRF refusal: a non-public hop is never requested at
+/// all ([`crate::federation::policy::check_url`] quarantines it first); a
+/// cross-origin public hop is requested unsigned, and the strip is logged by
+/// [`get_signed`].
+pub fn redirect_keeps_signature(first: &Url, next: &Url) -> bool {
+    first.origin() == next.origin()
+}
+
+/// `GET` a remote attachment, signed with the instance actor on same-origin
+/// hops, following redirects manually under the URL policy.
 async fn get_signed(
     config: &activitypub_federation::config::FederationConfig<FedContext>,
     first_url: Url,
 ) -> std::result::Result<reqwest::Response, DeliveryError> {
     let ctx: &FedContext = config;
     let data = config.to_request_data();
+    let first = first_url.clone();
     let mut url = first_url;
     for _hop in 0..=MAX_REDIRECT_HOPS {
         policy::check_url(&url, ctx.http.allow_http, &ctx.http.allowlist)
             .map_err(|e| DeliveryError::Quarantine(format!("attachment url refused: {e}")))?;
-        let response = if data.can_sign_requests() {
+        let same_origin = redirect_keeps_signature(&first, &url);
+        if data.can_sign_requests() && !same_origin {
+            tracing::info!(
+                target: "birchtree::federation",
+                direction = "inbound",
+                kind = "FetchRemoteMedia",
+                from_host = first.host_str().unwrap_or("-"),
+                to_host = url.host_str().unwrap_or("-"),
+                outcome = "signature_stripped",
+                "attachment redirect leaves the initial origin, fetching unsigned"
+            );
+        }
+        let response = if data.can_sign_requests() && same_origin {
             let builder = reqwest_middleware::ClientWithMiddleware::from(ctx.media_client.clone())
                 .get(url.as_str())
                 .header(reqwest::header::ACCEPT, "*/*");
             let request = data
                 .sign_request(builder, Bytes::new())
                 .await
-                .map_err(|e| DeliveryError::Retry(format!("signing the attachment fetch failed: {e}")))?;
+                .map_err(|e| {
+                    DeliveryError::Retry(format!("signing the attachment fetch failed: {e}"))
+                })?;
             ctx.media_client.execute(request).await
         } else {
             ctx.media_client
@@ -82,12 +117,16 @@ async fn get_signed(
             .headers()
             .get(reqwest::header::LOCATION)
             .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| DeliveryError::Quarantine("attachment redirect has no location".into()))?;
-        url = url
-            .join(location)
-            .map_err(|e| DeliveryError::Quarantine(format!("attachment redirect is invalid: {e}")))?;
+            .ok_or_else(|| {
+                DeliveryError::Quarantine("attachment redirect has no location".into())
+            })?;
+        url = url.join(location).map_err(|e| {
+            DeliveryError::Quarantine(format!("attachment redirect is invalid: {e}"))
+        })?;
     }
-    Err(DeliveryError::Quarantine("attachment redirected too many times".into()))
+    Err(DeliveryError::Quarantine(
+        "attachment redirected too many times".into(),
+    ))
 }
 
 /// Per-row blob key for a remote attachment (retained v1 decision: no
@@ -114,9 +153,9 @@ fn lock_ledger() -> Result<std::sync::MutexGuard<'static, CacheLedger>, Delivery
 /// (quarantine, like the existing failure arms below).
 fn ledger_outcome(err: CacheError) -> DeliveryError {
     match &err {
-        CacheError::BudgetExhausted { .. }
-        | CacheError::Store(_)
-        | CacheError::OriginDown(_) => DeliveryError::Retry(err.message()),
+        CacheError::BudgetExhausted { .. } | CacheError::Store(_) | CacheError::OriginDown(_) => {
+            DeliveryError::Retry(err.message())
+        }
         CacheError::Oversize { .. } | CacheError::Unsupported(_) | CacheError::Missing(_) => {
             DeliveryError::Quarantine(err.message())
         }
@@ -187,14 +226,24 @@ pub async fn fetch(
     let source = match store.remote_media_source(media_id).map_err(retry)? {
         Some(s) => s,
         None => {
-            let _ = store.mark_remote_media_failed(media_id, "attachment has no source", ctx.app.now_ms());
+            let _ = store.mark_remote_media_failed(
+                media_id,
+                "attachment has no source",
+                ctx.app.now_ms(),
+            );
             return Err(DeliveryError::Quarantine("attachment has no source".into()));
         }
     };
     let url = Url::parse(&source).map_err(|e| DeliveryError::Quarantine(e.to_string()))?;
     if let Err(e) = policy::check_url(&url, ctx.http.allow_http, &ctx.http.allowlist) {
-        let _ = store.mark_remote_media_failed(media_id, &format!("attachment url refused: {e}"), ctx.app.now_ms());
-        return Err(DeliveryError::Quarantine(format!("attachment url refused: {e}")));
+        let _ = store.mark_remote_media_failed(
+            media_id,
+            &format!("attachment url refused: {e}"),
+            ctx.app.now_ms(),
+        );
+        return Err(DeliveryError::Quarantine(format!(
+            "attachment url refused: {e}"
+        )));
     }
 
     let key = cache_key_for(media_id);
@@ -219,9 +268,9 @@ pub async fn fetch(
                         class: MediaClass::Full,
                         size: bytes.len() as u64,
                         last_use_ms: now,
-                        expiry_ms: now.saturating_add(MediaClass::Full.retention_ms(
-                            &RemoteCacheConfig::default(),
-                        )),
+                        expiry_ms: now.saturating_add(
+                            MediaClass::Full.retention_ms(&RemoteCacheConfig::default()),
+                        ),
                         etag: None,
                         has_bytes: true,
                     };
@@ -274,7 +323,9 @@ pub async fn fetch(
                             .map_err(|e| DeliveryError::Retry(e.to_string()))?;
                     }
                     let mut ledger = lock_ledger()?;
-                    ledger.reserve(MediaClass::Full, reserved).map_err(ledger_outcome)?;
+                    ledger
+                        .reserve(MediaClass::Full, reserved)
+                        .map_err(ledger_outcome)?;
                 }
                 Err(evict_err) => {
                     let _ = err;
@@ -294,18 +345,29 @@ pub async fn fetch(
         e
     })?;
     let status = response.status();
-    if status.is_server_error() || status == reqwest::StatusCode::REQUEST_TIMEOUT || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+    if status.is_server_error()
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+    {
         if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
             release(&mut ledger, reserved);
         }
-        return Err(DeliveryError::Retry(format!("attachment server answered {status}")));
+        return Err(DeliveryError::Retry(format!(
+            "attachment server answered {status}"
+        )));
     }
     if !status.is_success() {
         if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
             release(&mut ledger, reserved);
         }
-        let _ = store.mark_remote_media_failed(media_id, &format!("attachment server answered {status}"), ctx.app.now_ms());
-        return Err(DeliveryError::Quarantine(format!("attachment server answered {status}")));
+        let _ = store.mark_remote_media_failed(
+            media_id,
+            &format!("attachment server answered {status}"),
+            ctx.app.now_ms(),
+        );
+        return Err(DeliveryError::Quarantine(format!(
+            "attachment server answered {status}"
+        )));
     }
     // `Content-Length` is advisory: shrink the reservation to the declared
     // size, but keep the streaming abort below for dishonest lengths.
@@ -314,8 +376,14 @@ pub async fn fetch(
             if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
                 release(&mut ledger, reserved);
             }
-            let _ = store.mark_remote_media_failed(media_id, "attachment is larger than the limit", ctx.app.now_ms());
-            return Err(DeliveryError::Quarantine("attachment is larger than the limit".into()));
+            let _ = store.mark_remote_media_failed(
+                media_id,
+                "attachment is larger than the limit",
+                ctx.app.now_ms(),
+            );
+            return Err(DeliveryError::Quarantine(
+                "attachment is larger than the limit".into(),
+            ));
         }
         if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
             release(&mut ledger, reserved.saturating_sub(declared));
@@ -449,7 +517,9 @@ pub async fn fetch(
                     "attachment row is missing",
                     ctx.app.now_ms(),
                 );
-                return Err(DeliveryError::Quarantine("attachment row is missing".into()));
+                return Err(DeliveryError::Quarantine(
+                    "attachment row is missing".into(),
+                ));
             }
         }
     }
@@ -466,8 +536,14 @@ pub async fn fetch(
             if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
                 release(&mut ledger, reserved);
             }
-            let _ = store.mark_remote_media_failed(media_id, "attachment is larger than the limit", ctx.app.now_ms());
-            return Err(DeliveryError::Quarantine("attachment is larger than the limit".into()));
+            let _ = store.mark_remote_media_failed(
+                media_id,
+                "attachment is larger than the limit",
+                ctx.app.now_ms(),
+            );
+            return Err(DeliveryError::Quarantine(
+                "attachment is larger than the limit".into(),
+            ));
         }
         body.extend_from_slice(&chunk);
     }
@@ -477,19 +553,23 @@ pub async fn fetch(
             if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
                 release(&mut ledger, reserved);
             }
-            let _ = store.mark_remote_media_failed(media_id, "attachment is not a supported media file", ctx.app.now_ms());
-            return Err(DeliveryError::Quarantine("attachment is not a supported media file".into()));
+            let _ = store.mark_remote_media_failed(
+                media_id,
+                "attachment is not a supported media file",
+                ctx.app.now_ms(),
+            );
+            return Err(DeliveryError::Quarantine(
+                "attachment is not a supported media file".into(),
+            ));
         }
     };
 
-    cache_store(ctx)
-        .put(&key, &body)
-        .map_err(|e| {
-            if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
-                release(&mut ledger, reserved);
-            }
-            DeliveryError::Retry(e.to_string())
-        })?;
+    cache_store(ctx).put(&key, &body).map_err(|e| {
+        if let Ok(mut ledger) = remote_cache::process_ledger().lock() {
+            release(&mut ledger, reserved);
+        }
+        DeliveryError::Retry(e.to_string())
+    })?;
     // Settle the reservation into stored bytes, then stage the row (which
     // enqueues `ProcessMedia`, preserving the existing chain).
     let entry = remote_cache::RemoteCacheEntry::stored(
@@ -526,8 +606,14 @@ pub async fn fetch(
                     crate::persistence::redb::schema::remote_cache_key(&source, ATTACHMENT_VARIANT);
                 ledger.evict_one(&cache_key);
             }
-            let _ = store.mark_remote_media_failed(media_id, "attachment row is missing", ctx.app.now_ms());
-            Err(DeliveryError::Quarantine("attachment row is missing".into()))
+            let _ = store.mark_remote_media_failed(
+                media_id,
+                "attachment row is missing",
+                ctx.app.now_ms(),
+            );
+            Err(DeliveryError::Quarantine(
+                "attachment row is missing".into(),
+            ))
         }
     }
 }
@@ -564,7 +650,11 @@ pub fn split_remote_emoji_shortcode(stored: &str) -> Option<(&str, &str)> {
 /// Validate one remote emoji reference before any fetch: shortcode shape
 /// (Mastodon `SHORTCODE_RE_FRAGMENT`), a non-empty origin domain, and an
 /// `http(s)` source URL without credentials. Returns the parsed source URL.
-pub fn validate_remote_emoji(shortcode: &str, domain: &str, source_url: &str) -> Result<Url, String> {
+pub fn validate_remote_emoji(
+    shortcode: &str,
+    domain: &str,
+    source_url: &str,
+) -> Result<Url, String> {
     if !crate::domain::CustomEmoji::shortcode_valid(shortcode) {
         return Err("remote emoji shortcode is not valid".into());
     }
@@ -608,7 +698,10 @@ pub async fn fetch_remote_emoji_bytes(
     }
     let response = client
         .get(url.clone())
-        .header(reqwest::header::ACCEPT, "image/png,image/gif,image/webp,image/*,*/*")
+        .header(
+            reqwest::header::ACCEPT,
+            "image/png,image/gif,image/webp,image/*,*/*",
+        )
         .send()
         .await
         .map_err(|e| DeliveryError::Retry(e.to_string()))?;
@@ -617,28 +710,40 @@ pub async fn fetch_remote_emoji_bytes(
         || status == reqwest::StatusCode::REQUEST_TIMEOUT
         || status == reqwest::StatusCode::TOO_MANY_REQUESTS
     {
-        return Err(DeliveryError::Retry(format!("emoji server answered {status}")));
+        return Err(DeliveryError::Retry(format!(
+            "emoji server answered {status}"
+        )));
     }
     if !status.is_success() {
-        return Err(DeliveryError::Quarantine(format!("emoji server answered {status}")));
+        return Err(DeliveryError::Quarantine(format!(
+            "emoji server answered {status}"
+        )));
     }
     if let Some(declared) = response.content_length()
         && declared > MAX_REMOTE_EMOJI_BYTES
     {
-        return Err(DeliveryError::Quarantine("emoji is larger than the limit".into()));
+        return Err(DeliveryError::Quarantine(
+            "emoji is larger than the limit".into(),
+        ));
     }
     let mut body: Vec<u8> = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| DeliveryError::Retry(e.to_string()))?;
         if body.len() as u64 + chunk.len() as u64 > MAX_REMOTE_EMOJI_BYTES {
-            return Err(DeliveryError::Quarantine("emoji is larger than the limit".into()));
+            return Err(DeliveryError::Quarantine(
+                "emoji is larger than the limit".into(),
+            ));
         }
         body.extend_from_slice(&chunk);
     }
     let mime = match ingest::sniff(&body) {
         Some(sniffed) if ingest::is_emoji_image(&body) => sniffed.mime_type,
-        _ => return Err(DeliveryError::Quarantine("emoji is not a supported image".into())),
+        _ => {
+            return Err(DeliveryError::Quarantine(
+                "emoji is not a supported image".into(),
+            ));
+        }
     };
     Ok((body, mime))
 }
@@ -721,7 +826,10 @@ mod tests {
         let cfg = RemoteCacheConfig::default();
         assert!(!cfg.warming);
         assert!(!should_warm(&cfg, false));
-        let on = RemoteCacheConfig { warming: true, ..RemoteCacheConfig::default() };
+        let on = RemoteCacheConfig {
+            warming: true,
+            ..RemoteCacheConfig::default()
+        };
         assert!(should_warm(&on, false));
         assert!(!should_warm(&on, true));
     }

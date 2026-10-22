@@ -19,14 +19,16 @@ use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
 use crate::api::forms::LenientForm;
+use crate::api::mastodon::ApiState;
 use crate::api::mastodon::auth::Auth;
 use crate::api::mastodon::errors::{ApiError, ApiResult};
-use crate::api::mastodon::ApiState;
 use crate::application::conversations::known_alert_types;
 use crate::application::ports::Store;
 use crate::application::push;
-use crate::domain::conversation::{validate_push_endpoint, validate_push_keys};
+use crate::application::push_client;
+use crate::application::push_client::PushClientConfig;
 use crate::domain::Id;
+use crate::domain::conversation::{validate_push_endpoint, validate_push_keys};
 
 /// Push endpoints take the single `push` scope (upstream
 /// `doorkeeper_authorize! :push`).
@@ -66,15 +68,25 @@ async fn actor(auth: &Auth) -> ApiResult<Actor> {
     })
 }
 
-fn subscription_params(
+/// Parse and SSRF-validate the subscription half of the form: the endpoint
+/// must be an `https://` URL whose host resolves only to diallable addresses
+/// (loopback, private, link-local and the other prohibited ranges are
+/// refused), and the keys must decode to the right shapes. Runs DNS, so it
+/// is async.
+async fn subscription_params(
     pairs: &[(String, String)],
 ) -> Result<(String, String, String, bool), Response> {
     let endpoint = crate::api::forms::get(pairs, "subscription[endpoint]").unwrap_or("");
     let p256dh = crate::api::forms::get(pairs, "subscription[keys][p256dh]").unwrap_or("");
     let auth = crate::api::forms::get(pairs, "subscription[keys][auth]").unwrap_or("");
-    let standard = crate::api::forms::get(pairs, "subscription[standard]")
-        .is_some_and(bool_cast);
+    let standard = crate::api::forms::get(pairs, "subscription[standard]").is_some_and(bool_cast);
     if let Err(message) = validate_push_endpoint(endpoint) {
+        return Err(validation_failed(message));
+    }
+    if let Err(message) =
+        push_client::validate_endpoint_for_subscription(endpoint, &PushClientConfig::default())
+            .await
+    {
         return Err(validation_failed(message));
     }
     if let Err(message) = validate_push_keys(p256dh, auth) {
@@ -111,7 +123,7 @@ pub async fn create(
         Ok(actor) => actor,
         Err(err) => return err.into_response(),
     };
-    let (endpoint, p256dh, auth_key, standard) = match subscription_params(&pairs) {
+    let (endpoint, p256dh, auth_key, standard) = match subscription_params(&pairs).await {
         Ok(params) => params,
         Err(response) => return response,
     };
@@ -129,10 +141,11 @@ pub async fn create(
         Some(state.server.public_url.as_str()),
         state.context.now_ms(),
     ) {
-        Ok(subscription) => {
-            axum::Json(push::subscription_json(&subscription, &state.server.vapid_public_key))
-                .into_response()
-        }
+        Ok(subscription) => axum::Json(push::subscription_json(
+            &subscription,
+            &state.server.vapid_public_key,
+        ))
+        .into_response(),
         Err(err) => ApiError::from(err).into_response(),
     }
 }
@@ -154,10 +167,11 @@ pub async fn show(State(state): State<ApiState>, auth: Auth) -> Response {
         state.context.now_ms(),
     );
     match store.push_subscription_by_token(actor.token_id) {
-        Ok(Some(subscription)) => {
-            axum::Json(push::subscription_json(&subscription, &state.server.vapid_public_key))
-                .into_response()
-        }
+        Ok(Some(subscription)) => axum::Json(push::subscription_json(
+            &subscription,
+            &state.server.vapid_public_key,
+        ))
+        .into_response(),
         Ok(None) => no_subscription(),
         Err(err) => ApiError::from(err).into_response(),
     }
@@ -190,10 +204,11 @@ pub async fn update(
         alerts,
         state.context.now_ms(),
     ) {
-        Ok(Some(subscription)) => {
-            axum::Json(push::subscription_json(&subscription, &state.server.vapid_public_key))
-                .into_response()
-        }
+        Ok(Some(subscription)) => axum::Json(push::subscription_json(
+            &subscription,
+            &state.server.vapid_public_key,
+        ))
+        .into_response(),
         Ok(None) => no_subscription(),
         Err(err) => ApiError::from(err).into_response(),
     }

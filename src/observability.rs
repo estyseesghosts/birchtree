@@ -23,7 +23,9 @@ pub fn init_with_default(default: &str) {
 /// Redact an `Authorization` header value, preserving the scheme only.
 pub fn redact_authorization(value: &str) -> String {
     match value.split_once(' ') {
-        Some((scheme, _)) if scheme.eq_ignore_ascii_case("bearer") => "Bearer [redacted]".to_string(),
+        Some((scheme, _)) if scheme.eq_ignore_ascii_case("bearer") => {
+            "Bearer [redacted]".to_string()
+        }
         _ => "[redacted]".to_string(),
     }
 }
@@ -31,6 +33,43 @@ pub fn redact_authorization(value: &str) -> String {
 /// Redact a secret value entirely.
 pub fn redact(_secret: &str) -> &'static str {
     "[redacted]"
+}
+
+/// Path of a request URI without the query string.
+///
+/// Confirmation (`?confirmation_token=…`) and password-reset
+/// (`?reset_password_token=…`) bearers travel in the query, so any span,
+/// log line or proxy record that captures the full URI leaks a one-time
+/// secret. Always record [`redacted_path`] instead of the full URI.
+#[must_use]
+pub fn redacted_path(uri: &axum::http::Uri) -> &str {
+    uri.path()
+}
+
+/// `tower-http` span factory that records method + path only, never the
+/// query string.
+///
+/// `TraceLayer::new_for_http()` spans the full URI (including the query) at
+/// debug level, which would log confirmation/reset tokens. Wire this via
+/// `TraceLayer::new_for_http().make_span_with(RedactedHttpMakeSpan::default())`
+/// (see `api/mastodon/router.rs`).
+///
+/// Proxy note (operator docs): any reverse proxy in front of this server must
+/// likewise strip or redact the query string before logging request lines —
+/// `%r`/`$request_uri`-style full-URI access logs reintroduce the same token
+/// leak this span removes.
+#[derive(Debug, Clone, Default)]
+pub struct RedactedHttpMakeSpan;
+
+impl<B> tower_http::trace::MakeSpan<B> for RedactedHttpMakeSpan {
+    fn make_span(&mut self, request: &axum::http::Request<B>) -> tracing::Span {
+        tracing::debug_span!(
+            "http_request",
+            method = %request.method(),
+            path = %redacted_path(request.uri()),
+            version = ?request.version(),
+        )
+    }
 }
 
 /// Storage-overhaul counters (Agent C, `docs/database.md`): bytes used,
@@ -106,5 +145,70 @@ mod tests {
         assert_eq!(redact_authorization("Bearer abc.def"), "Bearer [redacted]");
         assert_eq!(redact_authorization("Basic dXNlcjpwYXNz"), "[redacted]");
         assert_eq!(redact("super-secret"), "[redacted]");
+    }
+
+    #[test]
+    fn redacted_path_drops_the_query_string() {
+        for (raw, path) in [
+            (
+                "/auth/confirmation?confirmation_token=secret-token",
+                "/auth/confirmation",
+            ),
+            (
+                "/auth/password/edit?reset_password_token=secret-token",
+                "/auth/password/edit",
+            ),
+            ("/api/v1/accounts?limit=20", "/api/v1/accounts"),
+            ("/health", "/health"),
+        ] {
+            let uri: axum::http::Uri = raw.parse().expect("test uri");
+            assert_eq!(redacted_path(&uri), path, "{raw}");
+            assert!(!redacted_path(&uri).contains("secret-token"), "{raw}");
+        }
+    }
+
+    #[test]
+    fn redacted_span_factory_builds_without_the_query() {
+        use std::io::Write;
+        use tower_http::trace::MakeSpan as _;
+
+        #[derive(Debug, Clone, Default)]
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("capture").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let request = axum::http::Request::builder()
+                .method("GET")
+                .uri("/auth/confirmation?confirmation_token=secret-token")
+                .body(())
+                .expect("test request");
+            let span = RedactedHttpMakeSpan.make_span(&request);
+            let _entered = span.enter();
+            tracing::debug!("probe event inside the span");
+        });
+        let text = String::from_utf8(captured.0.lock().expect("capture").clone())
+            .expect("tracing output is utf-8");
+        assert!(text.contains("/auth/confirmation"), "{text}");
+        assert!(!text.contains("secret-token"), "token leaked into {text}");
+        assert!(
+            !text.contains("confirmation_token"),
+            "query key leaked into {text}"
+        );
     }
 }

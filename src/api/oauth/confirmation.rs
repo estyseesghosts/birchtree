@@ -7,6 +7,13 @@
 //! the invalid shape (never a success-shaped page, never an oracle that
 //! distinguishes "unknown" from "used").
 //!
+//! Privacy: the `confirmation_token` bearer is a one-time secret. This handler
+//! never logs it, and the HTTP tracing span records the path without the query
+//! string (see [`crate::observability::RedactedHttpMakeSpan`]), so the token
+//! cannot leak through access logs. Reverse proxies in front of this server
+//! must likewise strip or redact the query string before logging request
+//! lines.
+//!
 //! Wiring is parent-owned (`src/api/oauth/mod.rs` is a shared file):
 //! ```ignore
 //! // src/api/oauth/mod.rs
@@ -75,7 +82,11 @@ pub async fn confirmation_get(
     Query(query): Query<ConfirmationQuery>,
 ) -> Response {
     let store: &dyn Store = &*state.context.store;
-    let confirmed = match query.confirmation_token.as_deref().filter(|t| !t.is_empty()) {
+    let confirmed = match query
+        .confirmation_token
+        .as_deref()
+        .filter(|t| !t.is_empty())
+    {
         Some(token) => accounts::confirm_email(store, token, state.context.now_ms()).is_ok(),
         None => false,
     };

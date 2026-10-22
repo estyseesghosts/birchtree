@@ -4,20 +4,21 @@
 //! ones so `/api/v1/accounts/verify_credentials` never resolves as an account
 //! id. Unimplemented endpoints are absent (they 404) rather than stubbed.
 
-use axum::Router;
 use axum::Extension;
+use axum::Router;
 use axum::extract::DefaultBodyLimit;
-use axum::response::Response;
 use axum::middleware;
+use axum::response::Response;
 use axum::routing::{delete, get, patch, post, put};
 use tower_http::trace::TraceLayer;
 
 pub mod readiness;
 
 use super::{ApiState, endpoints, rate_limits};
-use readiness::RuntimeProbes;
 use crate::api::json_body;
 use crate::api::oauth::{authorization, token};
+use crate::observability::RedactedHttpMakeSpan;
+use readiness::RuntimeProbes;
 
 /// Build the application router with no extra readiness probes (storage read
 /// only, as in tests and tools).
@@ -62,22 +63,58 @@ pub fn build_router_with_probes(state: ApiState, probes: RuntimeProbes) -> Route
         .route("/api/v1/instance", get(endpoints::instance::v1))
         .route("/api/v2/instance", get(endpoints::instance::v2))
         // Instance sub-resources (fix round; all v1-only upstream).
-        .route("/api/v1/instance/peers", get(endpoints::instance::peers_index))
+        .route(
+            "/api/v1/instance/peers",
+            get(endpoints::instance::peers_index),
+        )
         // Peer search (gaps G-C): substring-filtered known remote domains.
-        .route("/api/v1/instance/peers/search", get(endpoints::collections::route_peers_search))
-        .route("/api/v1/instance/rules", get(endpoints::instance::rules_index))
-        .route("/api/v1/instance/domain_blocks", get(endpoints::instance::domain_blocks_index))
-        .route("/api/v1/instance/terms_of_service", get(endpoints::instance::terms_of_service_index))
-        .route("/api/v1/instance/terms_of_service/:date", get(endpoints::instance::terms_of_service_show))
-        .route("/api/v1/instance/privacy_policy", get(endpoints::instance::privacy_policy_show))
-        .route("/api/v1/instance/extended_description", get(endpoints::instance::extended_description_show))
-        .route("/api/v1/instance/translation_languages", get(endpoints::instance::translation_languages_show))
-        .route("/api/v1/instance/languages", get(endpoints::instance::languages_show))
-        .route("/api/v1/instance/activity", get(endpoints::instance::activity_show))
+        .route(
+            "/api/v1/instance/peers/search",
+            get(endpoints::collections::route_peers_search),
+        )
+        .route(
+            "/api/v1/instance/rules",
+            get(endpoints::instance::rules_index),
+        )
+        .route(
+            "/api/v1/instance/domain_blocks",
+            get(endpoints::instance::domain_blocks_index),
+        )
+        .route(
+            "/api/v1/instance/terms_of_service",
+            get(endpoints::instance::terms_of_service_index),
+        )
+        .route(
+            "/api/v1/instance/terms_of_service/:date",
+            get(endpoints::instance::terms_of_service_show),
+        )
+        .route(
+            "/api/v1/instance/privacy_policy",
+            get(endpoints::instance::privacy_policy_show),
+        )
+        .route(
+            "/api/v1/instance/extended_description",
+            get(endpoints::instance::extended_description_show),
+        )
+        .route(
+            "/api/v1/instance/translation_languages",
+            get(endpoints::instance::translation_languages_show),
+        )
+        .route(
+            "/api/v1/instance/languages",
+            get(endpoints::instance::languages_show),
+        )
+        .route(
+            "/api/v1/instance/activity",
+            get(endpoints::instance::activity_show),
+        )
         // Applications.
         .route("/api/v1/apps", post(endpoints::apps::create_app))
         // Accounts: static sub-paths before the `{id}` form.
-        .route("/api/v1/accounts", get(endpoints::accounts::index).post(endpoints::accounts::register))
+        .route(
+            "/api/v1/accounts",
+            get(endpoints::accounts::index).post(endpoints::accounts::register),
+        )
         .route("/api/v1/accounts/lookup", get(endpoints::accounts::lookup))
         .route("/api/v1/accounts/search", get(endpoints::accounts::search))
         .route(
@@ -124,7 +161,10 @@ pub fn build_router_with_probes(state: ApiState, probes: RuntimeProbes) -> Route
         // Invites + email. Without a mail provider the mail endpoints
         // answer an explicit 503 (never fake success); invites read the
         // configured store (durable redb in production).
-        .route("/invite/:invite_code", get(endpoints::accounts::invite_show))
+        .route(
+            "/invite/:invite_code",
+            get(endpoints::accounts::invite_show),
+        )
         .route(
             "/api/v1/emails/confirmations",
             post(endpoints::accounts::email_confirmation_create),
@@ -240,27 +280,58 @@ pub fn build_router_with_probes(state: ApiState, probes: RuntimeProbes) -> Route
         )
         // Preferences.
         .route("/api/v1/preferences", get(endpoints::preferences::index))
-
         // Suggestions (Phase 7): v1 member delete; v2 has no destroy route
         // upstream (`config/routes/api.rb:265`).
         .route("/api/v1/suggestions", get(endpoints::suggestions::v1))
-        .route("/api/v1/suggestions/:id", delete(endpoints::suggestions::delete_v1))
+        .route(
+            "/api/v1/suggestions/:id",
+            delete(endpoints::suggestions::delete_v1),
+        )
         .route("/api/v2/suggestions", get(endpoints::suggestions::v2))
         // Profile directory (P1/S1).
         .route("/api/v1/directory", get(endpoints::directory::show))
         // Announcements (Phase 7).
-        .route("/api/v1/announcements", get(endpoints::announcements::index))
-        .route("/api/v1/announcements/:id/dismiss", post(endpoints::announcements::dismiss))
-        .route("/api/v1/announcements/:announcement_id/reactions/:id", put(endpoints::announcements::reaction_put).patch(endpoints::announcements::reaction_put).delete(endpoints::announcements::reaction_delete))
+        .route(
+            "/api/v1/announcements",
+            get(endpoints::announcements::index),
+        )
+        .route(
+            "/api/v1/announcements/:id/dismiss",
+            post(endpoints::announcements::dismiss),
+        )
+        .route(
+            "/api/v1/announcements/:announcement_id/reactions/:id",
+            put(endpoints::announcements::reaction_put)
+                .patch(endpoints::announcements::reaction_put)
+                .delete(endpoints::announcements::reaction_delete),
+        )
         // Announcements admin authoring (new API surface; upstream is HTML
         // only). Administration-only (Admin/Owner; Moderator lacks
         // `manage_announcements` — `config/roles.yml` at the pin).
-        .route("/api/v1/admin/announcements", get(endpoints::announcements::admin_index).post(endpoints::announcements::admin_create))
-        .route("/api/v1/admin/announcements/:id", get(endpoints::announcements::admin_show).put(endpoints::announcements::admin_update).patch(endpoints::announcements::admin_update).delete(endpoints::announcements::admin_destroy))
-        .route("/api/v1/admin/announcements/:id/publish", post(endpoints::announcements::admin_publish))
-        .route("/api/v1/admin/announcements/:id/unpublish", post(endpoints::announcements::admin_unpublish))
+        .route(
+            "/api/v1/admin/announcements",
+            get(endpoints::announcements::admin_index).post(endpoints::announcements::admin_create),
+        )
+        .route(
+            "/api/v1/admin/announcements/:id",
+            get(endpoints::announcements::admin_show)
+                .put(endpoints::announcements::admin_update)
+                .patch(endpoints::announcements::admin_update)
+                .delete(endpoints::announcements::admin_destroy),
+        )
+        .route(
+            "/api/v1/admin/announcements/:id/publish",
+            post(endpoints::announcements::admin_publish),
+        )
+        .route(
+            "/api/v1/admin/announcements/:id/unpublish",
+            post(endpoints::announcements::admin_unpublish),
+        )
         // Donation campaigns (Phase 7).
-        .route("/api/v1/donation_campaigns", get(endpoints::donation_campaigns::index))
+        .route(
+            "/api/v1/donation_campaigns",
+            get(endpoints::donation_campaigns::index),
+        )
         // Statuses: multi-fetch + CRUD (static `{id}` sub-routes after the
         // collection routes).
         .route("/api/v1/statuses", post(endpoints::statuses::create))
@@ -268,10 +339,7 @@ pub fn build_router_with_probes(state: ApiState, probes: RuntimeProbes) -> Route
         .route("/api/v1/statuses/:id", get(endpoints::statuses::show))
         .route("/api/v1/statuses/:id", put(endpoints::statuses::update))
         .route("/api/v1/statuses/:id", patch(endpoints::statuses::update))
-        .route(
-            "/api/v1/statuses/:id",
-            delete(endpoints::statuses::destroy),
-        )
+        .route("/api/v1/statuses/:id", delete(endpoints::statuses::destroy))
         // The viewer's collections containing the status (gaps G-C).
         .route(
             "/api/v1/statuses/:id/in_collections",
@@ -329,84 +397,273 @@ pub fn build_router_with_probes(state: ApiState, probes: RuntimeProbes) -> Route
         // Reports (Phase 6): filed here; forwarded to a remote server as a Flag when asked.
         .route("/api/v1/reports", post(endpoints::reports::create))
         // Conversations + conversation mutes (Phase 7).
-        .route("/api/v1/conversations", get(endpoints::conversations::index))
-        .route("/api/v1/conversations/:id", delete(endpoints::conversations::destroy))
-        .route("/api/v1/conversations/:id/read", post(endpoints::conversations::read))
-        .route("/api/v1/conversations/:id/unread", post(endpoints::conversations::unread))
-        .route("/api/v1/statuses/:id/mute", post(endpoints::conversations::mute_status))
-        .route("/api/v1/statuses/:id/unmute", post(endpoints::conversations::unmute_status))
+        .route(
+            "/api/v1/conversations",
+            get(endpoints::conversations::index),
+        )
+        .route(
+            "/api/v1/conversations/:id",
+            delete(endpoints::conversations::destroy),
+        )
+        .route(
+            "/api/v1/conversations/:id/read",
+            post(endpoints::conversations::read),
+        )
+        .route(
+            "/api/v1/conversations/:id/unread",
+            post(endpoints::conversations::unread),
+        )
+        .route(
+            "/api/v1/statuses/:id/mute",
+            post(endpoints::conversations::mute_status),
+        )
+        .route(
+            "/api/v1/statuses/:id/unmute",
+            post(endpoints::conversations::unmute_status),
+        )
         // Web Push (Phase 7).
-        .route("/api/v1/push/subscription", post(endpoints::push::create).get(endpoints::push::show).put(endpoints::push::update).patch(endpoints::push::update).delete(endpoints::push::destroy))
+        .route(
+            "/api/v1/push/subscription",
+            post(endpoints::push::create)
+                .get(endpoints::push::show)
+                .put(endpoints::push::update)
+                .patch(endpoints::push::update)
+                .delete(endpoints::push::destroy),
+        )
         // Phase 7 first-party web surface (session + CSRF).
-        .route("/api/web/settings", put(endpoints::web::settings_update).patch(endpoints::web::settings_update))
+        .route(
+            "/api/web/settings",
+            put(endpoints::web::settings_update).patch(endpoints::web::settings_update),
+        )
         .route("/api/web/embeds/:id", get(endpoints::web::embeds_show))
-        .route("/api/web/push_subscriptions", post(endpoints::web::push_create))
-        .route("/api/web/push_subscriptions/:id", put(endpoints::web::push_update).patch(endpoints::web::push_update).delete(endpoints::web::push_destroy))
+        .route(
+            "/api/web/push_subscriptions",
+            post(endpoints::web::push_create),
+        )
+        .route(
+            "/api/web/push_subscriptions/:id",
+            put(endpoints::web::push_update)
+                .patch(endpoints::web::push_update)
+                .delete(endpoints::web::push_destroy),
+        )
         // Stray Phase 7 rows.
-        .route("/api/v1/timelines/link", get(endpoints::timelines_link::link))
-        .route("/api/v1/apps/verify_credentials", get(endpoints::timelines_link::verify_app_credentials))
+        .route(
+            "/api/v1/timelines/link",
+            get(endpoints::timelines_link::link),
+        )
+        .route(
+            "/api/v1/apps/verify_credentials",
+            get(endpoints::timelines_link::verify_app_credentials),
+        )
         // Relation collection reads + tag surface (Phase 7).
-        .route("/api/v1/accounts/familiar_followers", get(endpoints::relations_extra::familiar_followers))
+        .route(
+            "/api/v1/accounts/familiar_followers",
+            get(endpoints::relations_extra::familiar_followers),
+        )
         .route("/api/v1/blocks", get(endpoints::relations_extra::blocks))
         .route("/api/v1/mutes", get(endpoints::relations_extra::mutes))
-        .route("/api/v1/favourites", get(endpoints::relations_extra::favourites))
-        .route("/api/v1/bookmarks", get(endpoints::relations_extra::bookmarks))
-        .route("/api/v1/featured_tags", get(endpoints::relations_extra::featured_tags_index).post(endpoints::relations_extra::featured_tags_create))
-        .route("/api/v1/featured_tags/:id", delete(endpoints::relations_extra::featured_tags_destroy))
-        .route("/api/v1/followed_tags", get(endpoints::relations_extra::followed_tags))
-        .route("/api/v1/accounts/:id/featured_tags", get(endpoints::relations_extra::account_featured_tags))
-        .route("/api/v1/tags/:id", get(endpoints::relations_extra::tag_show))
-        .route("/api/v1/tags/:id/follow", post(endpoints::relations_extra::tag_follow))
-        .route("/api/v1/tags/:id/unfollow", post(endpoints::relations_extra::tag_unfollow))
-        .route("/api/v1/tags/:id/feature", post(endpoints::relations_extra::tag_feature))
-        .route("/api/v1/tags/:id/unfeature", post(endpoints::relations_extra::tag_unfeature))
+        .route(
+            "/api/v1/favourites",
+            get(endpoints::relations_extra::favourites),
+        )
+        .route(
+            "/api/v1/bookmarks",
+            get(endpoints::relations_extra::bookmarks),
+        )
+        .route(
+            "/api/v1/featured_tags",
+            get(endpoints::relations_extra::featured_tags_index)
+                .post(endpoints::relations_extra::featured_tags_create),
+        )
+        .route(
+            "/api/v1/featured_tags/:id",
+            delete(endpoints::relations_extra::featured_tags_destroy),
+        )
+        .route(
+            "/api/v1/followed_tags",
+            get(endpoints::relations_extra::followed_tags),
+        )
+        .route(
+            "/api/v1/accounts/:id/featured_tags",
+            get(endpoints::relations_extra::account_featured_tags),
+        )
+        .route(
+            "/api/v1/tags/:id",
+            get(endpoints::relations_extra::tag_show),
+        )
+        .route(
+            "/api/v1/tags/:id/follow",
+            post(endpoints::relations_extra::tag_follow),
+        )
+        .route(
+            "/api/v1/tags/:id/unfollow",
+            post(endpoints::relations_extra::tag_unfollow),
+        )
+        .route(
+            "/api/v1/tags/:id/feature",
+            post(endpoints::relations_extra::tag_feature),
+        )
+        .route(
+            "/api/v1/tags/:id/unfeature",
+            post(endpoints::relations_extra::tag_unfeature),
+        )
         // keystodon first-party bundle (404 unless configured).
         .route("/app", get(endpoints::web::serve_bundle))
         .route("/app/*path", get(endpoints::web::serve_bundle))
         // Admin API (Phase 7.3): roles + scope families are enforced centrally
         // in each handler (role before scope).
-        .route("/api/v1/admin/accounts", get(endpoints::admin_accounts::index_v1))
-        .route("/api/v2/admin/accounts", get(endpoints::admin_accounts::index_v2))
-        .route("/api/v1/admin/accounts/:id", get(endpoints::admin_accounts::show).delete(endpoints::admin_accounts::destroy))
-        .route("/api/v1/admin/accounts/:id/enable", post(endpoints::admin_accounts::enable))
-        .route("/api/v1/admin/accounts/:id/unsensitive", post(endpoints::admin_accounts::unsensitive))
-        .route("/api/v1/admin/accounts/:id/unsilence", post(endpoints::admin_accounts::unsilence))
-        .route("/api/v1/admin/accounts/:id/unsuspend", post(endpoints::admin_accounts::unsuspend))
-        .route("/api/v1/admin/accounts/:id/approve", post(endpoints::admin_accounts::approve))
-        .route("/api/v1/admin/accounts/:id/reject", post(endpoints::admin_accounts::reject))
-        .route("/api/v1/admin/accounts/:account_id/action", post(endpoints::admin_accounts::action))
-        .route("/api/v1/admin/reports", get(endpoints::admin_reports::index))
-        .route("/api/v1/admin/reports/:id", get(endpoints::admin_reports::show).put(endpoints::admin_reports::update).patch(endpoints::admin_reports::update))
-        .route("/api/v1/admin/reports/:id/assign_to_self", post(endpoints::admin_reports::assign_to_self))
-        .route("/api/v1/admin/reports/:id/unassign", post(endpoints::admin_reports::unassign))
-        .route("/api/v1/admin/reports/:id/reopen", post(endpoints::admin_reports::reopen))
-        .route("/api/v1/admin/reports/:id/resolve", post(endpoints::admin_reports::resolve))
-        .route("/api/v1/admin/custom_emojis", get(endpoints::admin_emoji::index).post(endpoints::admin_emoji::create))
-        .route("/api/v1/admin/custom_emojis/:shortcode", put(endpoints::admin_emoji::update).delete(endpoints::admin_emoji::destroy))
+        .route(
+            "/api/v1/admin/accounts",
+            get(endpoints::admin_accounts::index_v1),
+        )
+        .route(
+            "/api/v2/admin/accounts",
+            get(endpoints::admin_accounts::index_v2),
+        )
+        .route(
+            "/api/v1/admin/accounts/:id",
+            get(endpoints::admin_accounts::show).delete(endpoints::admin_accounts::destroy),
+        )
+        .route(
+            "/api/v1/admin/accounts/:id/enable",
+            post(endpoints::admin_accounts::enable),
+        )
+        .route(
+            "/api/v1/admin/accounts/:id/unsensitive",
+            post(endpoints::admin_accounts::unsensitive),
+        )
+        .route(
+            "/api/v1/admin/accounts/:id/unsilence",
+            post(endpoints::admin_accounts::unsilence),
+        )
+        .route(
+            "/api/v1/admin/accounts/:id/unsuspend",
+            post(endpoints::admin_accounts::unsuspend),
+        )
+        .route(
+            "/api/v1/admin/accounts/:id/approve",
+            post(endpoints::admin_accounts::approve),
+        )
+        .route(
+            "/api/v1/admin/accounts/:id/reject",
+            post(endpoints::admin_accounts::reject),
+        )
+        .route(
+            "/api/v1/admin/accounts/:account_id/action",
+            post(endpoints::admin_accounts::action),
+        )
+        .route(
+            "/api/v1/admin/reports",
+            get(endpoints::admin_reports::index),
+        )
+        .route(
+            "/api/v1/admin/reports/:id",
+            get(endpoints::admin_reports::show)
+                .put(endpoints::admin_reports::update)
+                .patch(endpoints::admin_reports::update),
+        )
+        .route(
+            "/api/v1/admin/reports/:id/assign_to_self",
+            post(endpoints::admin_reports::assign_to_self),
+        )
+        .route(
+            "/api/v1/admin/reports/:id/unassign",
+            post(endpoints::admin_reports::unassign),
+        )
+        .route(
+            "/api/v1/admin/reports/:id/reopen",
+            post(endpoints::admin_reports::reopen),
+        )
+        .route(
+            "/api/v1/admin/reports/:id/resolve",
+            post(endpoints::admin_reports::resolve),
+        )
+        .route(
+            "/api/v1/admin/custom_emojis",
+            get(endpoints::admin_emoji::index).post(endpoints::admin_emoji::create),
+        )
+        .route(
+            "/api/v1/admin/custom_emojis/:shortcode",
+            put(endpoints::admin_emoji::update).delete(endpoints::admin_emoji::destroy),
+        )
         .merge(endpoints::admin_infra::routes())
         // Trends (Phase 7.3): public approved-only reads.
         .route("/api/v1/trends", get(endpoints::trends::trends_alias))
         .route("/api/v1/trends/tags", get(endpoints::trends::tags_index))
         .route("/api/v1/trends/links", get(endpoints::trends::links_index))
-        .route("/api/v1/trends/statuses", get(endpoints::trends::statuses_index))
-        .route("/api/v1/admin/trends/tags", get(endpoints::admin_trends::tags_index))
-        .route("/api/v1/admin/trends/tags/:id/approve", post(endpoints::admin_trends::tags_approve))
-        .route("/api/v1/admin/trends/tags/:id/reject", post(endpoints::admin_trends::tags_reject))
-        .route("/api/v1/admin/trends/links", get(endpoints::admin_trends::links_index))
-        .route("/api/v1/admin/trends/links/:id/approve", post(endpoints::admin_trends::links_approve))
-        .route("/api/v1/admin/trends/links/:id/reject", post(endpoints::admin_trends::links_reject))
-        .route("/api/v1/admin/trends/links/publishers", get(endpoints::admin_trends::publishers_index))
-        .route("/api/v1/admin/trends/links/publishers/:id/approve", post(endpoints::admin_trends::publishers_approve))
-        .route("/api/v1/admin/trends/links/publishers/:id/reject", post(endpoints::admin_trends::publishers_reject))
-        .route("/api/v1/admin/trends/statuses", get(endpoints::admin_trends::statuses_index))
-        .route("/api/v1/admin/trends/statuses/:id/approve", post(endpoints::admin_trends::statuses_approve))
-        .route("/api/v1/admin/trends/statuses/:id/reject", post(endpoints::admin_trends::statuses_reject))
+        .route(
+            "/api/v1/trends/statuses",
+            get(endpoints::trends::statuses_index),
+        )
+        .route(
+            "/api/v1/admin/trends/tags",
+            get(endpoints::admin_trends::tags_index),
+        )
+        .route(
+            "/api/v1/admin/trends/tags/:id/approve",
+            post(endpoints::admin_trends::tags_approve),
+        )
+        .route(
+            "/api/v1/admin/trends/tags/:id/reject",
+            post(endpoints::admin_trends::tags_reject),
+        )
+        .route(
+            "/api/v1/admin/trends/links",
+            get(endpoints::admin_trends::links_index),
+        )
+        .route(
+            "/api/v1/admin/trends/links/:id/approve",
+            post(endpoints::admin_trends::links_approve),
+        )
+        .route(
+            "/api/v1/admin/trends/links/:id/reject",
+            post(endpoints::admin_trends::links_reject),
+        )
+        .route(
+            "/api/v1/admin/trends/links/publishers",
+            get(endpoints::admin_trends::publishers_index),
+        )
+        .route(
+            "/api/v1/admin/trends/links/publishers/:id/approve",
+            post(endpoints::admin_trends::publishers_approve),
+        )
+        .route(
+            "/api/v1/admin/trends/links/publishers/:id/reject",
+            post(endpoints::admin_trends::publishers_reject),
+        )
+        .route(
+            "/api/v1/admin/trends/statuses",
+            get(endpoints::admin_trends::statuses_index),
+        )
+        .route(
+            "/api/v1/admin/trends/statuses/:id/approve",
+            post(endpoints::admin_trends::statuses_approve),
+        )
+        .route(
+            "/api/v1/admin/trends/statuses/:id/reject",
+            post(endpoints::admin_trends::statuses_reject),
+        )
         // Annual reports (Phase 7.3): `:id` is the year.
-        .route("/api/v1/annual_reports", get(endpoints::annual_reports::index))
-        .route("/api/v1/annual_reports/:id", get(endpoints::annual_reports::show))
-        .route("/api/v1/annual_reports/:id/state", get(endpoints::annual_reports::show_state))
-        .route("/api/v1/annual_reports/:id/generate", post(endpoints::annual_reports::generate))
-        .route("/api/v1/annual_reports/:id/read", post(endpoints::annual_reports::mark_read))
+        .route(
+            "/api/v1/annual_reports",
+            get(endpoints::annual_reports::index),
+        )
+        .route(
+            "/api/v1/annual_reports/:id",
+            get(endpoints::annual_reports::show),
+        )
+        .route(
+            "/api/v1/annual_reports/:id/state",
+            get(endpoints::annual_reports::show_state),
+        )
+        .route(
+            "/api/v1/annual_reports/:id/generate",
+            post(endpoints::annual_reports::generate),
+        )
+        .route(
+            "/api/v1/annual_reports/:id/read",
+            post(endpoints::annual_reports::mark_read),
+        )
         .route(
             "/api/v1/statuses/:id/quotes",
             get(endpoints::statuses::quotes_index),
@@ -430,23 +687,14 @@ pub fn build_router_with_probes(state: ApiState, probes: RuntimeProbes) -> Route
         )
         // Polls.
         .route("/api/v1/polls/:id", get(endpoints::polls::show))
-        .route(
-            "/api/v1/polls/:id/votes",
-            post(endpoints::polls::vote),
-        )
+        .route("/api/v1/polls/:id/votes", post(endpoints::polls::vote))
         // Timelines (Phase 4).
-        .route(
-            "/api/v1/timelines/home",
-            get(endpoints::timelines::home),
-        )
+        .route("/api/v1/timelines/home", get(endpoints::timelines::home))
         .route(
             "/api/v1/timelines/public",
             get(endpoints::timelines::public),
         )
-        .route(
-            "/api/v1/timelines/tag/:tag",
-            get(endpoints::timelines::tag),
-        )
+        .route("/api/v1/timelines/tag/:tag", get(endpoints::timelines::tag))
         .route(
             "/api/v1/timelines/list/:id",
             get(endpoints::timelines::list),
@@ -513,8 +761,7 @@ pub fn build_router_with_probes(state: ApiState, probes: RuntimeProbes) -> Route
         )
         .route(
             "/api/v1/notifications/policy",
-            get(endpoints::notifications::policy_show)
-                .put(endpoints::notifications::policy_update),
+            get(endpoints::notifications::policy_show).put(endpoints::notifications::policy_update),
         )
         .route(
             "/api/v1/notifications/:id",
@@ -624,26 +871,32 @@ pub fn build_router_with_probes(state: ApiState, probes: RuntimeProbes) -> Route
         )
         // Streaming (Phase 5): SSE and WebSocket share one handler.
         .route("/api/v1/streaming", get(crate::streaming::http::endpoint))
-        .route("/api/v1/streaming/*any", get(crate::streaming::http::endpoint))
+        .route(
+            "/api/v1/streaming/*any",
+            get(crate::streaming::http::endpoint),
+        )
         // Search (Phase 4: v2 only; v1 was removed upstream in Mastodon 3.0).
         .route("/api/v2/search", get(endpoints::search::index))
         // Custom emoji (Phase 4: public index).
-        .route(
-            "/api/v1/custom_emojis",
-            get(endpoints::emoji::index),
-        )
+        .route("/api/v1/custom_emojis", get(endpoints::emoji::index))
         // Filters (Phase 4): v1 synthesized from v2, then v2 CRUD + rules.
         .route("/api/v1/filters", get(endpoints::filters::v1_index))
         .route("/api/v1/filters", post(endpoints::filters::v1_create))
         .route("/api/v1/filters/:id", get(endpoints::filters::v1_show))
-        .route("/api/v1/filters/:id", put(endpoints::filters::v1_update).patch(endpoints::filters::v1_update))
+        .route(
+            "/api/v1/filters/:id",
+            put(endpoints::filters::v1_update).patch(endpoints::filters::v1_update),
+        )
         .route(
             "/api/v1/filters/:id",
             delete(endpoints::filters::v1_destroy),
         )
         .route("/api/v2/filters", get(endpoints::filters::v2_index))
         .route("/api/v2/filters", post(endpoints::filters::v2_create))
-        .route("/api/v2/filters/keywords/:id", get(endpoints::filters::keywords_show))
+        .route(
+            "/api/v2/filters/keywords/:id",
+            get(endpoints::filters::keywords_show),
+        )
         .route(
             "/api/v2/filters/keywords/:id",
             patch(endpoints::filters::keywords_update),
@@ -661,8 +914,14 @@ pub fn build_router_with_probes(state: ApiState, probes: RuntimeProbes) -> Route
             delete(endpoints::filters::statuses_destroy),
         )
         .route("/api/v2/filters/:id", get(endpoints::filters::v2_show))
-        .route("/api/v2/filters/:id", put(endpoints::filters::v2_update).patch(endpoints::filters::v2_update))
-        .route("/api/v2/filters/:id", delete(endpoints::filters::v2_destroy))
+        .route(
+            "/api/v2/filters/:id",
+            put(endpoints::filters::v2_update).patch(endpoints::filters::v2_update),
+        )
+        .route(
+            "/api/v2/filters/:id",
+            delete(endpoints::filters::v2_destroy),
+        )
         .route(
             "/api/v2/filters/:filter_id/keywords",
             get(endpoints::filters::keywords_index),
@@ -681,7 +940,9 @@ pub fn build_router_with_probes(state: ApiState, probes: RuntimeProbes) -> Route
         )
         // Federation (Phase 6): WebFinger, NodeInfo, the actor document and the
         // inboxes. The crate's middleware sits on these routes only.
-        .merge(crate::activitypub::http::routes::<ApiState>(state.federation.clone()))
+        .merge(crate::activitypub::http::routes::<ApiState>(
+            state.federation.clone(),
+        ))
         .layer(Extension(probes))
         .layer(Extension(limits.clone()))
         .layer(Extension(invites))
@@ -690,21 +951,28 @@ pub fn build_router_with_probes(state: ApiState, probes: RuntimeProbes) -> Route
         // Malformed JSON is refused before any handler runs (Rails parses
         // params before the action); this sits inside the rate limiter, which
         // runs first, as Rack::Attack does upstream.
-        .layer(middleware::from_fn_with_state(ip_block_state, endpoints::admin_infra::ip_block_middleware))
+        .layer(middleware::from_fn_with_state(
+            ip_block_state,
+            endpoints::admin_infra::ip_block_middleware,
+        ))
         .layer(middleware::from_fn(json_body::guard))
-        .layer(middleware::from_fn_with_state(limits, rate_limits::middleware))
+        .layer(middleware::from_fn_with_state(
+            limits,
+            rate_limits::middleware,
+        ))
         .layer(middleware::from_fn(vary_authorization))
         .layer(DefaultBodyLimit::max(max_body))
-        .layer(TraceLayer::new_for_http())
+        // The tracing span records method + path only, never the query string:
+        // confirmation/reset tokens travel in `?confirmation_token=` /
+        // `?reset_password_token=`, and the default `new_for_http` span would
+        // log the full URI at debug level.
+        .layer(TraceLayer::new_for_http().make_span_with(RedactedHttpMakeSpan::default()))
 }
 
 /// `Vary: Authorization` on API responses (Mastodon's `vary_by
 /// 'Authorization'` on every API controller), so shared caches never mix
 /// personalized and anonymous payloads.
-async fn vary_authorization(
-    request: axum::extract::Request,
-    next: middleware::Next,
-) -> Response {
+async fn vary_authorization(request: axum::extract::Request, next: middleware::Next) -> Response {
     let is_api = request.uri().path().starts_with("/api/");
     let mut response = next.run(request).await;
     if is_api {

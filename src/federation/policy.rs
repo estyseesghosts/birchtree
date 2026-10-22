@@ -103,12 +103,20 @@ fn mask(ip: IpAddr, prefix: u8) -> IpAddr {
     match ip {
         IpAddr::V4(v4) => {
             let bits = u32::from(v4);
-            let m = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix as u32) };
+            let m = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix as u32)
+            };
             IpAddr::V4(Ipv4Addr::from(bits & m))
         }
         IpAddr::V6(v6) => {
             let bits = u128::from(v6);
-            let m = if prefix == 0 { 0 } else { u128::MAX << (128 - prefix as u32) };
+            let m = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix as u32)
+            };
             IpAddr::V6(Ipv6Addr::from(bits & m))
         }
     }
@@ -128,9 +136,14 @@ fn normalize(ip: IpAddr) -> IpAddr {
 /// Whether `ip` is public unicast: safe to dial without an allowlist entry.
 ///
 /// Blocks unspecified, loopback, private, link-local, shared (CGNAT),
-/// benchmarking, documentation, multicast and reserved ranges. IPv6 forms that
-/// embed an IPv4 address (mapped, NAT64, 6to4) are judged by the embedded
-/// address, so `::ffff:127.0.0.1` and `64:ff9b::7f00:1` are refused too.
+/// benchmarking, documentation, protocol-assignment, multicast and reserved
+/// ranges. IPv6 forms that translate an IPv4 address (mapped `::ffff:0:0/96`,
+/// NAT64 `64:ff9b::/96` and local-use `64:ff9b:1::/48`) are judged by the
+/// embedded address, so `::ffff:127.0.0.1` and `64:ff9b::7f00:1` are refused.
+/// Every other non-global range in the IANA IPv6 Special-Purpose Registry
+/// (`global = false`: 6to4, Teredo, `2001::/23`, `2001:db8::/32`,
+/// `3fff::/20`, AS112-v6, SRv6 SIDs, 6bone, discard, IPv4-compatible) is
+/// refused outright, whatever it embeds.
 pub fn is_public_unicast(ip: IpAddr) -> bool {
     match normalize(ip) {
         IpAddr::V4(v4) => is_public_v4(v4),
@@ -158,24 +171,22 @@ fn is_public_v4(ip: Ipv4Addr) -> bool {
 
 fn is_public_v6(ip: Ipv6Addr) -> bool {
     let s = ip.segments();
-    // Embedded IPv4 forms: judged by the IPv4 address they carry.
-    if s[0] == 0x64 && s[1] == 0xff9b && s[2..6].iter().all(|&x| x == 0) {
-        // 64:ff9b::/96 NAT64
-        return is_public_v4(Ipv4Addr::new(
-            (s[6] >> 8) as u8,
-            s[6] as u8,
-            (s[7] >> 8) as u8,
-            s[7] as u8,
-        ));
+    // Translation prefixes carry an IPv4 address in the last 32 bits: the
+    // risk is whatever the translator would reach, so judge the embedded
+    // address. Well-known `64:ff9b::/96` (RFC 6052) and local-use
+    // `64:ff9b:1::/48` (RFC 8215) share the trailing-32-bits layout.
+    if s[0] == 0x64 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
+        // 64:ff9b::/96 well-known translation prefix.
+        return is_public_v4(last32_as_v4(s[6], s[7]));
     }
+    if s[0] == 0x64 && s[1] == 0xff9b && s[2] == 0x1 {
+        // 64:ff9b:1::/48 local-use translation prefix.
+        return is_public_v4(last32_as_v4(s[6], s[7]));
+    }
+    // 2002::/16 6to4 (historic, RFC 7526): never globally reachable, whatever
+    // IPv4 address it embeds.
     if s[0] == 0x2002 {
-        // 2002::/16 6to4 carries the IPv4 address in segments 1 and 2.
-        return is_public_v4(Ipv4Addr::new(
-            (s[1] >> 8) as u8,
-            s[1] as u8,
-            (s[2] >> 8) as u8,
-            s[2] as u8,
-        ));
+        return false;
     }
     if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
         return false;
@@ -183,19 +194,46 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
     if (s[0] & 0xffc0) == 0xfe80 {
         return false; // fe80::/10 link-local
     }
+    if (s[0] & 0xffc0) == 0xfec0 {
+        return false; // fec0::/10 site-local, deprecated (RFC 3879)
+    }
     if (s[0] & 0xfe00) == 0xfc00 {
         return false; // fc00::/7 unique local
     }
+    // 2001::/23 IETF protocol assignments (IANA global=false): Teredo
+    // 2001::/32, benchmarking 2001:2::/48, AMT, AS112, ORCHID, PCP, TURN.
+    if s[0] == 0x2001 && s[1] < 0x0200 {
+        return false;
+    }
     if s[0] == 0x2001 && s[1] == 0x0db8 {
-        return false; // 2001:db8::/32 documentation
+        return false; // 2001:db8::/32 documentation (RFC 3849)
+    }
+    // 3fff::/20 documentation (RFC 9632): first 20 bits of `3fff::`, i.e. the
+    // 3fff:0000::/20 block (`3fff::1` is inside, `3fff:f000::1` is not).
+    if s[0] == 0x3fff && (s[1] & 0xf000) == 0x0000 {
+        return false;
+    }
+    if s[0] == 0x2620 && s[1] == 0x004f && s[2] == 0x8000 {
+        return false; // 2620:4f:8000::/48 Direct Delegation AS112-v6
+    }
+    if s[0] == 0x5f00 {
+        return false; // 5f00::/16 Segment Routing SIDs (IANA global=false)
+    }
+    if s[0] == 0x3ffe {
+        return false; // 3ffe::/16 6bone, deprecated and unrouted (RFC 3701)
     }
     if s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0 {
-        return false; // 100::/64 discard-only
+        return false; // 100::/64 discard-only (RFC 6666)
     }
     if s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
-        return false; // ::/96 (deprecated IPv4-compatible and friends)
+        return false; // ::/96 deprecated IPv4-compatible range (RFC 4291)
     }
     true
+}
+
+/// The IPv4 address carried in the last 32 bits of a translation address.
+fn last32_as_v4(high: u16, low: u16) -> Ipv4Addr {
+    Ipv4Addr::new((high >> 8) as u8, high as u8, (low >> 8) as u8, low as u8)
 }
 
 /// Whether an address may be dialled: public unicast, or inside the operator allowlist.
@@ -281,7 +319,15 @@ mod tests {
 
     #[test]
     fn allows_public_addresses() {
-        for public in ["8.8.8.8", "1.1.1.1", "172.15.0.1", "172.32.0.1", "100.63.0.1", "2606:4700::1111", "::ffff:8.8.8.8"] {
+        for public in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "172.15.0.1",
+            "172.32.0.1",
+            "100.63.0.1",
+            "2606:4700::1111",
+            "::ffff:8.8.8.8",
+        ] {
             assert!(is_public_unicast(ip(public)), "{public} must be allowed");
         }
     }
@@ -318,9 +364,18 @@ mod tests {
     fn url_shape_refuses_credentials_and_ip_literals() {
         let creds = Url::parse("https://user:pw@remote.example/").unwrap();
         assert_eq!(check_url(&creds, false, &[]), Err(PolicyError::Credentials));
-        for literal in ["https://127.0.0.1/", "https://[::1]/", "https://0.0.0.0/", "https://169.254.169.254/latest"] {
+        for literal in [
+            "https://127.0.0.1/",
+            "https://[::1]/",
+            "https://0.0.0.0/",
+            "https://169.254.169.254/latest",
+        ] {
             let url = Url::parse(literal).unwrap();
-            assert_eq!(check_url(&url, false, &[]), Err(PolicyError::Address), "{literal}");
+            assert_eq!(
+                check_url(&url, false, &[]),
+                Err(PolicyError::Address),
+                "{literal}"
+            );
         }
         let lab = parse_allowlist("127.0.0.0/8").unwrap();
         let loopback = Url::parse("https://127.0.0.1:8443/").unwrap();

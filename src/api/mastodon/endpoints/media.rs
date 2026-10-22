@@ -21,6 +21,9 @@
 //! - the public file route serves only published media keys, streams from
 //!   disk and honors single `Range` requests.
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use axum::body::{Body, Bytes};
 use axum::extract::multipart::Field;
 use axum::extract::{FromRequest, Multipart, Path, Request, State};
@@ -30,12 +33,12 @@ use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::api::forms::{self, LenientForm};
+use crate::api::mastodon::ApiState;
 use crate::api::mastodon::auth::Auth;
 use crate::api::mastodon::dto;
 use crate::api::mastodon::errors::{ApiError, ApiResult};
-use crate::api::mastodon::ApiState;
 use crate::application::media;
-use crate::application::ports::Store;
+use crate::application::ports::{BlobStore, Store};
 use crate::domain::{Error as DomainError, Id, MediaAttachment, MediaState};
 use crate::media::public_media::{self, PublicMediaKind, RangeOutcome};
 use crate::media::upload_gate;
@@ -63,11 +66,7 @@ pub async fn create_v2(State(state): State<ApiState>, auth: Auth, request: Reque
 }
 
 /// `GET /api/v1/media/:id` — 206 while unprocessed.
-pub async fn show(
-    State(state): State<ApiState>,
-    auth: Auth,
-    Path(raw): Path<String>,
-) -> Response {
+pub async fn show(State(state): State<ApiState>, auth: Auth, Path(raw): Path<String>) -> Response {
     if let Err(err) = auth.0.require_scopes(MEDIA_SCOPES) {
         return err.into_response();
     }
@@ -120,7 +119,7 @@ pub async fn update(
             Ok(value) => Some(Some(value)),
             Err(_) => {
                 return ApiError::unprocessable(crate::domain::license::ERR_LICENSE_INVALID)
-                    .into_response()
+                    .into_response();
             }
         },
     };
@@ -234,16 +233,26 @@ pub async fn serve_file(
     }
 }
 
-/// Find the bytes for `key`: the durable root first (streamed), then the
-/// pool-routing store for cache keys.
+/// Find the bytes for `key`: every streaming root first (durable today —
+/// local keys and pre-split durable `remote/` shadows stream from disk),
+/// then the pool-routing store for cache keys.
+///
+/// `Located::File` streams from disk and seeks for `Range`; `Located::Bytes`
+/// is the buffered fallback for cache-pool keys and rootless doubles: it
+/// holds the whole blob in memory, so a large remote costs a full copy per
+/// request until the parent lands the proposed `BlobStore::cache_root_path`
+/// port addition, which adds the cache root to [`stream_roots`] and makes
+/// every served byte stream. The pool-aware open that addition enables
+/// already exists and is covered without buffering at the storage layer
+/// ([`PooledBlobStores::open_in_pool`](crate::media::pooled_blob_stores::PooledBlobStores::open_in_pool)).
 async fn locate(state: &ApiState, key: &str) -> Result<Option<Located>, DomainError> {
     let blobs = state.context.blobs.clone();
-    let key_owned: String = key.to_string();
-    let root = blobs.root_path();
-    if let Some(root) = root.clone() {
-        let owned = key_owned.clone();
+    let roots: Vec<PathBuf> = stream_roots(&blobs);
+    let had_roots: bool = !roots.is_empty();
+    for root in roots {
+        let key_owned: String = key.to_string();
         let opened = tokio::task::spawn_blocking(move || {
-            crate::media::blob_store::open_read_in_root(&root, &owned)
+            crate::media::blob_store::open_read_in_root(&root, &key_owned)
         })
         .await
         .map_err(|err| DomainError::Internal(format!("open blob task: {err}")))??;
@@ -258,13 +267,26 @@ async fn locate(state: &ApiState, key: &str) -> Result<Option<Located>, DomainEr
             }));
         }
     }
-    if root.is_none() || crate::media::remote_cache::is_cache_key(key) {
+    if !had_roots || crate::media::remote_cache::is_cache_key(key) {
+        let key_owned: String = key.to_string();
         let bytes = tokio::task::spawn_blocking(move || blobs.get(&key_owned))
             .await
             .map_err(|err| DomainError::Internal(format!("read blob task: {err}")))??;
         return Ok(bytes.map(Located::Bytes));
     }
     Ok(None)
+}
+
+/// Filesystem roots served by streaming, durable first.
+///
+/// Today this is the durable root only (`BlobStore::root_path`): the public
+/// file route streams local bytes and legacy durable shadows, while
+/// cache-pool keys fall through to the buffered `get()` in [`locate`]. The
+/// proposed `BlobStore::cache_root_path` port addition appends the cache
+/// root here (durable stays first so legacy shadows keep resolving), and
+/// from then on [`locate`] streams every key.
+fn stream_roots(blobs: &Arc<dyn BlobStore>) -> Vec<PathBuf> {
+    blobs.root_path().into_iter().collect()
 }
 
 /// Heal a missing cache entry: queue the single-flight refetch of a missing
@@ -514,7 +536,7 @@ async fn upload(state: &ApiState, auth: &Auth, request: Request, delay: bool) ->
                 return crate::api::mastodon::errors::ApiError::unprocessable(
                     crate::domain::license::ERR_LICENSE_INVALID,
                 )
-                .into_response()
+                .into_response();
             }
         },
     };
@@ -694,7 +716,11 @@ async fn update_fields(
             None,
             forms::get(&pairs, "license").map(|raw| {
                 let trimmed = raw.trim().to_string();
-                if trimmed.is_empty() { None } else { Some(trimmed) }
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
             }),
         ));
     }
@@ -746,9 +772,9 @@ async fn multipart(state: &ApiState, request: Request) -> ApiResult<Multipart> {
     let (parts, body) = request.into_parts();
     let paced = Body::from_stream(PacedBody::new(body.into_data_stream()));
     let request = Request::from_parts(parts, paced);
-    Multipart::from_request(request, state).await.map_err(|err| {
-        ApiError::bad_request(format!("Invalid multipart body: {err}"))
-    })
+    Multipart::from_request(request, state)
+        .await
+        .map_err(|err| ApiError::bad_request(format!("Invalid multipart body: {err}")))
 }
 
 /// A body-frame stream that yields `Pending` (after re-waking) between
@@ -800,11 +826,7 @@ async fn next_field(multipart: &mut Multipart) -> ApiResult<Option<Field<'_>>> {
 /// Stream one file part into a capped spool file. The cap is enforced as the
 /// bytes arrive, so an oversized part is rejected before it is resident, and
 /// every failure path drops the spool (which deletes its file).
-async fn spool_field(
-    state: &ApiState,
-    mut field: Field<'_>,
-    limit: u64,
-) -> ApiResult<UploadSpool> {
+async fn spool_field(state: &ApiState, mut field: Field<'_>, limit: u64) -> ApiResult<UploadSpool> {
     let root = state.context.blobs.root_path();
     let mut spool = UploadSpool::create(root.as_deref(), limit)
         .await

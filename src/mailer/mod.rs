@@ -31,6 +31,8 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use crate::config::Config;
+use crate::config::RuntimeMode;
 use crate::domain::Id;
 
 /// One outbound message.
@@ -76,9 +78,9 @@ impl std::error::Error for MailError {}
 impl From<MailError> for crate::domain::Error {
     fn from(err: MailError) -> Self {
         match err {
-            MailError::Disabled(msg) => crate::domain::Error::Forbidden(
-                format!("Email delivery is not configured ({msg})"),
-            ),
+            MailError::Disabled(msg) => {
+                crate::domain::Error::Forbidden(format!("Email delivery is not configured ({msg})"))
+            }
             MailError::InvalidRecipient(msg) => {
                 crate::domain::Error::InvalidInput(format!("email {msg}"))
             }
@@ -150,11 +152,16 @@ fn validate_recipient(to: &str) -> Result<(), MailError> {
     let to = to.trim();
     let ok = !to.is_empty()
         && !to.contains(char::is_whitespace)
-        && to.split('@').nth(1).is_some_and(|d| !d.is_empty() && d.contains('.'));
+        && to
+            .split('@')
+            .nth(1)
+            .is_some_and(|d| !d.is_empty() && d.contains('.'));
     if ok {
         Ok(())
     } else {
-        Err(MailError::InvalidRecipient("address is invalid".to_string()))
+        Err(MailError::InvalidRecipient(
+            "address is invalid".to_string(),
+        ))
     }
 }
 
@@ -257,10 +264,7 @@ impl SmtpMailer {
         let port = parsed
             .port()
             .unwrap_or(if implicit_tls { 465 } else { 587 });
-        let allow_plaintext = matches!(
-            host.as_str(),
-            "localhost" | "127.0.0.1" | "::1"
-        );
+        let allow_plaintext = matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1");
         let credentials = match (parsed.username(), parsed.password()) {
             ("", _) => None,
             (user, pass) => {
@@ -304,10 +308,11 @@ impl SmtpMailer {
         };
         builder = builder.timeout(Some(std::time::Duration::from_secs(30)));
         if let Some((user, pass)) = &self.credentials {
-            builder = builder.credentials(lettre::transport::smtp::authentication::Credentials::new(
-                user.clone(),
-                pass.clone(),
-            ));
+            builder =
+                builder.credentials(lettre::transport::smtp::authentication::Credentials::new(
+                    user.clone(),
+                    pass.clone(),
+                ));
         }
         Ok(builder.build())
     }
@@ -362,7 +367,9 @@ pub fn mailer_from_config(
     match smtp_url {
         None => {
             if mail_from.is_some() {
-                return Err("--mail-from is set but --smtp-url is not; mail would never send".to_string());
+                return Err(
+                    "--mail-from is set but --smtp-url is not; mail would never send".to_string(),
+                );
             }
             Ok(Arc::new(DisabledMailer))
         }
@@ -411,6 +418,46 @@ impl MailEnv {
     }
 }
 
+/// Startup predicate: registrations are open but no mail provider is
+/// configured, so a new account's `SendConfirmationEmail` job could never
+/// deliver and the user could never receive their token.
+///
+/// The job itself still fails loudly (retry, never `Ok`) when this slips
+/// through; this predicate lets startup (and the registration endpoint) fail
+/// closed instead. `true` means "would strand confirmation mail".
+#[must_use]
+pub fn open_registration_without_mail(cfg: &Config) -> bool {
+    cfg.registration_open && !cfg.mail_enabled()
+}
+
+/// Production startup guard for open registrations without a mail provider.
+///
+/// Returns `Err` (fatal, with an operator-actionable message naming only the
+/// flags, never any secret) when production has open registrations and no
+/// SMTP provider. Lab passes: the caller logs a warning and the mail job
+/// stays explicitly undelivered (retry, never `Ok`).
+pub fn require_mail_for_open_registration(cfg: &Config) -> Result<(), String> {
+    if open_registration_without_mail(cfg) && cfg.mode == RuntimeMode::Production {
+        return Err("registrations are open but no SMTP provider is configured \
+             (--smtp-url and --mail-from); confirmation mail could never deliver: \
+             configure SMTP or close registrations"
+            .to_string());
+    }
+    Ok(())
+}
+
+/// Whether a legacy-seal failure must fail startup.
+///
+/// `seal_legacy_secrets` / `seal_legacy_actor_keys` only warn today, which
+/// lets production keep serving with legacy-plaintext rows and no operator
+/// signal. In production the failure is fatal (fail closed: plaintext
+/// long-lived secrets must not survive silently); lab only warns. Takes the
+/// deployment mode rather than a bare boolean so call sites stay readable.
+#[must_use]
+pub fn seal_failure_is_fatal(mode: RuntimeMode) -> bool {
+    mode == RuntimeMode::Production
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,7 +498,11 @@ mod tests {
     #[test]
     fn config_without_smtp_is_disabled_not_fake_success() {
         let mailer = mailer_from_config(None, None).expect("builds");
-        assert!(mailer.send_confirmation("f", "u@example.com", Id::new(1), "t", "https://x").is_err());
+        assert!(
+            mailer
+                .send_confirmation("f", "u@example.com", Id::new(1), "t", "https://x")
+                .is_err()
+        );
     }
 
     #[test]

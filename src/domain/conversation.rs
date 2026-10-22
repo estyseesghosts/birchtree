@@ -61,12 +61,7 @@ impl ConversationState {
     /// Whether the thread reads unread given its current last status and
     /// author. An explicit unread mark always wins; a read mark holds until a
     /// newer status (or a status by someone else) arrives.
-    pub fn computed_unread(
-        &self,
-        last_status_id: Id,
-        last_author_id: Id,
-        viewer_id: Id,
-    ) -> bool {
+    pub fn computed_unread(&self, last_status_id: Id, last_author_id: Id, viewer_id: Id) -> bool {
         if let Some(forced) = self.unread_override {
             return forced;
         }
@@ -135,21 +130,31 @@ impl PushPolicy {
 
 /// Validate a push subscription endpoint (`Web::PushSubscription`
 /// `validates :endpoint, presence: true, url: true`).
+///
+/// This is the synchronous shape gate: the endpoint must be a blank-free
+/// `https://` URL with a host and no credentials. Plain `http://` is refused
+/// here — push endpoints carry bearer VAPID credentials and must never be
+/// registered over cleartext in production. The full SSRF policy (IP-literal
+/// and DNS checks against the prohibited ranges) lives one layer up in
+/// [`crate::application::push_client`] and runs at subscription time (async,
+/// in the endpoint handler) and again before every delivery; domain code
+/// performs no network I/O.
 pub fn validate_push_endpoint(endpoint: &str) -> Result<(), String> {
     if endpoint.trim().is_empty() {
         return Err("Validation failed: Endpoint can't be blank".to_string());
     }
-    let url = url::Url::parse(endpoint)
+    let url = url::Url::parse(endpoint.trim())
         .map_err(|_| "Validation failed: Endpoint is invalid".to_string())?;
-    match url.scheme() {
-        "http" | "https" => {
-            if url.host_str().is_none_or(|host| host.is_empty()) {
-                return Err("Validation failed: Endpoint is invalid".to_string());
-            }
-            Ok(())
-        }
-        _ => Err("Validation failed: Endpoint is invalid".to_string()),
+    if url.scheme() != "https" {
+        return Err("Validation failed: Endpoint is invalid".to_string());
     }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("Validation failed: Endpoint is invalid".to_string());
+    }
+    if url.host_str().is_none_or(|host| host.is_empty()) {
+        return Err("Validation failed: Endpoint is invalid".to_string());
+    }
+    Ok(())
 }
 
 /// Validate the subscription keys (`WebPushKeyValidator` encrypts a probe;
@@ -215,6 +220,19 @@ mod tests {
             validate_push_endpoint("gopher://x/y").unwrap_err(),
             "Validation failed: Endpoint is invalid"
         );
+        // Plain HTTP is refused: endpoints carry bearer VAPID credentials.
+        assert_eq!(
+            validate_push_endpoint("http://push.example/sub").unwrap_err(),
+            "Validation failed: Endpoint is invalid"
+        );
+        // Credentials in the URL are refused.
+        assert_eq!(
+            validate_push_endpoint("https://user:pw@push.example/").unwrap_err(),
+            "Validation failed: Endpoint is invalid"
+        );
+        // An IP literal passes the shape gate; the application layer decides
+        // whether dialling it is allowed.
+        assert!(validate_push_endpoint("https://127.0.0.1/sub").is_ok());
     }
 
     #[test]

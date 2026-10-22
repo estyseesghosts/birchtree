@@ -174,9 +174,8 @@ pub fn vapid_jwt(
         "exp": now_ms / 1000 + VAPID_JWT_LIFETIME_SECS,
         "sub": subject,
     });
-    let payload = enc.encode(
-        serde_json::to_vec(&claims).map_err(|err| format!("vapid claims: {err}"))?,
-    );
+    let payload =
+        enc.encode(serde_json::to_vec(&claims).map_err(|err| format!("vapid claims: {err}"))?);
     let message = format!("{header}.{payload}");
     let signature = pair
         .sign(&rng, message.as_bytes())
@@ -188,7 +187,9 @@ pub fn vapid_jwt(
 /// origin (`scheme://host[:port]`).
 pub fn push_audience_origin(endpoint: &str) -> std::result::Result<String, String> {
     let url = url::Url::parse(endpoint).map_err(|err| format!("push endpoint: {err}"))?;
-    let host = url.host_str().ok_or_else(|| "push endpoint has no host".to_string())?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "push endpoint has no host".to_string())?;
     match url.port() {
         Some(port) => Ok(format!("{}://{host}:{port}", url.scheme())),
         None => Ok(format!("{}://{host}", url.scheme())),
@@ -358,42 +359,124 @@ pub fn classify_push_response(status: u16) -> PushOutcome {
     }
 }
 
+/// Maximum redirect hops followed for one delivery. Every hop is revalidated
+/// (shape, DNS, origin); the VAPID `Authorization` header is only sent to the
+/// validated original origin and is stripped on the first cross-origin hop.
+pub const MAX_PUSH_REDIRECTS: usize = 3;
+
 /// Send one delivery through `client` (the safe outbound client in
-/// production; any `reqwest::Client` in tests). Tickles go out bodiless;
-/// encrypted requests carry `Content-Type: application/octet-stream` and
-/// their `Content-Encoding` (upstream's standard request adds the same
-/// pair, plus `Authorization`, `Ttl`/`TTL`, `Urgency` and `Unsubscribe-URL`).
+/// production: no proxy, no automatic redirects, bounded timeouts and a DNS
+/// resolver that refuses blocked addresses — see
+/// [`crate::application::push_client::build_push_client`]).
+///
+/// The request URL is revalidated before every send (shape plus DNS, under
+/// the production default-deny policy), and up to [`MAX_PUSH_REDIRECTS`]
+/// redirects are followed manually, revalidating each `Location` target the
+/// same way. Redirects re-POST the same body and headers, except the VAPID
+/// `Authorization` header, which is dropped once the origin changes (a
+/// cross-origin endpoint must never receive another origin's bearer
+/// credential). `Crypto-Key` is kept: it carries only the VAPID *public* key
+/// and the ephemeral sender point, never a secret.
+///
+/// Settlement: a policy refusal (bad shape, prohibited address) deletes the
+/// subscription ([`PushOutcome::Gone`] — a row that fails validation can
+/// never deliver and may be weaponised); DNS lookup and network failures
+/// retry with backoff. Tickles go out bodiless; encrypted requests carry
+/// `Content-Type: application/octet-stream` and their `Content-Encoding`
+/// (upstream's standard request adds the same pair, plus `Authorization`,
+/// `Ttl`/`TTL`, `Urgency` and `Unsubscribe-URL`).
 /// Legacy `aesgcm` requests additionally carry the
 /// `Encryption: salt=…` header (upstream's legacy request sends it
 /// alongside `Crypto-Key: dh=…;…`). `Unsubscribe-URL` is sent when
 /// [`PushRequest::unsubscribe_url`] is set (upstream always sends it; here
 /// the token source is still pending, so it is usually absent).
-pub async fn deliver_push(
+///
+/// Callers that must dial lab endpoints (tests, local development) use
+/// [`deliver_push_with_policy`] with an explicit
+/// [`crate::application::push_client::PushClientConfig`]; the two-argument
+/// form always enforces the production default-deny policy.
+pub async fn deliver_push(client: &reqwest::Client, request: &PushRequest) -> PushOutcome {
+    deliver_push_with_policy(
+        client,
+        request,
+        &crate::application::push_client::PushClientConfig::default(),
+    )
+    .await
+}
+
+/// Send one delivery under an explicit policy (lab/test hook; production
+/// passes the default-deny config via [`deliver_push`]). Behaviour is
+/// identical to [`deliver_push`] except for the URL policy it enforces.
+pub async fn deliver_push_with_policy(
     client: &reqwest::Client,
     request: &PushRequest,
+    config: &crate::application::push_client::PushClientConfig,
 ) -> PushOutcome {
-    let mut outgoing = client
-        .post(&request.url)
-        .header("Authorization", &request.authorization)
-        .header("Crypto-Key", &request.crypto_key)
-        .header("TTL", request.ttl_secs.to_string())
-        .header("Urgency", "normal");
-    if let Some(encoding) = &request.content_encoding {
+    use crate::application::push_client;
+
+    let mut url = match url::Url::parse(&request.url) {
+        Ok(url) => url,
+        Err(_) => return PushOutcome::Gone,
+    };
+    let original_origin = match push_audience_origin(&request.url) {
+        Ok(origin) => origin,
+        Err(_) => return PushOutcome::Gone,
+    };
+    let mut authorization: Option<&str> = Some(request.authorization.as_str());
+    for _hop in 0..=MAX_PUSH_REDIRECTS {
+        match push_client::validate_delivery_target(&url, config).await {
+            Ok(()) => {}
+            Err(refusal) => {
+                return match refusal.settlement {
+                    push_client::Refusal::Gone => PushOutcome::Gone,
+                    push_client::Refusal::Retry => PushOutcome::Retry(refusal.message),
+                };
+            }
+        }
+        if !push_client::same_origin(&original_origin, &url) {
+            authorization = None;
+        }
+        let mut outgoing = client.post(url.clone());
+        if let Some(authorization) = authorization {
+            outgoing = outgoing.header("Authorization", authorization);
+        }
         outgoing = outgoing
-            .header("Content-Type", "application/octet-stream")
-            .header("Content-Encoding", encoding.clone());
+            .header("Crypto-Key", &request.crypto_key)
+            .header("TTL", request.ttl_secs.to_string())
+            .header("Urgency", "normal");
+        if let Some(encoding) = &request.content_encoding {
+            outgoing = outgoing
+                .header("Content-Type", "application/octet-stream")
+                .header("Content-Encoding", encoding.clone());
+        }
+        if let Some(encryption) = &request.encryption {
+            outgoing = outgoing.header("Encryption", encryption.clone());
+        }
+        if let Some(unsubscribe) = &request.unsubscribe_url {
+            outgoing = outgoing.header("Unsubscribe-URL", unsubscribe.clone());
+        }
+        let response = match outgoing.body(request.body.clone()).send().await {
+            Ok(response) => response,
+            Err(err) => return PushOutcome::Retry(format!("push send failed: {err}")),
+        };
+        if !response.status().is_redirection() {
+            return classify_push_response(response.status().as_u16());
+        }
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        if location.is_empty() {
+            return PushOutcome::Retry("push endpoint redirected without a location".to_string());
+        }
+        match url.join(&location) {
+            Ok(next) => url = next,
+            Err(_) => return PushOutcome::Gone,
+        }
     }
-    if let Some(encryption) = &request.encryption {
-        outgoing = outgoing.header("Encryption", encryption.clone());
-    }
-    if let Some(unsubscribe) = &request.unsubscribe_url {
-        outgoing = outgoing.header("Unsubscribe-URL", unsubscribe.clone());
-    }
-    let response = outgoing.body(request.body.clone()).send().await;
-    match response {
-        Ok(response) => classify_push_response(response.status().as_u16()),
-        Err(err) => PushOutcome::Retry(format!("push send failed: {err}")),
-    }
+    PushOutcome::Retry("push endpoint redirected too many times".to_string())
 }
 
 /// Build the encrypted-payload plaintext for one notification: the JSON of
@@ -455,7 +538,10 @@ pub fn push_notification_payload(
         None => String::new(),
     };
     if body_text.trim().is_empty() {
-        body_text = actor.as_ref().map(|account| account.note.clone()).unwrap_or_default();
+        body_text = actor
+            .as_ref()
+            .map(|account| account.note.clone())
+            .unwrap_or_default();
     }
     let body_text: String = body_text.chars().take(140).collect();
     let payload = serde_json::json!({
@@ -491,7 +577,9 @@ pub enum PushJobOutcome {
 /// `perform_legacy_request`), and the VAPID tickle for legacy subscriptions
 /// with no keys. Missing rows complete silently (upstream rescues
 /// `RecordNotFound` the same way).
-#[allow(clippy::too_many_arguments)]
+///
+/// Production entry point: [`handle_push_job_with_policy`] under the
+/// default-deny URL policy (HTTPS only, no private ranges).
 pub async fn handle_push_job(
     store: &dyn crate::application::ports::Store,
     client: &reqwest::Client,
@@ -500,6 +588,33 @@ pub async fn handle_push_job(
     subscription_id: Id,
     notification_id: Id,
     now_ms: u64,
+) -> std::result::Result<PushJobOutcome, Error> {
+    handle_push_job_with_policy(
+        store,
+        client,
+        keys,
+        subject,
+        subscription_id,
+        notification_id,
+        now_ms,
+        &crate::application::push_client::PushClientConfig::default(),
+    )
+    .await
+}
+
+/// Run one `WebPushDelivery` job under an explicit URL policy (lab/test
+/// hook; production passes the default-deny config via [`handle_push_job`]).
+/// Otherwise identical to [`handle_push_job`].
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_push_job_with_policy(
+    store: &dyn crate::application::ports::Store,
+    client: &reqwest::Client,
+    keys: &VapidKeys,
+    subject: &str,
+    subscription_id: Id,
+    notification_id: Id,
+    now_ms: u64,
+    policy: &crate::application::push_client::PushClientConfig,
 ) -> std::result::Result<PushJobOutcome, Error> {
     let subscription = store.push_subscription_by_id(subscription_id)?;
     let Some(subscription) = subscription else {
@@ -512,11 +627,17 @@ pub async fn handle_push_job(
     if notification.recipient_id != subscription.user_id {
         return Ok(PushJobOutcome::Complete);
     }
-    if notification.created_at_ms.saturating_add(PUSH_TTL_SECS * 1000) < now_ms {
+    if notification
+        .created_at_ms
+        .saturating_add(PUSH_TTL_SECS * 1000)
+        < now_ms
+    {
         return Ok(PushJobOutcome::Complete);
     }
     if !keys.is_configured() {
-        return Ok(PushJobOutcome::Retry("vapid keys are not configured".into()));
+        return Ok(PushJobOutcome::Retry(
+            "vapid keys are not configured".into(),
+        ));
     }
     // Follow-policy gates (upstream `policy_allows_notification?`): `followed`
     // needs the recipient following the actor; `follower` the reverse.
@@ -557,7 +678,9 @@ pub async fn handle_push_job(
             // The reason names only roles and lengths, never key bytes.
             Err(message) => {
                 tracing::warn!(reason = message, "web_push_delivery: dropping subscription");
-                return Ok(PushJobOutcome::DeleteSubscriptionAndComplete(subscription.id));
+                return Ok(PushJobOutcome::DeleteSubscriptionAndComplete(
+                    subscription.id,
+                ));
             }
         }
     } else if subscription_has_keys(&subscription) {
@@ -568,7 +691,9 @@ pub async fn handle_push_job(
             // will not heal, and a tickle would hide the breakage.
             Err(message) => {
                 tracing::warn!(reason = message, "web_push_delivery: dropping subscription");
-                return Ok(PushJobOutcome::DeleteSubscriptionAndComplete(subscription.id));
+                return Ok(PushJobOutcome::DeleteSubscriptionAndComplete(
+                    subscription.id,
+                ));
             }
         }
     } else {
@@ -578,7 +703,7 @@ pub async fn handle_push_job(
     // request): the stored absolute URL, minted at subscription creation.
     // Pre-token rows carry none and send no header (never fabricated).
     request.unsubscribe_url = subscription.unsubscribe_url.clone();
-    match deliver_push(client, &request).await {
+    match deliver_push_with_policy(client, &request, policy).await {
         PushOutcome::Delivered => Ok(PushJobOutcome::Complete),
         PushOutcome::Gone => Ok(PushJobOutcome::DeleteSubscriptionAndComplete(
             subscription.id,
@@ -609,6 +734,8 @@ fn notification_activity_present(
 /// `Err((false, message))` to retry with backoff, `Err((true, message))` to
 /// quarantine (malformed payload, or the job's retry budget is spent by the
 /// caller).
+/// Production entry point: [`run_push_job_record_with_policy`] under the
+/// default-deny URL policy.
 pub async fn run_push_job_record(
     store: &dyn crate::application::ports::Store,
     client: &reqwest::Client,
@@ -616,6 +743,30 @@ pub async fn run_push_job_record(
     subject: &str,
     job: &crate::domain::Job,
     now_ms: u64,
+) -> std::result::Result<(), (bool, String)> {
+    run_push_job_record_with_policy(
+        store,
+        client,
+        keys,
+        subject,
+        job,
+        now_ms,
+        &crate::application::push_client::PushClientConfig::default(),
+    )
+    .await
+}
+
+/// Worker entry point under an explicit URL policy (lab/test hook;
+/// production passes the default-deny config via [`run_push_job_record`]).
+/// Otherwise identical to [`run_push_job_record`].
+pub async fn run_push_job_record_with_policy(
+    store: &dyn crate::application::ports::Store,
+    client: &reqwest::Client,
+    keys: &VapidKeys,
+    subject: &str,
+    job: &crate::domain::Job,
+    now_ms: u64,
+    policy: &crate::application::push_client::PushClientConfig,
 ) -> std::result::Result<(), (bool, String)> {
     let sub_id = job
         .payload
@@ -633,9 +784,18 @@ pub async fn run_push_job_record(
             "web_push_delivery: missing subscription_id/notification_id".to_string(),
         ));
     };
-    let outcome = handle_push_job(store, client, keys, subject, sub_id, notification_id, now_ms)
-        .await
-        .map_err(|err| (false, format!("web_push_delivery: {err}")))?;
+    let outcome = handle_push_job_with_policy(
+        store,
+        client,
+        keys,
+        subject,
+        sub_id,
+        notification_id,
+        now_ms,
+        policy,
+    )
+    .await
+    .map_err(|err| (false, format!("web_push_delivery: {err}")))?;
     match outcome {
         PushJobOutcome::Complete => Ok(()),
         PushJobOutcome::DeleteSubscriptionAndComplete(id) => {
@@ -731,27 +891,20 @@ mod tests {
         for gone in [400, 401, 403, 404, 410, 422, 499] {
             assert_eq!(classify_push_response(gone), PushOutcome::Gone, "{gone}");
         }
-        assert!(matches!(
-            classify_push_response(408),
-            PushOutcome::Retry(_)
-        ));
-        assert!(matches!(
-            classify_push_response(429),
-            PushOutcome::Retry(_)
-        ));
-        assert!(matches!(
-            classify_push_response(500),
-            PushOutcome::Retry(_)
-        ));
+        assert!(matches!(classify_push_response(408), PushOutcome::Retry(_)));
+        assert!(matches!(classify_push_response(429), PushOutcome::Retry(_)));
+        assert!(matches!(classify_push_response(500), PushOutcome::Retry(_)));
     }
 
     #[test]
     fn vapid_keys_configuration_gate() {
-        assert!(!VapidKeys {
-            public_b64: String::new(),
-            private_b64: String::new(),
-        }
-        .is_configured());
+        assert!(
+            !VapidKeys {
+                public_b64: String::new(),
+                private_b64: String::new(),
+            }
+            .is_configured()
+        );
         let keys = test_keypair();
         assert!(keys.is_configured());
     }
@@ -760,8 +913,13 @@ mod tests {
     fn vapid_jwt_builds_and_verifies() {
         use base64::Engine as _;
         let keys = test_keypair();
-        let jwt = vapid_jwt(&keys, "https://push.example", "mailto:admin@example.social", 1_700_000_000_000)
-            .expect("jwt");
+        let jwt = vapid_jwt(
+            &keys,
+            "https://push.example",
+            "mailto:admin@example.social",
+            1_700_000_000_000,
+        )
+        .expect("jwt");
         let mut parts = jwt.split('.');
         let (header_b64, payload_b64, sig_b64) = (
             parts.next().expect("header"),
@@ -771,12 +929,17 @@ mod tests {
         assert!(parts.next().is_none());
         let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let header: serde_json::Value =
-            serde_json::from_slice(&enc.decode(header_b64).expect("header b64")).expect("header json");
+            serde_json::from_slice(&enc.decode(header_b64).expect("header b64"))
+                .expect("header json");
         assert_eq!(header, serde_json::json!({"typ": "JWT", "alg": "ES256"}));
         let payload: serde_json::Value =
-            serde_json::from_slice(&enc.decode(payload_b64).expect("payload b64")).expect("payload json");
+            serde_json::from_slice(&enc.decode(payload_b64).expect("payload b64"))
+                .expect("payload json");
         assert_eq!(payload["aud"], serde_json::json!("https://push.example"));
-        assert_eq!(payload["sub"], serde_json::json!("mailto:admin@example.social"));
+        assert_eq!(
+            payload["sub"],
+            serde_json::json!("mailto:admin@example.social")
+        );
         assert_eq!(
             payload["exp"],
             serde_json::json!(1_700_000_000u64 + VAPID_JWT_LIFETIME_SECS)
@@ -789,10 +952,7 @@ mod tests {
         );
         let message = format!("{header_b64}.{payload_b64}");
         verifier
-            .verify(
-                message.as_bytes(),
-                &enc.decode(sig_b64).expect("sig b64"),
-            )
+            .verify(message.as_bytes(), &enc.decode(sig_b64).expect("sig b64"))
             .expect("signature verifies");
     }
 

@@ -6,6 +6,8 @@
 
 use crate::application::ports::{BlobStore, Store};
 use crate::domain::{CustomEmoji, Error, Result};
+use crate::media::ingest;
+use crate::media::staging::StagingGuard;
 
 /// Public index (`GET /api/v1/custom_emojis`): listed emoji in shortcode
 /// order.
@@ -31,9 +33,7 @@ pub fn add_emoji(
         ));
     }
     if image.len() as u64 > CustomEmoji::IMAGE_LIMIT {
-        return Err(Error::InvalidInput(
-            "Image must be less than 256 KB".into(),
-        ));
+        return Err(Error::InvalidInput("Image must be less than 256 KB".into()));
     }
     // Reject anything that is not a PNG/GIF/WebP image (Mastodon's content
     // type list) by magic bytes.
@@ -42,11 +42,28 @@ pub fn add_emoji(
             "File content type is invalid, File is invalid".into(),
         ));
     }
+    let sniffed = crate::media::ingest::sniff(image).ok_or_else(|| {
+        Error::InvalidInput("File content type is invalid, File is invalid".into())
+    })?;
+    // Bounded header check before staging: the declared dimensions are read
+    // from the container header only (no pixel decode, no allocation) and
+    // refused past the shared image caps, so a tiny file declaring gigapixel
+    // dimensions never lands in the emoji pool. Emoji bytes are served as-is
+    // (never processed), so this header gate is the dimension bound.
+    crate::media::processing::check_image_limits(sniffed.mime_type, image).map_err(|err| {
+        Error::InvalidInput(format!(
+            "File content type is invalid, File is invalid ({err})"
+        ))
+    })?;
     let partition = emoji_partition(shortcode);
     let image_key = format!("custom_emojis/images/{partition}/original/{shortcode}.png");
     let static_key = format!("custom_emojis/images/{partition}/static/{shortcode}.png");
-    blobs.put(&image_key, image)?;
-    blobs.put(&static_key, image)?;
+    // Stage/commit/cleanup: both variants stage first, the row commits
+    // second, and the guard removes staged-but-uncommitted bytes when the
+    // second stage or the row commit fails.
+    let mut staging = StagingGuard::new(blobs);
+    staging.put(&image_key, image)?;
+    staging.put(&static_key, image)?;
     let emoji = CustomEmoji {
         shortcode: shortcode.to_string(),
         image_key,
@@ -55,7 +72,32 @@ pub fn add_emoji(
         disabled: false,
         category: category.map(str::to_string).filter(|c| !c.is_empty()),
     };
-    store.upsert_emoji(emoji)
+    let stored = store.upsert_emoji(emoji)?;
+    staging.commit();
+    Ok(stored)
+}
+
+/// Validate fetched remote-emoji bytes before staging: size cap, magic-byte
+/// signature and bounded header dimensions. Returns the sniffed MIME for the
+/// row. The federation writer must call this — and stage only into the
+/// evictable [`crate::media::remote_cache::remote_emoji_keys`] namespace
+/// afterwards — so a malicious origin cannot land a decompression bomb, an
+/// oversized file or a non-image in the emoji pool.
+pub fn validate_remote_emoji_bytes(bytes: &[u8]) -> Result<&'static str> {
+    if bytes.len() as u64 > CustomEmoji::IMAGE_LIMIT {
+        return Err(Error::InvalidInput("Image must be less than 256 KB".into()));
+    }
+    let sniffed = ingest::sniff(bytes)
+        .filter(|_| ingest::is_emoji_image(bytes))
+        .ok_or_else(|| {
+            Error::InvalidInput("File content type is invalid, File is invalid".into())
+        })?;
+    crate::media::processing::check_image_limits(sniffed.mime_type, bytes).map_err(|err| {
+        Error::InvalidInput(format!(
+            "File content type is invalid, File is invalid ({err})"
+        ))
+    })?;
+    Ok(sniffed.mime_type)
 }
 
 /// CLI: remove an emoji and its bytes.
