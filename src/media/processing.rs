@@ -176,13 +176,15 @@ fn process_image(mime_type: &str, bytes: &[u8]) -> Result<Processed, ProcessErro
     // Encode-only use: this is the single `blurhash::` call in the tree, and
     // `decode` is never called (nor reachable through any dependency), so the
     // crafted-input decode advisory (RUSTSEC-2023-0083) does not apply here.
+    // The crate is pinned to the fixed 0.2 line regardless.
     let blurhash = blurhash::encode(
         components_x,
         components_y,
         preview_w,
         preview_h,
         rgba.as_raw(),
-    );
+    )
+    .map_err(|err| ProcessError::Other(format!("encode blurhash: {err}")))?;
 
     // Re-encode in the source format where one exists; GIF/BMP previews are
     // PNG (animated GIFs would lose animation either way).

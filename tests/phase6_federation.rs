@@ -15,17 +15,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use activitypub_federation::http_signatures::generate_actor_keypair;
 use activitypub_federation::protocol::context::WithContext;
 use activitypub_federation::traits::ActivityHandler;
+use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::routing::post;
-use axum::Router;
-use birchtree::activitypub::activities::{AcceptObject, Accept, Activity, Follow, Undo, UndoObject};
+use birchtree::activitypub::activities::{
+    Accept, AcceptObject, Activity, Follow, Undo, UndoObject,
+};
 use birchtree::activitypub::http;
 use birchtree::api::mastodon::ServerInfo;
 use birchtree::application::context::Context;
 use birchtree::application::federation::{
-    receive_accept, receive_follow, receive_undo_follow, request_remote_follow, InboundAccept,
-    InboundFollow, InboundUndoFollow, OutboundFollow,
+    InboundAccept, InboundFollow, InboundUndoFollow, OutboundFollow, receive_accept,
+    receive_follow, receive_undo_follow, request_remote_follow,
 };
 use birchtree::application::federation_ports::{
     DeliverySpec, FederationStore, InboundDisposition, RemoteAccountUpsert,
@@ -37,7 +39,7 @@ use birchtree::federation::delivery::{self, DeliveryError};
 use birchtree::federation::net::SafeHttpConfig;
 use birchtree::persistence::redb::RedbStore;
 use birchtree::streaming::{Hub, Limits};
-use common::{send, temp_store, TEST_PUBLIC_URL};
+use common::{TEST_PUBLIC_URL, send, temp_store};
 use serde_json::json;
 use tower::ServiceExt;
 
@@ -45,23 +47,39 @@ const LOCAL_ACTOR: &str = "https://example.social/users/alice";
 
 /// A job ID unique within the test run (the store's own generator is private).
 fn unique_job_id() -> Id {
-    Id::new(SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos() as u64)
+    Id::new(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos() as u64,
+    )
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64
 }
 
 fn context(store: &Arc<RedbStore>, dir: &std::path::Path) -> Arc<Context> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let ids: Arc<dyn IdGenerator> = Arc::new(TimestampIdGenerator::new(Box::new(SystemClock)));
-    let blobs = Arc::new(birchtree::media::blob_store::FsBlobStore::open(dir.join("media")).expect("blobs"));
+    let blobs = Arc::new(
+        birchtree::media::blob_store::FsBlobStore::open(dir.join("media")).expect("blobs"),
+    );
     let server = Arc::new(ServerInfo::from_config(&Config {
         public_url: TEST_PUBLIC_URL.to_string(),
         ..Config::default()
     }));
     let streams = Hub::new(store.clone(), clock.clone(), server, Limits::default());
-    Arc::new(Context::new(clock, ids, store.clone(), blobs, Arc::new(streams)))
+    Arc::new(Context::new(
+        clock,
+        ids,
+        store.clone(),
+        blobs,
+        Arc::new(streams),
+    ))
 }
 
 /// A remote actor known to the store, with a fresh key, so no test fetches the network.
@@ -80,7 +98,9 @@ fn remote_actor(store: &RedbStore, name: &str) -> RemoteAccountUpsert {
         public_key_pem: keys.public_key,
         key_id: format!("{actor_uri}#main-key"),
     };
-    store.upsert_remote(upsert.clone(), now_ms()).expect("upsert remote");
+    store
+        .upsert_remote(upsert.clone(), now_ms())
+        .expect("upsert remote");
     upsert
 }
 
@@ -115,7 +135,11 @@ async fn webfinger_answers_for_local_names_and_refuses_the_rest() {
     assert_eq!(me["type"], "application/activity+json");
     assert_eq!(me["href"], LOCAL_ACTOR);
 
-    for resource in ["acct:nobody@example.social", "acct:alice@elsewhere.test", "junk"] {
+    for resource in [
+        "acct:nobody@example.social",
+        "acct:alice@elsewhere.test",
+        "junk",
+    ] {
         let (status, _, _) = send(
             &srv.router,
             Request::builder()
@@ -143,20 +167,37 @@ async fn actor_document_carries_the_key_the_signatures_use() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(headers.get("content-type").unwrap(), "application/activity+json");
+    assert_eq!(
+        headers.get("content-type").unwrap(),
+        "application/activity+json"
+    );
     let doc = common::json(&body);
     assert_eq!(doc["type"], "Person");
     assert_eq!(doc["id"], LOCAL_ACTOR);
     assert_eq!(doc["preferredUsername"], "alice");
     assert_eq!(doc["inbox"], "https://example.social/users/alice/inbox");
-    assert_eq!(doc["endpoints"]["sharedInbox"], "https://example.social/inbox");
-    assert_eq!(doc["publicKey"]["id"], "https://example.social/users/alice#main-key");
+    assert_eq!(
+        doc["endpoints"]["sharedInbox"],
+        "https://example.social/inbox"
+    );
+    assert_eq!(
+        doc["publicKey"]["id"],
+        "https://example.social/users/alice#main-key"
+    );
     assert_eq!(doc["publicKey"]["owner"], LOCAL_ACTOR);
-    assert!(doc["publicKey"]["publicKeyPem"].as_str().unwrap().starts_with("-----BEGIN PUBLIC KEY-----"));
+    assert!(
+        doc["publicKey"]["publicKeyPem"]
+            .as_str()
+            .unwrap()
+            .starts_with("-----BEGIN PUBLIC KEY-----")
+    );
 
     let (status, _, _) = send(
         &srv.router,
-        Request::builder().uri("/users/nobody").body(Body::empty()).unwrap(),
+        Request::builder()
+            .uri("/users/nobody")
+            .body(Body::empty())
+            .unwrap(),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -167,7 +208,10 @@ async fn nodeinfo_describes_the_software() {
     let srv = common::TestServer::new(true);
     let (status, _, body) = send(
         &srv.router,
-        Request::builder().uri("/.well-known/nodeinfo").body(Body::empty()).unwrap(),
+        Request::builder()
+            .uri("/.well-known/nodeinfo")
+            .body(Body::empty())
+            .unwrap(),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -177,7 +221,10 @@ async fn nodeinfo_describes_the_software() {
     );
     let (status, _, body) = send(
         &srv.router,
-        Request::builder().uri("/nodeinfo/2.0").body(Body::empty()).unwrap(),
+        Request::builder()
+            .uri("/nodeinfo/2.0")
+            .body(Body::empty())
+            .unwrap(),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -230,12 +277,76 @@ async fn unsigned_activity_from_a_known_actor_is_refused_with_no_state_change() 
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-    assert!(!store.activity_seen(activity_id).unwrap(), "a refused activity is not recorded");
-    assert!(store.follow_of(eve_id(&store, &eve), bob).unwrap().is_none());
+    assert!(
+        !store.activity_seen(activity_id).unwrap(),
+        "a refused activity is not recorded"
+    );
+    assert!(
+        store
+            .follow_of(eve_id(&store, &eve), bob)
+            .unwrap()
+            .is_none()
+    );
 }
 
 fn eve_id(store: &RedbStore, upsert: &RemoteAccountUpsert) -> Id {
-    store.account_by_actor_uri(&upsert.actor_uri).unwrap().expect("eve").id
+    store
+        .account_by_actor_uri(&upsert.actor_uri)
+        .unwrap()
+        .expect("eve")
+        .id
+}
+
+/// An RFC 9421-shaped request (modern `Signature-Input`/`Signature`
+/// headers, no legacy Cavage `Signature` header) is refused without state
+/// change: Ed25519/RFC 9421 is explicitly remaining work (see
+/// `docs/birchtree-rsa-prod.md`), so modern-only senders 401 — never
+/// accepted, never crashed, never silently downgraded.
+#[tokio::test]
+async fn rfc9421_shaped_request_is_refused_without_state_change() {
+    let (dir, store) = temp_store();
+    let bob = local_id(&store, "bob");
+    let eve = remote_actor(&store, "eve");
+    let router = federation_router(&store, dir.path());
+
+    let activity_id = "https://remote.example/activities/rfc9421";
+    let body = json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "type": "Follow",
+        "id": activity_id,
+        "actor": eve.actor_uri,
+        "object": "https://example.social/users/bob"
+    });
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/users/bob/inbox")
+                .header("content-type", "application/activity+json")
+                .header(
+                    "signature-input",
+                    "sig=(\"@method\" \"@target-uri\" \"content-digest\");created=1700000000;keyid=\"https://remote.example/users/eve#ed25519-key\"",
+                )
+                .header("signature", "sig=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=:")
+                .header("content-digest", "sha-512=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=:")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    assert!(
+        !store.activity_seen(activity_id).unwrap(),
+        "a refused activity is not recorded"
+    );
+    assert!(
+        store
+            .follow_of(eve_id(&store, &eve), bob)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -280,7 +391,10 @@ async fn accept_naming_another_followed_account_is_refused() {
     let accept = Accept {
         kind: Default::default(),
         id: "https://remote.example/accepts/1".parse().unwrap(),
-        actor: "https://remote.example/users/eve".parse::<url::Url>().unwrap().into(),
+        actor: "https://remote.example/users/eve"
+            .parse::<url::Url>()
+            .unwrap()
+            .into(),
         object: AcceptObject::Follow(Box::new(follow)),
         result: None,
     };
@@ -319,7 +433,9 @@ async fn undo_of_someone_elses_follow_is_refused() {
 #[test]
 fn unsupported_activity_types_do_not_parse() {
     // Anything outside the Phase 6 set is refused at parse time, never accepted and dropped.
-    for kind in ["Like", "Announce", "Create", "Flag", "Update", "Delete", "Question"] {
+    for kind in [
+        "Like", "Announce", "Create", "Flag", "Update", "Delete", "Question",
+    ] {
         let body = json!({
             "type": kind,
             "id": "https://remote.example/x",
@@ -347,7 +463,11 @@ fn an_ignored_undo_is_not_recorded_so_a_later_real_undo_applies() {
     // The Undo arrives before any follow exists: recorded as ignored, so nothing is stored.
     let first = receive_undo_follow(
         &*store,
-        InboundUndoFollow { activity_uri: undo_id.into(), actor: eve.clone(), target_id: alice },
+        InboundUndoFollow {
+            activity_uri: undo_id.into(),
+            actor: eve.clone(),
+            target_id: alice,
+        },
         now_ms(),
     )
     .unwrap();
@@ -373,7 +493,11 @@ fn an_ignored_undo_is_not_recorded_so_a_later_real_undo_applies() {
 
     let second = receive_undo_follow(
         &*store,
-        InboundUndoFollow { activity_uri: undo_id.into(), actor: eve, target_id: alice },
+        InboundUndoFollow {
+            activity_uri: undo_id.into(),
+            actor: eve,
+            target_id: alice,
+        },
         now_ms(),
     )
     .unwrap();
@@ -394,10 +518,20 @@ fn a_redelivered_applied_follow_is_a_duplicate_and_changes_nothing() {
         accept_uri: "https://remote.example/follows/7#accept".into(),
         accept_body: json!({}),
     };
-    assert_eq!(receive_follow(&*store, input(), now_ms()).unwrap(), InboundDisposition::Applied);
-    let eve_id = store.account_by_actor_uri(&eve.actor_uri).unwrap().unwrap().id;
+    assert_eq!(
+        receive_follow(&*store, input(), now_ms()).unwrap(),
+        InboundDisposition::Applied
+    );
+    let eve_id = store
+        .account_by_actor_uri(&eve.actor_uri)
+        .unwrap()
+        .unwrap()
+        .id;
     let before = store.account_stats(alice).unwrap();
-    assert_eq!(receive_follow(&*store, input(), now_ms()).unwrap(), InboundDisposition::Duplicate);
+    assert_eq!(
+        receive_follow(&*store, input(), now_ms()).unwrap(),
+        InboundDisposition::Duplicate
+    );
     let after = store.account_stats(alice).unwrap();
     assert_eq!(before.followers_count, after.followers_count);
     assert_eq!(before.follow_requests_count, after.follow_requests_count);
@@ -415,7 +549,11 @@ fn an_accept_from_an_account_that_was_not_followed_changes_nothing() {
         &*store,
         OutboundFollow {
             follower_id: alice,
-            followed_id: store.account_by_actor_uri(&followed.actor_uri).unwrap().unwrap().id,
+            followed_id: store
+                .account_by_actor_uri(&followed.actor_uri)
+                .unwrap()
+                .unwrap()
+                .id,
             follow_uri: follow_uri.into(),
             inbox_uri: followed.inbox_uri.clone(),
             body: json!({"type": "Follow"}),
@@ -434,9 +572,19 @@ fn an_accept_from_an_account_that_was_not_followed_changes_nothing() {
         now_ms(),
     )
     .unwrap();
-    assert!(matches!(disposition, InboundDisposition::Ignored(_)), "{disposition:?}");
+    assert!(
+        matches!(disposition, InboundDisposition::Ignored(_)),
+        "{disposition:?}"
+    );
     let row = store
-        .follow_of(alice, store.account_by_actor_uri(&followed.actor_uri).unwrap().unwrap().id)
+        .follow_of(
+            alice,
+            store
+                .account_by_actor_uri(&followed.actor_uri)
+                .unwrap()
+                .unwrap()
+                .id,
+        )
         .unwrap()
         .expect("the pending follow is still there");
     assert_eq!(row.state, birchtree::domain::FollowState::Pending);
@@ -449,7 +597,12 @@ fn sender_with_keys(store: &RedbStore) -> Id {
     let alice = local_id(store, "alice");
     let pair = generate_actor_keypair().expect("keypair");
     store
-        .store_local_keys(alice, &format!("{LOCAL_ACTOR}#main-key"), &pair.public_key, &pair.private_key)
+        .store_local_keys(
+            alice,
+            &format!("{LOCAL_ACTOR}#main-key"),
+            &pair.public_key,
+            &pair.private_key,
+        )
         .expect("keys");
     alice
 }
@@ -468,7 +621,9 @@ fn delivery_job(sender: Id, inbox: &str, body: serde_json::Value) -> Job {
 fn follow_body(object: &str) -> serde_json::Value {
     serde_json::to_value(WithContext::new_default(Activity::Follow(Follow {
         kind: Default::default(),
-        id: "https://example.social/users/alice/follows/1".parse().unwrap(),
+        id: "https://example.social/users/alice/follows/1"
+            .parse()
+            .unwrap(),
         actor: LOCAL_ACTOR.parse::<url::Url>().unwrap().into(),
         object: object.parse::<url::Url>().unwrap().into(),
     })))
@@ -481,7 +636,9 @@ async fn loopback_inbox(status: u16) -> String {
         "/inbox",
         post(move || async move { StatusCode::from_u16(status).unwrap() }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let port = listener.local_addr().expect("addr").port();
     tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
     // A host name, not an IP literal: the crate's URL check requires a domain.
@@ -513,9 +670,16 @@ async fn delivery_retries_a_server_error_and_completes_an_accepted_one() {
 
     let alice = sender_with_keys(&store);
     let busy = loopback_inbox(503).await;
-    let job = delivery_job(alice, &busy, follow_body("https://remote.example/users/eve"));
+    let job = delivery_job(
+        alice,
+        &busy,
+        follow_body("https://remote.example/users/eve"),
+    );
     let outcome = delivery::run(&config, &job).await;
-    assert!(matches!(outcome, Err(DeliveryError::Retry(_))), "{outcome:?}");
+    assert!(
+        matches!(outcome, Err(DeliveryError::Retry(_))),
+        "{outcome:?}"
+    );
 
     let ok = loopback_inbox(202).await;
     let job = delivery_job(alice, &ok, follow_body("https://remote.example/users/eve"));
@@ -535,8 +699,15 @@ async fn delivery_retries_a_client_error() {
     );
     let alice = sender_with_keys(&store);
     let rejecting = loopback_inbox(400).await;
-    let job = delivery_job(alice, &rejecting, follow_body("https://remote.example/users/eve"));
-    assert!(matches!(delivery::run(&config, &job).await, Err(DeliveryError::Retry(_))));
+    let job = delivery_job(
+        alice,
+        &rejecting,
+        follow_body("https://remote.example/users/eve"),
+    );
+    assert!(matches!(
+        delivery::run(&config, &job).await,
+        Err(DeliveryError::Retry(_))
+    ));
 }
 
 #[tokio::test]
@@ -544,9 +715,16 @@ async fn delivery_quarantines_a_target_the_policy_refuses() {
     let (dir, store) = temp_store();
     let config = common::federation_config(context(&store, dir.path()), TEST_PUBLIC_URL);
     let alice = sender_with_keys(&store);
-    let job = delivery_job(alice, "https://10.0.0.5/inbox", follow_body("https://remote.example/users/eve"));
+    let job = delivery_job(
+        alice,
+        "https://10.0.0.5/inbox",
+        follow_body("https://remote.example/users/eve"),
+    );
     let outcome = delivery::run(&config, &job).await;
-    assert!(matches!(outcome, Err(DeliveryError::Quarantine(_))), "{outcome:?}");
+    assert!(
+        matches!(outcome, Err(DeliveryError::Quarantine(_))),
+        "{outcome:?}"
+    );
 }
 
 #[tokio::test]
@@ -567,7 +745,10 @@ async fn delivery_quarantines_a_job_whose_sender_has_no_signing_key() {
         now_ms(),
     );
     let outcome = delivery::run(&config, &job).await;
-    assert!(matches!(outcome, Err(DeliveryError::Quarantine(_))), "{outcome:?}");
+    assert!(
+        matches!(outcome, Err(DeliveryError::Quarantine(_))),
+        "{outcome:?}"
+    );
 }
 
 #[test]
@@ -586,7 +767,9 @@ fn delivery_spec_is_the_store_payload() {
 
 /// Serve `router` on a loopback port and return the port.
 async fn serve_loopback(router: Router) -> u16 {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let port = listener.local_addr().expect("addr").port();
     tokio::spawn(async move { axum::serve(listener, router).await.expect("serve") });
     port
@@ -596,7 +779,9 @@ async fn serve_loopback(router: Router) -> u16 {
 async fn a_signature_that_fails_against_a_stale_cached_key_is_checked_against_a_refetched_one() {
     // Sender: a local `alice` whose actor document and signatures carry key B.
     let (sender_dir, sender_store) = temp_store();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let sender_port = listener.local_addr().expect("addr").port();
     let sender_url = format!("http://localhost:{sender_port}");
     let sender_config = common::federation_config_with(
@@ -621,7 +806,12 @@ async fn a_signature_that_fails_against_a_stale_cached_key_is_checked_against_a_
     let key_b = generate_actor_keypair().expect("keypair");
     let alice_uri = format!("{sender_url}/users/alice");
     sender_store
-        .store_local_keys(alice, &format!("{alice_uri}#main-key"), &key_b.public_key, &key_b.private_key)
+        .store_local_keys(
+            alice,
+            &format!("{alice_uri}#main-key"),
+            &key_b.public_key,
+            &key_b.private_key,
+        )
         .expect("keys");
     let sender_router = http::routes::<()>(sender_config.clone()).with_state(());
     tokio::spawn(async move { axum::serve(listener, sender_router).await.expect("serve") });
@@ -659,15 +849,28 @@ async fn a_signature_that_fails_against_a_stale_cached_key_is_checked_against_a_
         kind: Default::default(),
         id: format!("{alice_uri}/follows/1").parse().unwrap(),
         actor: alice_uri.parse::<url::Url>().unwrap().into(),
-        object: format!("{TEST_PUBLIC_URL}/users/bob").parse::<url::Url>().unwrap().into(),
+        object: format!("{TEST_PUBLIC_URL}/users/bob")
+            .parse::<url::Url>()
+            .unwrap()
+            .into(),
     })))
     .unwrap();
-    let job = delivery_job(alice, &format!("http://localhost:{recv_port}/users/bob/inbox"), body);
+    let job = delivery_job(
+        alice,
+        &format!("http://localhost:{recv_port}/users/bob/inbox"),
+        body,
+    );
     assert_eq!(delivery::run(&sender_config, &job).await, Ok(()));
 
-    let alice_remote = recv_store.account_by_actor_uri(&alice_uri).unwrap().expect("alice");
+    let alice_remote = recv_store
+        .account_by_actor_uri(&alice_uri)
+        .unwrap()
+        .expect("alice");
     assert!(
-        recv_store.follow_of(alice_remote.id, bob).unwrap().is_some(),
+        recv_store
+            .follow_of(alice_remote.id, bob)
+            .unwrap()
+            .is_some(),
         "the follow was accepted after the key was refetched"
     );
 }

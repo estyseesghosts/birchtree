@@ -8,6 +8,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# The audit job reports through the Checks API, which needs an explicit
+# grant: without `checks: write` the run fails creating the check.
+permissions:
+  contents: read
+  checks: write
+
 jobs:
   test:
     name: check, test, release build

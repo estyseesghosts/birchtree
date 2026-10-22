@@ -4,6 +4,47 @@
 
 **Purpose:** fix the verified correctness, security, storage, coupling, and operational risks before public production use. Keep the modular-monolith architecture and `redb`; do not turn this into a rewrite.
 
+## Status as of prod-2 (schema v23): RSA provider landed, RFC 9421 open
+
+**Shipped (aws-lc-rs today):** the RSA migration in §4.3 is landed, not
+"not started". RustCrypto `rsa` is absent from the tree (`Cargo.toml`
+documents the removal; `cargo audit` is green on RUSTSEC-2023-0071).
+`vendor/activitypub_federation/src/rsa_provider.rs` is the single AWS-LC
+touchpoint: 2048-bit generation, PKCS#8 import, `sign_legacy_rsa_sha256`
+(blinded inside the AWS-LC operation — no unblinded path exists) and
+`verify_legacy_rsa_sha256` against SPKI PEM via the `spki` crate (no
+hand-parsed DER). Stored PKCS#8 PEM keys still load, key IDs are stable,
+and an OpenSSL-produced fixture signature verifies byte-identically
+(`tests/a_rsa_provider.rs`). Outbound stays legacy draft-Cavage
+`rsa-sha256`; inbound verifies legacy RSA and refuses unsigned requests
+(401, no state change — `tests/phase6_federation.rs`).
+
+**Compatibility exception (deliberate, not a migration gap):** legacy RSA
+outbound is kept for RSA-only peers (older Mastodon, Misskey/Sharkey and
+other implementations without RFC 9421 support). Dropping PKCS#1 v1.5
+outbound unilaterally would break those peers, so the default stays
+Cavage `rsa-sha256` until the dual-stack below ships.
+
+**Explicitly remaining work (not done): Ed25519 + RFC 9421 dual-stack.**
+No Ed25519 key is generated, published, or verified anywhere in the tree,
+and no RFC 9421 `Signature-Input`/`Signature` path exists; an RFC
+9421-shaped request is refused (401), never accepted and never crashes
+(pinned by `rfc9421_shaped_request_is_refused_without_state_change`).
+The design, when it ships, is dual-stack per peer — never
+Ed25519-only-outbound:
+
+1. Generate and publish an Ed25519 key alongside the existing RSA key
+   (no key rotation: the RSA `keyId` stays).
+2. Outbound: a peer that advertises an Ed25519 key / accepts RFC 9421 gets
+   RFC 9421 signatures only. A failed Ed25519 sign fails the delivery; it
+   never silently falls back to RSA for that peer.
+3. Outbound to RSA-only peers keeps `sign_legacy_rsa_sha256` under this
+   compatibility exception.
+4. Inbound verifies RFC 9421 and legacy RSA; unsigned stays refused.
+5. Interop exit: one Mastodon 4.7-shaped RFC 9421 request accepted, one
+   legacy draft-cavage request accepted, one bad signature rejected —
+   proven by a live 4.7 lab run, not by unit fixtures alone.
+
 ## Working rules
 
 1. Work in small, independent commits. Do not combine crypto migration, storage lifecycle, and broad refactoring in one patch.
