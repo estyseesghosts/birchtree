@@ -753,30 +753,62 @@ pub async fn fetch_remote_emoji_bytes(
 /// Remote rows are never picker-visible and never listed (upstream
 /// `CustomEmoji.listed` is local-only); renderers serve them through the
 /// `emojis` arrays only.
+///
+/// Bytes land in the evictable [`remote_cache::remote_emoji_keys`] namespace
+/// — never under `custom_emojis/images/…`, which is the durable pool with no
+/// eviction — through the pool-routed blob handle (the caller passes the
+/// runtime handle, so `remote/…` keys reach the cache pool). Both copies are
+/// registered as durable `REMOTE_CACHE` rows ([`EMOJI_VARIANT`] and
+/// [`EMOJI_STATIC_VARIANT` under the fetch `source_url`), so
+/// `cache_evict_batch` can reclaim them; eviction drops bytes but the shells
+/// (and the render row below) survive for refetch.
 pub fn store_remote_emoji(
-    store: &dyn crate::application::ports::EmojiStore,
+    store: &dyn crate::application::ports::Store,
     blobs: &dyn BlobStore,
     namespaced_shortcode: &str,
     origin_domain: &str,
+    source_url: &str,
     bytes: &[u8],
-    mime_type: &str,
     now_ms: u64,
 ) -> std::result::Result<crate::domain::CustomEmoji, String> {
-    if bytes.len() as u64 > MAX_REMOTE_EMOJI_BYTES {
-        return Err("emoji is larger than the limit".into());
-    }
-    let sniffed_ok = ingest::sniff(bytes).is_some_and(|s| s.mime_type == mime_type);
-    if !sniffed_ok || !ingest::is_emoji_image(bytes) {
-        return Err("emoji is not a supported image".into());
-    }
-    let (shortcode, _) = split_remote_emoji_shortcode(namespaced_shortcode)
+    let mime_type = crate::application::emoji::validate_remote_emoji_bytes(bytes)
+        .map_err(|err| err.to_string())?;
+    let (shortcode, namespaced_domain) = split_remote_emoji_shortcode(namespaced_shortcode)
         .ok_or_else(|| "remote emoji key is not namespaced".to_string())?;
-    let partition = crate::application::emoji::emoji_partition(shortcode);
-    let image_key = format!("custom_emojis/images/{partition}/original/{namespaced_shortcode}.png");
-    let static_key = format!("custom_emojis/images/{partition}/static/{namespaced_shortcode}.png");
+    if namespaced_domain != origin_domain.to_ascii_lowercase() {
+        return Err("remote emoji domain does not match its key".into());
+    }
+    let (image_key, static_key) =
+        remote_cache::remote_emoji_keys(origin_domain, shortcode).ok_or_else(|| {
+            "remote emoji domain or shortcode is not a servable shape".to_string()
+        })?;
     blobs.put(&image_key, bytes).map_err(|e| e.to_string())?;
     blobs.put(&static_key, bytes).map_err(|e| e.to_string())?;
-    let _ = (mime_type, now_ms);
+    let size = bytes.len() as u64;
+    // Durable byte rows first (one transaction each, mapping + counters
+    // together): a later failure leaves counted bytes the reconciler can
+    // see, never phantom blobs.
+    store
+        .cache_mark_stored(
+            source_url,
+            remote_cache::EMOJI_VARIANT,
+            &image_key,
+            size,
+            None,
+            now_ms,
+        )
+        .map_err(|e| e.to_string())?;
+    store
+        .cache_mark_stored(
+            source_url,
+            remote_cache::EMOJI_STATIC_VARIANT,
+            &static_key,
+            size,
+            None,
+            now_ms,
+        )
+        .map_err(|e| e.to_string())?;
+    let _ = mime_type;
     let row = store
         .upsert_emoji(crate::domain::CustomEmoji {
             shortcode: namespaced_shortcode.to_string(),
@@ -789,14 +821,16 @@ pub fn store_remote_emoji(
         .map_err(|e| e.to_string())?;
     // `REMOTE_EMOJI` render row alongside the interim namespaced row: the
     // status `emojis` arrays look rows up by bare shortcode (parent merge of
-    // G-D S10) and serve the staged bytes through the same `system/` asset
-    // route as local emoji. The interim row stays for fetch-stage
-    // bookkeeping.
+    // G-D S10) and serve the staged bytes through the `system/remote/emojis/`
+    // asset route. The interim row stays for fetch-stage bookkeeping. The
+    // origin `source_url` rides along so a byte miss enqueues a refetch
+    // instead of answering 500.
     store
         .upsert_remote_emoji(crate::application::ports::RemoteEmojiRow {
             shortcode: shortcode.to_string(),
             domain: origin_domain.to_string(),
             url: format!("system/{image_key}"),
+            source_url: source_url.to_string(),
         })
         .map_err(|e| e.to_string())?;
     Ok(row)

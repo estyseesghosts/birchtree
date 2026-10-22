@@ -2050,13 +2050,19 @@ pub trait EmojiStore: Send + Sync {
 }
 
 /// One remote custom emoji row (federation tail, G-D): the origin domain +
-/// shortcode key the render path, with the source URL served in `emojis`
-/// arrays (never picker-visible, never listed).
+/// shortcode key the render path, with the local asset path served in
+/// `emojis` arrays (never picker-visible, never listed).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RemoteEmojiRow {
     pub shortcode: String,
     pub domain: String,
     pub url: String,
+    /// Origin image URL the bytes were fetched from. The serve path uses it
+    /// to enqueue a `FetchRemoteEmoji` refetch on a byte miss (evicted bytes
+    /// heal; they never 500). Defaults for rows written before the field
+    /// existed (which never refetch).
+    #[serde(default)]
+    pub source_url: String,
 }
 
 /// Bounded local search scans backing `GET /api/v2/search`.

@@ -19,6 +19,14 @@ pub fn index(store: &dyn Store) -> Result<Vec<CustomEmoji>> {
 ///
 /// The image is staged first, then the row commits — file storage cannot
 /// join the `redb` transaction (`birchtree.md` §5).
+///
+/// Replacement is transactional: a replace stages under fresh unpublished
+/// keys (`{shortcode}@restage-{rand}`, still inside the served partition so
+/// the committed row serves immediately), commits the row to those keys,
+/// and only then deletes the previous keys. A failed stage or a failed row
+/// commit leaves the previous keys — and their bytes — untouched; the
+/// [`StagingGuard`] only ever cleans never-published keys, never rolls back
+/// an in-place overwrite (there is none).
 pub fn add_emoji(
     store: &dyn Store,
     blobs: &dyn BlobStore,
@@ -56,24 +64,53 @@ pub fn add_emoji(
         ))
     })?;
     let partition = emoji_partition(shortcode);
-    let image_key = format!("custom_emojis/images/{partition}/original/{shortcode}.png");
-    let static_key = format!("custom_emojis/images/{partition}/static/{shortcode}.png");
+    let canonical_image_key = format!("custom_emojis/images/{partition}/original/{shortcode}.png");
+    let canonical_static_key = format!("custom_emojis/images/{partition}/static/{shortcode}.png");
+    // A replace stages under fresh keys; a fresh add takes the canonical
+    // ones. Either way the guard below only cleans keys this call staged.
+    let previous = store.emoji_by_shortcode(shortcode)?;
+    let (image_key, static_key) = match &previous {
+        Some(_) => {
+            let nonce = crate::application::crypto::random_token_hex(4);
+            (
+                format!(
+                    "custom_emojis/images/{partition}/original/{shortcode}@restage-{nonce}.png"
+                ),
+                format!(
+                    "custom_emojis/images/{partition}/static/{shortcode}@restage-{nonce}.png"
+                ),
+            )
+        }
+        None => (canonical_image_key, canonical_static_key),
+    };
     // Stage/commit/cleanup: both variants stage first, the row commits
     // second, and the guard removes staged-but-uncommitted bytes when the
-    // second stage or the row commit fails.
+    // second stage or the row commit fails. Live keys are never overwritten
+    // here, so a failure cannot strand the previous generation.
     let mut staging = StagingGuard::new(blobs);
     staging.put(&image_key, image)?;
     staging.put(&static_key, image)?;
     let emoji = CustomEmoji {
         shortcode: shortcode.to_string(),
-        image_key,
-        static_image_key: static_key,
+        image_key: image_key.clone(),
+        static_image_key: static_key.clone(),
         visible_in_picker,
         disabled: false,
         category: category.map(str::to_string).filter(|c| !c.is_empty()),
     };
     let stored = store.upsert_emoji(emoji)?;
     staging.commit();
+    // The previous generation is unreferenced now: drop it best-effort (a
+    // failure leaves a bounded orphan, never a dangling row).
+    if let Some(old) = previous {
+        for old_key in [old.image_key, old.static_image_key] {
+            if old_key != image_key && old_key != static_key
+                && let Err(err) = blobs.delete(&old_key)
+            {
+                tracing::warn!(shortcode, error = %err, "replaced emoji blob left for cleanup");
+            }
+        }
+    }
     Ok(stored)
 }
 

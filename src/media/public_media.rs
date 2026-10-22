@@ -111,12 +111,18 @@ pub fn classify_key(path: &str) -> Option<PublicMediaKind> {
 /// touching the filesystem.
 ///
 /// Accepted shapes are exactly the ones the server writes
-/// (`application::emoji::add_emoji`, `federation::media::store_remote_emoji`):
+/// (`application::emoji::add_emoji`):
 ///
 /// - `{p0}/{p1}/{shortcode}/original/{shortcode}.png` — local emoji;
 /// - `{p0}/{p1}/{shortcode}/static/{shortcode}.png` — local static variant;
 /// - `.../{shortcode}/original/{shortcode}@{domain}.png` (and `static`) —
-///   remote emoji namespaced by origin domain.
+///   namespaced generations: remote-origin rows staged through this route
+///   before the `remote/emojis/` split, and local replacement generations
+///   (`@restage-{rand}`).
+///
+/// Remote-origin emoji now live under `remote/emojis/` (see
+/// [`remote_emoji_blob_key`]); this gate keeps serving their legacy
+/// `custom_emojis/` rows until refetch rewrites them.
 ///
 /// `{p0}/{p1}` must be the hex of the shortcode's first two bytes (the
 /// writer's partition), so staging siblings, scratch files, other namespaces,

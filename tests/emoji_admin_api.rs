@@ -90,8 +90,7 @@ fn mk_user(srv: &TestServer, username: &str) -> Id {
 fn admin_router(srv: &TestServer) -> axum::Router {
     use axum::routing::{get, put};
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let ids: Arc<dyn IdGenerator> =
-        Arc::new(TimestampIdGenerator::new(Box::new(SystemClock)));
+    let ids: Arc<dyn IdGenerator> = Arc::new(TimestampIdGenerator::new(Box::new(SystemClock)));
     let cfg = Config {
         public_url: TEST_PUBLIC_URL.to_string(),
         ..Config::default()
@@ -169,10 +168,19 @@ fn fixtures(srv: &TestServer) -> Fixtures {
 
 const BOUNDARY: &str = "emoji-test-boundary";
 
+/// A real 1x1 PNG whose single pixel is derived from `tag` (same encoder
+/// stack the server validates with — never synthetic magic bytes: the
+/// parser's `IHDR` checks stay strict).
 fn png(tag: u8) -> Vec<u8> {
-    let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-    bytes.extend_from_slice(&[tag; 32]);
-    bytes
+    let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        1,
+        1,
+        image::Rgba([tag.wrapping_mul(37).wrapping_add(11), 20, 30, 255]),
+    ));
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut cursor, image::ImageFormat::Png)
+        .expect("png");
+    cursor.into_inner()
 }
 
 fn multipart_request(
@@ -213,13 +221,10 @@ fn multipart_request(
         part("visible_in_picker", None, vis.as_bytes());
     }
     body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
-    let mut builder = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header(
-            "content-type",
-            format!("multipart/form-data; boundary={BOUNDARY}"),
-        );
+    let mut builder = Request::builder().method("POST").uri(uri).header(
+        "content-type",
+        format!("multipart/form-data; boundary={BOUNDARY}"),
+    );
     if let Some(token) = token {
         builder = builder.header("authorization", format!("Bearer {token}"));
     }
@@ -252,7 +257,12 @@ async fn admin_list(router: &axum::Router, token: &str) -> Value {
         get_request("/api/v1/admin/custom_emojis", Some(token), None),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "admin list: {}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "admin list: {}",
+        String::from_utf8_lossy(&bytes)
+    );
     json(&bytes)
 }
 
@@ -312,11 +322,7 @@ async fn admin_emoji_auth_matrix() {
     // Admin without admin scopes → 403 scopes message.
     let (status, _, bytes) = send(
         &router,
-        get_request(
-            "/api/v1/admin/custom_emojis",
-            Some(&fx.admin_noscope),
-            None,
-        ),
+        get_request("/api/v1/admin/custom_emojis", Some(&fx.admin_noscope), None),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -331,7 +337,12 @@ async fn admin_emoji_auth_matrix() {
         get_request("/api/v1/admin/custom_emojis", Some(&fx.admin), None),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "admin: {}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "admin: {}",
+        String::from_utf8_lossy(&bytes)
+    );
     assert_eq!(json(&bytes), json!([]));
 
     // Write paths are gated too (plain user + moderator POST → 403).
@@ -462,7 +473,12 @@ async fn admin_emoji_crud_replace_delete() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "create: {}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "create: {}",
+        String::from_utf8_lossy(&bytes)
+    );
     let row = json(&bytes);
     assert_eq!(row["shortcode"], "dance");
     assert_eq!(row["visible_in_picker"], true);
@@ -476,9 +492,19 @@ async fn admin_emoji_crud_replace_delete() {
     assert_eq!(served, png(1));
 
     // Public index lists it.
-    let (status, _, bytes) = send(&srv.router, get_request("/api/v1/custom_emojis", None, None)).await;
+    let (status, _, bytes) = send(
+        &srv.router,
+        get_request("/api/v1/custom_emojis", None, None),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(json(&bytes).as_array().unwrap().iter().any(|v| v["shortcode"] == "dance"));
+    assert!(
+        json(&bytes)
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["shortcode"] == "dance")
+    );
 
     // Disable + hide via PUT.
     let (status, _, bytes) = send(
@@ -491,17 +517,38 @@ async fn admin_emoji_crud_replace_delete() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "update: {}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "update: {}",
+        String::from_utf8_lossy(&bytes)
+    );
     let row = json(&bytes);
     assert_eq!(row["disabled"], true);
     assert_eq!(row["visible_in_picker"], false);
 
     // Public index drops it; admin list keeps it with full fields.
-    let (status, _, bytes) = send(&srv.router, get_request("/api/v1/custom_emojis", None, None)).await;
+    let (status, _, bytes) = send(
+        &srv.router,
+        get_request("/api/v1/custom_emojis", None, None),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(!json(&bytes).as_array().unwrap().iter().any(|v| v["shortcode"] == "dance"));
+    assert!(
+        !json(&bytes)
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["shortcode"] == "dance")
+    );
     let list = admin_list(&router, &fx.admin).await;
-    let entry = list.as_array().unwrap().iter().find(|v| v["shortcode"] == "dance").expect("admin row").clone();
+    let entry = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["shortcode"] == "dance")
+        .expect("admin row")
+        .clone();
     assert_eq!(entry["disabled"], true);
     assert_eq!(entry["category"], "fun");
 
@@ -518,7 +565,12 @@ async fn admin_emoji_crud_replace_delete() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "replace: {}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "replace: {}",
+        String::from_utf8_lossy(&bytes)
+    );
     let row = json(&bytes);
     assert_eq!(row["category"], "games");
     let (status, _, served) = send(&router, get_request(&image_path(&row), None, None)).await;
@@ -531,11 +583,22 @@ async fn admin_emoji_crud_replace_delete() {
         delete_request("/api/v1/admin/custom_emojis/dance", &fx.admin),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "delete: {}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "delete: {}",
+        String::from_utf8_lossy(&bytes)
+    );
     let (status, _, _) = send(&router, get_request(&path, None, None)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let list = admin_list(&router, &fx.admin).await;
-    assert!(!list.as_array().unwrap().iter().any(|v| v["shortcode"] == "dance"));
+    assert!(
+        !list
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["shortcode"] == "dance")
+    );
 
     // Second delete + update of a missing row → 404.
     let (status, _, _) = send(
@@ -575,7 +638,12 @@ async fn admin_emoji_category_update() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "create: {}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "create: {}",
+        String::from_utf8_lossy(&bytes)
+    );
 
     // Null clears the category.
     let (status, _, bytes) = send(
@@ -630,11 +698,13 @@ async fn admin_emoji_category_update() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 
     // The `set_emoji_category` use case directly: set, then missing → NotFound.
-    let row = emoji_uc::set_emoji_category(&*srv.store, "catmoji", Some("ccc")).expect("set category");
+    let row =
+        emoji_uc::set_emoji_category(&*srv.store, "catmoji", Some("ccc")).expect("set category");
     assert_eq!(row.category.as_deref(), Some("ccc"));
     let row = emoji_uc::set_emoji_category(&*srv.store, "catmoji", None).expect("clear category");
     assert_eq!(row.category, None);
-    let err = emoji_uc::set_emoji_category(&*srv.store, "nosuchemoji", Some("x")).expect_err("missing");
+    let err =
+        emoji_uc::set_emoji_category(&*srv.store, "nosuchemoji", Some("x")).expect_err("missing");
     assert!(
         matches!(err, birchtree::domain::Error::NotFound(_)),
         "unexpected: {err:?}"

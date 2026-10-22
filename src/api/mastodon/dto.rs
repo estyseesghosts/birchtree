@@ -98,14 +98,35 @@ pub fn account_json_with_stats(
     object.insert("url".into(), json!(account.actor_uri));
     object.insert("uri".into(), json!(account.actor_uri));
     object.insert("avatar".into(), json!(avatar_url(server, account)));
-    object.insert("avatar_static".into(), json!(avatar_static_url(server, account)));
-    object.insert("avatar_description".into(), json!(account.avatar_description.clone()));
+    object.insert(
+        "avatar_static".into(),
+        json!(avatar_static_url(server, account)),
+    );
+    object.insert(
+        "avatar_description".into(),
+        json!(account.avatar_description.clone()),
+    );
     object.insert("header".into(), json!(header_url(server, account)));
-    object.insert("header_static".into(), json!(header_static_url(server, account)));
-    object.insert("header_description".into(), json!(account.header_description.clone()));
-    object.insert("followers_count".into(), json!(stats.map_or(0, |s| s.followers_count)));
-    object.insert("following_count".into(), json!(stats.map_or(0, |s| s.following_count)));
-    object.insert("statuses_count".into(), json!(stats.map_or(0, |s| s.statuses_count)));
+    object.insert(
+        "header_static".into(),
+        json!(header_static_url(server, account)),
+    );
+    object.insert(
+        "header_description".into(),
+        json!(account.header_description.clone()),
+    );
+    object.insert(
+        "followers_count".into(),
+        json!(stats.map_or(0, |s| s.followers_count)),
+    );
+    object.insert(
+        "following_count".into(),
+        json!(stats.map_or(0, |s| s.following_count)),
+    );
+    object.insert(
+        "statuses_count".into(),
+        json!(stats.map_or(0, |s| s.statuses_count)),
+    );
     object.insert(
         "last_status_at".into(),
         match stats.and_then(|s| s.last_status_at_ms) {
@@ -115,7 +136,10 @@ pub fn account_json_with_stats(
     );
     object.insert(
         "hide_collections".into(),
-        account.hide_collections.map(Value::from).unwrap_or(Value::Null),
+        account
+            .hide_collections
+            .map(Value::from)
+            .unwrap_or(Value::Null),
     );
     object.insert("show_media".into(), json!(true));
     object.insert("show_media_replies".into(), json!(true));
@@ -153,12 +177,10 @@ pub fn account_json_with_stats(
     }
     // Core extension CORE-L: `preferredLicense` renders only when the policy
     // is enabled (`off` omits the key); enabled + `None` renders `null`.
-    if let Some(value) =
-        crate::application::license_policy::license_wire_value(
-            &server.license_policy,
-            account.default_license,
-        )
-    {
+    if let Some(value) = crate::application::license_policy::license_wire_value(
+        &server.license_policy,
+        account.default_license,
+    ) {
         object.insert("preferredLicense".into(), value);
     }
     Value::Object(object)
@@ -209,9 +231,7 @@ pub fn credential_account_json_with_stats(
 /// collapses roles to an enum with no row ids, so the ids are these canonical
 /// ordinals, never `-1`.
 pub fn role_json(user: Option<&LocalUser>) -> Value {
-    use crate::domain::user::{
-        ADMIN_PERMISSIONS, MODERATOR_PERMISSIONS, UserRole as DomainRole,
-    };
+    use crate::domain::user::{ADMIN_PERMISSIONS, MODERATOR_PERMISSIONS, UserRole as DomainRole};
     let (id, name, permissions, highlighted) = match user.map(|u| u.role).unwrap_or_default() {
         DomainRole::Admin => (2u64, "Admin", ADMIN_PERMISSIONS, true),
         DomainRole::Moderator => (1u64, "Moderator", MODERATOR_PERMISSIONS, true),
@@ -627,9 +647,7 @@ pub struct StatusView {
 
 /// Local file path of an attachment blob key under the media route.
 pub fn media_file_url(server: &ServerInfo, file_key: &str) -> String {
-    server.asset_url(&format!(
-        "system/media_attachments/files/{file_key}"
-    ))
+    server.asset_url(&format!("system/media_attachments/files/{file_key}"))
 }
 
 /// `REST::MediaAttachmentSerializer`.
@@ -676,9 +694,10 @@ pub fn media_attachment_json(server: &ServerInfo, media: &MediaAttachment) -> Va
     // Core extension CORE-L: `license` renders only when the policy is
     // enabled (`off` omits the key); enabled + `None` renders `null`
     // (all rights reserved).
-    if let Some(license) =
-        crate::application::license_policy::license_wire_value(&server.license_policy, media.license)
-    {
+    if let Some(license) = crate::application::license_policy::license_wire_value(
+        &server.license_policy,
+        media.license,
+    ) {
         if let Some(object) = value.as_object_mut() {
             object.insert("license".into(), license);
         }
@@ -725,10 +744,7 @@ fn media_meta_json(media: &MediaAttachment) -> Value {
         meta.insert("small".into(), Value::Object(small));
     }
     if let Some(focus) = media.focus {
-        meta.insert(
-            "focus".into(),
-            json!({ "x": focus.x, "y": focus.y }),
-        );
+        meta.insert("focus".into(), json!({ "x": focus.x, "y": focus.y }));
     }
     Value::Object(meta)
 }
@@ -914,10 +930,7 @@ pub fn status_json(
         );
     }
 
-    object.insert(
-        "quote".into(),
-        quote_json(server, viewer, now_ms, view),
-    );
+    object.insert("quote".into(), quote_json(server, viewer, now_ms, view));
     object.insert("card".into(), Value::Null);
     object.insert(
         "poll".into(),
@@ -926,7 +939,10 @@ pub fn status_json(
             .map(|poll| poll_json_with_ballot(poll, viewer, view.viewer_ballot.as_deref(), now_ms))
             .unwrap_or(Value::Null),
     );
-    object.insert("quote_approval".into(), quote_approval_json(status, viewer, view));
+    object.insert(
+        "quote_approval".into(),
+        quote_approval_json(status, viewer, view),
+    );
 
     Value::Object(object)
 }
@@ -942,7 +958,11 @@ fn application_json(application: &StatusApplication) -> Value {
 /// Nested mention (`REST::StatusSerializer::MentionSerializer`).
 fn mention_json(server: &ServerInfo, account: &Account) -> Value {
     let url = if account.local {
-        format!("{}/@{}", server.public_url.trim_end_matches('/'), account.username)
+        format!(
+            "{}/@{}",
+            server.public_url.trim_end_matches('/'),
+            account.username
+        )
     } else {
         account.actor_uri.clone()
     };
@@ -1094,10 +1114,7 @@ pub fn notification_json(
         json!(format!("ungrouped-{}", notification.id)),
     );
     object.insert("account".into(), account);
-    object.insert(
-        "status".into(),
-        status.unwrap_or(Value::Null),
-    );
+    object.insert("status".into(), status.unwrap_or(Value::Null));
     Value::Object(object)
 }
 
@@ -1193,7 +1210,11 @@ pub fn filter_v1_json(
 }
 
 /// `REST::FilterResultSerializer` element of a status's `filtered` array.
-pub fn filter_result_json(bundle: &crate::application::ports::FilterBundle, keyword_matches: Vec<String>, status_matches: Vec<crate::domain::Id>) -> Value {
+pub fn filter_result_json(
+    bundle: &crate::application::ports::FilterBundle,
+    keyword_matches: Vec<String>,
+    status_matches: Vec<crate::domain::Id>,
+) -> Value {
     let filter = filter_json(bundle, false);
     json!({
         "filter": filter,
@@ -1246,23 +1267,25 @@ pub fn scheduled_status_json(
 /// `REST::CustomEmojiSerializer`. `category`/`featured` are emitted only for
 /// the index endpoint (`with_category`), matching the association-loaded
 /// conditional in the pinned serializer; payload embeddings omit them.
-pub fn custom_emoji_json(server: &ServerInfo, emoji: &crate::domain::CustomEmoji, with_category: bool) -> Value {
+///
+/// URLs come from the ROW's keys, not the shortcode: a replaced emoji
+/// commits fresh keys (transactional replace), and the canonical
+/// shortcode-derived path would 404 for the new generation. Fresh rows keep
+/// the canonical keys, so their output is unchanged.
+pub fn custom_emoji_json(
+    server: &ServerInfo,
+    emoji: &crate::domain::CustomEmoji,
+    with_category: bool,
+) -> Value {
     let mut object = Map::new();
     object.insert("shortcode".into(), json!(emoji.shortcode));
-    let partition = crate::application::emoji::emoji_partition(&emoji.shortcode);
     object.insert(
         "url".into(),
-        json!(server.asset_url(&format!(
-            "system/custom_emojis/images/{partition}/original/{}.png",
-            emoji.shortcode
-        ))),
+        json!(server.asset_url(&format!("system/{}", emoji.image_key))),
     );
     object.insert(
         "static_url".into(),
-        json!(server.asset_url(&format!(
-            "system/custom_emojis/images/{partition}/static/{}.png",
-            emoji.shortcode
-        ))),
+        json!(server.asset_url(&format!("system/{}", emoji.static_image_key))),
     );
     object.insert("visible_in_picker".into(), json!(emoji.visible_in_picker));
     if with_category {
@@ -1344,14 +1367,16 @@ pub fn trend_tag_json(
     );
     object.insert(
         "history".into(),
-        json!(history
-            .iter()
-            .map(|day| serde_json::json!({
-                "day": day.day_sec.to_string(),
-                "uses": day.uses.to_string(),
-                "accounts": day.accounts.to_string(),
-            }))
-            .collect::<Vec<_>>()),
+        json!(
+            history
+                .iter()
+                .map(|day| serde_json::json!({
+                    "day": day.day_sec.to_string(),
+                    "uses": day.uses.to_string(),
+                    "accounts": day.accounts.to_string(),
+                }))
+                .collect::<Vec<_>>()
+        ),
     );
     if viewer.is_some() {
         object.insert("following".into(), json!(following));

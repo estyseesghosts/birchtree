@@ -208,10 +208,7 @@ async fn react(
 /// The local enabled custom emoji behind `name`, if any (mirrors
 /// `AnnouncementReaction#set_custom_emoji`: `CustomEmoji.local.enabled`).
 /// Storage failures surface as 500; absence is `None` (unicode path).
-fn resolve_custom_emoji(
-    store: &dyn Store,
-    name: &str,
-) -> Result<Option<String>, ApiError> {
+fn resolve_custom_emoji(store: &dyn Store, name: &str) -> Result<Option<String>, ApiError> {
     if !uc_is_shortcode_shaped(name) {
         return Ok(None);
     }
@@ -224,8 +221,7 @@ fn resolve_custom_emoji(
 
 fn uc_is_shortcode_shaped(name: &str) -> bool {
     let len = name.chars().count();
-    (2..=128).contains(&len)
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    (2..=128).contains(&len) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 // ---------------------------------------------------------------------------
@@ -290,18 +286,13 @@ pub async fn admin_show(
     };
     let db = db_for(&state.context.store);
     match db.announcement_by_id(id) {
-        Ok(Some(row)) => match render_announcement(
-            &state.server,
-            &*state.context.store,
-            db,
-            &row,
-            viewer,
-        )
-        .await
-        {
-            Ok(value) => axum::Json(value).into_response(),
-            Err(err) => err.into_response(),
-        },
+        Ok(Some(row)) => {
+            match render_announcement(&state.server, &*state.context.store, db, &row, viewer).await
+            {
+                Ok(value) => axum::Json(value).into_response(),
+                Err(err) => err.into_response(),
+            }
+        }
         Ok(None) => ApiError::not_found().into_response(),
         Err(err) => ApiError::from(err).into_response(),
     }
@@ -336,7 +327,9 @@ where
         Some(Value::String(s)) => parse_iso_ms(&s)
             .map(|ms| Some(Some(ms)))
             .map_err(serde::de::Error::custom),
-        Some(_) => Err(serde::de::Error::custom("must be an ISO-8601 timestamp or null")),
+        Some(_) => Err(serde::de::Error::custom(
+            "must be an ISO-8601 timestamp or null",
+        )),
     }
 }
 
@@ -393,8 +386,7 @@ pub async fn admin_create(
         }
         Err(err) => return ApiError::from(err).into_response(),
     };
-    match render_announcement(&state.server, &*state.context.store, db, &row, viewer).await
-    {
+    match render_announcement(&state.server, &*state.context.store, db, &row, viewer).await {
         Ok(value) => axum::Json(value).into_response(),
         Err(err) => err.into_response(),
     }
@@ -435,8 +427,7 @@ pub async fn admin_update(
         Ok(row) => row,
         Err(err) => return ApiError::from(err).into_response(),
     };
-    match render_announcement(&state.server, &*state.context.store, db, &row, viewer).await
-    {
+    match render_announcement(&state.server, &*state.context.store, db, &row, viewer).await {
         Ok(value) => axum::Json(value).into_response(),
         Err(err) => err.into_response(),
     }
@@ -460,9 +451,11 @@ pub async fn admin_destroy(
         Ok(_) => {
             // Announcement streaming (gaps G-B): destroys ride
             // `announcement.delete` on `user` streams.
-            state.streams.publish_announcement(
-                crate::streaming::hub::AnnouncementEvent::Deleted { announcement_id: id },
-            );
+            state
+                .streams
+                .publish_announcement(crate::streaming::hub::AnnouncementEvent::Deleted {
+                    announcement_id: id,
+                });
             (StatusCode::OK, axum::Json(json!({}))).into_response()
         }
         Err(err) => ApiError::from(err).into_response(),
@@ -517,15 +510,18 @@ async fn admin_flip(state: &ApiState, auth: &Auth, raw: &str, publish: bool) -> 
             // was found for edits.)
             if publish {
                 state.streams.publish_announcement(
-                    crate::streaming::hub::AnnouncementEvent::Published { announcement_id: row.id },
+                    crate::streaming::hub::AnnouncementEvent::Published {
+                        announcement_id: row.id,
+                    },
                 );
             } else {
                 state.streams.publish_announcement(
-                    crate::streaming::hub::AnnouncementEvent::Deleted { announcement_id: row.id },
+                    crate::streaming::hub::AnnouncementEvent::Deleted {
+                        announcement_id: row.id,
+                    },
                 );
             }
-            match render_announcement(&state.server, &*state.context.store, db, &row, viewer)
-                .await
+            match render_announcement(&state.server, &*state.context.store, db, &row, viewer).await
             {
                 Ok(value) => axum::Json(value).into_response(),
                 Err(err) => err.into_response(),
@@ -564,10 +560,23 @@ async fn render_announcement(
         })
         .collect::<Vec<_>>();
     let emojis = resolve_emojis(store, server, &row.text).map_err(ApiError::from)?;
-    let reactions = uc::reaction_views(db, row.id, viewer)
+    let reactions = uc::reaction_views(db, row.id, viewer).map_err(ApiError::from)?;
+    // Reaction URLs follow the emoji ROW's keys (a replaced emoji commits
+    // fresh keys; the canonical shortcode path would 404). One batched
+    // lookup covers every custom reaction.
+    let reaction_shortcodes: Vec<String> = reactions
+        .iter()
+        .filter_map(|r| r.custom_emoji_shortcode.clone())
+        .collect();
+    let reaction_emoji: std::collections::HashMap<String, CustomEmoji> = store
+        .emojis_by_shortcodes(&reaction_shortcodes)
         .map_err(ApiError::from)?
         .into_iter()
-        .map(|r| reaction_json(server, &r))
+        .map(|emoji| (emoji.shortcode.clone(), emoji))
+        .collect();
+    let reactions = reactions
+        .into_iter()
+        .map(|r| reaction_json(server, &r, reaction_emoji.get(r.custom_emoji_shortcode.as_deref().unwrap_or_default())))
         .collect::<Vec<_>>();
     let mut object = Map::new();
     object.insert("id".into(), json!(row.id.to_string()));
@@ -609,27 +618,40 @@ async fn render_announcement(
 
 /// `REST::ReactionSerializer` at the pin (`reaction_serializer.rb`): `name,
 /// count`, `me` (signed in — always here), `url`/`static_url` for custom
-/// emoji only.
-fn reaction_json(server: &ServerInfo, r: &uc::ReactionView) -> Value {
+/// emoji only. URLs follow the emoji row's keys when the row is known (a
+/// replaced emoji commits fresh keys), falling back to the canonical
+/// shortcode path for rows that predate the lookup (fresh rows keep the
+/// canonical keys, so the fallback renders identically).
+fn reaction_json(
+    server: &ServerInfo,
+    r: &uc::ReactionView,
+    emoji: Option<&CustomEmoji>,
+) -> Value {
     let mut object = Map::new();
     object.insert("name".into(), json!(r.name));
     object.insert("count".into(), json!(r.count));
     object.insert("me".into(), json!(r.me));
     match &r.custom_emoji_shortcode {
         Some(shortcode) => {
-            let partition = crate::application::emoji::emoji_partition(shortcode);
-            object.insert(
-                "url".into(),
-                json!(server.asset_url(&format!(
-                    "system/custom_emojis/images/{partition}/original/{shortcode}.png"
-                ))),
-            );
-            object.insert(
-                "static_url".into(),
-                json!(server.asset_url(&format!(
-                    "system/custom_emojis/images/{partition}/static/{shortcode}.png"
-                ))),
-            );
+            let (url, static_url) = match emoji {
+                Some(row) => (
+                    server.asset_url(&format!("system/{}", row.image_key)),
+                    server.asset_url(&format!("system/{}", row.static_image_key)),
+                ),
+                None => {
+                    let partition = crate::application::emoji::emoji_partition(shortcode);
+                    (
+                        server.asset_url(&format!(
+                            "system/custom_emojis/images/{partition}/original/{shortcode}.png"
+                        )),
+                        server.asset_url(&format!(
+                            "system/custom_emojis/images/{partition}/static/{shortcode}.png"
+                        )),
+                    )
+                }
+            };
+            object.insert("url".into(), json!(url));
+            object.insert("static_url".into(), json!(static_url));
         }
         None => {
             object.insert("url".into(), Value::Null);
@@ -661,9 +683,7 @@ fn resolve_mentions(
         if domain != server.domain {
             continue;
         }
-        if let Some(account) =
-            store.account_by_handle(&user.to_lowercase(), &server.domain)?
-        {
+        if let Some(account) = store.account_by_handle(&user.to_lowercase(), &server.domain)? {
             out.push(account);
         }
     }
@@ -678,18 +698,14 @@ fn scan_mentions(text: &str) -> Vec<String> {
         if bytes[i] == b'@' {
             let mut j = i + 1;
             while j < bytes.len()
-                && (bytes[j].is_ascii_alphanumeric()
-                    || bytes[j] == b'_'
-                    || bytes[j] == b'.')
+                && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'.')
             {
                 j += 1;
             }
             if j < bytes.len() && bytes[j] == b'@' {
                 let mut k = j + 1;
                 while k < bytes.len()
-                    && (bytes[k].is_ascii_alphanumeric()
-                        || bytes[k] == b'-'
-                        || bytes[k] == b'.')
+                    && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'-' || bytes[k] == b'.')
                 {
                     k += 1;
                 }
@@ -718,9 +734,7 @@ fn extract_tags(text: &str) -> Vec<String> {
     while i < bytes.len() {
         if bytes[i] == b'#' {
             let mut j = i + 1;
-            while j < bytes.len()
-                && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
-            {
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
                 j += 1;
             }
             if j > i + 1 {
@@ -750,9 +764,7 @@ fn resolve_emojis(
     while i < bytes.len() {
         if bytes[i] == b':' {
             let mut j = i + 1;
-            while j < bytes.len()
-                && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
-            {
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
                 j += 1;
             }
             if j < bytes.len() && bytes[j] == b':' && j > i + 1 {

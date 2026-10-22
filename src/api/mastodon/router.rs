@@ -715,6 +715,12 @@ pub fn build_router_with_probes(state: ApiState, probes: RuntimeProbes) -> Route
             "/system/custom_emojis/images/*path",
             get(endpoints::emoji::serve_image),
         )
+        // Remote emoji (federation tail): the evictable `remote/emojis/`
+        // namespace, served through its own gate with refetch-on-miss.
+        .route(
+            "/system/remote/emojis/*path",
+            get(endpoints::emoji::serve_remote_image),
+        )
         // Notifications (Phase 4). Static collection paths before `{id}`.
         .route(
             "/api/v1/notifications",

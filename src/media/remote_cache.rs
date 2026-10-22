@@ -108,7 +108,7 @@ impl MediaClass {
 /// originals (the attachment path stores `original`).
 pub fn class_for_variant(variant: &str) -> MediaClass {
     match variant {
-        "avatar" | "header" | "emoji" => MediaClass::AvatarEmoji,
+        "avatar" | "header" | "emoji" | "emoji_static" => MediaClass::AvatarEmoji,
         "preview" | "thumbnail" | "small" | "card" => MediaClass::Preview,
         "stream" | "segment" => MediaClass::Stream,
         _ => MediaClass::Full,
@@ -308,6 +308,12 @@ pub fn is_cache_key(key: &str) -> bool {
 
 /// Variant name for remote custom-emoji bytes in the evictable namespace.
 pub const EMOJI_VARIANT: &str = "emoji";
+
+/// Variant name for the static copy of a remote custom emoji (same bytes,
+/// served when clients disable animation). Maps to the same reserved
+/// [`MediaClass::AvatarEmoji`] class as [`EMOJI_VARIANT`], so both copies
+/// are evictable by the same pressure and expiry passes.
+pub const EMOJI_STATIC_VARIANT: &str = "emoji_static";
 
 /// Blob keys for a remote custom emoji in the evictable namespace:
 /// `remote/emojis/{domain}/{shortcode}/original.png` (served bytes) and

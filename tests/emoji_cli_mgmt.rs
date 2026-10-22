@@ -8,12 +8,18 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_birchtree")
 }
 
-/// Minimal PNG (magic + padding): passes `is_emoji_image`'s sniff (needs 12+
-/// bytes starting with the PNG magic).
+/// A real 1x1 PNG (same encoder stack the server validates with — the
+/// parser's `IHDR` checks stay strict, so synthetic magic bytes are out).
 fn png_bytes() -> Vec<u8> {
-    let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-    bytes.extend_from_slice(&[0; 8]);
-    bytes
+    let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        1,
+        1,
+        image::Rgba([10, 20, 30, 255]),
+    ));
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut cursor, image::ImageFormat::Png)
+        .expect("png");
+    cursor.into_inner()
 }
 
 fn run(dir: &tempfile::TempDir, args: &[&str]) -> Output {

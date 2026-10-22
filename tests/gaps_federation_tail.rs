@@ -16,23 +16,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use activitypub_federation::config::FederationConfig;
 use activitypub_federation::http_signatures::generate_actor_keypair;
+use axum::Router;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
-use axum::Router;
+use birchtree::activitypub::FedContext;
 use birchtree::activitypub::activities::{Activity, Move, apply_move_counted};
 use birchtree::activitypub::objects::{
-    display_counts, featured_tags_collection_doc, featured_tags_collection_uri, fetch_remote_embed,
-    hint_count, lookup_should_resolve_live, note_replies_value, parse_remote_embed,
-    parse_remote_emojis, remote_emoji_entity, sanitize_embed_html, split_remote_acct,
-    validate_remote_counts, EmbedFetchError, RemoteCountsHint,
+    EmbedFetchError, RemoteCountsHint, display_counts, featured_tags_collection_doc,
+    featured_tags_collection_uri, fetch_remote_embed, hint_count, lookup_should_resolve_live,
+    note_replies_value, parse_remote_embed, parse_remote_emojis, remote_emoji_entity,
+    sanitize_embed_html, split_remote_acct, validate_remote_counts,
 };
-use birchtree::activitypub::FedContext;
 use birchtree::application::context::Context;
 use birchtree::application::federation_ports::{
     FederationContentStore, FederationStore, NewQuote, NewReport, RemoteAccountUpsert,
 };
 use birchtree::application::ports::{
-    EmojiStore, FollowOptions, JobQueue, RelationshipStore, StatusStore,
+    BlobStore, CacheStore, EmojiStore, FollowOptions, JobQueue, RelationshipStore, StatusStore,
 };
 use birchtree::config::Config;
 use birchtree::domain::{
@@ -46,31 +46,47 @@ use birchtree::federation::media::{
 };
 use birchtree::federation::net::SafeHttpConfig;
 use birchtree::federation::threads::{
-    enqueue_collection_update, plan_quote_reverify, run_quote_reverify, QuoteReverifyPlan,
+    QuoteReverifyPlan, enqueue_collection_update, plan_quote_reverify, run_quote_reverify,
 };
 use birchtree::persistence::redb::RedbStore;
 use birchtree::streaming::{Hub, Limits};
-use common::{mk_account, temp_store, TEST_PUBLIC_URL};
+use common::{TEST_PUBLIC_URL, mk_account, temp_store};
 use serde_json::json;
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64
 }
 
 fn unique_job_id() -> Id {
-    Id::new(SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos() as u64)
+    Id::new(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos() as u64,
+    )
 }
 
 fn context(store: &Arc<RedbStore>, dir: &std::path::Path) -> Arc<Context> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let ids: Arc<dyn IdGenerator> = Arc::new(TimestampIdGenerator::new(Box::new(SystemClock)));
-    let blobs = Arc::new(birchtree::media::blob_store::FsBlobStore::open(dir.join("media")).expect("blobs"));
+    let blobs = Arc::new(
+        birchtree::media::blob_store::FsBlobStore::open(dir.join("media")).expect("blobs"),
+    );
     let server = Arc::new(birchtree::api::mastodon::ServerInfo::from_config(&Config {
         public_url: TEST_PUBLIC_URL.to_string(),
         ..Config::default()
     }));
     let streams = Hub::new(store.clone(), clock.clone(), server, Limits::default());
-    Arc::new(Context::new(clock, ids, store.clone(), blobs, Arc::new(streams)))
+    Arc::new(Context::new(
+        clock,
+        ids,
+        store.clone(),
+        blobs,
+        Arc::new(streams),
+    ))
 }
 
 fn federation(
@@ -134,7 +150,11 @@ fn new_status(account_id: Id, text: &str) -> birchtree::application::ports::NewS
 }
 
 fn publish(store: &RedbStore, author: Id, text: &str, now: u64) -> Id {
-    store.create_status(new_status(author, text), now).expect("create status").status.id
+    store
+        .create_status(new_status(author, text), now)
+        .expect("create status")
+        .status
+        .id
 }
 
 // --- Move -------------------------------------------------------------------
@@ -155,13 +175,23 @@ fn move_parses_as_its_own_activity_and_refuses_misaddressed_shapes() {
     let target = "https://remote.example/users/new";
     let activity: Activity =
         serde_json::from_value(move_json(actor, actor, target)).expect("Move parses");
-    assert!(matches!(activity, Activity::Move(_)), "untagged enum picks Move");
+    assert!(
+        matches!(activity, Activity::Move(_)),
+        "untagged enum picks Move"
+    );
 
     // Misaddressed shapes parse (the inbox answers them 4xx at verify time).
-    let bad_object: Move = serde_json::from_value(move_json(actor, target, target)).expect("parses");
-    assert_ne!(bad_object.object.as_str(), bad_object.actor.inner().as_str());
+    let bad_object: Move =
+        serde_json::from_value(move_json(actor, target, target)).expect("parses");
+    assert_ne!(
+        bad_object.object.as_str(),
+        bad_object.actor.inner().as_str()
+    );
     let self_target: Move = serde_json::from_value(move_json(actor, actor, actor)).expect("parses");
-    assert_eq!(self_target.target.as_str(), self_target.actor.inner().as_str());
+    assert_eq!(
+        self_target.target.as_str(),
+        self_target.actor.inner().as_str()
+    );
 }
 
 #[test]
@@ -176,7 +206,17 @@ fn move_migrates_local_followers_and_leaves_remote_ones_alone() {
 
     for follower in [alice, bob, carol] {
         store
-            .follow(follower, old, FollowOptions { show_reblogs: true, notify: false, languages: None }, false, now)
+            .follow(
+                follower,
+                old,
+                FollowOptions {
+                    show_reblogs: true,
+                    notify: false,
+                    languages: None,
+                },
+                false,
+                now,
+            )
             .expect("follow old");
     }
 
@@ -184,9 +224,18 @@ fn move_migrates_local_followers_and_leaves_remote_ones_alone() {
     assert_eq!(outcome.migrated, 2, "both local followers move");
     assert_eq!(outcome.already, 0);
     // Remote followers' servers apply their own moves.
-    assert!(store.follow_of(carol, new).unwrap().is_none(), "remote follower untouched");
-    assert!(store.follow_of(alice, new).unwrap().is_some(), "alice follows new");
-    assert!(store.follow_of(bob, new).unwrap().is_some(), "bob follows new");
+    assert!(
+        store.follow_of(carol, new).unwrap().is_none(),
+        "remote follower untouched"
+    );
+    assert!(
+        store.follow_of(alice, new).unwrap().is_some(),
+        "alice follows new"
+    );
+    assert!(
+        store.follow_of(bob, new).unwrap().is_some(),
+        "bob follows new"
+    );
 
     // Redelivery is idempotent: every row is already in place.
     let again = apply_move_counted(&*store, old, new, now + 1).expect("redelivery applies");
@@ -195,11 +244,26 @@ fn move_migrates_local_followers_and_leaves_remote_ones_alone() {
 
     // Blocked pairs and the successor itself never migrate.
     let dave = mk_account(&store, "dave").id;
-    store.follow(dave, old, FollowOptions { show_reblogs: true, notify: false, languages: None }, false, now).expect("dave follows old");
+    store
+        .follow(
+            dave,
+            old,
+            FollowOptions {
+                show_reblogs: true,
+                notify: false,
+                languages: None,
+            },
+            false,
+            now,
+        )
+        .expect("dave follows old");
     let _ = store.block(new, dave, now).expect("new blocks dave");
     let third = apply_move_counted(&*store, old, new, now + 2).expect("move applies");
     assert_eq!(third.migrated, 0);
-    assert!(store.follow_of(dave, new).unwrap().is_none(), "blocked follower stays");
+    assert!(
+        store.follow_of(dave, new).unwrap().is_none(),
+        "blocked follower stays"
+    );
 }
 
 #[test]
@@ -211,7 +275,19 @@ fn move_to_a_local_successor_lands_on_local_rows() {
     // land on the local row through the same path.
     let new_local = mk_account(&store, "newlocal").id;
     let alice = mk_account(&store, "alice3").id;
-    store.follow(alice, old, FollowOptions { show_reblogs: true, notify: false, languages: None }, false, now).expect("follow old");
+    store
+        .follow(
+            alice,
+            old,
+            FollowOptions {
+                show_reblogs: true,
+                notify: false,
+                languages: None,
+            },
+            false,
+            now,
+        )
+        .expect("follow old");
     let outcome = apply_move_counted(&*store, old, new_local, now).expect("move applies");
     assert_eq!(outcome.migrated, 1);
     assert!(store.follow_of(alice, new_local).unwrap().is_some());
@@ -238,11 +314,16 @@ fn remote_emoji_are_carried_from_tag_arrays_with_bounds() {
     });
     let emojis = parse_remote_emojis(&raw);
     let codes: Vec<&str> = emojis.iter().map(|e| e.shortcode.as_str()).collect();
-    assert_eq!(codes, vec!["party", "blob", "array"], "only usable emoji survive");
+    assert_eq!(
+        codes,
+        vec!["party", "blob", "array"],
+        "only usable emoji survive"
+    );
     assert_eq!(emojis[0].url, "https://remote.example/emoji/party.png");
 
     // Single (non-array) `tag` reads too; duplicates collapse.
-    let single = json!({"tag": {"type": "Emoji", "name": ":one:", "icon": "https://remote.example/1.png"}});
+    let single =
+        json!({"tag": {"type": "Emoji", "name": ":one:", "icon": "https://remote.example/1.png"}});
     assert_eq!(parse_remote_emojis(&single).len(), 1);
     let dup = json!({"tag": [
         {"type": "Emoji", "name": ":xy:", "icon": "https://remote.example/1.png"},
@@ -266,46 +347,160 @@ fn remote_emoji_are_carried_from_tag_arrays_with_bounds() {
 #[test]
 fn remote_emoji_ingest_validates_namespaces_and_stages_bytes() {
     let (dir, store) = temp_store();
-    let blobs = birchtree::media::blob_store::FsBlobStore::open(dir.path().join("media")).expect("blobs");
+    let blobs =
+        birchtree::media::blob_store::FsBlobStore::open(dir.path().join("media")).expect("blobs");
     let now = now_ms();
 
-    assert!(validate_remote_emoji("party", "remote.example", "https://remote.example/e.png").is_ok());
-    assert!(validate_remote_emoji("x", "remote.example", "https://remote.example/e.png").is_err(), "shortcode too short");
-    assert!(validate_remote_emoji("ok", "", "https://remote.example/e.png").is_err(), "empty domain");
-    assert!(validate_remote_emoji("ok", "remote.example", "ftp://remote.example/e.png").is_err(), "scheme");
-    assert!(validate_remote_emoji("ok", "remote.example", "https://u:p@remote.example/e.png").is_err(), "credentials");
+    assert!(
+        validate_remote_emoji("party", "remote.example", "https://remote.example/e.png").is_ok()
+    );
+    assert!(
+        validate_remote_emoji("x", "remote.example", "https://remote.example/e.png").is_err(),
+        "shortcode too short"
+    );
+    assert!(
+        validate_remote_emoji("ok", "", "https://remote.example/e.png").is_err(),
+        "empty domain"
+    );
+    assert!(
+        validate_remote_emoji("ok", "remote.example", "ftp://remote.example/e.png").is_err(),
+        "scheme"
+    );
+    assert!(
+        validate_remote_emoji("ok", "remote.example", "https://u:p@remote.example/e.png").is_err(),
+        "credentials"
+    );
 
     let key = remote_emoji_shortcode("party", "Remote.Example");
     assert_eq!(key, "party@remote.example", "domain lowercased");
-    assert_eq!(split_remote_emoji_shortcode(&key), Some(("party", "remote.example")));
+    assert_eq!(
+        split_remote_emoji_shortcode(&key),
+        Some(("party", "remote.example"))
+    );
     assert!(split_remote_emoji_shortcode("plain").is_none());
 
-    // Fake PNG bytes (magic only — the sniffer reads leading bytes).
-    let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-    png.extend_from_slice(&[0; 16]);
-    let row = store_remote_emoji(&*store, &blobs, &key, "remote.example", &png, "image/png", now).expect("staged");
+    // A real 2x1 PNG (same encoder stack the server validates with): the
+    // writer sniffs, dimension-checks and stages real bytes now, never
+    // magic-only prefixes.
+    let png = png_bytes();
+    let source = "https://remote.example/e.png";
+    let row = store_remote_emoji(&*store, &blobs, &key, "remote.example", source, &png, now)
+        .expect("staged");
     assert!(!row.visible_in_picker, "never picker-visible");
     assert!(!row.listed(), "never listed");
     assert_eq!(row.category.as_deref(), Some("remote:remote.example"));
-    assert!(store.emoji_by_shortcode(&key).unwrap().is_some(), "row retrievable");
+    assert!(
+        store.emoji_by_shortcode(&key).unwrap().is_some(),
+        "row retrievable"
+    );
+    // Evictable namespace, never the durable emoji tree.
+    assert_eq!(
+        row.image_key,
+        "remote/emojis/remote.example/party/original.png"
+    );
+    assert_eq!(
+        row.static_image_key,
+        "remote/emojis/remote.example/party/static.png"
+    );
+    assert_eq!(
+        blobs.get(&row.image_key).unwrap().as_deref(),
+        Some(png.as_slice())
+    );
+    assert!(
+        !dir.path()
+            .join("media/custom_emojis")
+            .exists(),
+        "no durable emoji bytes for remote rows"
+    );
+    // Durable byte rows make both copies evictable; the render row serves
+    // the local asset path and remembers the origin for refetch.
+    let entry = store
+        .cache_get(source, birchtree::media::remote_cache::EMOJI_VARIANT)
+        .unwrap()
+        .expect("image row");
+    assert!(entry.has_bytes);
+    assert_eq!(entry.blob_key, row.image_key);
+    let rows = store
+        .remote_emojis_by_shortcodes(&["party".to_string()])
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].url, format!("system/{}", row.image_key));
+    assert_eq!(rows[0].source_url, source);
 
-    assert!(store_remote_emoji(&*store, &blobs, &key, "remote.example", &vec![0u8; 300 * 1024], "image/png", now).is_err(), "oversize refused");
-    assert!(store_remote_emoji(&*store, &blobs, &key, "remote.example", b"plain text not an image at all!!!!!!!!", "text/plain", now).is_err(), "non-image refused");
+    assert!(
+        store_remote_emoji(
+            &*store,
+            &blobs,
+            &key,
+            "remote.example",
+            source,
+            &vec![0u8; 300 * 1024],
+            now
+        )
+        .is_err(),
+        "oversize refused"
+    );
+    assert!(
+        store_remote_emoji(
+            &*store,
+            &blobs,
+            &key,
+            "remote.example",
+            source,
+            b"plain text not an image at all!!!!!!!!",
+            now
+        )
+        .is_err(),
+        "non-image refused"
+    );
+    // A namespaced key from another domain is refused against this origin.
+    assert!(
+        store_remote_emoji(
+            &*store,
+            &blobs,
+            "party@other.example",
+            "remote.example",
+            source,
+            &png,
+            now
+        )
+        .is_err(),
+        "domain mismatch refused"
+    );
+}
+
+/// A valid 2x1 PNG (same encoder stack the server validates with).
+fn png_bytes() -> Vec<u8> {
+    let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        2,
+        1,
+        image::Rgba([10, 20, 30, 255]),
+    ));
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut cursor, image::ImageFormat::Png)
+        .expect("png");
+    cursor.into_inner()
 }
 
 #[tokio::test]
 async fn remote_emoji_fetch_enforces_ssrf_size_and_status() {
     let app = Router::new()
-        .route("/ok.png", get(|| async {
-            let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-            png.extend_from_slice(&[0; 16]);
-            (StatusCode::OK, png)
-        }))
+        .route(
+            "/ok.png",
+            get(|| async {
+                let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+                png.extend_from_slice(&[0; 16]);
+                (StatusCode::OK, png)
+            }),
+        )
         .route("/missing.png", get(|| async { StatusCode::NOT_FOUND }))
-        .route("/big.png", get(|| async {
-            (StatusCode::OK, vec![0u8; 300 * 1024])
-        }));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        .route(
+            "/big.png",
+            get(|| async { (StatusCode::OK, vec![0u8; 300 * 1024]) }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let port = listener.local_addr().expect("addr").port();
     tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
     let base = format!("http://127.0.0.1:{port}");
@@ -313,7 +508,9 @@ async fn remote_emoji_fetch_enforces_ssrf_size_and_status() {
     let allow = loopback_policy();
 
     let url = url::Url::parse(&format!("{base}/ok.png")).unwrap();
-    let (bytes, mime) = fetch_remote_emoji_bytes(&client, &url, true, &allow.allowlist).await.expect("fetched");
+    let (bytes, mime) = fetch_remote_emoji_bytes(&client, &url, true, &allow.allowlist)
+        .await
+        .expect("fetched");
     assert_eq!(mime, "image/png");
     assert!(!bytes.is_empty());
 
@@ -362,20 +559,28 @@ fn sender_with_keys(store: &RedbStore) -> Id {
     let pair = generate_actor_keypair().expect("keypair");
     let actor = format!("{TEST_PUBLIC_URL}/users/alice");
     store
-        .store_local_keys(alice, &format!("{actor}#main-key"), &pair.public_key, &pair.private_key)
+        .store_local_keys(
+            alice,
+            &format!("{actor}#main-key"),
+            &pair.public_key,
+            &pair.private_key,
+        )
         .expect("keys");
     alice
 }
 
 fn follow_body(object: &str) -> serde_json::Value {
-    serde_json::to_value(activitypub_federation::protocol::context::WithContext::new_default(
-        Activity::Follow(serde_json::from_value(json!({
-            "type": "Follow",
-            "id": "https://example.social/users/alice/follows/1",
-            "actor": format!("{TEST_PUBLIC_URL}/users/alice"),
-            "object": object,
-        })).unwrap()),
-    ))
+    serde_json::to_value(
+        activitypub_federation::protocol::context::WithContext::new_default(Activity::Follow(
+            serde_json::from_value(json!({
+                "type": "Follow",
+                "id": "https://example.social/users/alice/follows/1",
+                "actor": format!("{TEST_PUBLIC_URL}/users/alice"),
+                "object": object,
+            }))
+            .unwrap(),
+        )),
+    )
     .unwrap()
 }
 
@@ -390,7 +595,9 @@ async fn counting_inbox(status: u16, hits: Arc<AtomicUsize>) -> String {
             }
         }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let port = listener.local_addr().expect("addr").port();
     tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
     format!("http://localhost:{port}/inbox")
@@ -415,16 +622,31 @@ async fn relay_forward_lab_run_reaches_the_peer_with_delivery_semantics() {
     // Lab run: the relay peer answers 202, the activity arrives once.
     let hits = Arc::new(AtomicUsize::new(0));
     let relay = counting_inbox(202, hits.clone()).await;
-    let job = relay_job(alice, &relay, follow_body("https://remote.example/users/eve"));
+    let job = relay_job(
+        alice,
+        &relay,
+        follow_body("https://remote.example/users/eve"),
+    );
     assert_eq!(delivery::run_relay_forward(&config, &job).await, Ok(()));
-    assert_eq!(hits.load(Ordering::SeqCst), 1, "one signed POST to the relay");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "one signed POST to the relay"
+    );
 
     // A down relay charges the shared per-host budget (reachability claim).
     let failing = Arc::new(AtomicUsize::new(0));
     let down = counting_inbox(503, failing.clone()).await;
-    let job = relay_job(alice, &down, follow_body("https://remote.example/users/eve"));
+    let job = relay_job(
+        alice,
+        &down,
+        follow_body("https://remote.example/users/eve"),
+    );
     let outcome = delivery::run_relay_forward(&config, &job).await;
-    assert!(matches!(outcome, Err(DeliveryError::Retry(_))), "{outcome:?}");
+    assert!(
+        matches!(outcome, Err(DeliveryError::Retry(_))),
+        "{outcome:?}"
+    );
     assert_eq!(failing.load(Ordering::SeqCst), 1);
 
     // Unparseable payloads quarantine without touching the network.
@@ -434,9 +656,18 @@ async fn relay_forward_lab_run_reaches_the_peer_with_delivery_semantics() {
         json!({"sender_id": 1, "relay_inbox": "ftp://x/inbox", "body": {}}),
         json!({"sender_id": 1, "relay_inbox": "http://127.0.0.1:1/inbox"}),
     ] {
-        let job = Job::new(unique_job_id(), JobKind::RelayForward, payload, now_ms(), now_ms());
+        let job = Job::new(
+            unique_job_id(),
+            JobKind::RelayForward,
+            payload,
+            now_ms(),
+            now_ms(),
+        );
         assert!(
-            matches!(delivery::run_relay_forward(&config, &job).await, Err(DeliveryError::Quarantine(_))),
+            matches!(
+                delivery::run_relay_forward(&config, &job).await,
+                Err(DeliveryError::Quarantine(_))
+            ),
             "bad relay payload quarantines"
         );
     }
@@ -451,7 +682,17 @@ fn inbox_forwarding_plans_one_job_per_follower_inbox() {
     let r2 = remote_on(&store, "r2", "other.example");
     for follower in [r1, r2] {
         store
-            .follow(follower, alice, FollowOptions { show_reblogs: true, notify: false, languages: None }, false, now)
+            .follow(
+                follower,
+                alice,
+                FollowOptions {
+                    show_reblogs: true,
+                    notify: false,
+                    languages: None,
+                },
+                false,
+                now,
+            )
             .expect("remote follows alice");
     }
     // r1 and r2 share nothing: two distinct shared inboxes.
@@ -461,11 +702,21 @@ fn inbox_forwarding_plans_one_job_per_follower_inbox() {
     assert!(!delivery::should_forward_inbound("Flag"));
 
     let body = follow_body("https://remote.example/users/eve");
-    let planned = delivery::plan_inbox_forward(&*store, alice, "https://example.social/activities/1", &body, None, now)
-        .expect("planned");
+    let planned = delivery::plan_inbox_forward(
+        &*store,
+        alice,
+        "https://example.social/activities/1",
+        &body,
+        None,
+        now,
+    )
+    .expect("planned");
     assert_eq!(planned, 2, "one job per follower inbox");
     let jobs = store.claim_due(now + 1, 100).expect("claim");
-    let deliveries: Vec<&Job> = jobs.iter().filter(|j| j.kind == JobKind::DeliverActivity).collect();
+    let deliveries: Vec<&Job> = jobs
+        .iter()
+        .filter(|j| j.kind == JobKind::DeliverActivity)
+        .collect();
     assert_eq!(deliveries.len(), 2);
 
     // The inbox the activity arrived from is excluded (no relay loop).
@@ -494,9 +745,22 @@ fn remote_counters_are_hints_never_authority() {
     assert_eq!(hint_count(100_000_001), None, "absurd claims dropped");
 
     let hint = validate_remote_counts(Some(10), Some(u64::MAX), Some(3));
-    assert_eq!(hint, RemoteCountsHint { followers: Some(10), following: None, statuses: Some(3) });
+    assert_eq!(
+        hint,
+        RemoteCountsHint {
+            followers: Some(10),
+            following: None,
+            statuses: Some(3)
+        }
+    );
 
-    let local = AccountStats { followers_count: 5, following_count: 0, statuses_count: 0, last_status_at_ms: None, follow_requests_count: 0 };
+    let local = AccountStats {
+        followers_count: 5,
+        following_count: 0,
+        statuses_count: 0,
+        last_status_at_ms: None,
+        follow_requests_count: 0,
+    };
     // Local accounts always render local measurements.
     assert_eq!(display_counts(true, local, hint).followers_count, 5);
     // Remote accounts fill only zero fields from the hint.
@@ -511,26 +775,43 @@ fn remote_counters_are_hints_never_authority() {
 #[test]
 fn note_replies_and_featured_tags_collections_have_stable_shapes() {
     let replies = note_replies_value("https://example.social/users/a/statuses/9", 4);
-    assert_eq!(replies["id"], "https://example.social/users/a/statuses/9/replies");
+    assert_eq!(
+        replies["id"],
+        "https://example.social/users/a/statuses/9/replies"
+    );
     assert_eq!(replies["type"], "Collection");
     assert_eq!(replies["totalItems"], 4);
-    assert_eq!(replies["first"], "https://example.social/users/a/statuses/9/replies?page=true");
+    assert_eq!(
+        replies["first"],
+        "https://example.social/users/a/statuses/9/replies?page=true"
+    );
 
     let actor = "https://example.social/users/alice";
     assert_eq!(
         featured_tags_collection_uri(actor),
         "https://example.social/users/alice/collections/featured"
     );
-    let doc = featured_tags_collection_doc(actor, TEST_PUBLIC_URL, &[("rust".into(), 1), ("art".into(), 2)]);
+    let doc = featured_tags_collection_doc(
+        actor,
+        TEST_PUBLIC_URL,
+        &[("rust".into(), 1), ("art".into(), 2)],
+    );
     assert_eq!(doc["type"], "OrderedCollection");
     assert_eq!(doc["totalItems"], 2);
     assert_eq!(doc["orderedItems"][0]["name"], "#rust");
-    assert_eq!(doc["orderedItems"][0]["href"], format!("{TEST_PUBLIC_URL}/tags/rust"));
+    assert_eq!(
+        doc["orderedItems"][0]["href"],
+        format!("{TEST_PUBLIC_URL}/tags/rust")
+    );
 }
 
 // --- quote re-verify ------------------------------------------------------------
 
-fn quoted_and_quoting(store: &RedbStore, tag: &str, now: u64) -> (Id, Id, birchtree::domain::QuoteRecord) {
+fn quoted_and_quoting(
+    store: &RedbStore,
+    tag: &str,
+    now: u64,
+) -> (Id, Id, birchtree::domain::QuoteRecord) {
     let alice = mk_account(store, &format!("alice-{tag}")).id;
     let eve = remote(store, "eve");
     let quoted = publish(store, alice, "quotable", now);
@@ -555,10 +836,11 @@ fn quoted_and_quoting(store: &RedbStore, tag: &str, now: u64) -> (Id, Id, bircht
         quote_uri: None,
         poll: None,
     };
-    let quoting = birchtree::application::federation_inbound::ingest_note(&*store, quoting_note, None, now)
-        .expect("ingest quoting")
-        .status
-        .id;
+    let quoting =
+        birchtree::application::federation_inbound::ingest_note(&*store, quoting_note, None, now)
+            .expect("ingest quoting")
+            .status
+            .id;
     let quote = store
         .create_quote(
             NewQuote {
@@ -592,33 +874,91 @@ async fn quote_reverify_keeps_revokes_and_stops_at_caps_with_counts_in_step() {
     let config = federation(&store, dir.path(), &SafeHttpConfig::default());
     let now = now_ms();
     let (quoted, _quoting, quote) = quoted_and_quoting(&store, "a", now);
-    assert_eq!(store.status_by_id(quoted).unwrap().expect("quoted").quotes_count, 1, "accepted quote counts");
+    assert_eq!(
+        store
+            .status_by_id(quoted)
+            .unwrap()
+            .expect("quoted")
+            .quotes_count,
+        1,
+        "accepted quote counts"
+    );
 
     // Alive quoted status, no remote authorization: kept, counts untouched.
-    assert_eq!(plan_quote_reverify(&*store, quote.id).unwrap(), QuoteReverifyPlan::CheckRemote);
-    assert_eq!(run_quote_reverify(&config, &reverify_job(quote.id, 0)).await, Ok(()));
-    assert_eq!(store.quote_by_id(quote.id).unwrap().expect("quote").state, QuoteState::Accepted);
-    assert_eq!(store.status_by_id(quoted).unwrap().expect("quoted").quotes_count, 1);
+    assert_eq!(
+        plan_quote_reverify(&*store, quote.id).unwrap(),
+        QuoteReverifyPlan::CheckRemote
+    );
+    assert_eq!(
+        run_quote_reverify(&config, &reverify_job(quote.id, 0)).await,
+        Ok(())
+    );
+    assert_eq!(
+        store.quote_by_id(quote.id).unwrap().expect("quote").state,
+        QuoteState::Accepted
+    );
+    assert_eq!(
+        store
+            .status_by_id(quoted)
+            .unwrap()
+            .expect("quoted")
+            .quotes_count,
+        1
+    );
 
     // Missing quote, rejected quote: terminal no-ops.
-    assert_eq!(run_quote_reverify(&config, &reverify_job(Id::new(u64::MAX - 7), 0)).await, Ok(()));
-    store.set_quote_state(quote.id, QuoteState::Rejected, None, None).expect("reject");
-    assert_eq!(plan_quote_reverify(&*store, quote.id).unwrap(), QuoteReverifyPlan::Done);
-    assert_eq!(run_quote_reverify(&config, &reverify_job(quote.id, 0)).await, Ok(()));
+    assert_eq!(
+        run_quote_reverify(&config, &reverify_job(Id::new(u64::MAX - 7), 0)).await,
+        Ok(())
+    );
+    store
+        .set_quote_state(quote.id, QuoteState::Rejected, None, None)
+        .expect("reject");
+    assert_eq!(
+        plan_quote_reverify(&*store, quote.id).unwrap(),
+        QuoteReverifyPlan::Done
+    );
+    assert_eq!(
+        run_quote_reverify(&config, &reverify_job(quote.id, 0)).await,
+        Ok(())
+    );
 
     // Back to accepted, then the quoted status is deleted: the delete path
     // cascades the quote to `deleted` itself, so re-verify is a terminal
     // no-op — a dead quote is never revived (never-promote-to-root holds).
-    store.set_quote_state(quote.id, QuoteState::Accepted, None, None).expect("accept");
-    let alice = store.status_by_id(quoted).unwrap().expect("quoted").account_id;
-    store.delete_status(quoted, alice, now + 1).expect("delete quoted");
-    assert_eq!(store.quote_by_id(quote.id).unwrap().expect("quote").state, QuoteState::Deleted);
-    assert_eq!(plan_quote_reverify(&*store, quote.id).unwrap(), QuoteReverifyPlan::Done);
-    assert_eq!(run_quote_reverify(&config, &reverify_job(quote.id, 0)).await, Ok(()));
-    assert_eq!(store.quote_by_id(quote.id).unwrap().expect("quote").state, QuoteState::Deleted);
+    store
+        .set_quote_state(quote.id, QuoteState::Accepted, None, None)
+        .expect("accept");
+    let alice = store
+        .status_by_id(quoted)
+        .unwrap()
+        .expect("quoted")
+        .account_id;
+    store
+        .delete_status(quoted, alice, now + 1)
+        .expect("delete quoted");
+    assert_eq!(
+        store.quote_by_id(quote.id).unwrap().expect("quote").state,
+        QuoteState::Deleted
+    );
+    assert_eq!(
+        plan_quote_reverify(&*store, quote.id).unwrap(),
+        QuoteReverifyPlan::Done
+    );
+    assert_eq!(
+        run_quote_reverify(&config, &reverify_job(quote.id, 0)).await,
+        Ok(())
+    );
+    assert_eq!(
+        store.quote_by_id(quote.id).unwrap().expect("quote").state,
+        QuoteState::Deleted
+    );
 
     // Hop cap and fetch budget stop the chain with state kept.
-    assert_eq!(run_quote_reverify(&config, &reverify_job(quote.id, 8)).await, Ok(()));
+    assert_eq!(
+        run_quote_reverify(&config, &reverify_job(quote.id, 8)).await,
+        Ok(())
+    );
     let capped = Job::new(
         unique_job_id(),
         JobKind::QuoteReverify,
@@ -629,7 +969,10 @@ async fn quote_reverify_keeps_revokes_and_stops_at_caps_with_counts_in_step() {
     assert_eq!(run_quote_reverify(&config, &capped).await, Ok(()));
     // A malformed job quarantines without touching state.
     let bad = Job::new(unique_job_id(), JobKind::QuoteReverify, json!({}), now, now);
-    assert!(matches!(run_quote_reverify(&config, &bad).await, Err(DeliveryError::Quarantine(_))));
+    assert!(matches!(
+        run_quote_reverify(&config, &bad).await,
+        Err(DeliveryError::Quarantine(_))
+    ));
 }
 
 #[tokio::test]
@@ -639,20 +982,39 @@ async fn quote_reverify_never_rolls_back_on_federation_failure() {
     let now = now_ms();
     let (_quoted, _quoting, quote) = quoted_and_quoting(&store, "b", now);
     // A pending quote is left to the request flow, whatever the network says.
-    store.set_quote_state(quote.id, QuoteState::Pending, None, None).expect("pend");
-    assert_eq!(plan_quote_reverify(&*store, quote.id).unwrap(), QuoteReverifyPlan::Done);
-    assert_eq!(run_quote_reverify(&config, &reverify_job(quote.id, 0)).await, Ok(()));
-    assert_eq!(store.quote_by_id(quote.id).unwrap().expect("quote").state, QuoteState::Pending);
+    store
+        .set_quote_state(quote.id, QuoteState::Pending, None, None)
+        .expect("pend");
+    assert_eq!(
+        plan_quote_reverify(&*store, quote.id).unwrap(),
+        QuoteReverifyPlan::Done
+    );
+    assert_eq!(
+        run_quote_reverify(&config, &reverify_job(quote.id, 0)).await,
+        Ok(())
+    );
+    assert_eq!(
+        store.quote_by_id(quote.id).unwrap().expect("quote").state,
+        QuoteState::Pending
+    );
 }
 
 #[tokio::test]
 async fn quote_reverify_revokes_only_on_positive_remote_evidence() {
     let app = Router::new()
         .route("/gone", get(|| async { StatusCode::NOT_FOUND }))
-        .route("/live", get(|| async {
-            (StatusCode::OK, serde_json::to_vec(&json!({"type": "QuoteAuthorization"})).unwrap())
-        }));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        .route(
+            "/live",
+            get(|| async {
+                (
+                    StatusCode::OK,
+                    serde_json::to_vec(&json!({"type": "QuoteAuthorization"})).unwrap(),
+                )
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let port = listener.local_addr().expect("addr").port();
     tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
 
@@ -663,17 +1025,48 @@ async fn quote_reverify_revokes_only_on_positive_remote_evidence() {
     let (quoted_live, _, quote_live) = quoted_and_quoting(&store, "l1", now + 1);
     let gone_url = format!("http://127.0.0.1:{port}/gone");
     let live_url = format!("http://127.0.0.1:{port}/live");
-    store.set_quote_state(quote_gone.id, QuoteState::Accepted, Some(gone_url), None).expect("approval");
-    store.set_quote_state(quote_live.id, QuoteState::Accepted, Some(live_url), None).expect("approval");
-    assert_eq!(plan_quote_reverify(&*store, quote_gone.id).unwrap(), QuoteReverifyPlan::CheckRemote);
+    store
+        .set_quote_state(quote_gone.id, QuoteState::Accepted, Some(gone_url), None)
+        .expect("approval");
+    store
+        .set_quote_state(quote_live.id, QuoteState::Accepted, Some(live_url), None)
+        .expect("approval");
+    assert_eq!(
+        plan_quote_reverify(&*store, quote_gone.id).unwrap(),
+        QuoteReverifyPlan::CheckRemote
+    );
 
     // 404 on the authorization: the quoted author withdrew it — revoke with
     // the counter in step and a revoke event for the quoting server.
-    assert_eq!(run_quote_reverify(&config, &reverify_job(quote_gone.id, 0)).await, Ok(()));
-    assert_eq!(store.quote_by_id(quote_gone.id).unwrap().expect("quote").state, QuoteState::Revoked);
+    assert_eq!(
+        run_quote_reverify(&config, &reverify_job(quote_gone.id, 0)).await,
+        Ok(())
+    );
+    assert_eq!(
+        store
+            .quote_by_id(quote_gone.id)
+            .unwrap()
+            .expect("quote")
+            .state,
+        QuoteState::Revoked
+    );
     // Both quotes counted while accepted; the revoked one steps down.
-    assert_eq!(store.status_by_id(quoted_gone).unwrap().expect("quoted").quotes_count, 0);
-    assert_eq!(store.status_by_id(quoted_live).unwrap().expect("quoted").quotes_count, 1);
+    assert_eq!(
+        store
+            .status_by_id(quoted_gone)
+            .unwrap()
+            .expect("quoted")
+            .quotes_count,
+        0
+    );
+    assert_eq!(
+        store
+            .status_by_id(quoted_live)
+            .unwrap()
+            .expect("quoted")
+            .quotes_count,
+        1
+    );
     let jobs = store.claim_due(now + 3_600_000, 100).expect("claim");
     assert!(
         jobs.iter().any(|j| j.kind == JobKind::FederationEvent
@@ -683,9 +1076,26 @@ async fn quote_reverify_revokes_only_on_positive_remote_evidence() {
     );
 
     // A resolving authorization keeps the quote and its count.
-    assert_eq!(run_quote_reverify(&config, &reverify_job(quote_live.id, 0)).await, Ok(()));
-    assert_eq!(store.quote_by_id(quote_live.id).unwrap().expect("quote").state, QuoteState::Accepted);
-    assert_eq!(store.status_by_id(quoted_live).unwrap().expect("quoted").quotes_count, 1);
+    assert_eq!(
+        run_quote_reverify(&config, &reverify_job(quote_live.id, 0)).await,
+        Ok(())
+    );
+    assert_eq!(
+        store
+            .quote_by_id(quote_live.id)
+            .unwrap()
+            .expect("quote")
+            .state,
+        QuoteState::Accepted
+    );
+    assert_eq!(
+        store
+            .status_by_id(quoted_live)
+            .unwrap()
+            .expect("quoted")
+            .quotes_count,
+        1
+    );
 }
 
 // --- report -> Flag forward -----------------------------------------------------
@@ -719,17 +1129,25 @@ async fn local_report_forwards_a_flag_to_the_remote_inbox() {
     let jobs = store.claim_due(now + 1, 100).expect("claim");
     let event = jobs
         .iter()
-        .find(|j| j.kind == JobKind::FederationEvent && j.payload.get("report_id") == Some(&json!(report.id.value())))
+        .find(|j| {
+            j.kind == JobKind::FederationEvent
+                && j.payload.get("report_id") == Some(&json!(report.id.value()))
+        })
         .expect("flag event queued with the report");
     assert_eq!(event.payload.get("event"), Some(&json!("flag")));
 
     // The event worker plans one Flag delivery to the target's shared inbox.
     // (The worker stamps its own clock, so claim past any skew.)
-    birchtree::federation::events::run(&config, event).await.expect("flag planned");
+    birchtree::federation::events::run(&config, event)
+        .await
+        .expect("flag planned");
     let jobs = store.claim_due(now + 3_600_000, 100).expect("claim");
     let delivery = jobs
         .iter()
-        .find(|j| j.kind == JobKind::DeliverActivity && j.payload.get("inbox") == Some(&json!("https://remote.example/inbox")))
+        .find(|j| {
+            j.kind == JobKind::DeliverActivity
+                && j.payload.get("inbox") == Some(&json!("https://remote.example/inbox"))
+        })
         .expect("Flag delivery to the remote shared inbox");
     let body = delivery.payload.get("body").expect("activity body");
     assert_eq!(body.get("type"), Some(&json!("Flag")));
@@ -750,11 +1168,24 @@ fn webfinger_lookup_shape_resolves_remotes_live_and_404s_only_when_missing() {
         split_remote_acct("@bob@Remote.Example"),
         Some(("bob".into(), "remote.example".into()))
     );
-    assert_eq!(split_remote_acct("carol@remote.example"), Some(("carol".into(), "remote.example".into())));
-    assert_eq!(split_remote_acct("localname"), None, "bare names stay local");
+    assert_eq!(
+        split_remote_acct("carol@remote.example"),
+        Some(("carol".into(), "remote.example".into()))
+    );
+    assert_eq!(
+        split_remote_acct("localname"),
+        None,
+        "bare names stay local"
+    );
     assert_eq!(split_remote_acct("acct:@"), None);
-    assert!(lookup_should_resolve_live("remote.example", "example.social"));
-    assert!(!lookup_should_resolve_live("EXAMPLE.social", "example.social"), "local stays in the index");
+    assert!(lookup_should_resolve_live(
+        "remote.example",
+        "example.social"
+    ));
+    assert!(
+        !lookup_should_resolve_live("EXAMPLE.social", "example.social"),
+        "local stays in the index"
+    );
 }
 
 // --- remote embeds ------------------------------------------------------------------
@@ -772,7 +1203,10 @@ fn embed_html_sanitizer_drops_active_content_and_keeps_prose() {
     assert!(!clean.contains("data:text"), "data urls gone");
     assert!(!clean.contains("<!--"), "comments gone");
     assert!(clean.contains("<p>kept</p>"), "prose kept");
-    assert!(clean.contains("https://remote.example/x"), "safe links kept");
+    assert!(
+        clean.contains("https://remote.example/x"),
+        "safe links kept"
+    );
 
     // Nested dropped elements collapse fully.
     let nested = "<div>a<script>b<iframe>c</iframe>d</script>e</div>";
@@ -804,19 +1238,32 @@ fn remote_oembed_documents_parse_with_request_overrides() {
     let over = parse_remote_embed(&raw, Some(200), Some(99)).expect("parses");
     assert_eq!((over.width, over.height), (200, Some(99)));
     let wild = parse_remote_embed(&raw, Some(99999), None).expect("parses");
-    assert_eq!(wild.width, 500, "out-of-range override falls back to the document");
+    assert_eq!(
+        wild.width, 500,
+        "out-of-range override falls back to the document"
+    );
 
-    assert!(parse_remote_embed(&json!({"type": "nonsense", "html": "<p>x</p>"}), None, None).is_none());
-    assert!(parse_remote_embed(&json!({"type": "rich"}), None, None).is_none(), "html required");
+    assert!(
+        parse_remote_embed(&json!({"type": "nonsense", "html": "<p>x</p>"}), None, None).is_none()
+    );
+    assert!(
+        parse_remote_embed(&json!({"type": "rich"}), None, None).is_none(),
+        "html required"
+    );
 }
 
 #[tokio::test]
 async fn remote_oembed_fetch_maps_status_to_terminal_or_transient() {
     let doc = json!({"type": "rich", "html": "<p>remote</p>", "author_name": "r"});
     let body = serde_json::to_vec(&doc).unwrap();
-    let ok = fetch_remote_embed(|_: String| async { Ok::<_, String>((200u16, body.clone())) }, "https://remote.example/embed/1", None, None)
-        .await
-        .expect("fetched");
+    let ok = fetch_remote_embed(
+        |_: String| async { Ok::<_, String>((200u16, body.clone())) },
+        "https://remote.example/embed/1",
+        None,
+        None,
+    )
+    .await
+    .expect("fetched");
     assert_eq!(ok.author_name, "r");
 
     let missing = fetch_remote_embed(
@@ -826,7 +1273,10 @@ async fn remote_oembed_fetch_maps_status_to_terminal_or_transient() {
         None,
     )
     .await;
-    assert!(matches!(missing, Err(EmbedFetchError::Terminal(_))), "404 never retries");
+    assert!(
+        matches!(missing, Err(EmbedFetchError::Terminal(_))),
+        "404 never retries"
+    );
 
     let big = fetch_remote_embed(
         |_: String| async { Ok::<_, String>((200u16, vec![0u8; 70 * 1024])) },
@@ -835,7 +1285,10 @@ async fn remote_oembed_fetch_maps_status_to_terminal_or_transient() {
         None,
     )
     .await;
-    assert!(matches!(big, Err(EmbedFetchError::Terminal(_))), "oversize is terminal");
+    assert!(
+        matches!(big, Err(EmbedFetchError::Terminal(_))),
+        "oversize is terminal"
+    );
 
     let down = fetch_remote_embed(
         |_: String| async { Err::<(u16, Vec<u8>), _>("dns".to_string()) },
@@ -844,7 +1297,10 @@ async fn remote_oembed_fetch_maps_status_to_terminal_or_transient() {
         None,
     )
     .await;
-    assert!(matches!(down, Err(EmbedFetchError::Transient(_))), "transport may retry");
+    assert!(
+        matches!(down, Err(EmbedFetchError::Transient(_))),
+        "transport may retry"
+    );
 }
 
 // --- collection_update hook ----------------------------------------------------------
@@ -861,18 +1317,27 @@ fn poll_collection_update_hook_enqueues_a_deduped_notification_job() {
     let jobs = store.claim_due(now + 1, 100).expect("claim");
     let job = jobs
         .iter()
-        .find(|j| j.kind == JobKind::FanOutNotification && j.payload.get("type") == Some(&json!("collection_update")))
+        .find(|j| {
+            j.kind == JobKind::FanOutNotification
+                && j.payload.get("type") == Some(&json!("collection_update"))
+        })
         .expect("collection_update job queued");
     assert_eq!(job.payload.get("recipient_id"), Some(&json!(alice.value())));
 
     // The job produces a real notification through the shared fan-out.
-    let produced = birchtree::application::notifications::fan_out_from_payload(&*store, &job.payload).expect("fan out");
+    let produced =
+        birchtree::application::notifications::fan_out_from_payload(&*store, &job.payload)
+            .expect("fan out");
     assert!(produced.is_some(), "collection_update notification created");
-    assert!(matches!(NotificationType::parse("collection_update"), Some(NotificationType::CollectionUpdate)));
+    assert!(matches!(
+        NotificationType::parse("collection_update"),
+        Some(NotificationType::CollectionUpdate)
+    ));
 
     // Self-notifications never enqueue.
     let before = store.claim_due(now + 2, 100).expect("claim").len();
-    enqueue_collection_update(&*store, alice, Some(alice), Some(status), now + 2).expect("self is a no-op");
+    enqueue_collection_update(&*store, alice, Some(alice), Some(status), now + 2)
+        .expect("self is a no-op");
     let after = store.claim_due(now + 3, 100).expect("claim").len();
     assert_eq!(before, after, "no job for a self trigger");
 }

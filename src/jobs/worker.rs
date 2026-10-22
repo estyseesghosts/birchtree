@@ -374,7 +374,7 @@ async fn process_one(
                 let url =
                     crate::federation::media::validate_remote_emoji(&shortcode, &domain, &source)
                         .map_err(DeliveryError::Quarantine)?;
-                let (bytes, mime) = crate::federation::media::fetch_remote_emoji_bytes(
+                let (bytes, _mime) = crate::federation::media::fetch_remote_emoji_bytes(
                     &ctx.media_client,
                     &url,
                     ctx.http.allow_http,
@@ -387,8 +387,8 @@ async fn process_one(
                     &*blobs,
                     &key,
                     &domain,
+                    url.as_str(),
                     &bytes,
-                    mime,
                     clock.now_ms(),
                 )
                 .map_err(DeliveryError::Quarantine)?;
