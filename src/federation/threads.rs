@@ -26,6 +26,7 @@ use crate::activitypub::FedContext;
 use crate::application::ports::Store;
 use crate::domain::{Id, JobKind, Result};
 use crate::federation::delivery::DeliveryError;
+use crate::federation::threads_auth;
 
 /// Parent hops per chain (contract D: a proposal; upstream has no hop cap).
 pub const MAX_PARENT_HOPS: u64 = 40;
@@ -415,7 +416,7 @@ pub async fn run_quote_reverify(
     match plan {
         QuoteReverifyPlan::Done => Ok(()),
         QuoteReverifyPlan::Revoke => {
-            revoke_verified(store, quote_id, now).map_err(retry)?;
+            threads_auth::revoke_verified(store, quote_id, now).map_err(retry)?;
             Ok(())
         }
         QuoteReverifyPlan::CheckRemote => {
@@ -425,34 +426,6 @@ pub async fn run_quote_reverify(
             check_authorization_remote(ctx, store, quote_id, hop, fetches, Some(next_quote_id), now).await
         }
     }
-}
-
-/// Revoke a quote whose death is positively evidenced, and queue its
-/// `Delete` of the `QuoteAuthorization` for the quoting server (a no-op when
-/// the quoted author is remote — the event worker only sends for locals).
-fn revoke_verified(store: &dyn Store, quote_id: Id, now_ms: u64) -> Result<()> {
-    use crate::domain::QuoteState;
-    let Some(quote) = store.quote_by_id(quote_id)? else {
-        return Ok(());
-    };
-    if quote.state != QuoteState::Accepted {
-        return Ok(());
-    }
-    store.set_quote_state(quote.id, QuoteState::Revoked, None, None)?;
-    store.enqueue_event(
-        quote.quoted_account_id,
-        serde_json::json!({"event": "quote_revoke", "quote_id": quote.id.value()}),
-        now_ms,
-    )?;
-    tracing::info!(
-        target: "birchtree::federation",
-        direction = "inbound",
-        kind = "QuoteReverify",
-        quote = quote.id.value(),
-        outcome = "revoked: quoted status is gone",
-        "thread"
-    );
-    Ok(())
 }
 
 /// Fetch the quote's authorization document (one fetch, the job's hop) and
@@ -468,102 +441,10 @@ async fn check_authorization_remote(
     chain: Option<Id>,
     now_ms: u64,
 ) -> std::result::Result<(), DeliveryError> {
-    use crate::domain::QuoteState;
-    let retry = |e: crate::domain::Error| DeliveryError::Retry(e.to_string());
-    let Some(quote) = store.quote_by_id(quote_id).map_err(retry)? else {
-        return Ok(());
-    };
-    if quote.state != QuoteState::Accepted {
-        return Ok(());
-    }
-    let Some(approval) = quote.approval_uri.clone() else {
-        // A local-policy quote carries no remote authorization to check.
-        // Still continue a nested chain, if any.
-        if let Some(next) = chain {
-            store
-                .enqueue(
-                    JobKind::QuoteReverify,
-                    serde_json::json!({ "quote_id": next.value(), "hop": hop + 1, "fetches": fetches }),
-                    now_ms,
-                )
-                .map_err(retry)?;
-        }
-        return Ok(());
-    };
-    let url = Url::parse(&approval).map_err(|e| DeliveryError::Quarantine(e.to_string()))?;
-    if let Err(policy) = crate::federation::policy::check_url(&url, ctx.http.allow_http, &ctx.http.allowlist) {
-        // A refused authorization URL is not evidence of death: keep the quote.
-        tracing::info!(
-            target: "birchtree::federation",
-            direction = "inbound",
-            kind = "QuoteReverify",
-            quote = quote.id.value(),
-            outcome = %format!("kept: authorization url refused by policy: {policy}"),
-            "thread"
-        );
-        return Ok(());
-    }
-    let response = ctx
-        .media_client
-        .get(url)
-        .header(reqwest::header::ACCEPT, "application/activity+json, application/ld+json")
-        .send()
+    threads_auth::QuoteAuthCtx::new(ctx, store, quote_id, hop, fetches, chain, now_ms)
+        .authorize_step()
         .await
-        .map_err(|e| DeliveryError::Retry(e.to_string()))?;
-    let status = response.status();
-    if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
-        revoke_verified(store, quote.id, now_ms).map_err(retry)?;
-        return Ok(());
-    }
-    if status.is_server_error()
-        || status == reqwest::StatusCode::REQUEST_TIMEOUT
-        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-    {
-        return Err(DeliveryError::Retry(format!("authorization server answered {status}")));
-    }
-    if !status.is_success() {
-        // Any other client answer is not evidence of death: keep the quote.
-        return Ok(());
-    }
-    if let Some(declared) = response.content_length()
-        && declared > QUOTE_REVERIFY_MAX_BODY_BYTES
-    {
-        return Ok(());
-    }
-    // Bounded read: the authorization document is tiny; anything past the
-    // remote-document cap is not evidence of anything — keep the quote.
-    use futures_util::StreamExt as _;
-    let mut body: Vec<u8> = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| DeliveryError::Retry(e.to_string()))?;
-        if body.len() as u64 + chunk.len() as u64 > QUOTE_REVERIFY_MAX_BODY_BYTES {
-            return Ok(());
-        }
-        body.extend_from_slice(&chunk);
-    }
-    let _doc: serde_json::Value = match serde_json::from_slice(&body) {
-        Ok(doc) => doc,
-        Err(_) => return Ok(()),
-    };
-    if let Some(next) = chain {
-        store
-            .enqueue(
-                JobKind::QuoteReverify,
-                serde_json::json!({ "quote_id": next.value(), "hop": hop + 1, "fetches": fetches + 1 }),
-                now_ms,
-            )
-            .map_err(retry)?;
-    }
-    tracing::info!(
-        target: "birchtree::federation",
-        direction = "inbound",
-        kind = "QuoteReverify",
-        quote = quote.id.value(),
-        outcome = "kept: authorization still resolves",
-        "thread"
-    );
-    Ok(())
+        .map(|_| ())
 }
 
 // ---------------------------------------------------------------------------

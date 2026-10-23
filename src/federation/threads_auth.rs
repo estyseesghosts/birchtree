@@ -269,10 +269,10 @@ pub fn budget_exhausted(hop: u64, fetches: u64) -> bool {
 /// `Delete` of the `QuoteAuthorization` for the quoting server (a no-op when
 /// the quoted author is remote — the event worker only sends for locals).
 ///
-/// Verbatim from `threads.rs::revoke_verified`: no-ops on a missing row or a
+/// Verbatim from `threads::revoke_verified`: no-ops on a missing row or a
 /// non-accepted quote, keeps the quoted status's counter in step via
 /// `set_quote_state`, and enqueues the same `quote_revoke` event.
-fn revoke_verified(store: &dyn Store, quote_id: Id, now_ms: u64) -> crate::domain::Result<()> {
+pub(crate) fn revoke_verified(store: &dyn Store, quote_id: Id, now_ms: u64) -> crate::domain::Result<()> {
     use crate::domain::QuoteState;
 
     let Some(quote) = store.quote_by_id(quote_id)? else {

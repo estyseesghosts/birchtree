@@ -328,3 +328,263 @@ where
         cfg,
     )
 }
+
+/// Reserve worst-case budget for one fetch, evicting durable-first on pressure.
+///
+/// Verbatim from `media::fetch`: holds `MAX_REMOTE_MEDIA_BYTES` of `Full`
+/// budget up front; only `BudgetExhausted` triggers the shared durable-first
+/// eviction (unmap rows+counters in one transaction, delete blobs, ledger
+/// catches up) followed by one retry of the reservation; any other refusal
+/// maps through `media::ledger_outcome` with no eviction. The guard frees the
+/// holding on every return below, so no path needs a manual release.
+pub fn reserve_room(
+    store: &dyn Store,
+    blobs: &dyn BlobStore,
+    now_ms: u64,
+) -> Result<remote_cache::Reservation<'static>, DeliveryError> {
+    match remote_cache::Reservation::reserve(
+        remote_cache::process_ledger(),
+        remote_cache::MediaClass::Full,
+        MAX_REMOTE_MEDIA_BYTES,
+    ) {
+        Ok(guard) => Ok(guard),
+        Err(remote_cache::CacheError::BudgetExhausted { .. }) => {
+            crate::media::cache_maintenance::evict_pressure_durable_first(
+                store,
+                blobs,
+                None,
+                remote_cache::process_ledger(),
+                remote_cache::MediaClass::Full,
+                MAX_REMOTE_MEDIA_BYTES,
+                now_ms,
+                crate::media::cache_maintenance::MAINTENANCE_BATCH,
+            )
+            .map_err(|err| DeliveryError::Retry(err.to_string()))?;
+            remote_cache::Reservation::reserve(
+                remote_cache::process_ledger(),
+                remote_cache::MediaClass::Full,
+                MAX_REMOTE_MEDIA_BYTES,
+            )
+            .map_err(crate::federation::media::ledger_outcome)
+        }
+        Err(other) => Err(crate::federation::media::ledger_outcome(other)),
+    }
+}
+
+/// Map the attachment response head to a live stream cap.
+///
+/// Verbatim from `media::fetch`: 5xx/408/429 retry with
+/// `"attachment server answered {status}"`; any other non-success marks the
+/// row with the same string and quarantines; otherwise the declared size is
+/// enforced by [`enforce_declared_cap`] and the reservation shrinks by
+/// `remaining - declared` (a dishonest length cannot overshoot the budget
+/// because the body arms still cap the stream at the live reservation).
+/// Returns the live reservation: the cap both body arms stream under.
+pub fn head_status_and_cap(
+    store: &dyn Store,
+    media_id: Id,
+    status: reqwest::StatusCode,
+    declared: Option<u64>,
+    reservation: &mut remote_cache::Reservation<'_>,
+    now_ms: u64,
+) -> Result<u64, DeliveryError> {
+    if status.is_server_error()
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+    {
+        return Err(DeliveryError::Retry(format!(
+            "attachment server answered {status}"
+        )));
+    }
+    if !status.is_success() {
+        let _ = store.mark_remote_media_failed(
+            media_id,
+            &format!("attachment server answered {status}"),
+            now_ms,
+        );
+        return Err(DeliveryError::Quarantine(format!(
+            "attachment server answered {status}"
+        )));
+    }
+    // `Content-Length` is advisory: shrink the reservation to the declared
+    // size, but cap the body stream at the live reservation below.
+    if let Some(declared) = enforce_declared_cap(store, media_id, declared, now_ms)? {
+        reservation.shrink(reservation.remaining().saturating_sub(declared));
+    }
+    Ok(reservation.remaining())
+}
+
+/// Stream the response body to a staging tmp file under the live cap, then settle.
+///
+/// Verbatim from the staging-root arm of `media::fetch`: the body streams to
+/// `tmp/{rand}.part` under `stream_cap` and renames onto the key — no `Vec`
+/// buffering. The classifier only reads a 64 KiB prefix (magic + `ftyp`
+/// brand classifies exactly like the full body). Audio/video originals are
+/// `Stream` — never persisted: the tmp is removed, the row is marked with the
+/// shared never-cached reason, and the job completes successfully with no blob
+/// and no ledger movement. Otherwise the tmp is published first (a crash
+/// leaves at most an uncounted orphan blob, never counted bytes without a
+/// blob) and [`commit_bytes`] settles.
+pub async fn stage_streamed(
+    store: &dyn Store,
+    blobs: &dyn BlobStore,
+    response: reqwest::Response,
+    staging_root: std::path::PathBuf,
+    stream_cap: u64,
+    reservation: &mut remote_cache::Reservation<'_>,
+    source_url: &str,
+    media_id: Id,
+    blob_key: &str,
+    now_ms: u64,
+    cfg: &RemoteCacheConfig,
+) -> Result<(), DeliveryError> {
+    use tokio::io::AsyncReadExt as _;
+
+    let tmp = crate::media::fetch_stream::tmp_path_for(&staging_root)
+        .map_err(|e| DeliveryError::Retry(e.to_string()))?;
+    let stream = response.bytes_stream();
+    let staged = crate::media::fetch_stream::copy_stream_capped(stream, &tmp, stream_cap)
+        .await
+        .map_err(|e| match e {
+            crate::domain::Error::InvalidInput(_) => {
+                let _ = store.mark_remote_media_failed(
+                    media_id,
+                    "attachment is larger than the limit",
+                    now_ms,
+                );
+                DeliveryError::Quarantine("attachment is larger than the limit".into())
+            }
+            other => DeliveryError::Retry(other.to_string()),
+        })?;
+    // Sniff from a bounded prefix: the classifier only reads leading bytes.
+    let prefix = {
+        let file = tokio::fs::File::open(&tmp).await.map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            DeliveryError::Retry(e.to_string())
+        })?;
+        let mut buf = Vec::new();
+        file.take(65536).read_to_end(&mut buf).await.map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            DeliveryError::Retry(e.to_string())
+        })?;
+        buf
+    };
+    let sniffed = match ingest::sniff(&prefix).filter(|s| ingest::validate(*s)) {
+        Some(s) => s,
+        None => {
+            let _ = std::fs::remove_file(&tmp);
+            let _ = store.mark_remote_media_failed(
+                media_id,
+                "attachment is not a supported media file",
+                now_ms,
+            );
+            return Err(DeliveryError::Quarantine(
+                "attachment is not a supported media file".into(),
+            ));
+        }
+    };
+    // Classify AFTER the sniff, never assume `Full` (adversarial-2 D2 stage 1).
+    if remote_cache::class_for_fetch(sniffed.mime_type, ATTACHMENT_VARIANT)
+        == remote_cache::MediaClass::Stream
+    {
+        let _ = std::fs::remove_file(&tmp);
+        let reason = "remote audio/video streams from its origin and is never cached";
+        let _ = store.mark_remote_media_failed(media_id, reason, now_ms);
+        return Ok(());
+    }
+    blobs.publish_tmp(&tmp, blob_key).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        DeliveryError::Retry(e.to_string())
+    })?;
+    commit_bytes(
+        store,
+        blobs,
+        reservation,
+        source_url,
+        media_id,
+        blob_key,
+        staged,
+        sniffed.mime_type,
+        now_ms,
+        cfg,
+    )
+}
+
+/// Buffer the response body under the live cap, then settle.
+///
+/// Verbatim from the legacy arm of `media::fetch` (handles without a staging
+/// root, e.g. in-memory doubles): chunk loop aborts past `stream_cap` with
+/// `"attachment is larger than the limit"`; sniff + `validate` else
+/// `"attachment is not a supported media file"`; audio/video originals take
+/// the same never-persisted `Stream` outcome as the staged path (no `put`, no
+/// commit, job `Ok`, row marked); otherwise `put` then [`commit_bytes`].
+pub async fn stage_buffered(
+    store: &dyn Store,
+    blobs: &dyn BlobStore,
+    response: reqwest::Response,
+    stream_cap: u64,
+    reservation: &mut remote_cache::Reservation<'_>,
+    source_url: &str,
+    media_id: Id,
+    blob_key: &str,
+    now_ms: u64,
+    cfg: &RemoteCacheConfig,
+) -> Result<(), DeliveryError> {
+    use futures_util::StreamExt as _;
+
+    let mut body: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| DeliveryError::Retry(e.to_string()))?;
+        if chunk_over_cap(body.len() as u64, chunk.len() as u64, stream_cap) {
+            let _ = store.mark_remote_media_failed(
+                media_id,
+                "attachment is larger than the limit",
+                now_ms,
+            );
+            return Err(DeliveryError::Quarantine(
+                "attachment is larger than the limit".into(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let sniffed = match ingest::sniff(&body).filter(|s| ingest::validate(*s)) {
+        Some(s) => s,
+        None => {
+            let _ = store.mark_remote_media_failed(
+                media_id,
+                "attachment is not a supported media file",
+                now_ms,
+            );
+            return Err(DeliveryError::Quarantine(
+                "attachment is not a supported media file".into(),
+            ));
+        }
+    };
+    // Same classification as the streamed path: audio/video originals are
+    // `Stream` and are never persisted (no put, no commit). The guard frees
+    // the reservation. The job completes successfully with the row marked
+    // non-cached; clients use `remote_url`.
+    if remote_cache::class_for_fetch(sniffed.mime_type, ATTACHMENT_VARIANT)
+        == remote_cache::MediaClass::Stream
+    {
+        let reason = "remote audio/video streams from its origin and is never cached";
+        let _ = store.mark_remote_media_failed(media_id, reason, now_ms);
+        return Ok(());
+    }
+    blobs
+        .put(blob_key, &body)
+        .map_err(|e| DeliveryError::Retry(e.to_string()))?;
+    commit_bytes(
+        store,
+        blobs,
+        reservation,
+        source_url,
+        media_id,
+        blob_key,
+        body.len() as u64,
+        sniffed.mime_type,
+        now_ms,
+        cfg,
+    )
+}

@@ -9,7 +9,8 @@
 //! deletes the row's own `remote/{media_id}` key (per-row keys retained, no
 //! sharing, no refcount; durable local media is never touched).
 //!
-//! The fetch is instance-actor-signed on same-origin hops ([`get_signed`]):
+//! The fetch is instance-actor-signed on same-origin hops
+//! ([`media_fetch::signed_get`]):
 //! when an instance actor is configured each `GET` whose URL shares the
 //! initial URL's origin carries its HTTP signature, so authorized-fetch peers
 //! accept the dereference; without a configured actor the fetch is an unsigned
@@ -27,8 +28,6 @@
 
 use std::sync::Mutex;
 
-use axum::body::Bytes;
-use futures_util::StreamExt;
 use url::Url;
 
 use crate::activitypub::FedContext;
@@ -37,9 +36,10 @@ use crate::application::ports::{BlobStore, CacheStore};
 use crate::config::RemoteCacheConfig;
 use crate::domain::{Id, Job};
 use crate::federation::delivery::DeliveryError;
+use crate::federation::media_fetch;
 use crate::federation::policy;
 use crate::media::ingest;
-use crate::media::remote_cache::{self, CacheError, CacheLedger, MediaClass};
+use crate::media::remote_cache::{self, CacheError, MediaClass};
 
 /// The largest remote attachment accepted (Mastodon's default upload limit: 40 MiB).
 /// Stays the per-file ceiling inside the class/global budgets (not a config key).
@@ -63,72 +63,9 @@ pub const MAX_REDIRECT_HOPS: usize = 5;
 /// This is distinct from SSRF refusal: a non-public hop is never requested at
 /// all ([`crate::federation::policy::check_url`] quarantines it first); a
 /// cross-origin public hop is requested unsigned, and the strip is logged by
-/// [`get_signed`].
+/// [`media_fetch::signed_get`].
 pub fn redirect_keeps_signature(first: &Url, next: &Url) -> bool {
     first.origin() == next.origin()
-}
-
-/// `GET` a remote attachment, signed with the instance actor on same-origin
-/// hops, following redirects manually under the URL policy.
-async fn get_signed(
-    config: &activitypub_federation::config::FederationConfig<FedContext>,
-    first_url: Url,
-) -> std::result::Result<reqwest::Response, DeliveryError> {
-    let ctx: &FedContext = config;
-    let data = config.to_request_data();
-    let first = first_url.clone();
-    let mut url = first_url;
-    for _hop in 0..=MAX_REDIRECT_HOPS {
-        policy::check_url(&url, ctx.http.allow_http, &ctx.http.allowlist)
-            .map_err(|e| DeliveryError::Quarantine(format!("attachment url refused: {e}")))?;
-        let same_origin = redirect_keeps_signature(&first, &url);
-        if data.can_sign_requests() && !same_origin {
-            tracing::info!(
-                target: "birchtree::federation",
-                direction = "inbound",
-                kind = "FetchRemoteMedia",
-                from_host = first.host_str().unwrap_or("-"),
-                to_host = url.host_str().unwrap_or("-"),
-                outcome = "signature_stripped",
-                "attachment redirect leaves the initial origin, fetching unsigned"
-            );
-        }
-        let response = if data.can_sign_requests() && same_origin {
-            let builder = reqwest_middleware::ClientWithMiddleware::from(ctx.media_client.clone())
-                .get(url.as_str())
-                .header(reqwest::header::ACCEPT, "*/*");
-            let request = data
-                .sign_request(builder, Bytes::new())
-                .await
-                .map_err(|e| {
-                    DeliveryError::Retry(format!("signing the attachment fetch failed: {e}"))
-                })?;
-            ctx.media_client.execute(request).await
-        } else {
-            ctx.media_client
-                .get(url.clone())
-                .header(reqwest::header::ACCEPT, "*/*")
-                .send()
-                .await
-        };
-        let response = response.map_err(|e| DeliveryError::Retry(e.to_string()))?;
-        if !response.status().is_redirection() {
-            return Ok(response);
-        }
-        let location = response
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| {
-                DeliveryError::Quarantine("attachment redirect has no location".into())
-            })?;
-        url = url.join(location).map_err(|e| {
-            DeliveryError::Quarantine(format!("attachment redirect is invalid: {e}"))
-        })?;
-    }
-    Err(DeliveryError::Quarantine(
-        "attachment redirected too many times".into(),
-    ))
 }
 
 /// Per-row blob key for a remote attachment (retained v1 decision: no
@@ -144,16 +81,10 @@ fn cache_store(ctx: &FedContext) -> &dyn BlobStore {
     &*ctx.app.blobs
 }
 
-fn lock_ledger() -> Result<std::sync::MutexGuard<'static, CacheLedger>, DeliveryError> {
-    remote_cache::process_ledger()
-        .lock()
-        .map_err(|e| DeliveryError::Retry(format!("cache ledger poisoned: {e}")))
-}
-
 /// Map a ledger refusal to a job outcome: budget/store/origin pressure is
 /// transient (retry with backoff); oversize/unsupported/missing is permanent
 /// (quarantine, like the existing failure arms below).
-fn ledger_outcome(err: CacheError) -> DeliveryError {
+pub(crate) fn ledger_outcome(err: CacheError) -> DeliveryError {
     match &err {
         CacheError::BudgetExhausted { .. } | CacheError::Store(_) | CacheError::OriginDown(_) => {
             DeliveryError::Retry(err.message())
@@ -430,339 +361,69 @@ pub async fn fetch(
 ) -> std::result::Result<(), DeliveryError> {
     let ctx: &FedContext = config;
     let store = &*ctx.app.store;
-    let media_id = job
-        .payload
-        .get("media_id")
-        .and_then(serde_json::Value::as_u64)
-        .map(Id::new)
-        .ok_or_else(|| DeliveryError::Quarantine("media job has no media".into()))?;
-    let retry = |e: crate::domain::Error| DeliveryError::Retry(e.to_string());
-    let source = match store.remote_media_source(media_id).map_err(retry)? {
-        Some(s) => s,
-        None => {
-            let _ = store.mark_remote_media_failed(
-                media_id,
-                "attachment has no source",
-                ctx.app.now_ms(),
-            );
-            return Err(DeliveryError::Quarantine("attachment has no source".into()));
-        }
-    };
-    let url = Url::parse(&source).map_err(|e| DeliveryError::Quarantine(e.to_string()))?;
-    if let Err(e) = policy::check_url(&url, ctx.http.allow_http, &ctx.http.allowlist) {
-        let _ = store.mark_remote_media_failed(
-            media_id,
-            &format!("attachment url refused: {e}"),
-            ctx.app.now_ms(),
-        );
-        return Err(DeliveryError::Quarantine(format!(
-            "attachment url refused: {e}"
-        )));
-    }
-
-    let key = cache_key_for(media_id);
+    let blobs = cache_store(ctx);
     let now = ctx.app.now_ms();
-
-    // Disabled mode refuses before any admission or eviction: there is
-    // nowhere to keep fetched bytes, so the fetch must not reserve budget,
-    // count cached bytes, or displace them (adversarial-2 F1).
-    let persist = remote_cache::process_ledger()
-        .lock()
-        .map(|ledger| ledger.persistence_allowed())
-        .unwrap_or(false);
-    // Fast path: bytes already cached (first request won, or a retried job).
-    // Count them if the ledger has not seen them (restart / pre-split rows),
-    // refresh last-use, and make sure the row is staged.
-    if persist && cache_store(ctx).get(&key).map_err(retry)?.is_some() {
-        {
-            let mut ledger = lock_ledger()?;
-            let cache_key =
-                crate::persistence::redb::schema::remote_cache_key(&source, ATTACHMENT_VARIANT);
-            let seen = ledger.get(&cache_key).is_some_and(|e| e.has_bytes);
-            if !seen {
-                // Size is advisory here (already on disk); count, don't refuse.
-                if let Ok(Some(bytes)) = cache_store(ctx).get(&key).map_err(|_| ()) {
-                    // Classify AFTER the sniff, never assume `Full`:
-                    // audio/video originals stream from their origin and are
-                    // never persisted, so stale cached bytes are dropped,
-                    // counted nowhere and staged nowhere (adversarial-2 N5).
-                    let streams = ingest::sniff(&bytes)
-                        .filter(|sniffed| ingest::validate(*sniffed))
-                        .is_some_and(|sniffed| {
-                            remote_cache::class_for_fetch(sniffed.mime_type, ATTACHMENT_VARIANT)
-                                == MediaClass::Stream
-                        });
-                    if streams {
-                        let _ = cache_store(ctx).delete(&key);
-                        let reason =
-                            "remote audio/video streams from its origin and is never cached";
-                        let _ = store.mark_remote_media_failed(media_id, reason, ctx.app.now_ms());
-                        return Err(DeliveryError::Quarantine(reason.into()));
-                    }
-                    let entry = remote_cache::RemoteCacheEntry::stored(
-                        &source,
-                        ATTACHMENT_VARIANT,
-                        MediaClass::Full,
-                        &key,
-                        bytes.len() as u64,
-                        now,
-                        &ctx.remote_cache,
-                    );
-                    let _ = ledger.commit(MediaClass::Full, 0, entry);
-                }
-            } else {
-                ledger.touch(&cache_key, now);
-            }
+    let media_id = media_fetch::parse_job(job)?;
+    let source = media_fetch::load_source(store, media_id, now)?;
+    let url = Url::parse(&source).map_err(|e| DeliveryError::Quarantine(e.to_string()))?;
+    if let Err(e) = media_fetch::gate_url(&url, ctx.http.allow_http, &ctx.http.allowlist) {
+        if let DeliveryError::Quarantine(reason) = &e {
+            let _ = store.mark_remote_media_failed(media_id, reason, now);
         }
-        if let Ok(Some(row)) = store.media_by_id(media_id).map_err(|_| None::<()>) {
-            if !row.file_key.is_empty() {
-                return Ok(());
-            }
-        }
-        // Row unstaged but bytes present (torn write): heal below by staging.
-        if let Ok(Some(bytes)) = cache_store(ctx).get(&key).map_err(|_| None::<()>) {
-            if bytes.len() as u64 <= MAX_REMOTE_MEDIA_BYTES {
-                if let Some(sniffed) = ingest::sniff(&bytes).filter(|s| ingest::validate(*s)) {
-                    let staged = store
-                        .stage_remote_media(
-                            media_id,
-                            &key,
-                            sniffed.mime_type,
-                            bytes.len() as u64,
-                            now,
-                        )
-                        .map_err(retry)?;
-                    if staged.is_some() {
-                        return Ok(());
-                    }
-                }
-            }
-        }
+        return Err(e);
     }
-
-    // Worst-case reservation first: concurrent fetches each hold their ceiling
-    // until headers shrink it, so the committed total never overshoots. Only
-    // a budget exhaustion evicts (durable-first, shared with scheduled
-    // maintenance); any other refusal maps straight to its outcome with no
-    // eviction (adversarial-2 F1). The guard frees the holding on every
-    // return below, so no path needs a manual release.
-    let mut reservation = match remote_cache::Reservation::reserve(
-        remote_cache::process_ledger(),
-        MediaClass::Full,
-        MAX_REMOTE_MEDIA_BYTES,
-    ) {
-        Ok(guard) => guard,
-        Err(CacheError::BudgetExhausted { .. }) => {
-            // Make room through the durable-first eviction shared with
-            // scheduled maintenance: victims are unmapped (rows + counters)
-            // in one redb transaction BEFORE any blob is deleted, then the
-            // blobs go, then the in-memory ledger catches up. A durable
-            // failure deletes nothing and the fetch does not proceed
-            // (transient retry, no download).
-            crate::media::cache_maintenance::evict_pressure_durable_first(
-                store,
-                cache_store(ctx),
-                None,
-                remote_cache::process_ledger(),
-                MediaClass::Full,
-                MAX_REMOTE_MEDIA_BYTES,
-                now,
-                crate::media::cache_maintenance::MAINTENANCE_BATCH,
-            )
-            .map_err(|err| DeliveryError::Retry(err.to_string()))?;
-            remote_cache::Reservation::reserve(
-                remote_cache::process_ledger(),
-                MediaClass::Full,
-                MAX_REMOTE_MEDIA_BYTES,
-            )
-            .map_err(ledger_outcome)?
-        }
-        Err(other) => return Err(ledger_outcome(other)),
-    };
-
-    let response = get_signed(config, url.clone()).await?;
-    let status = response.status();
-    if status.is_server_error()
-        || status == reqwest::StatusCode::REQUEST_TIMEOUT
-        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-    {
-        return Err(DeliveryError::Retry(format!(
-            "attachment server answered {status}"
-        )));
-    }
-    if !status.is_success() {
-        let _ = store.mark_remote_media_failed(
-            media_id,
-            &format!("attachment server answered {status}"),
-            ctx.app.now_ms(),
-        );
-        return Err(DeliveryError::Quarantine(format!(
-            "attachment server answered {status}"
-        )));
-    }
-    // `Content-Length` is advisory: shrink the reservation to the declared
-    // size, but cap the body stream at the live reservation so a dishonest
-    // length cannot overshoot the budget (adversarial-2 N2).
-    if let Some(declared) = response.content_length() {
-        if declared > MAX_REMOTE_MEDIA_BYTES {
-            let _ = store.mark_remote_media_failed(
-                media_id,
-                "attachment is larger than the limit",
-                ctx.app.now_ms(),
-            );
-            return Err(DeliveryError::Quarantine(
-                "attachment is larger than the limit".into(),
-            ));
-        }
-        reservation.shrink(reservation.remaining().saturating_sub(declared));
-    }
-    let stream_cap = reservation.remaining();
-    // Stream-to-disk on the cache filesystem (adversarial-2 F11): when the
-    // blob handle exposes a staging root, the body streams to
-    // `tmp/{rand}.part` under the cap and renames onto the key — no `Vec`
-    // buffering. The pooled handle stages under the cache root so
-    // `publish_tmp` stays a same-volume rename and bursty fetches never
-    // consume durable volume space. Handles without a root (in-memory
-    // doubles) keep the legacy buffered path.
-    if let Some(root) = cache_store(ctx).staging_root() {
-        use tokio::io::AsyncReadExt as _;
-
-        let tmp = crate::media::fetch_stream::tmp_path_for(&root)
-            .map_err(|e| DeliveryError::Retry(e.to_string()))?;
-        let stream = response.bytes_stream();
-        let staged = crate::media::fetch_stream::copy_stream_capped(stream, &tmp, stream_cap)
-            .await
-            .map_err(|e| match e {
-                crate::domain::Error::InvalidInput(_) => {
-                    let _ = store.mark_remote_media_failed(
-                        media_id,
-                        "attachment is larger than the limit",
-                        ctx.app.now_ms(),
-                    );
-                    DeliveryError::Quarantine("attachment is larger than the limit".into())
-                }
-                other => DeliveryError::Retry(other.to_string()),
-            })?;
-        // Sniff from a bounded prefix: the classifier only reads leading
-        // bytes (magic + `ftyp` brand), so 64 KiB classifies every accepted
-        // format exactly like the full body did.
-        let prefix = {
-            let file = tokio::fs::File::open(&tmp).await.map_err(|e| {
-                let _ = std::fs::remove_file(&tmp);
-                DeliveryError::Retry(e.to_string())
-            })?;
-            let mut buf = Vec::new();
-            file.take(65536).read_to_end(&mut buf).await.map_err(|e| {
-                let _ = std::fs::remove_file(&tmp);
-                DeliveryError::Retry(e.to_string())
-            })?;
-            buf
-        };
-        let sniffed = match ingest::sniff(&prefix).filter(|s| ingest::validate(*s)) {
-            Some(s) => s,
-            None => {
-                let _ = std::fs::remove_file(&tmp);
-                let _ = store.mark_remote_media_failed(
-                    media_id,
-                    "attachment is not a supported media file",
-                    ctx.app.now_ms(),
-                );
-                return Err(DeliveryError::Quarantine(
-                    "attachment is not a supported media file".into(),
-                ));
-            }
-        };
-        // Classify AFTER the sniff, never assume `Full`: audio/video
-        // originals are `Stream` — never persisted by design (not a working
-        // delivery mode on its own; clients play them from the origin URL
-        // in `remote_url`). A Stream outcome drops the download and records
-        // the row as non-cached with a clear reason, then completes the job
-        // successfully (adversarial-2 D2 stage 1): no cache blob is created
-        // and `stored_full` never moves. `reserve(Stream)` is never called
-        // (it refuses loudly by design). The guard frees the reservation.
-        let class = remote_cache::class_for_fetch(sniffed.mime_type, ATTACHMENT_VARIANT);
-        if class == MediaClass::Stream {
-            let _ = std::fs::remove_file(&tmp);
-            let reason = "remote audio/video streams from its origin and is never cached";
-            let _ = store.mark_remote_media_failed(media_id, reason, ctx.app.now_ms());
-            return Ok(());
-        }
-        // Publish first, then settle into stored bytes: a crash between
-        // leaves at most an uncounted orphan blob for the reconciler, never
-        // counted bytes without a blob.
-        cache_store(ctx).publish_tmp(&tmp, &key).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            DeliveryError::Retry(e.to_string())
-        })?;
-        return settle_staged(
-            store,
-            cache_store(ctx),
-            &mut reservation,
-            &source,
-            ATTACHMENT_VARIANT,
-            media_id,
-            &key,
-            staged,
-            sniffed.mime_type,
-            now,
-            &ctx.remote_cache,
-        );
-    }
-    let mut body: Vec<u8> = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| DeliveryError::Retry(e.to_string()))?;
-        if body.len() as u64 + chunk.len() as u64 > stream_cap {
-            let _ = store.mark_remote_media_failed(
-                media_id,
-                "attachment is larger than the limit",
-                ctx.app.now_ms(),
-            );
-            return Err(DeliveryError::Quarantine(
-                "attachment is larger than the limit".into(),
-            ));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    let sniffed = match ingest::sniff(&body).filter(|s| ingest::validate(*s)) {
-        Some(s) => s,
-        None => {
-            let _ = store.mark_remote_media_failed(
-                media_id,
-                "attachment is not a supported media file",
-                ctx.app.now_ms(),
-            );
-            return Err(DeliveryError::Quarantine(
-                "attachment is not a supported media file".into(),
-            ));
-        }
-    };
-    // Same classification as the streamed path: audio/video originals are
-    // `Stream` and are never persisted (no put, no commit). The guard frees
-    // the reservation. The job completes successfully with the row marked
-    // non-cached (adversarial-2 D2 stage 1); clients use `remote_url`.
-    if remote_cache::class_for_fetch(sniffed.mime_type, ATTACHMENT_VARIANT) == MediaClass::Stream {
-        let reason = "remote audio/video streams from its origin and is never cached";
-        let _ = store.mark_remote_media_failed(media_id, reason, ctx.app.now_ms());
-        return Ok(());
-    }
-
-    cache_store(ctx)
-        .put(&key, &body)
-        .map_err(|e| DeliveryError::Retry(e.to_string()))?;
-    settle_staged(
+    let key = cache_key_for(media_id);
+    if media_fetch::fast_path_if_cached(
         store,
-        cache_store(ctx),
-        &mut reservation,
+        blobs,
         &source,
-        ATTACHMENT_VARIANT,
         media_id,
         &key,
-        body.len() as u64,
-        sniffed.mime_type,
+        now,
+        &ctx.remote_cache,
+    )? == media_fetch::FastPath::Hit
+    {
+        return Ok(());
+    }
+    let mut reservation = media_fetch::reserve_room(store, blobs, now)?;
+    let response = media_fetch::signed_get(config, url).await?;
+    let stream_cap = media_fetch::head_status_and_cap(
+        store,
+        media_id,
+        response.status(),
+        response.content_length(),
+        &mut reservation,
+        now,
+    )?;
+    if let Some(root) = blobs.staging_root() {
+        return media_fetch::stage_streamed(
+            store,
+            blobs,
+            response,
+            root,
+            stream_cap,
+            &mut reservation,
+            &source,
+            media_id,
+            &key,
+            now,
+            &ctx.remote_cache,
+        )
+        .await;
+    }
+    media_fetch::stage_buffered(
+        store,
+        blobs,
+        response,
+        stream_cap,
+        &mut reservation,
+        &source,
+        media_id,
+        &key,
         now,
         &ctx.remote_cache,
     )
+    .await
 }
 
 // ---------------------------------------------------------------------------

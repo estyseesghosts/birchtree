@@ -15,9 +15,70 @@ use serde_json::Value;
 use crate::activitypub::FedContext;
 use crate::activitypub::actor::ActorRecord;
 use crate::activitypub::outgoing;
+use crate::application::federation_ports::DeliverySpec;
 use crate::application::ports::Store;
-use crate::domain::{Account, Id, Result, Status};
+use crate::domain::{Account, Id, Job, JobKind, Result, Status};
 use crate::federation::delivery::DeliveryError;
+
+/// Parsed head of a `FederationEvent` job: the event name, the resolved
+/// local author, and the id/uri selectors the builders read. Rejection
+/// strings are verbatim from the `events::run` prelude.
+pub struct EventHead {
+    /// Event name (`payload["event"]`, empty when absent).
+    pub event: String,
+    /// Local author (`payload["actor_id"]`); remote/missing actors reject.
+    pub author: Account,
+    /// Subject status (`payload["status_id"]`).
+    pub status_id: Option<Id>,
+    /// Block/flag target (`payload["target_id"]`).
+    pub target_id: Option<Id>,
+    /// Flag report (`payload["report_id"]`).
+    pub report_id: Option<Id>,
+    /// Quote (`payload["quote_id"]`).
+    pub quote_id: Option<Id>,
+    /// Announce URI override (`payload["announce_uri"]`).
+    pub announce_uri: Option<String>,
+}
+
+/// Parse a job into its [`EventHead`]: event name, local author and arm
+/// selectors. Verbatim from the `events::run` prelude (same order: event,
+/// actor, author; the selectors are pure payload reads).
+pub fn load_head(store: &dyn Store, job: &Job) -> std::result::Result<EventHead, DeliveryError> {
+    let quarantine = |msg: String| DeliveryError::Quarantine(msg);
+    let uint = |key: &str| job.payload.get(key).and_then(Value::as_u64).map(Id::new);
+    let text = |key: &str| {
+        job.payload
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let event = job
+        .payload
+        .get("event")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let actor_id = job
+        .payload
+        .get("actor_id")
+        .and_then(Value::as_u64)
+        .map(Id::new)
+        .ok_or_else(|| quarantine("event has no actor".into()))?;
+    let author = store
+        .account_by_id(actor_id)
+        .map_err(|e| DeliveryError::Retry(e.to_string()))?
+        .filter(|a| a.local)
+        .ok_or_else(|| quarantine("event actor is not local".into()))?;
+    Ok(EventHead {
+        event,
+        author,
+        status_id: uint("status_id"),
+        target_id: uint("target_id"),
+        report_id: uint("report_id"),
+        quote_id: uint("quote_id"),
+        announce_uri: text("announce_uri"),
+    })
+}
 
 /// Build the full-document `Update` and `Delete` activities: status
 /// `create`/`update`/`delete`, actor `profile_update` and `delete_actor`.
@@ -335,7 +396,11 @@ pub fn build_quote(
     }
 }
 
-fn status_of(store: &dyn Store, id: Option<Id>) -> std::result::Result<Status, DeliveryError> {
+/// Load the status for an event, or quarantine when it is missing.
+pub(crate) fn status_of(
+    store: &dyn Store,
+    id: Option<Id>,
+) -> std::result::Result<Status, DeliveryError> {
     let id = id.ok_or_else(|| DeliveryError::Quarantine("event has no status".into()))?;
     store
         .status_by_id(id)
@@ -343,7 +408,8 @@ fn status_of(store: &dyn Store, id: Option<Id>) -> std::result::Result<Status, D
         .ok_or_else(|| DeliveryError::Quarantine(format!("event status {id} is missing")))
 }
 
-fn quote_of(
+/// Load the quote for an event, or quarantine when it is missing.
+pub(crate) fn quote_of(
     store: &dyn Store,
     id: Option<Id>,
 ) -> std::result::Result<crate::domain::QuoteRecord, DeliveryError> {
@@ -354,7 +420,11 @@ fn quote_of(
         .ok_or_else(|| DeliveryError::Quarantine(format!("event quote {id} is missing")))
 }
 
-fn author_uri_of(store: &dyn Store, id: Id) -> std::result::Result<String, DeliveryError> {
+/// Load the actor URI of an account, or quarantine when it is missing.
+pub(crate) fn author_uri_of(
+    store: &dyn Store,
+    id: Id,
+) -> std::result::Result<String, DeliveryError> {
     store
         .account_by_id(id)
         .map_err(|e| DeliveryError::Retry(e.to_string()))?
@@ -363,7 +433,11 @@ fn author_uri_of(store: &dyn Store, id: Id) -> std::result::Result<String, Deliv
 }
 
 /// Inboxes for a status: followers (unless direct), its mentions, and its reply's parent author.
-fn status_audience(store: &dyn Store, author: &Account, status: &Status) -> Result<Vec<String>> {
+pub(crate) fn status_audience(
+    store: &dyn Store,
+    author: &Account,
+    status: &Status,
+) -> Result<Vec<String>> {
     let mut ids: Vec<Id> = status.mentions.clone();
     if let Some(parent) = status.in_reply_to_account_id {
         ids.push(parent);
@@ -380,7 +454,7 @@ fn status_audience(store: &dyn Store, author: &Account, status: &Status) -> Resu
 }
 
 /// Inboxes for a boost: the followers (when the boost is visible to them) and the boosted author.
-fn boost_audience(
+pub(crate) fn boost_audience(
     store: &dyn Store,
     author: &Account,
     target: &Status,
@@ -395,4 +469,81 @@ fn boost_audience(
         }
     }
     Ok(inboxes)
+}
+
+/// Fan out public content activities to configured relay peers (G-D
+/// relays): same fixed bytes, per-host budget via `RelayForward`. Targeted
+/// activities (likes, flags, quotes, blocks, profile/deletion bookkeeping)
+/// never leave their addressed inboxes, and non-public statuses never reach
+/// a relay. Verbatim from `events::run`.
+pub(crate) fn enqueue_relays(
+    store: &dyn Store,
+    relays: &[String],
+    head: &EventHead,
+    bodies: &[Value],
+    now: u64,
+) -> Result<()> {
+    if !matches!(
+        head.event.as_str(),
+        "create" | "update" | "delete" | "announce" | "question_update"
+    ) {
+        return Ok(());
+    }
+    let relay_public = head
+        .status_id
+        .and_then(|id| store.status_by_id(id).ok().flatten())
+        .is_some_and(|status| status.visibility == crate::domain::Visibility::Public);
+    if relay_public {
+        for relay in crate::federation::delivery::relay_inboxes(relays) {
+            for body in bodies {
+                // The relay send carries the relay host's sequence, minted
+                // in the same transaction as the insert (see the job
+                // queue's delivery mint), so relay traffic joins the same
+                // per-host FIFO without a stamp-then-enqueue race.
+                let payload = serde_json::json!({
+                    "sender_id": head.author.id.value(),
+                    "relay_inbox": relay.as_str(),
+                    "activity_uri": body.get("id").and_then(Value::as_str).unwrap_or_default(),
+                    "body": body,
+                });
+                store.enqueue(JobKind::RelayForward, payload, now)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Enqueue one `DeliverActivity` job per destination inbox for each planned
+/// body. Plan order is sequence order: the atomic enqueue mints the host
+/// sequence and inserts the job in one transaction, so a `Follow` planned
+/// before its `Undo` always carries the smaller number. Verbatim from
+/// `events::run`.
+pub(crate) fn enqueue_deliveries(
+    store: &dyn Store,
+    head: &EventHead,
+    bodies: &[Value],
+    inboxes: &[String],
+    now: u64,
+) -> Result<()> {
+    for body in bodies {
+        let activity_uri = body
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        tracing::debug!(target: "birchtree::federation", direction = "outbound", event = %head.event, activity = %activity_uri, destinations = inboxes.len(), "event planned");
+        for inbox in inboxes {
+            // Plan order is sequence order: the atomic enqueue mints the host
+            // sequence and inserts the job in one transaction, so a `Follow`
+            // planned before its `Undo` always carries the smaller number.
+            let delivery = DeliverySpec {
+                sender_id: head.author.id,
+                inbox_uri: inbox.clone(),
+                activity_uri: activity_uri.clone(),
+                body: body.clone(),
+            };
+            store.enqueue_delivery(delivery, now)?;
+        }
+    }
+    Ok(())
 }

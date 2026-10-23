@@ -35,19 +35,16 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use activitypub_federation::{
-    activity_sending::SendActivityTask, config::FederationConfig, error::Error as ProtocolError,
-    traits::ActivityHandler,
-};
+use activitypub_federation::{config::FederationConfig, traits::ActivityHandler};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::Mutex as AsyncMutex;
 use url::Url;
 
 use crate::activitypub::FedContext;
-use crate::activitypub::actor::ActorRecord;
 use crate::activitypub::error::FedError;
-use crate::domain::{DeliveryDestState, Id, Job, JobKind};
+use crate::domain::{Id, Job, JobKind};
+use crate::federation::delivery_send;
 
 /// First cooldown after one failed attempt to a host.
 pub const DEST_COOLDOWN_BASE_MS: u64 = 60_000;
@@ -258,230 +255,24 @@ impl ActivityHandler for OutboundActivity {
 
 /// Attempt one delivery. `job` must be a `DeliverActivity` job.
 pub async fn run(config: &FederationConfig<FedContext>, job: &Job) -> Result<(), DeliveryError> {
-    if job.kind != JobKind::DeliverActivity {
-        return Err(DeliveryError::Quarantine("not a delivery job".into()));
-    }
-    let payload = &job.payload;
-    let sender = payload
-        .get("sender_id")
-        .and_then(Value::as_u64)
-        .map(Id::new)
-        .ok_or_else(|| DeliveryError::Quarantine("delivery has no sender".into()))?;
-    let inbox = payload
-        .get("inbox")
-        .and_then(Value::as_str)
-        .ok_or_else(|| DeliveryError::Quarantine("delivery has no inbox".into()))?;
-    let inbox_url = Url::parse(inbox)
-        .map_err(|_| DeliveryError::Quarantine("delivery inbox is not a URL".into()))?;
-    let body = payload
-        .get("body")
-        .cloned()
-        .ok_or_else(|| DeliveryError::Quarantine("delivery has no body".into()))?;
-    let activity = OutboundActivity::from_body(body)
-        .map_err(|e| DeliveryError::Quarantine(format!("delivery body is not an activity: {e}")))?;
-
+    let parsed = delivery_send::parse_delivery_job(job)?;
     let ctx: &FedContext = config;
     let store = &*ctx.app.store;
     let now = ctx.app.now_ms();
-    let host = dest_host(&inbox_url);
     // Serialize with the other in-flight deliveries to this host (see the
     // per-destination ordering note above): the guard spans the cooldown
     // check and the send, so a `Follow`/`Undo` pair to one inbox cannot
     // interleave. Other hosts take other locks and proceed in parallel.
-    let destination_guard_lock = destination_lock(&host);
+    let destination_guard_lock = destination_lock(&parsed.host);
     let _destination_guard = destination_guard_lock.lock().await;
-    // Per-destination FIFO gate: sequence N+1 for this host must not send
-    // while N is still unfinished (`Pending` or `Leased`). Park instead — a
-    // deferred copy due shortly, no retry budget consumed — so a `Follow`
-    // and its `Undo` can never go out on the wire even when the worker runs
-    // them concurrently or a restart reorders the claims. Terminal rows
-    // never block (see the ordering note above). Past [`SEQ_PARK_MAX`] parks
-    // (or [`SEQ_PARK_MAX_AGE_MS`] since the first park) the ordering relaxes:
-    // the send goes out even though an earlier sequence is still unfinished,
-    // so a permanently failing head cannot wedge its host.
-    let seq = payload.get("seq").and_then(Value::as_u64).unwrap_or(0);
-    if store
-        .delivery_blocked_by(&host, seq)
-        .map_err(|e| DeliveryError::Retry(e.to_string()))?
-    {
-        let parks = payload
-            .get("seq_parks")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let first_at = payload
-            .get("seq_park_first_at")
-            .and_then(Value::as_u64)
-            .unwrap_or(now);
-        let past_parks = parks >= u64::from(SEQ_PARK_MAX);
-        let past_age = now.saturating_sub(first_at) >= SEQ_PARK_MAX_AGE_MS;
-        if past_parks || past_age {
-            tracing::info!(
-                target: "birchtree::federation",
-                direction = "outbound",
-                inbox,
-                host = %host,
-                seq,
-                seq_parks = parks,
-                outcome = "ordering-relaxed: earlier sequence still unfinished past cap",
-                "delivery sent out of order"
-            );
-        } else {
-            let mut parked = payload.clone();
-            if let Some(object) = parked.as_object_mut() {
-                object.insert("seq_parks".into(), Value::from(parks + 1));
-                if payload.get("seq_park_first_at").is_none() {
-                    object.insert("seq_park_first_at".into(), Value::from(now));
-                }
-            }
-            store
-                .enqueue_at(
-                    JobKind::DeliverActivity,
-                    parked,
-                    now.saturating_add(SEQ_PARK_DELAY_MS),
-                    now,
-                )
-                .map_err(|e| DeliveryError::Retry(e.to_string()))?;
-            tracing::info!(
-                target: "birchtree::federation",
-                direction = "outbound",
-                inbox,
-                host = %host,
-                seq,
-                seq_parks = parks + 1,
-                outcome = "parked: earlier sequence unfinished",
-                "delivery deferred"
-            );
-            return Ok(());
-        }
-    }
-    // A host inside its cooldown is not hit again: park this job as a
-    // deferred copy due when the cooldown ends. The park does not consume
-    // the job's retry budget; past the deferral cap the job quarantines.
-    if let Some(state) = store
-        .delivery_dest(&host)
-        .map_err(|e| DeliveryError::Retry(e.to_string()))?
-        && now < state.cooldown_until_ms
-    {
-        let deferrals = payload
-            .get("deferrals")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        if deferrals >= u64::from(DEST_MAX_DEFERRALS) {
-            return Err(DeliveryError::Quarantine(format!(
-                "destination {host} still cooling down after {deferrals} deferrals"
-            )));
-        }
-        let mut parked = payload.clone();
-        if let Some(object) = parked.as_object_mut() {
-            object.insert("deferrals".into(), Value::from(deferrals + 1));
-        }
-        store
-            .enqueue_at(
-                JobKind::DeliverActivity,
-                parked,
-                state.cooldown_until_ms,
-                now,
-            )
-            .map_err(|e| DeliveryError::Retry(e.to_string()))?;
-        tracing::info!(
-            target: "birchtree::federation",
-            direction = "outbound",
-            inbox,
-            host = %host,
-            deferrals = deferrals + 1,
-            outcome = "parked: destination cooling down",
-            "delivery deferred"
-        );
+    if delivery_send::park_if_sequence_blocked(store, &parsed, job, now)? {
         return Ok(());
     }
-
-    let account = store
-        .account_by_id(sender)
-        .map_err(|e| DeliveryError::Retry(e.to_string()))?
-        .ok_or_else(|| DeliveryError::Quarantine("sender account is gone".into()))?;
-    let keys = store
-        .actor_keys(sender)
-        .map_err(|e| DeliveryError::Retry(e.to_string()))?
-        .filter(|keys| keys.private_key_pem.is_some())
-        .ok_or_else(|| DeliveryError::Quarantine("sender has no local signing key".into()))?;
-    let sender_actor =
-        ActorRecord::new(account, keys).map_err(|e| DeliveryError::Quarantine(e.to_string()))?;
-
-    let data = config.to_request_data();
-    let tasks = SendActivityTask::prepare(&activity, &sender_actor, vec![inbox_url], &data)
-        .await
-        .map_err(classify)?;
-    if tasks.is_empty() {
-        return Err(DeliveryError::Quarantine(format!(
-            "inbox {inbox} refused by federation policy"
-        )));
+    if delivery_send::park_if_cooling(store, &parsed, job, now)? {
+        return Ok(());
     }
-    for task in tasks {
-        match task.sign_and_send(&data).await {
-            Ok(()) => {
-                // A success resets the host: the outage, if any, is over.
-                if store
-                    .delivery_dest(&host)
-                    .map_err(|e| DeliveryError::Retry(e.to_string()))?
-                    .is_some()
-                {
-                    store
-                        .set_delivery_dest(
-                            &host,
-                            DeliveryDestState {
-                                failures: 0,
-                                cooldown_until_ms: 0,
-                            },
-                        )
-                        .map_err(|e| DeliveryError::Retry(e.to_string()))?;
-                }
-                tracing::info!(
-                    target: "birchtree::federation",
-                    direction = "outbound",
-                    inbox,
-                    activity = %activity.id(),
-                    outcome = "delivered (2xx)",
-                    "activity sent"
-                );
-            }
-            Err(err) => {
-                let settled = classify(err);
-                // Only a retryable failure charges the host's budget: a
-                // permanent refusal is one bad inbox, not a sick host.
-                if let DeliveryError::Retry(msg) = &settled {
-                    let failures = store
-                        .delivery_dest(&host)
-                        .map_err(|e| DeliveryError::Retry(e.to_string()))?
-                        .map(|s| s.failures)
-                        .unwrap_or(0)
-                        .saturating_add(1);
-                    let state = DeliveryDestState {
-                        failures,
-                        cooldown_until_ms: now.saturating_add(dest_cooldown_ms(failures)),
-                    };
-                    store
-                        .set_delivery_dest(&host, state)
-                        .map_err(|e| DeliveryError::Retry(e.to_string()))?;
-                    if failures > DEST_FAILURE_BUDGET {
-                        return Err(DeliveryError::Quarantine(format!(
-                            "destination {host} failed {failures} times in a row; budget exhausted: {msg}"
-                        )));
-                    }
-                }
-                return Err(settled);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn classify(err: ProtocolError) -> DeliveryError {
-    match err {
-        ProtocolError::UrlVerificationError(_) | ProtocolError::SerializeOutgoingActivity(..) => {
-            DeliveryError::Quarantine(err.to_string())
-        }
-        other => DeliveryError::Retry(other.to_string()),
-    }
+    let sender_actor = delivery_send::load_sender_keys(store, parsed.sender)?;
+    delivery_send::send_and_settle(config, store, &parsed, &sender_actor, now).await
 }
 
 // ---------------------------------------------------------------------------
