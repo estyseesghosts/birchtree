@@ -227,6 +227,9 @@ fn test_note(to: Vec<url::Url>) -> Note {
         tag: vec![],
         attachment: vec![],
         quote: None,
+        quote_uri_alias: None,
+        misskey_quote_alias: None,
+        quote_url_alias: None,
         quote_authorization: None,
         content_map: None,
         url: None,
@@ -624,4 +627,34 @@ async fn webfinger_suspended_is_gone() {
     .await;
     assert_eq!(status, StatusCode::GONE);
     let _ = token;
+}
+
+// Stored-shape canonical URI alias: production mints
+// `{base}/users/{username}/{id}` (no `/statuses/` segment), so the
+// advertised object id must resolve. Both the canonical `/statuses/`
+// route and the alias serve the same Note.
+#[tokio::test]
+async fn stored_shape_note_uri_resolves_on_both_routes() {
+    let srv = TestServer::new(true);
+    let token = user_token(&srv, "notefix").await;
+    let id = post_status(&srv, &token, "canonical uri check").await;
+    let stored = format!("https://example.social/users/notefix/{id}");
+    for path in [
+        format!("/users/notefix/{id}"),
+        format!("/users/notefix/statuses/{id}"),
+    ] {
+        let (status, _, bytes) = send(&srv.router, get_request(&path, None, None)).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        let body = json(&bytes);
+        assert_eq!(body["type"], "Note", "{path}");
+        assert_eq!(body["id"], stored, "{path}");
+    }
+    // Unknown numeric id still 404s on the alias (no shadowing of
+    // static segments: /users/notefix/outbox is the outbox, not a note).
+    let (status, _, _) = send(
+        &srv.router,
+        get_request("/users/notefix/outbox", None, None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
 }

@@ -125,6 +125,10 @@ appears in `src/`; absence was verified by search, not assumed.
   (or `Question` for polls); deleted → `410` with a `Tombstone` document;
   non-public (followers-only/direct) → `404`. Tombstones keep the
   `STATUS_BY_URI` mapping so redelivered `Create`s stay duplicates.
+  Stored canonical ids omit the `/statuses/` segment
+  (`{base}/users/{username}/{id}`), and that stored shape is served too
+  (`GET /users/:username/:id` alias, same handler) so advertised object
+  ids always resolve.
 - **Quote authorization:** `GET /users/:username/quote_authorizations/:id`
   serves the `QuoteAuthorization` of an accepted quote.
 - **Collections:** `followers`/`following` return `OrderedCollection` with
@@ -164,7 +168,7 @@ fail parsing and never change state.
 | `Accept` (follow / quote) | Yes | Must be directed at the local actor. Follow: applies the follow grant. Quote: requires `result` approval URI; unknown/non-pending quote → ignored, already-accepted → duplicate. |
 | `Reject` (follow / quote) | Yes | Mirrors `Accept`. |
 | `Undo(Follow\|Like\|Announce\|Block)` | Yes (closed set) | Embedded actor must equal the outer actor; `Undo(Follow)` additionally requires a local object. Unknown-target `Undo(Like/Announce)` → duplicate (delete-wins); unknown-target `Undo(Follow/Block)` → ignored and **not** recorded (see D33 below). Other `Undo` payloads fail parsing. |
-| `Create(Note\|Question\|Id)` | Yes | `Note`: authorship enforced (`attributedTo` == actor, same host). Vote-shaped Notes (`name` set, empty content, `inReplyTo` set) tally against known local polls or ingest as statuses. `Question`: must have expiry + 2–10 named options or it ingests poll-less (never `422`). Bare-ID `Create` dereferences the object. Tombstoned URIs are dropped as duplicates. Unknown parents schedule one-hop `ResolveParent` jobs (cap 40 hops). |
+| `Create(Note\|Question\|Id)` | Yes | `Note`: authorship enforced (`attributedTo` == actor, same host). Quote target merges `quote` (canonical, wins) with the `quoteUri` / `_misskey_quote` / `quoteUrl` legacy spellings — senders that emit canonical + aliases together parse (bare `alias` pairs used to 422 as `duplicate field`). Vote-shaped Notes (`name` set, empty content, `inReplyTo` set) tally against known local polls or ingest as statuses. `Question`: must have expiry + 2–10 named options or it ingests poll-less (never `422`). Bare-ID `Create` dereferences the object. Tombstoned URIs are dropped as duplicates. Unknown parents schedule one-hop `ResolveParent` jobs (cap 40 hops). |
 | `Update(Note\|Person\|Question)` | Yes | Author-equality enforced; unknown target → ignored. `Person` refreshes profile + key (always applied). `Question` on a known status syncs tallies/options only if author/poll/options match, else ignored; on an unknown status it ingests as a `Create` (out-of-order delivery). Other `Update` object types → accepted-and-dropped (`202`). |
 | `Delete` | Yes | Three branches: approval-URI → quote revocation (quoted author only); object == actor → account deletion; else status deletion (wrong author → ignored). Unknown same-host object URIs file a tombstone (cross-host `Delete`s never tombstone); `Delete` beats a racing `Create` on every ingest and dereference path. |
 | `Like` / `Undo(Like)` | Yes | Unknown/invisible target → ignored (`Like`) / duplicate (`Undo`). |

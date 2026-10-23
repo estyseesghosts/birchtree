@@ -52,9 +52,20 @@ pub struct Note {
     pub tag: Vec<Tag>,
     #[serde(default, deserialize_with = "deserialize_one_or_many")]
     pub attachment: Vec<Attachment>,
-    /// The quoted status (FEP-044f). `quoteUri` and `_misskey_quote` are read too.
-    #[serde(default, alias = "quoteUri", alias = "_misskey_quote", skip_serializing_if = "Option::is_none")]
+    /// The quoted status (FEP-044f). `quoteUri`, `_misskey_quote` and
+    /// `quoteUrl` arrive as separate legacy fields: senders emit the
+    /// canonical form *plus* compatibility aliases in one object, and
+    /// serde rejects duplicate `alias` hits on a single field, so each
+    /// spelling gets its own slot and [`Note::quote_uri`] merges them
+    /// (canonical wins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quote: Option<Url>,
+    #[serde(default, rename = "quoteUri", skip_serializing_if = "Option::is_none")]
+    pub quote_uri_alias: Option<Url>,
+    #[serde(default, rename = "_misskey_quote", skip_serializing_if = "Option::is_none")]
+    pub misskey_quote_alias: Option<Url>,
+    #[serde(default, rename = "quoteUrl", skip_serializing_if = "Option::is_none")]
+    pub quote_url_alias: Option<Url>,
     /// The authorization URI, present once the quote is accepted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quote_authorization: Option<Url>,
@@ -73,6 +84,16 @@ pub struct Note {
 }
 
 impl Note {
+    /// The quoted status URI: canonical `quote` wins, then the legacy
+    /// `quoteUri` / `_misskey_quote` / `quoteUrl` spellings.
+    pub fn quote_uri(&self) -> Option<&Url> {
+        self.quote
+            .as_ref()
+            .or(self.quote_uri_alias.as_ref())
+            .or(self.misskey_quote_alias.as_ref())
+            .or(self.quote_url_alias.as_ref())
+    }
+
     /// The status language: the single `contentMap` key, if there is one, in
     /// BCP47 canonical case. Upstream maps the downcased key through its
     /// locale table (`NORMALIZED_LOCALE_NAMES`, falling back to the raw key);

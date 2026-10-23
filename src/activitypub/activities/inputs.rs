@@ -142,7 +142,7 @@ pub fn note_input_for(note: &Note, author_id: Id, author_sensitized: bool) -> Re
                 url: e.url,
             })
             .collect(),
-        quote_uri: note.quote.as_ref().map(|u| u.to_string()),
+        quote_uri: note.quote_uri().map(|u| u.to_string()),
         poll: None,
     }
 }
