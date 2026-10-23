@@ -412,13 +412,15 @@ async fn budget_exhaustion_evicts_then_admits() {
                 MediaClass::Full,
                 victim_bytes.len() as u64,
                 birchtree::media::remote_cache::RemoteCacheEntry::stored(
-                    victim_source,
-                    "original",
-                    MediaClass::Full,
-                    victim_key,
+                    &birchtree::media::remote_cache::CacheEntryCtx {
+                        source_url: victim_source,
+                        variant: "original",
+                        class: MediaClass::Full,
+                        blob_key: victim_key,
+                        now_ms: now,
+                        cfg: &RemoteCacheConfig::default(),
+                    },
                     victim_bytes.len() as u64,
-                    now,
-                    &RemoteCacheConfig::default(),
                 ),
             )
             .expect("seed commit");

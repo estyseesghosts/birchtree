@@ -40,6 +40,8 @@ pub struct SearchQuery<'a> {
 
 impl<'a> SearchQuery<'a> {
     /// Bundle the `search` arguments in field order.
+    // WHY: constructor mirrors the search cluster field-for-field so call
+    // sites convert mechanically; prefer the struct literal instead.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         viewer: Option<Id>,

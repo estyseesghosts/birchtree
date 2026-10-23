@@ -21,7 +21,6 @@ use super::schema::{
     self, BOOKMARKS, FAVOURITES, REBLOGS_BY_ACCOUNT, STATUS_AUTHOR_INDEX, STATUS_PARENT_INDEX,
     STATUS_PINS, STATUS_VERSIONS, STATUSES,
 };
-use super::statuses_interactions::PinRecord;
 use super::{RedbStore, StoreResult, decode, encode};
 
 /// Bounded scan of a status's reply-children index.
@@ -338,98 +337,10 @@ pub(super) fn statuses_by_account_impl(
 
     if query.pinned_only {
         // Pin records first (pin order, newest pin first), then rows.
-        let mut pinned: Vec<(u64, Id)> = Vec::new();
-        {
-            let pins = read.open_table(STATUS_PINS)?;
-            let lo = schema::pair_key(account_id.value(), 0);
-            let hi = schema::pair_key(account_id.value(), u64::MAX);
-            for entry in pins.range(lo.as_slice()..=hi.as_slice())? {
-                let (key, value) = entry?;
-                let bytes = key.value();
-                let status_id = Id::new(u64::from_be_bytes(bytes[8..16].try_into().unwrap()));
-                let record: PinRecord = decode(value.value())?;
-                pinned.push((record.pinned_at_ms, status_id));
-                if pinned.len() >= PINS_SCAN_CAP {
-                    break;
-                }
-            }
-        }
-        pinned.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
-
-        let mut out = Vec::new();
-        let statuses = read.open_table(STATUSES)?;
-        for (_, status_id) in pinned {
-            if let Some(m) = query.max_id
-                && status_id >= m
-            {
-                continue;
-            }
-            let Some(guard) = statuses.get(status_id.value())? else {
-                continue;
-            };
-            let status: Status = decode(guard.value())?;
-            if status.is_deleted() {
-                continue;
-            }
-            out.push(status);
-            if out.len() >= query.limit {
-                break;
-            }
-        }
-        return Ok(out);
+        return super::statuses_read_stages::pinned_statuses(&read, account_id, &query);
     }
 
-    // Author index: keys are `(account || desc(id))`, so a forward scan
-    // yields status ids descending. With `min_id` (and no `since_id`) the
-    // oldest matching ids are wanted, so keep scanning and retain the
-    // last `limit` matches instead of stopping at the first `limit`.
-    let want_oldest = query.min_id.is_some() && query.since_id.is_none();
-    let mut matched: Vec<Status> = Vec::new();
-    {
-        let index = read.open_table(STATUS_AUTHOR_INDEX)?;
-        let statuses = read.open_table(STATUSES)?;
-        let lo = schema::pair_key(account_id.value(), 0);
-        let hi = schema::pair_key(account_id.value(), u64::MAX);
-        let mut scanned = 0usize;
-        for entry in index.range(lo.as_slice()..=hi.as_slice())? {
-            if scanned >= AUTHOR_SCAN_CAP {
-                break;
-            }
-            scanned += 1;
-            let (key, _value) = entry?;
-            let bytes = key.value();
-            let desc = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
-            let id = Id::new(u64::MAX - desc);
-            if query.max_id.is_some_and(|m| id >= m)
-                || query.since_id.is_some_and(|s| id <= s)
-                || query.min_id.is_some_and(|m| id <= m)
-            {
-                continue;
-            }
-            let Some(guard) = statuses.get(id.value())? else {
-                continue;
-            };
-            let status: Status = decode(guard.value())?;
-            if status.is_deleted() {
-                continue;
-            }
-            if query.exclude_replies && status.in_reply_to_id.is_some() {
-                continue;
-            }
-            if query.exclude_reblogs && status.is_reblog() {
-                continue;
-            }
-            matched.push(status);
-            if !want_oldest && matched.len() >= query.limit {
-                break;
-            }
-        }
-        store.note_scanned(scanned);
-    }
-    if want_oldest && matched.len() > query.limit {
-        matched.drain(..matched.len() - query.limit);
-    }
-    Ok(matched)
+    super::statuses_read_stages::general_statuses(&read, store, account_id, &query)
 }
 
 /// Viewer flags for a batch of statuses (no N+1).

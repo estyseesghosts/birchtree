@@ -69,14 +69,12 @@ pub fn notification(
     recipient: Id,
     notification: &Notification,
 ) -> Result<Option<Value>, ApiError> {
-    let (rows, _, _) = render_notifications(
-        server,
+    let ctx = crate::application::notifications::NotificationCtx {
         store,
+        recipient_id: recipient,
         now_ms,
-        recipient,
-        vec![notification.clone()],
-        // Stream payloads carry no fallback, like upstream.
-        None,
-    )?;
+    };
+    // Stream payloads carry no fallback, like upstream.
+    let (rows, _, _) = render_notifications(&ctx, server, vec![notification.clone()], None)?;
     Ok(rows.into_iter().next())
 }

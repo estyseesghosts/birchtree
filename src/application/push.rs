@@ -612,6 +612,8 @@ pub async fn handle_push_job(
 /// Run one `WebPushDelivery` job under an explicit URL policy (lab/test
 /// hook; production passes the default-deny config via [`handle_push_job`]).
 /// Otherwise identical to [`handle_push_job`].
+// WHY: lab/test hook mirroring handle_push_job plus an explicit URL policy;
+// the policy param is the point.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_push_job_with_policy(
     store: &dyn crate::application::ports::Store,

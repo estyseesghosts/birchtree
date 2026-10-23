@@ -488,7 +488,7 @@ fn every_command_preserves_metadata_and_never_strips() {
         (TranscodePlan::VideoToWebm, true),
         (TranscodePlan::VideoToWebm, false),
     ] {
-        let argv = build_argv("ffmpeg", input, output, plan, with_audio, &cfg);
+        let argv = build_argv(input, output, plan, with_audio, &cfg);
         // Metadata rides along; no strip flag, no pixel filter (orientation
         // is kept as a tag, never applied).
         assert!(argv.contains(&"-map_metadata".to_string()), "{plan:?}");
@@ -502,17 +502,16 @@ fn every_command_preserves_metadata_and_never_strips() {
         assert_eq!(argv.last().map(String::as_str), Some("/tmp/out.bin"));
     }
     // Recorded Phase 7.1 quality defaults.
-    let still = build_argv("ffmpeg", input, output, TranscodePlan::ImageToWebp, false, &cfg);
+    let still = build_argv(input, output, TranscodePlan::ImageToWebp, false, &cfg);
     assert!(still.contains(&"libwebp".to_string()));
     assert!(still.contains(&"80".to_string()));
-    let video = build_argv("ffmpeg", input, output, TranscodePlan::VideoToWebm, true, &cfg);
+    let video = build_argv(input, output, TranscodePlan::VideoToWebm, true, &cfg);
     assert!(video.contains(&"libvpx-vp9".to_string()));
     assert!(video.contains(&"30".to_string()));
     assert!(video.contains(&"libopus".to_string()));
     assert!(video.contains(&"96k".to_string()));
     // Silent video maps no audio stream.
     let silent = build_argv(
-        "ffmpeg",
         input,
         output,
         TranscodePlan::VideoToWebm,

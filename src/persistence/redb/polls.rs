@@ -171,6 +171,8 @@ impl PollStore for RedbStore {
         Ok(out)
     }
 
+    // WHY single-txn: one begin_write owns the ballot row + tallies + expiry job atomically
+    // (architecture rule); splitting would move work across the commit boundary.
     fn vote_poll(
         &self,
         poll_id: Id,

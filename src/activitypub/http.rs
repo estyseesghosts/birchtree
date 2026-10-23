@@ -295,7 +295,14 @@ pub async fn note(
     if !matches!(status.visibility, crate::domain::Visibility::Public | crate::domain::Visibility::Unlisted) {
         return Err(not_found("status"));
     }
-    let mut note = crate::activitypub::outgoing::note_for_status(&*data.app.store, &data.public_url, &status, data.app.now_ms(), &data.license_policy, &data.place_policy)?;
+    let ctx = crate::activitypub::outgoing::OutgoingCtx {
+        store: &*data.app.store,
+        public_url: &data.public_url,
+        now_ms: data.app.now_ms(),
+        license_policy: &data.license_policy,
+        place_policy: &data.place_policy,
+    };
+    let mut note = crate::activitypub::outgoing::note_for_status(&ctx, &status)?;
     note["@context"] = crate::activitypub::outgoing::context();
     Ok(FederationJson(note).into_response())
 }
@@ -539,6 +546,13 @@ pub async fn outbox(
     let mut item_ids: Vec<crate::domain::Id> = Vec::new();
     let mut scanned = 0usize;
     let mut last_seen: Option<crate::domain::Id> = None;
+    let ctx = crate::activitypub::outgoing::OutgoingCtx {
+        store: &*data.app.store,
+        public_url: &data.public_url,
+        now_ms: data.app.now_ms(),
+        license_policy: &data.license_policy,
+        place_policy: &data.place_policy,
+    };
     for id in store.account_status_ids(account.id)? {
         if let Some(max_id) = max_id
             && id >= max_id
@@ -561,7 +575,7 @@ pub async fn outbox(
         if let Some(status) = store.status_by_id(id)? {
             if status.visibility == crate::domain::Visibility::Public {
                 item_ids.push(status.id);
-                items.push(crate::activitypub::outgoing::create(store, &data.public_url, &status, data.app.now_ms(), &data.license_policy, &data.place_policy)?);
+                items.push(crate::activitypub::outgoing::create(&ctx, &status)?);
             }
         }
     }

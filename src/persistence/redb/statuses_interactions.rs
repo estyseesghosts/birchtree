@@ -247,6 +247,8 @@ pub(super) fn unbookmark_status_impl(
 }
 
 /// Create (or return the existing) reblog by `account_id` of `status_id`.
+// WHY single-txn: one begin_write owns the reblog row + counters + follow-up job atomically
+// (architecture rule); splitting would move work across the commit boundary.
 pub(super) fn reblog_status_impl(
     store: &RedbStore,
     account_id: Id,

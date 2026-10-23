@@ -321,7 +321,6 @@ fn quality_knobs_validate_and_thread_through() {
 
     // The ffmpeg argv actually carries the knobs.
     let argv = birchtree::media::transcode::build_argv(
-        "ffmpeg",
         std::path::Path::new("/tmp/in.img"),
         std::path::Path::new("/tmp/out.webp"),
         birchtree::media::transcode::TranscodePlan::ImageToWebp,

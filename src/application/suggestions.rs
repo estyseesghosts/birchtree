@@ -127,6 +127,35 @@ pub fn rank_suggestions(
         return Ok(Vec::new());
     }
 
+    let (following_set, dismissed, frequency) = load_follow_graph(store, viewer)?;
+    let mut accounts = load_candidate_pool(store, &frequency)?;
+    accounts.retain(|id, account| {
+        *id != viewer
+            && !following_set.contains(id)
+            && !dismissed.contains(id)
+            && account.local
+            && !account.suspended
+            && !account.silenced
+            && account.moved_to.is_none()
+    });
+    apply_pairwise_exclusions(store, viewer, now_ms, &mut accounts)?;
+    let ids: Vec<Id> = accounts.keys().copied().collect();
+    let stats = store.account_stats_by_ids(&ids)?;
+    let (fof, global) = split_and_sort(&frequency, accounts, &stats);
+    Ok(fof
+        .into_iter()
+        .chain(global)
+        .skip(offset)
+        .take(limit)
+        .collect())
+}
+
+/// The viewer's follow graph: exclusion set, dismissed set, and
+/// friends-of-friends frequencies over a bounded seed window.
+fn load_follow_graph(
+    store: &dyn Store,
+    viewer: Id,
+) -> Result<(HashSet<Id>, HashSet<Id>, HashMap<Id, usize>)> {
     // The viewer's follow graph: exclusion set and friends-of-friends seeds.
     let following = store.following(viewer, None, FOLLOW_SCAN_CAP)?;
     let following_set: HashSet<Id> = following.iter().copied().collect();
@@ -151,9 +180,15 @@ pub fn rank_suggestions(
             }
         }
     }
+    Ok((following_set, dismissed, frequency))
+}
 
-    // Candidate pool: bounded handle-index scan (`search_accounts` with an
-    // empty needle matches every handle) plus any FoF-only ids.
+/// Candidate pool: bounded handle-index scan (`search_accounts` with an
+/// empty needle matches every handle) plus any FoF-only ids.
+fn load_candidate_pool(
+    store: &dyn Store,
+    frequency: &HashMap<Id, usize>,
+) -> Result<HashMap<Id, Account>> {
     let scanned = store.search_accounts("", CANDIDATE_SCAN_CAP)?;
     let mut accounts: HashMap<Id, Account> =
         scanned.into_iter().map(|account| (account.id, account)).collect();
@@ -167,23 +202,18 @@ pub fn rank_suggestions(
             accounts.insert(id, account);
         }
     }
+    Ok(accounts)
+}
 
-    // Intrinsic eligibility (mirrors `source.rb base_account_scope` for the
-    // stores that exist: `searchable` minus suspended/moved, `without_silenced`,
-    // not-self, not-dismissed; `discoverable`/memorial filters have no store yet).
-    accounts.retain(|id, account| {
-        *id != viewer
-            && !following_set.contains(id)
-            && !dismissed.contains(id)
-            && account.local
-            && !account.suspended
-            && !account.silenced
-            && account.moved_to.is_none()
-    });
-
-    // Pairwise exclusions in ONE batch (mirrors `not_excluded_by_account` +
-    // `not_domain_blocked_by_account`, `account.rb:164-165,467-473`: either
-    // direction blocks, mutes, domain blocks, plus pending outgoing requests).
+/// Pairwise exclusions in ONE batch (mirrors `not_excluded_by_account` +
+/// `not_domain_blocked_by_account`, `account.rb:164-165,467-473`: either
+/// direction blocks, mutes, domain blocks, plus pending outgoing requests).
+fn apply_pairwise_exclusions(
+    store: &dyn Store,
+    viewer: Id,
+    now_ms: u64,
+    accounts: &mut HashMap<Id, Account>,
+) -> Result<()> {
     let targets: Vec<(Id, String)> = accounts
         .values()
         .map(|account| (account.id, account.domain.clone()))
@@ -204,15 +234,17 @@ pub fn rank_suggestions(
             .collect();
         accounts.retain(|id, _| !excluded.contains(id));
     }
+    Ok(())
+}
 
-    // Counters for ordering and serializers.
-    let ids: Vec<Id> = accounts.keys().copied().collect();
-    let stats = store.account_stats_by_ids(&ids)?;
-
-    // Friends-of-friends first (frequency desc, followers asc — mirrors the
-    // FoF SQL — then id asc), then the global most-followed fill (followers
-    // desc, recent activity desc nulls-last, id asc). Offset/limit apply over
-    // the merged list like upstream `AccountSuggestions#get`.
+/// Friends-of-friends first (frequency desc, followers asc — mirrors the
+/// FoF SQL — then id asc), then the global most-followed fill (followers
+/// desc, recent activity desc nulls-last, id asc).
+fn split_and_sort(
+    frequency: &HashMap<Id, usize>,
+    accounts: HashMap<Id, Account>,
+    stats: &HashMap<Id, AccountStats>,
+) -> (Vec<RankedSuggestion>, Vec<RankedSuggestion>) {
     let mut fof: Vec<RankedSuggestion> = Vec::new();
     let mut global: Vec<RankedSuggestion> = Vec::new();
     for (id, account) in accounts {
@@ -244,13 +276,7 @@ pub fn rank_suggestions(
             .then_with(|| last_status(&b.stats).cmp(&last_status(&a.stats)))
             .then_with(|| a.account.id.value().cmp(&b.account.id.value()))
     });
-
-    Ok(fof
-        .into_iter()
-        .chain(global)
-        .skip(offset)
-        .take(limit)
-        .collect())
+    (fof, global)
 }
 
 fn followers(stats: &Option<AccountStats>) -> u64 {

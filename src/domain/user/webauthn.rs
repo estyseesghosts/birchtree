@@ -162,22 +162,7 @@ pub fn verify_webauthn_registration(
     if attestation_object.len() > WEBAUTHN_MAX_CEREMONY_BYTES {
         return Err(webauthn_err("WebAuthn attestation object is too large"));
     }
-    let (att_obj, _) = cbor_decode(attestation_object, 0)?;
-    let Cbor::Map(ref pairs) = att_obj else {
-        return Err(webauthn_err("WebAuthn attestation object is malformed"));
-    };
-    let fmt = match cbor_map_find(pairs, &Cbor::Text("fmt".to_string())) {
-        Some(Cbor::Text(fmt)) => fmt.clone(),
-        _ => return Err(webauthn_err("WebAuthn attestation object is malformed")),
-    };
-    let auth_data_raw: Vec<u8> = match cbor_map_find(pairs, &Cbor::Text("authData".to_string())) {
-        Some(Cbor::Bytes(bytes)) => bytes.clone(),
-        _ => return Err(webauthn_err("WebAuthn attestation object is malformed")),
-    };
-    let att_stmt = match cbor_map_find(pairs, &Cbor::Text("attStmt".to_string())) {
-        Some(Cbor::Map(stmt)) => stmt.clone(),
-        _ => return Err(webauthn_err("WebAuthn attestation object is malformed")),
-    };
+    let (auth_data_raw, att_stmt, fmt) = parse_attestation_object(attestation_object)?;
     let parsed = parse_auth_data(&auth_data_raw, true)?;
     if parsed.rp_id_hash != sha256_of(rp_id.as_bytes()) {
         return Err(webauthn_err(
@@ -200,41 +185,7 @@ pub fn verify_webauthn_registration(
             }
         }
         "packed" => {
-            if cbor_map_find(&att_stmt, &Cbor::Text("x5c".to_string())).is_some()
-                || cbor_map_find(&att_stmt, &Cbor::Text("ecdaaKeyId".to_string())).is_some()
-            {
-                return Err(webauthn_err(
-                    "WebAuthn attestation chains are not supported (self-attestation only)",
-                ));
-            }
-            let alg = match cbor_map_find(&att_stmt, &Cbor::Text("alg".to_string())) {
-                Some(Cbor::Negative(n)) => *n,
-                Some(Cbor::Unsigned(n)) => i64::try_from(*n).unwrap_or(i64::MAX),
-                _ => {
-                    return Err(webauthn_err(
-                        "WebAuthn packed attestation is missing its algorithm",
-                    ));
-                }
-            };
-            if alg != WEBAUTHN_COSE_ES256 {
-                return Err(webauthn_err(
-                    "WebAuthn attestation algorithm is not supported (only ES256)",
-                ));
-            }
-            let sig = match cbor_map_find(&att_stmt, &Cbor::Text("sig".to_string())) {
-                Some(Cbor::Bytes(sig)) => sig.clone(),
-                _ => {
-                    return Err(webauthn_err(
-                        "WebAuthn packed attestation is missing its signature",
-                    ));
-                }
-            };
-            let client_hash = sha256_of(client_data_json);
-            let mut message = auth_data_raw.clone();
-            message.extend_from_slice(&client_hash);
-            if !verify_es256(&point, &message, &sig) {
-                return Err(webauthn_err("WebAuthn attestation signature is invalid"));
-            }
+            verify_packed_self_attestation(&att_stmt, &auth_data_raw, client_data_json, &point)?;
         }
         _ => {
             return Err(webauthn_err(format!(
@@ -252,6 +203,75 @@ pub fn verify_webauthn_registration(
         y,
         sign_count: parsed.sign_count,
     })
+}
+
+/// Decode the attestation object into its auth-data bytes, statement map,
+/// and format name.
+fn parse_attestation_object(
+    attestation_object: &[u8],
+) -> crate::domain::Result<(Vec<u8>, Vec<(Cbor, Cbor)>, String)> {
+    let (att_obj, _) = cbor_decode(attestation_object, 0)?;
+    let Cbor::Map(ref pairs) = att_obj else {
+        return Err(webauthn_err("WebAuthn attestation object is malformed"));
+    };
+    let fmt = match cbor_map_find(pairs, &Cbor::Text("fmt".to_string())) {
+        Some(Cbor::Text(fmt)) => fmt.clone(),
+        _ => return Err(webauthn_err("WebAuthn attestation object is malformed")),
+    };
+    let auth_data_raw: Vec<u8> = match cbor_map_find(pairs, &Cbor::Text("authData".to_string())) {
+        Some(Cbor::Bytes(bytes)) => bytes.clone(),
+        _ => return Err(webauthn_err("WebAuthn attestation object is malformed")),
+    };
+    let att_stmt = match cbor_map_find(pairs, &Cbor::Text("attStmt".to_string())) {
+        Some(Cbor::Map(stmt)) => stmt.clone(),
+        _ => return Err(webauthn_err("WebAuthn attestation object is malformed")),
+    };
+    Ok((auth_data_raw, att_stmt, fmt))
+}
+
+/// Verify a self-attested packed credential (no attestation chains).
+fn verify_packed_self_attestation(
+    att_stmt: &[(Cbor, Cbor)],
+    auth_data_raw: &[u8],
+    client_data_json: &[u8],
+    point: &[u8],
+) -> crate::domain::Result<()> {
+    if cbor_map_find(att_stmt, &Cbor::Text("x5c".to_string())).is_some()
+        || cbor_map_find(att_stmt, &Cbor::Text("ecdaaKeyId".to_string())).is_some()
+    {
+        return Err(webauthn_err(
+            "WebAuthn attestation chains are not supported (self-attestation only)",
+        ));
+    }
+    let alg = match cbor_map_find(att_stmt, &Cbor::Text("alg".to_string())) {
+        Some(Cbor::Negative(n)) => *n,
+        Some(Cbor::Unsigned(n)) => i64::try_from(*n).unwrap_or(i64::MAX),
+        _ => {
+            return Err(webauthn_err(
+                "WebAuthn packed attestation is missing its algorithm",
+            ));
+        }
+    };
+    if alg != WEBAUTHN_COSE_ES256 {
+        return Err(webauthn_err(
+            "WebAuthn attestation algorithm is not supported (only ES256)",
+        ));
+    }
+    let sig = match cbor_map_find(att_stmt, &Cbor::Text("sig".to_string())) {
+        Some(Cbor::Bytes(sig)) => sig.clone(),
+        _ => {
+            return Err(webauthn_err(
+                "WebAuthn packed attestation is missing its signature",
+            ));
+        }
+    };
+    let client_hash = sha256_of(client_data_json);
+    let mut message = auth_data_raw.to_vec();
+    message.extend_from_slice(&client_hash);
+    if !verify_es256(point, &message, &sig) {
+        return Err(webauthn_err("WebAuthn attestation signature is invalid"));
+    }
+    Ok(())
 }
 
 /// Verify an authentication ceremony against a stored credential.

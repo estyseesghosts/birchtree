@@ -400,20 +400,22 @@ fn ap_emit_omits_location_when_off() {
         )
         .expect("create")
         .status;
-    let off =
-        outgoing::note_for_status(&*store, common::TEST_PUBLIC_URL, &status, common::T0, "off", "off")
-            .expect("note");
+    let ctx = birchtree::activitypub::outgoing::OutgoingCtx {
+        store: &*store,
+        public_url: common::TEST_PUBLIC_URL,
+        now_ms: common::T0,
+        license_policy: "off",
+        place_policy: "off",
+    };
+    let off = outgoing::note_for_status(&ctx, &status).expect("note");
     assert_eq!(off.get("location"), None);
     assert!(off["attachment"].as_array().unwrap().is_empty());
-    let on = outgoing::note_for_status(
-        &*store,
-        common::TEST_PUBLIC_URL,
-        &status,
-        common::T0,
-        "unenforced",
-        "unenforced",
-    )
-    .expect("note");
+    let ctx = birchtree::activitypub::outgoing::OutgoingCtx {
+        place_policy: "unenforced",
+        license_policy: "unenforced",
+        ..ctx
+    };
+    let on = outgoing::note_for_status(&ctx, &status).expect("note");
     let location = &on["location"];
     assert_eq!(location["name"], serde_json::json!("Berlin"));
     assert_eq!(location["type"], serde_json::json!("Place"));

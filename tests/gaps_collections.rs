@@ -95,6 +95,18 @@ fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
         .collect()
 }
 
+fn ictx<'a>(
+    store: &'a birchtree::persistence::redb::RedbStore,
+    server: &'a birchtree::api::mastodon::ServerInfo,
+) -> gc::CollectionCtx<'a> {
+    gc::CollectionCtx {
+        store,
+        collections: store,
+        server,
+        now_ms: now_ms(),
+    }
+}
+
 // -- OAuth dance (copied shape from `phase4_lists.rs`) for real tokens. -----
 
 fn enc(value: &str) -> String {
@@ -290,25 +302,25 @@ async fn items_add_remove_round_trip() {
     // Add both (private collection default).
     let s1s = s1.to_string();
     let s2s = s2.to_string();
-    let (status, added) = body(gc::items_add(store, store, &alice_auth, &id, &pairs(&[("status_ids[]", s1s.as_str()), ("status_ids[]", s2s.as_str())]), now_ms())).await;
+    let (status, added) = body(gc::items_add(&ictx(store, &common::server_info()), &alice_auth, &id, &pairs(&[("status_ids[]", s1s.as_str()), ("status_ids[]", s2s.as_str())]))).await;
     assert_eq!(status, StatusCode::OK, "{added}");
     assert_eq!(added["added"].as_array().unwrap().len(), 2);
 
     // Duplicate add is idempotent.
-    let (status, added) = body(gc::items_add(store, store, &alice_auth, &id, &pairs(&[("status_ids[]", s1s.as_str())]), now_ms())).await;
+    let (status, added) = body(gc::items_add(&ictx(store, &common::server_info()), &alice_auth, &id, &pairs(&[("status_ids[]", s1s.as_str())]))).await;
     assert_eq!(status, StatusCode::OK);
     assert!(added["added"].as_array().unwrap().is_empty());
 
     // Owner reads both members, newest first.
     let server = common::server_info();
-    let (status, items) = body(gc::items_index(store, store, &server, &opt(&alice_auth), &id, None, now_ms())).await;
+    let (status, items) = body(gc::items_index(&ictx(store, &server), &opt(&alice_auth), &id, None)).await;
     assert_eq!(status, StatusCode::OK, "{items}");
     assert_eq!(items.as_array().unwrap().len(), 2);
     assert_eq!(items[0]["id"], s2.to_string());
     assert_eq!(items[1]["id"], s1.to_string());
 
     // Cursor paging.
-    let (status, page) = body(gc::items_index(store, store, &server, &opt(&alice_auth), &id, Some(&format!("max_id={s2}")), now_ms())).await;
+    let (status, page) = body(gc::items_index(&ictx(store, &server), &opt(&alice_auth), &id, Some(&format!("max_id={s2}")))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(page.as_array().unwrap().len(), 1);
     assert_eq!(page[0]["id"], s1.to_string());
@@ -324,13 +336,13 @@ async fn items_add_remove_round_trip() {
     // Edges: unknown status, foreign collection, oversized batch.
     // (A syntactically huge but valid id: missing rows 404. An unparsable
     // id is dropped from `status_ids[]`, like list membership ids.)
-    let (status, _) = body(gc::items_add(store, store, &alice_auth, &id, &pairs(&[("status_ids[]", "18446744073709551615")]), now_ms())).await;
+    let (status, _) = body(gc::items_add(&ictx(store, &common::server_info()), &alice_auth, &id, &pairs(&[("status_ids[]", "18446744073709551615")]))).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let bob_auth = user_auth(bob_id, READ_WRITE);
-    let (status, _) = body(gc::items_add(store, store, &bob_auth, &id, &pairs(&[("status_ids[]", s2s.as_str())]), now_ms())).await;
+    let (status, _) = body(gc::items_add(&ictx(store, &common::server_info()), &bob_auth, &id, &pairs(&[("status_ids[]", s2s.as_str())]))).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let big: Vec<(String, String)> = (0..501).map(|n| ("status_ids[]".to_string(), Id::new(1_000_000 + n).to_string())).collect();
-    let (status, err) = body(gc::items_add(store, store, &alice_auth, &id, &big, now_ms())).await;
+    let (status, err) = body(gc::items_add(&ictx(store, &common::server_info()), &alice_auth, &id, &big)).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(err["error"], "Validation failed: Too many status ids (maximum is 500)");
 }
@@ -348,7 +360,7 @@ async fn revoke_clears_items_and_enqueues_bounded_job() {
     let id = created["id"].as_str().unwrap().to_string();
     let s1s = s1.to_string();
     let s2s = s2.to_string();
-    let (status, _) = body(gc::items_add(store, store, &alice_auth, &id, &pairs(&[("status_ids[]", s1s.as_str()), ("status_ids[]", s2s.as_str())]), now_ms())).await;
+    let (status, _) = body(gc::items_add(&ictx(store, &common::server_info()), &alice_auth, &id, &pairs(&[("status_ids[]", s1s.as_str()), ("status_ids[]", s2s.as_str())]))).await;
     assert_eq!(status, StatusCode::OK);
 
     // Revoke.
@@ -359,7 +371,7 @@ async fn revoke_clears_items_and_enqueues_bounded_job() {
 
     // Members gone, counts stay rendered.
     let server = common::server_info();
-    let (status, items) = body(gc::items_index(store, store, &server, &opt(&alice_auth), &id, None, now_ms())).await;
+    let (status, items) = body(gc::items_index(&ictx(store, &server), &opt(&alice_auth), &id, None)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(items.as_array().unwrap().is_empty());
     let (status, shown) = body(gc::collections_show(store, &opt(&alice_auth), &id)).await;
@@ -379,7 +391,7 @@ async fn revoke_clears_items_and_enqueues_bounded_job() {
     assert_eq!(revoke_job.payload["item_ids"].as_array().unwrap().len(), 2);
 
     // Revoked collections refuse new items and edits.
-    let (status, err) = body(gc::items_add(store, store, &alice_auth, &id, &pairs(&[("status_ids[]", s1s.as_str())]), now_ms())).await;
+    let (status, err) = body(gc::items_add(&ictx(store, &common::server_info()), &alice_auth, &id, &pairs(&[("status_ids[]", s1s.as_str())]))).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(err["error"], "Validation failed: Collection has been revoked");
     let (status, _) = body(gc::collections_update(store, &alice_auth, &id, &pairs(&[("title", "x")]), now_ms())).await;
@@ -406,7 +418,7 @@ async fn hide_collections_members_hidden_counts_kept() {
     )).await;
     let id = created["id"].as_str().unwrap().to_string();
     let s1s = s1.to_string();
-    let (status, _) = body(gc::items_add(store, store, &alice_auth, &id, &pairs(&[("status_ids[]", s1s.as_str())]), now_ms())).await;
+    let (status, _) = body(gc::items_add(&ictx(store, &common::server_info()), &alice_auth, &id, &pairs(&[("status_ids[]", s1s.as_str())]))).await;
     assert_eq!(status, StatusCode::OK);
 
     // Flag the owner.
@@ -420,10 +432,10 @@ async fn hide_collections_members_hidden_counts_kept() {
 
     let server = common::server_info();
     // A non-owner sees no members...
-    let (status, items) = body(gc::items_index(store, store, &server, &opt(&bob_auth), &id, None, now_ms())).await;
+    let (status, items) = body(gc::items_index(&ictx(store, &server), &opt(&bob_auth), &id, None)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(items.as_array().unwrap().is_empty(), "{items}");
-    let (status, items) = body(gc::items_index(store, store, &server, &anon(), &id, None, now_ms())).await;
+    let (status, items) = body(gc::items_index(&ictx(store, &server), &anon(), &id, None)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(items.as_array().unwrap().is_empty());
     // ...but the collection (with its count) stays listed.
@@ -435,7 +447,7 @@ async fn hide_collections_members_hidden_counts_kept() {
     assert_eq!(listed.as_array().unwrap().len(), 1);
     assert_eq!(listed[0]["items_count"], 1);
     // The owner still sees members.
-    let (status, items) = body(gc::items_index(store, store, &server, &opt(&alice_auth), &id, None, now_ms())).await;
+    let (status, items) = body(gc::items_index(&ictx(store, &server), &opt(&alice_auth), &id, None)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(items.as_array().unwrap().len(), 1);
 }
@@ -460,7 +472,7 @@ async fn in_collections_and_account_collections() {
     let c_private = created["id"].as_str().unwrap().to_string();
     let s1s = s1.to_string();
     for cid in [&c_public, &c_private] {
-        let (status, _) = body(gc::items_add(store, store, &alice_auth, cid, &pairs(&[("status_ids[]", s1s.as_str())]), now_ms())).await;
+        let (status, _) = body(gc::items_add(&ictx(store, &common::server_info()), &alice_auth, cid, &pairs(&[("status_ids[]", s1s.as_str())]))).await;
         assert_eq!(status, StatusCode::OK);
     }
 
@@ -799,9 +811,10 @@ async fn collection_fanout_notifies_authors_idempotently() {
     let alice_post_s = alice_post.to_string();
     let cid_s = cid.to_string();
     let (status, _) = body(gc::items_add(
-        store, store, &alice_auth, &cid_s,
+        &ictx(store, &common::server_info()),
+        &alice_auth,
+        &cid_s,
         &pairs(&[("status_ids[]", bob_post_s.as_str()), ("status_ids[]", alice_post_s.as_str())]),
-        now_ms(),
     ))
     .await;
     assert_eq!(status, StatusCode::OK);

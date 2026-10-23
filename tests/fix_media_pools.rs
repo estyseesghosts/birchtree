@@ -260,13 +260,15 @@ fn disabled_mode_never_persists_and_never_fetches() {
         Err(remote_cache::CacheError::Unsupported(_))
     ));
     let entry = remote_cache::RemoteCacheEntry::stored(
-        "https://cdn.example/a.png",
-        "original",
-        MediaClass::Full,
-        "remote/1",
+        &remote_cache::CacheEntryCtx {
+            source_url: "https://cdn.example/a.png",
+            variant: "original",
+            class: MediaClass::Full,
+            blob_key: "remote/1",
+            now_ms: T0,
+            cfg: &RemoteCacheConfig::default(),
+        },
         64,
-        T0,
-        &RemoteCacheConfig::default(),
     );
     assert!(ledger.commit(MediaClass::Full, 0, entry).is_err());
 
@@ -311,13 +313,15 @@ fn remote_emoji_namespace_is_evictable_and_keyed() {
                 MediaClass::AvatarEmoji,
                 0,
                 remote_cache::RemoteCacheEntry::stored(
-                    source,
-                    remote_cache::EMOJI_VARIANT,
-                    MediaClass::AvatarEmoji,
-                    key,
+                    &remote_cache::CacheEntryCtx {
+                        source_url: source,
+                        variant: remote_cache::EMOJI_VARIANT,
+                        class: MediaClass::AvatarEmoji,
+                        blob_key: key,
+                        now_ms: T0,
+                        cfg: &RemoteCacheConfig::default(),
+                    },
                     1024,
-                    T0,
-                    &RemoteCacheConfig::default(),
                 ),
             )
             .expect("commit");

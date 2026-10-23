@@ -335,7 +335,18 @@ pub async fn tag(
         Ok(None) => {}
         Err(err) => return err.into_response(),
     };
-    match timelines::tag_filtered(store, viewer, &raw, &any, &all, &none, query, state.context.now_ms()) {
+    match timelines::tag_filtered(
+        store,
+        viewer,
+        timelines::TagFilterQuery {
+            raw_tag: &raw,
+            any: &any,
+            all: &all,
+            none: &none,
+            query,
+            now_ms: state.context.now_ms(),
+        },
+    ) {
         Ok(page) => timeline_response(&state, viewer, &uri, public_cache(viewer), page, false),
         Err(err) => ApiError::from(err).into_response(),
     }

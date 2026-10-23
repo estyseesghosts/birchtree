@@ -222,13 +222,15 @@ fn b2_delete_error_leaves_ledger_and_redb_equal() {
             let source = format!("https://cdn.example/del-{i}.png");
             let blob_key = format!("remote/{}", 700 + i);
             let entry = birchtree::media::remote_cache::RemoteCacheEntry::stored(
-                &source,
-                "original",
-                MediaClass::Full,
-                &blob_key,
+                &birchtree::media::remote_cache::CacheEntryCtx {
+                    source_url: &source,
+                    variant: "original",
+                    class: MediaClass::Full,
+                    blob_key: &blob_key,
+                    now_ms: T0,
+                    cfg: &cfg,
+                },
                 1024,
-                T0,
-                &cfg,
             );
             guard.restore_entry(entry).expect("restore");
         }

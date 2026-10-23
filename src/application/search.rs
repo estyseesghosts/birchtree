@@ -14,6 +14,7 @@
 //! that do not thread a mode (it is the `Database` arm, exactly).
 
 use crate::application::ports::Store;
+use crate::application::search_query::SearchQuery;
 use crate::domain::{Account, Error, Id, Result, Status};
 use crate::search::{EmbeddedIndex, SearchMode};
 
@@ -32,43 +33,48 @@ pub struct SearchResults {
 ///
 /// `type` narrows the search; an unknown type returns empty arrays (Mastodon
 /// runs no branch for it). `offset` pages accounts/hashtags only (bounded).
-pub fn search(
-    store: &dyn Store,
-    viewer: Option<Id>,
-    query: &str,
-    kind: Option<&str>,
-    offset: usize,
-    limit: usize,
-    following: bool,
-    account_id: Option<Id>,
-    max_id: Option<Id>,
-    min_id: Option<Id>,
-) -> Result<SearchResults> {
-    let query = query.trim();
-    let wants_accounts = kind.is_none_or(|k| k == "accounts");
-    let wants_hashtags = kind.is_none_or(|k| k == "hashtags");
-    let wants_statuses = kind == Some("statuses");
+pub fn search(store: &dyn Store, query: &SearchQuery<'_>) -> Result<SearchResults> {
+    let query_text = query.query.trim();
+    let wants_accounts = query.kind.is_none_or(|k| k == "accounts");
+    let wants_hashtags = query.kind.is_none_or(|k| k == "hashtags");
+    let wants_statuses = query.kind == Some("statuses");
 
     let mut results = SearchResults {
         accounts: Vec::new(),
         hashtags: Vec::new(),
         statuses: Vec::new(),
     };
-    if query.is_empty() {
+    if query_text.is_empty() {
         return Ok(results);
     }
 
     if wants_accounts {
-        results.accounts = search_accounts(store, viewer, query, offset, limit, following)?;
+        results.accounts = search_accounts(
+            store,
+            query.viewer,
+            query_text,
+            query.offset,
+            query.limit,
+            query.following,
+        )?;
     }
     if wants_hashtags {
-        results.hashtags = search_hashtags(store, query, offset, limit)?;
+        results.hashtags =
+            search_hashtags(store, query_text, query.offset, query.limit)?;
     }
     if wants_statuses {
         // Mastodon only serves status search to authenticated callers (with
         // Elasticsearch enabled upstream). Anonymous callers get `[]`.
-        if let Some(viewer) = viewer {
-            results.statuses = search_statuses(store, viewer, query, limit, account_id, max_id, min_id)?;
+        if let Some(viewer) = query.viewer {
+            results.statuses = search_statuses(
+                store,
+                viewer,
+                query_text,
+                query.limit,
+                query.account_id,
+                query.max_id,
+                query.min_id,
+            )?;
         }
     }
     Ok(results)
@@ -201,59 +207,79 @@ const EMBEDDED_CANDIDATE_CAP: usize = 2_000;
 /// Every other rule is mode-independent: `type` narrowing, unknown-type
 /// emptiness, `offset`/`limit` paging, `following`, `resolve`/`collections`
 /// handling (owned by the endpoint), and authenticated-only status search.
-#[allow(clippy::too_many_arguments)]
 pub fn search_with_mode(
     mode: SearchMode,
     store: &dyn Store,
     index: Option<&EmbeddedIndex>,
-    viewer: Option<Id>,
-    query: &str,
-    kind: Option<&str>,
-    offset: usize,
-    limit: usize,
-    following: bool,
-    account_id: Option<Id>,
-    max_id: Option<Id>,
-    min_id: Option<Id>,
+    query: &SearchQuery<'_>,
 ) -> Result<SearchResults> {
-    let query = query.trim();
-    let wants_accounts = kind.is_none_or(|k| k == "accounts");
-    let wants_hashtags = kind.is_none_or(|k| k == "hashtags");
-    let wants_statuses = kind == Some("statuses");
+    let query_text = query.query.trim();
+    let wants_accounts = query.kind.is_none_or(|k| k == "accounts");
+    let wants_hashtags = query.kind.is_none_or(|k| k == "hashtags");
+    let wants_statuses = query.kind == Some("statuses");
 
     let mut results = SearchResults {
         accounts: Vec::new(),
         hashtags: Vec::new(),
         statuses: Vec::new(),
     };
-    if query.is_empty() {
+    if query_text.is_empty() {
         return Ok(results);
     }
 
     if wants_accounts {
-        results.accounts = search_accounts(store, viewer, query, offset, limit, following)?;
+        results.accounts = search_accounts(
+            store,
+            query.viewer,
+            query_text,
+            query.offset,
+            query.limit,
+            query.following,
+        )?;
     }
     if wants_hashtags {
-        results.hashtags = search_hashtags(store, query, offset, limit)?;
+        results.hashtags =
+            search_hashtags(store, query_text, query.offset, query.limit)?;
     }
     if wants_statuses {
         // Mastodon only serves status search to authenticated callers (with
         // Elasticsearch enabled upstream). Anonymous callers get `[]`.
-        if let Some(viewer) = viewer {
+        if let Some(viewer) = query.viewer {
             results.statuses = match mode {
                 SearchMode::Off => Vec::new(),
-                SearchMode::Database => {
-                    search_statuses(store, viewer, query, limit, account_id, max_id, min_id)?
-                }
+                SearchMode::Database => search_statuses(
+                    store,
+                    viewer,
+                    query_text,
+                    query.limit,
+                    query.account_id,
+                    query.max_id,
+                    query.min_id,
+                )?,
                 SearchMode::Embedded => match index {
                     Some(index) if !index.is_empty() => search_statuses_embedded(
-                        store, index, viewer, query, limit, account_id, max_id, min_id,
+                        store,
+                        index,
+                        viewer,
+                        query_text,
+                        query.limit,
+                        query.account_id,
+                        query.max_id,
+                        query.min_id,
                     )?,
                     // No (or cold) index: degrade to the database scan
                     // rather than failing the search. A cold index and a
                     // fresh server both read empty here; once the backfill
                     // chain fills the index this arm stops triggering.
-                    _ => search_statuses(store, viewer, query, limit, account_id, max_id, min_id)?,
+                    _ => search_statuses(
+                        store,
+                        viewer,
+                        query_text,
+                        query.limit,
+                        query.account_id,
+                        query.max_id,
+                        query.min_id,
+                    )?,
                 },
             };
         }
@@ -267,6 +293,8 @@ pub fn search_with_mode(
 /// author (`account_id`) and fetchability (`can_fetch`: blocks, visibility,
 /// deletion) filters apply after the lookup, exactly as on the database
 /// path, before truncating to `limit`.
+// WHY: cursor+filter cluster mirrors search_statuses; folds into SearchQuery
+// with the S12 search migration.
 #[allow(clippy::too_many_arguments)]
 fn search_statuses_embedded(
     store: &dyn Store,

@@ -1033,6 +1033,8 @@ pub fn check_registration_email(
 /// row in the same transaction as the account.
 /// Legacy policy path (invite + profile + email gates): delegates to
 /// [`register`]. Kept for direct callers; the endpoint uses [`register`].
+// WHY: legacy shim preserving the pre-unified signature; delegates to
+// register(RegisterInput) and deletes once external callers move.
 #[allow(clippy::too_many_arguments)]
 pub fn register_account_with_profile(
     accounts: &dyn AccountStore,

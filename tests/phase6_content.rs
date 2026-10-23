@@ -742,7 +742,17 @@ fn outgoing_create_of_a_poll_is_a_question() {
     let (_dir, store) = temp_store();
     let alice = mk_account(&store, "alice");
     let status = local_poll(&store, alice.id, "tea or coffee?", &["tea", "coffee"], now_ms() + 3_600_000);
-    let body = outgoing::create(&*store, TEST_PUBLIC_URL, &status, now_ms(), "off", "off").expect("create");
+    let body = outgoing::create(
+        &birchtree::activitypub::outgoing::OutgoingCtx {
+            store: &*store,
+            public_url: TEST_PUBLIC_URL,
+            now_ms: now_ms(),
+            license_policy: "off",
+            place_policy: "off",
+        },
+        &status,
+    )
+    .expect("create");
     let object = &body["object"];
     assert_eq!(object["type"], "Question");
     assert_eq!(object["oneOf"].as_array().expect("oneOf").len(), 2);

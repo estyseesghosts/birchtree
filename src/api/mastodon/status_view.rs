@@ -127,21 +127,7 @@ impl<'a> StatusViewContext<'a> {
     pub fn view_for(&mut self, status: Status) -> Result<dto::StatusView, ApiError> {
         let account = self.account(status.account_id)?;
         let account_stats = self.stats(status.account_id)?;
-
-        // Wrapped reblog target (one level; reblogs of reblogs unwrap to
-        // proper). A missing target row is an internal inconsistency, matching
-        // the previous per-status loader.
-        let reblog = match status.reblog_of_id {
-            Some(proper_id) => {
-                let proper = self
-                    .status_row(proper_id)?
-                    .ok_or_else(ApiError::internal)?;
-                let inner = self.view_for(proper)?;
-                Some(Box::new(inner))
-            }
-            None => None,
-        };
-
+        let reblog = self.assemble_reblog(&status)?;
         let flags = match self.viewer {
             Some(viewer) => self.flags_for(viewer, &status)?,
             None => StatusViewFlags::default(),
@@ -161,6 +147,61 @@ impl<'a> StatusViewContext<'a> {
             }
         }
 
+        let (poll, viewer_ballot) = self.assemble_poll_section(&status)?;
+
+        let quote = self.quote_view(status.clone())?;
+        let quote_current_user = self.quote_current_user(&status)?;
+
+        let (emojis, remote_media_sources) = self.assemble_emoji_section(&status, &media)?;
+
+        // Core extension CORE-P: the attached place (batched above;
+        // dangling ids read as no place).
+        let place = status.place_id.and_then(|id| self.batch.places.get(&id).cloned());
+        Ok(dto::StatusView {
+            status,
+            account,
+            account_stats: Some(account_stats),
+            flags,
+            reblog,
+            poll,
+            viewer_ballot,
+            media,
+            mentions,
+            quote,
+            quote_current_user,
+            shallow_quote: false,
+            filtered: Vec::new(),
+            emojis,
+            place,
+            remote_media_sources,
+        })
+    }
+
+    /// Wrapped reblog target (one level; reblogs of reblogs unwrap to
+    /// proper). A missing target row is an internal inconsistency, matching
+    /// the previous per-status loader.
+    fn assemble_reblog(
+        &mut self,
+        status: &Status,
+    ) -> Result<Option<Box<dto::StatusView>>, ApiError> {
+        let reblog = match status.reblog_of_id {
+            Some(proper_id) => {
+                let proper = self
+                    .status_row(proper_id)?
+                    .ok_or_else(ApiError::internal)?;
+                let inner = self.view_for(proper)?;
+                Some(Box::new(inner))
+            }
+            None => None,
+        };
+        Ok(reblog)
+    }
+
+    /// Poll plus the viewer's ballot on it (verbatim section).
+    fn assemble_poll_section(
+        &mut self,
+        status: &Status,
+    ) -> Result<(Option<Poll>, Option<Vec<u64>>), ApiError> {
         let poll = match status.poll_id {
             Some(poll_id) => self.poll(poll_id)?,
             None => None,
@@ -169,10 +210,15 @@ impl<'a> StatusViewContext<'a> {
             (Some(poll), Some(viewer)) => self.ballot(poll.id, viewer)?,
             _ => None,
         };
+        Ok((poll, viewer_ballot))
+    }
 
-        let quote = self.quote_view(status.clone())?;
-        let quote_current_user = self.quote_current_user(&status)?;
-
+    /// Custom emoji plus per-attachment remote origin URLs (verbatim section).
+    fn assemble_emoji_section(
+        &mut self,
+        status: &Status,
+        media: &[MediaAttachment],
+    ) -> Result<(Vec<serde_json::Value>, HashMap<Id, String>), ApiError> {
         // Custom emoji referenced by this status's text (page-batched).
         let mut shortcodes = crate::application::statuses::extract_emoji_shortcodes(
             &status.source_text,
@@ -207,35 +253,15 @@ impl<'a> StatusViewContext<'a> {
             }
         }
 
-        // Core extension CORE-P: the attached place (batched above;
-        // dangling ids read as no place).
-        let place = status.place_id.and_then(|id| self.batch.places.get(&id).cloned());
         // Remote origin URLs for this status's attachments (batch-loaded
         // above; point lookup only for chains beyond the prefetch rounds).
         let mut remote_media_sources = HashMap::with_capacity(media.len());
-        for attachment in &media {
+        for attachment in media {
             if let Some(source) = self.remote_source(attachment.id)? {
                 remote_media_sources.insert(attachment.id, source);
             }
         }
-        Ok(dto::StatusView {
-            status,
-            account,
-            account_stats: Some(account_stats),
-            flags,
-            reblog,
-            poll,
-            viewer_ballot,
-            media,
-            mentions,
-            quote,
-            quote_current_user,
-            shallow_quote: false,
-            filtered: Vec::new(),
-            emojis,
-            place,
-            remote_media_sources,
-        })
+        Ok((emojis, remote_media_sources))
     }
 
     // -- cache accessors (point lookup fallback on a miss) -------------------

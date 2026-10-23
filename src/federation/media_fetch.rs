@@ -149,13 +149,15 @@ pub fn fast_path_if_cached(
                     return Err(DeliveryError::Quarantine(reason.into()));
                 }
                 let entry = remote_cache::RemoteCacheEntry::stored(
-                    source,
-                    ATTACHMENT_VARIANT,
-                    remote_cache::MediaClass::Full,
-                    key,
+                    &remote_cache::CacheEntryCtx {
+                        source_url: source,
+                        variant: ATTACHMENT_VARIANT,
+                        class: remote_cache::MediaClass::Full,
+                        blob_key: key,
+                        now_ms,
+                        cfg,
+                    },
                     bytes.len() as u64,
-                    now_ms,
-                    cfg,
                 );
                 let _ = ledger.commit(remote_cache::MediaClass::Full, 0, entry);
             }
@@ -297,6 +299,8 @@ pub fn chunk_over_cap(collected: u64, chunk_len: u64, stream_cap: u64) -> bool {
 /// mapping on every failure path. Keeping the call here (rather than copying
 /// the ~100-line body) guarantees byte-identical commit behavior while the
 /// parent owns the orchestration.
+// WHY: thin verbatim delegate to settle_staged so the fetch path and tests share one commit
+// body; bundling would fork the two call shapes.
 #[allow(clippy::too_many_arguments)]
 pub fn commit_bytes<StoreT, BlobsT>(
     store: &StoreT,

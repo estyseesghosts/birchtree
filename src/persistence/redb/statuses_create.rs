@@ -17,10 +17,10 @@
 use redb::{ReadableTable, WriteTransaction};
 
 use crate::application::notifications::fan_out_payload;
-use crate::application::ports::{CreatedStatus, NewStatus, RelationshipStore};
+use crate::application::ports::{CreatedStatus, NewStatus};
 use crate::domain::{
     AccountStats, Error, Id, IdempotencyRecord, Job, JobKind, NotificationType, QuotePolicy,
-    Result, Status, Visibility,
+    Result, Status,
 };
 
 use super::media::{check_attachable_txn, read_media_txn, write_media_txn};
@@ -33,17 +33,17 @@ use super::{RedbStore, StoreResult, decode, encode};
 
 /// Identity, poll and relation state minted before the status row is written.
 pub(super) struct PreparedCreate {
-    status_id: Id,
-    uri: String,
-    url: String,
-    poll_id: Option<Id>,
-    mentions: Vec<Id>,
-    silent_mentions: Vec<Id>,
-    tags: Vec<String>,
+    pub(super) status_id: Id,
+    pub(super) uri: String,
+    pub(super) url: String,
+    pub(super) poll_id: Option<Id>,
+    pub(super) mentions: Vec<Id>,
+    pub(super) silent_mentions: Vec<Id>,
+    pub(super) tags: Vec<String>,
     /// Author to notify with a `Quote` notification, if a quote was attached.
-    quoted_account: Option<Id>,
+    pub(super) quoted_account: Option<Id>,
     /// Parent author to notify with a `Mention`, if a non-self reply.
-    reply_notify: Option<Id>,
+    pub(super) reply_notify: Option<Id>,
 }
 
 /// Idempotency-record key: `account_id_be || sha256("status_create:{key}")[..16]`
@@ -293,106 +293,16 @@ pub(super) fn enqueue_create_jobs_txn(
 ) -> Result<()> {
     let status_id = prepared.status_id;
 
-    if let Some(recipient) = prepared.quoted_account {
-        enqueue_fan_out(
-            store,
-            write,
-            recipient,
-            NotificationType::Quote,
-            Some(input.account_id),
-            Some(status_id),
-            now_ms,
-        )?;
-    }
-    if let Some(recipient) = prepared.reply_notify {
-        enqueue_fan_out(
-            store,
-            write,
-            recipient,
-            NotificationType::Mention,
-            Some(input.account_id),
-            Some(status_id),
-            now_ms,
-        )?;
-    }
-    for mentioned in &prepared.mentions {
-        if *mentioned != input.account_id {
-            enqueue_fan_out(
-                store,
-                write,
-                *mentioned,
-                NotificationType::Mention,
-                Some(input.account_id),
-                Some(status_id),
-                now_ms,
-            )?;
-        }
-    }
-
-    // -- D51 `status`: followers with `notify` set are fanned out in
-    // this same transaction (G-B producer). Non-Direct only: followers
-    // cannot see direct posts (upstream's exact visibility gate is
-    // unverified — revisit against `fan_out_on_write_service.rb`).
-    if input.visibility != Visibility::Direct {
-        use crate::application::notifications::emit_status_for_followers;
-        let mut notify: Vec<Id> = Vec::new();
-        let mut cursor: Option<Id> = None;
-        for _ in 0..20 {
-            let batch = store.followers(input.account_id, cursor, 500)?;
-            if batch.is_empty() {
-                break;
-            }
-            for follower in &batch {
-                cursor = Some(*follower);
-                if store
-                    .follow_of(*follower, input.account_id)?
-                    .is_some_and(|f| f.notify)
-                {
-                    notify.push(*follower);
-                }
-            }
-            if batch.len() < 500 {
-                break;
-            }
-        }
-        for job in emit_status_for_followers(input.account_id, status_id, &notify, now_ms) {
-            super::jobs::insert_job(
-                write,
-                &Job::new(store.next_id(), job.kind, job.payload, now_ms, now_ms),
-            )?;
-        }
-    }
-
-    super::federation_content::federation_event_txn(
+    super::statuses_create_stages::fan_out_quote_reply_txn(store, write, input, prepared, now_ms)?;
+    super::statuses_create_stages::fan_out_followers_txn(store, write, input, status_id, now_ms)?;
+    super::statuses_create_stages::federation_search_txn(
+        store,
         write,
-        store.next_id(),
         input.account_id,
-        serde_json::json!({"event": "create", "status_id": status_id.value()}),
+        status_id,
         now_ms,
     )?;
-    // Phase 7.2: incremental search indexing rides the same commit.
-    super::jobs::insert_job(
-        write,
-        &Job::new(
-            store.next_id(),
-            JobKind::SearchIndexStatus,
-            crate::jobs::search_index::index_payload(status_id),
-            now_ms,
-            now_ms,
-        ),
-    )?;
-
-    // -- Idempotency record, committed with the mutation it protects.
-    if let Some(raw) = input.idempotency_key.as_deref() {
-        let key = idempotency_key(input.account_id, raw)?;
-        let record = IdempotencyRecord {
-            created_at_ms: now_ms,
-            scope: "status_create".to_string(),
-            result_id: status_id,
-        };
-        let mut table = write.open_table(IDEMPOTENCY)?;
-        table.insert(key.as_slice(), encode(&record)?.as_slice())?;
-    }
+    super::statuses_create_stages::write_idempotency_txn(write, input, status_id, now_ms)?;
     Ok(())
 }
 

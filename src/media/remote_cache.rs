@@ -37,7 +37,6 @@
 //! parent-owned).
 
 use std::collections::BTreeMap;
-use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -157,6 +156,26 @@ fn disabled_refusal() -> CacheError {
     CacheError::Unsupported("remote cache is disabled: refusing to persist bytes".into())
 }
 
+/// Construction context for [`RemoteCacheEntry`]: the ledger-row identity
+/// plus the config its TTL is computed from. Lets `stored` / `metadata_only`
+/// take 1–2 params instead of 6–7 without changing the row shape, key
+/// computation or TTL math. `size` stays a separate argument to `stored`
+/// (metadata shells have no size; no magic `0`).
+pub struct CacheEntryCtx<'a> {
+    /// Origin URL (first half of the ledger key).
+    pub source_url: &'a str,
+    /// Cache variant (`"original"`, `"avatar"`, `EMOJI_VARIANT`, …).
+    pub variant: &'a str,
+    /// Budget/TTL class.
+    pub class: MediaClass,
+    /// Evictable blob key (`remote/…`; still refused unless [`is_cache_key`]).
+    pub blob_key: &'a str,
+    /// Send/fetch time: `last_use_ms` and TTL base.
+    pub now_ms: u64,
+    /// Operator cache config (retention days per class).
+    pub cfg: &'a RemoteCacheConfig,
+}
+
 /// One cache entry: the durable metadata row in miniature. Metadata survives
 /// byte eviction (`has_bytes == false` keeps `source_url` for re-fetch).
 /// `refcount` counts the attachments sharing these bytes (adversarial-2 B0
@@ -185,22 +204,15 @@ fn default_entry_refcount() -> u32 {
 
 impl RemoteCacheEntry {
     /// Metadata-first record: no bytes yet, nothing counted.
-    pub fn metadata_only(
-        source_url: &str,
-        variant: &str,
-        class: MediaClass,
-        blob_key: &str,
-        now_ms: u64,
-        cfg: &RemoteCacheConfig,
-    ) -> Self {
+    pub fn metadata_only(ctx: &CacheEntryCtx) -> Self {
         Self {
-            source_url: source_url.to_string(),
-            variant: variant.to_string(),
-            blob_key: blob_key.to_string(),
-            class,
+            source_url: ctx.source_url.to_string(),
+            variant: ctx.variant.to_string(),
+            blob_key: ctx.blob_key.to_string(),
+            class: ctx.class,
             size: 0,
-            last_use_ms: now_ms,
-            expiry_ms: now_ms.saturating_add(class.retention_ms(cfg)),
+            last_use_ms: ctx.now_ms,
+            expiry_ms: ctx.now_ms.saturating_add(ctx.class.retention_ms(ctx.cfg)),
             etag: None,
             has_bytes: false,
             refcount: 0,
@@ -208,16 +220,8 @@ impl RemoteCacheEntry {
     }
 
     /// Stored entry with bytes, freshly fetched.
-    pub fn stored(
-        source_url: &str,
-        variant: &str,
-        class: MediaClass,
-        blob_key: &str,
-        size: u64,
-        now_ms: u64,
-        cfg: &RemoteCacheConfig,
-    ) -> Self {
-        let mut entry = Self::metadata_only(source_url, variant, class, blob_key, now_ms, cfg);
+    pub fn stored(ctx: &CacheEntryCtx, size: u64) -> Self {
+        let mut entry = Self::metadata_only(ctx);
         entry.size = size;
         entry.has_bytes = true;
         entry.refcount = 1;
@@ -856,136 +860,9 @@ impl CacheLedger {
     }
 }
 
-/// RAII in-flight budget reservation (adversarial-2 F6).
-///
-/// `reserve` holds `bytes` of `class` budget; dropping the guard without
-/// settling releases whatever is still held, so every fetch early-return
-/// frees the budget exactly once with no manual `release` bookkeeping.
-/// Settlement goes through [`Reservation::commit_entry`], which consumes the
-/// held budget into stored bytes even when the commit itself is refused
-/// (the ledger releases the reservation on every commit path), so the
-/// guard never releases twice.
-#[must_use]
-#[derive(Debug)]
-pub struct Reservation<'a> {
-    ledger: &'a Mutex<CacheLedger>,
-    class: MediaClass,
-    remaining: u64,
-}
+mod reservation;
 
-impl<'a> Reservation<'a> {
-    /// Hold `bytes` of `class` budget (same refusals as
-    /// [`CacheLedger::reserve`], plus `Store` when the ledger is poisoned).
-    pub fn reserve(
-        ledger: &'a Mutex<CacheLedger>,
-        class: MediaClass,
-        bytes: u64,
-    ) -> Result<Self, CacheError> {
-        ledger
-            .lock()
-            .map_err(|_| CacheError::Store("cache ledger poisoned".into()))?
-            .reserve(class, bytes)?;
-        Ok(Self {
-            ledger,
-            class,
-            remaining: bytes,
-        })
-    }
-
-    /// The class this reservation holds budget for.
-    pub fn class(&self) -> MediaClass {
-        self.class
-    }
-
-    /// Budget still held (the live stream cap; shrinks with `Content-Length`).
-    pub fn remaining(&self) -> u64 {
-        self.remaining
-    }
-
-    /// Release `amount` of the held budget (clamped to what is held), e.g.
-    /// shrinking a worst-case reservation once `Content-Length` is known. A
-    /// poisoned ledger keeps the holding: the drop retries the release.
-    pub fn shrink(&mut self, amount: u64) {
-        let take = amount.min(self.remaining);
-        if take == 0 {
-            return;
-        }
-        if let Ok(mut ledger) = self.ledger.lock() {
-            ledger.release(self.class, take);
-            self.remaining -= take;
-        }
-    }
-
-    /// Hold `extra` more budget (the N2 top-up when staged bytes exceed the
-    /// shrunk reservation). On refusal nothing is held and the guard is
-    /// unchanged.
-    pub fn grow(&mut self, extra: u64) -> Result<(), CacheError> {
-        if extra == 0 {
-            return Ok(());
-        }
-        self.ledger
-            .lock()
-            .map_err(|_| CacheError::Store("cache ledger poisoned".into()))?
-            .reserve(self.class, extra)?;
-        self.remaining = self.remaining.saturating_add(extra);
-        Ok(())
-    }
-
-    /// Settle `reserved` of the held budget into `entry`'s stored bytes. The
-    /// held budget is consumed whether the commit lands or is refused (the
-    /// ledger releases the reservation on every commit path), so the guard
-    /// never releases twice.
-    pub fn commit_entry(
-        &mut self,
-        reserved: u64,
-        entry: RemoteCacheEntry,
-    ) -> Result<(), CacheError> {
-        let take = reserved.min(self.remaining);
-        let outcome = self
-            .ledger
-            .lock()
-            .map_err(|_| CacheError::Store("cache ledger poisoned".into()))?
-            .commit(self.class, take, entry);
-        self.remaining -= take;
-        outcome
-    }
-
-    /// Drop the ledger mapping for `key` without touching the budget (the
-    /// row-gone unwind after a settled commit).
-    pub fn evict_key(&self, key: &[u8]) {
-        if let Ok(mut ledger) = self.ledger.lock() {
-            ledger.evict_one(key);
-        }
-    }
-}
-
-impl Drop for Reservation<'_> {
-    fn drop(&mut self) {
-        if self.remaining == 0 {
-            return;
-        }
-        if let Ok(mut ledger) = self.ledger.lock() {
-            ledger.release(self.class, self.remaining);
-        }
-    }
-}
-
-/// Process-wide admission ledger for the fetch path. Budgets come from
-/// operator config via [`configure_process_ledger`] (parent wires it in
-/// `main.rs`); until then the plan defaults apply.
-static PROCESS_LEDGER: OnceLock<Mutex<CacheLedger>> = OnceLock::new();
-
-/// The process-wide cache ledger.
-pub fn process_ledger() -> &'static Mutex<CacheLedger> {
-    PROCESS_LEDGER.get_or_init(|| Mutex::new(CacheLedger::new(RemoteCacheConfig::default())))
-}
-
-/// Install operator budgets into the process ledger (idempotent).
-pub fn configure_process_ledger(cfg: RemoteCacheConfig) {
-    if let Ok(mut ledger) = process_ledger().lock() {
-        ledger.set_caps(cfg);
-    }
-}
+pub use reservation::{Reservation, configure_process_ledger, process_ledger};
 
 #[cfg(test)]
 mod tests {
@@ -1005,13 +882,15 @@ mod tests {
 
     fn full_entry(source: &str, size: u64, now: u64, cfg: &RemoteCacheConfig) -> RemoteCacheEntry {
         RemoteCacheEntry::stored(
-            source,
-            "original",
-            MediaClass::Full,
-            &format!("remote/{}", source.len()),
+            &CacheEntryCtx {
+                source_url: source,
+                variant: "original",
+                class: MediaClass::Full,
+                blob_key: &format!("remote/{}", source.len()),
+                now_ms: now,
+                cfg,
+            },
             size,
-            now,
-            cfg,
         )
     }
 
@@ -1031,13 +910,15 @@ mod tests {
             .reserve(MediaClass::AvatarEmoji, 64 * 1024)
             .expect("avatar fits its reserve");
         let avatar = RemoteCacheEntry::stored(
-            "https://cdn.example/a.png",
-            "avatar",
-            MediaClass::AvatarEmoji,
-            "remote/1",
+            &CacheEntryCtx {
+                source_url: "https://cdn.example/a.png",
+                variant: "avatar",
+                class: MediaClass::AvatarEmoji,
+                blob_key: "remote/1",
+                now_ms: 1000,
+                cfg: &cfg,
+            },
             64 * 1024,
-            1000,
-            &cfg,
         );
         ledger
             .commit(MediaClass::AvatarEmoji, 64 * 1024, avatar)
@@ -1185,13 +1066,15 @@ mod tests {
         {
             let mut guard = Reservation::reserve(&ledger, MediaClass::Full, 64).expect("reserve");
             let mismatched = RemoteCacheEntry::stored(
-                "https://cdn.example/h.png",
-                "avatar",
-                MediaClass::AvatarEmoji,
-                "remote/9",
+                &CacheEntryCtx {
+                    source_url: "https://cdn.example/h.png",
+                    variant: "avatar",
+                    class: MediaClass::AvatarEmoji,
+                    blob_key: "remote/9",
+                    now_ms: T0_FIXTURE,
+                    cfg: &cfg,
+                },
                 64,
-                T0_FIXTURE,
-                &cfg,
             );
             assert!(guard.commit_entry(64, mismatched).is_err());
             assert_eq!(guard.remaining(), 0);
@@ -1213,26 +1096,30 @@ mod tests {
             Err(CacheError::Unsupported(_))
         ));
         let entry = RemoteCacheEntry::stored(
-            "https://cdn.example/a.png",
-            "original",
-            MediaClass::Full,
-            "remote/1",
+            &CacheEntryCtx {
+                source_url: "https://cdn.example/a.png",
+                variant: "original",
+                class: MediaClass::Full,
+                blob_key: "remote/1",
+                now_ms: 1000,
+                cfg: &cfg,
+            },
             64,
-            1000,
-            &cfg,
         );
         assert!(matches!(
             ledger.commit(MediaClass::Full, 0, entry),
             Err(CacheError::Unsupported(_))
         ));
         let shell = RemoteCacheEntry::stored(
-            "https://cdn.example/b.png",
-            "original",
-            MediaClass::Full,
-            "remote/2",
+            &CacheEntryCtx {
+                source_url: "https://cdn.example/b.png",
+                variant: "original",
+                class: MediaClass::Full,
+                blob_key: "remote/2",
+                now_ms: 1000,
+                cfg: &cfg,
+            },
             64,
-            1000,
-            &cfg,
         );
         assert!(ledger.restore_entry(shell).is_err());
         assert!(ledger.is_empty());

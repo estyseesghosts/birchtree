@@ -463,8 +463,38 @@ pub fn announcement_payload(
     let read = store
         .announcement_muted(row.id, viewer)
         .map_err(err)?;
+    let mentions = announcement_mentions(server, store, &row.text)?;
+    let tags = announcement_tags(server, &row.text);
+    let emojis = announcement_emojis(server, store, &row.text)?;
+    let reactions = announcement_reactions(server, store, row, viewer)?;
+    let mut object = serde_json::Map::new();
+    object.insert("id".into(), Value::String(row.id.to_string()));
+    object.insert("content".into(), Value::String(escape_html(&row.text)));
+    object.insert("starts_at".into(), opt_time_ms(row.starts_at_ms));
+    object.insert("ends_at".into(), opt_time_ms(row.ends_at_ms));
+    object.insert("all_day".into(), Value::Bool(row.all_day));
+    object.insert("published_at".into(), opt_time_ms(row.published_at_ms));
+    object.insert(
+        "updated_at".into(),
+        Value::String(iso_ms(row.updated_at_ms)),
+    );
+    object.insert("read".into(), Value::Bool(read));
+    object.insert("mentions".into(), Value::Array(mentions));
+    object.insert("statuses".into(), Value::Array(Vec::new()));
+    object.insert("tags".into(), Value::Array(tags));
+    object.insert("emojis".into(), Value::Array(emojis));
+    object.insert("reactions".into(), Value::Array(reactions));
+    Ok(Value::Object(object))
+}
+
+/// Deduped mention handles in first-seen order, resolved to local accounts.
+fn announcement_mentions(
+    server: &ServerInfo,
+    store: &dyn Store,
+    text: &str,
+) -> Result<Vec<Value>, String> {
     let mut seen: Vec<String> = Vec::new();
-    for handle in scan_mention_handles(&row.text) {
+    for handle in scan_mention_handles(text) {
         if !seen.iter().any(|h| h == &handle) {
             seen.push(handle);
         }
@@ -491,7 +521,12 @@ pub fn announcement_payload(
             None => {}
         }
     }
-    let tags: Vec<Value> = extract_tag_names(&row.text)
+    Ok(mentions)
+}
+
+/// Tag objects for `#names` in the text.
+fn announcement_tags(server: &ServerInfo, text: &str) -> Vec<Value> {
+    extract_tag_names(text)
         .into_iter()
         .map(|tag| {
             serde_json::json!({
@@ -499,9 +534,17 @@ pub fn announcement_payload(
                 "url": server.asset_url(&format!("tags/{tag}")),
             })
         })
-        .collect();
+        .collect()
+}
+
+/// Listed custom emoji for `:shortcodes:` in the text.
+fn announcement_emojis(
+    server: &ServerInfo,
+    store: &dyn Store,
+    text: &str,
+) -> Result<Vec<Value>, String> {
     let mut shortcodes: Vec<String> = Vec::new();
-    for code in scan_shortcode_tokens(&row.text) {
+    for code in scan_shortcode_tokens(text) {
         if !shortcodes.iter().any(|c| c == &code) {
             shortcodes.push(code);
         }
@@ -515,6 +558,16 @@ pub fn announcement_payload(
             _ => {}
         }
     }
+    Ok(emojis)
+}
+
+/// Reaction views with the conditional custom-emoji `url`/`static_url` pair.
+fn announcement_reactions(
+    server: &ServerInfo,
+    store: &dyn Store,
+    row: &AnnouncementRecord,
+    viewer: Id,
+) -> Result<Vec<Value>, String> {
     let reactions: Vec<Value> = reaction_views(store, row.id, viewer)
         .map_err(err)?
         .iter()
@@ -548,24 +601,7 @@ pub fn announcement_payload(
             Value::Object(object)
         })
         .collect();
-    let mut object = serde_json::Map::new();
-    object.insert("id".into(), Value::String(row.id.to_string()));
-    object.insert("content".into(), Value::String(escape_html(&row.text)));
-    object.insert("starts_at".into(), opt_time_ms(row.starts_at_ms));
-    object.insert("ends_at".into(), opt_time_ms(row.ends_at_ms));
-    object.insert("all_day".into(), Value::Bool(row.all_day));
-    object.insert("published_at".into(), opt_time_ms(row.published_at_ms));
-    object.insert(
-        "updated_at".into(),
-        Value::String(iso_ms(row.updated_at_ms)),
-    );
-    object.insert("read".into(), Value::Bool(read));
-    object.insert("mentions".into(), Value::Array(mentions));
-    object.insert("statuses".into(), Value::Array(Vec::new()));
-    object.insert("tags".into(), Value::Array(tags));
-    object.insert("emojis".into(), Value::Array(emojis));
-    object.insert("reactions".into(), Value::Array(reactions));
-    Ok(Value::Object(object))
+    Ok(reactions)
 }
 
 /// The `announcement.reaction` payload: `{name, count, announcement_id}`

@@ -134,6 +134,8 @@ impl RedbStore {
 }
 
 impl AccountStore for RedbStore {
+    // WHY single-txn: one begin_write owns the account row + credential rows + counters atomically
+    // (architecture rule); splitting would move work across the commit boundary.
     fn create_local_account(&self, input: NewLocalAccount) -> Result<Account> {
         let key = crate::domain::account::handle_key(&input.normalized_username, &input.domain);
 

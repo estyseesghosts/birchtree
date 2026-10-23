@@ -102,6 +102,8 @@ pub async fn build_config(
 /// As [`build_config`], with the operator's remote-media cache policy: the
 /// ingest path enqueues `FetchRemoteMedia` eagerly only when the policy
 /// allows it (otherwise fetches happen on demand at the first cache miss).
+// WHY: FederationConfig builder taking every FedContext field explicitly so
+// a missing field is a compile error; a ctx struct would silence that.
 #[allow(clippy::too_many_arguments)]
 pub async fn build_config_with_remote_cache(
     context: Arc<Context>,

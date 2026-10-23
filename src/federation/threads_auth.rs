@@ -18,12 +18,9 @@
 //! `store`) with those scalars so one chain hop can be passed along without
 //! a new context object.
 
-use url::Url;
-
 use crate::activitypub::FedContext;
 use crate::application::ports::Store;
 use crate::domain::Id;
-use crate::domain::JobKind;
 use crate::federation::delivery::DeliveryError;
 
 /// Parent hops per chain (contract D: a proposal; upstream has no hop cap).
@@ -120,140 +117,25 @@ impl<'a> QuoteAuthCtx<'a> {
     /// Returns the enqueued next hop when the chain continues, `None` when
     /// the chain ends here.
     pub async fn authorize_step(self) -> Result<Option<QuoteAuthCtx<'a>>, DeliveryError> {
-        use futures_util::StreamExt as _;
+        use super::threads_auth_stages as stages;
 
-        use crate::domain::QuoteState;
-
-        let retry = |e: crate::domain::Error| DeliveryError::Retry(e.to_string());
-        let Some(quote) = self.store.quote_by_id(self.quote_id).map_err(retry)? else {
-            return Ok(None);
-        };
-        if quote.state != QuoteState::Accepted {
-            return Ok(None);
-        }
-        let Some(approval) = quote.approval_uri.clone() else {
-            // A local-policy quote carries no remote authorization to check.
-            // Still continue a nested chain, if any.
-            if let Some(next) = self.chain {
-                self.store
-                    .enqueue(
-                        JobKind::QuoteReverify,
-                        serde_json::json!({ "quote_id": next.value(), "hop": self.hop + 1, "fetches": self.fetches }),
-                        self.now_ms,
-                    )
-                    .map_err(retry)?;
-                return Ok(Some(QuoteAuthCtx {
-                    ctx: self.ctx,
-                    store: self.store,
-                    quote_id: next,
-                    hop: self.hop + 1,
-                    fetches: self.fetches,
-                    chain: None,
-                    now_ms: self.now_ms,
-                }));
+        match stages::load_and_gate(&self)? {
+            stages::GateOutcome::End => Ok(None),
+            stages::GateOutcome::ForwardChain { next } => {
+                Ok(Some(stages::enqueue_next(&self, next, self.fetches)?))
             }
-            return Ok(None);
-        };
-        let url = Url::parse(&approval).map_err(|e| DeliveryError::Quarantine(e.to_string()))?;
-        if let Err(policy) = crate::federation::policy::check_url(
-            &url,
-            self.ctx.http.allow_http,
-            &self.ctx.http.allowlist,
-        ) {
-            // A refused authorization URL is not evidence of death: keep the quote.
-            tracing::info!(
-                target: "birchtree::federation",
-                direction = "inbound",
-                kind = "QuoteReverify",
-                quote = self.quote_id.value(),
-                outcome = %format!("kept: authorization url refused by policy: {policy}"),
-                "thread"
-            );
-            return Ok(None);
-        }
-        let response = self
-            .ctx
-            .media_client
-            .get(url)
-            .header(
-                reqwest::header::ACCEPT,
-                "application/activity+json, application/ld+json",
-            )
-            .send()
-            .await
-            .map_err(|e| DeliveryError::Retry(e.to_string()))?;
-        let status = response.status();
-        if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
-            revoke_verified(self.store, self.quote_id, self.now_ms).map_err(retry)?;
-            return Ok(None);
-        }
-        if status.is_server_error()
-            || status == reqwest::StatusCode::REQUEST_TIMEOUT
-            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-        {
-            return Err(DeliveryError::Retry(format!(
-                "authorization server answered {status}"
-            )));
-        }
-        if !status.is_success() {
-            // Any other client answer is not evidence of death: keep the quote.
-            return Ok(None);
-        }
-        if let Some(declared) = response.content_length()
-            && declared > QUOTE_REVERIFY_MAX_BODY_BYTES
-        {
-            return Ok(None);
-        }
-        // Bounded read: the authorization document is tiny; anything past the
-        // remote-document cap is not evidence of anything — keep the quote.
-        let mut body: Vec<u8> = Vec::new();
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| DeliveryError::Retry(e.to_string()))?;
-            if body.len() as u64 + chunk.len() as u64 > QUOTE_REVERIFY_MAX_BODY_BYTES {
-                return Ok(None);
+            stages::GateOutcome::Fetch { approval } => {
+                match stages::fetch_authorization(&self, &approval).await? {
+                    stages::FetchOutcome::Keep => Ok(None),
+                    stages::FetchOutcome::Revoked => {
+                        let retry = |e: crate::domain::Error| DeliveryError::Retry(e.to_string());
+                        revoke_verified(self.store, self.quote_id, self.now_ms).map_err(retry)?;
+                        Ok(None)
+                    }
+                    stages::FetchOutcome::Document(body) => stages::settle_document(self, &body),
+                }
             }
-            body.extend_from_slice(&chunk);
         }
-        let _doc: serde_json::Value = match serde_json::from_slice(&body) {
-            Ok(doc) => doc,
-            Err(_) => return Ok(None),
-        };
-        if let Some(next) = self.chain {
-            self.store
-                .enqueue(
-                    JobKind::QuoteReverify,
-                    serde_json::json!({ "quote_id": next.value(), "hop": self.hop + 1, "fetches": self.fetches + 1 }),
-                    self.now_ms,
-                )
-                .map_err(retry)?;
-            tracing::info!(
-                target: "birchtree::federation",
-                direction = "inbound",
-                kind = "QuoteReverify",
-                quote = self.quote_id.value(),
-                outcome = "kept: authorization still resolves",
-                "thread"
-            );
-            return Ok(Some(QuoteAuthCtx {
-                ctx: self.ctx,
-                store: self.store,
-                quote_id: next,
-                hop: self.hop + 1,
-                fetches: self.fetches + 1,
-                chain: None,
-                now_ms: self.now_ms,
-            }));
-        }
-        tracing::info!(
-            target: "birchtree::federation",
-            direction = "inbound",
-            kind = "QuoteReverify",
-            quote = self.quote_id.value(),
-            outcome = "kept: authorization still resolves",
-            "thread"
-        );
-        Ok(None)
     }
 }
 
@@ -272,7 +154,11 @@ pub fn budget_exhausted(hop: u64, fetches: u64) -> bool {
 /// Verbatim from `threads::revoke_verified`: no-ops on a missing row or a
 /// non-accepted quote, keeps the quoted status's counter in step via
 /// `set_quote_state`, and enqueues the same `quote_revoke` event.
-pub(crate) fn revoke_verified(store: &dyn Store, quote_id: Id, now_ms: u64) -> crate::domain::Result<()> {
+pub(crate) fn revoke_verified(
+    store: &dyn Store,
+    quote_id: Id,
+    now_ms: u64,
+) -> crate::domain::Result<()> {
     use crate::domain::QuoteState;
 
     let Some(quote) = store.quote_by_id(quote_id)? else {

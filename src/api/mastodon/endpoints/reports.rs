@@ -56,35 +56,18 @@ pub async fn create(State(state): State<ApiState>, auth: Auth, LenientForm(pairs
         Err(err) => return err.into_response(),
     };
     let store: &dyn Store = &*state.context.store;
-    let Some(account_raw) = forms::get(&pairs, "account_id") else {
-        return ApiError::new(axum::http::StatusCode::UNPROCESSABLE_ENTITY, "Validation failed: Account can't be blank").into_response();
+    let target = match resolve_report_target(store, &pairs, viewer) {
+        Ok(target) => target,
+        Err(response) => return response,
     };
-    let Ok(target_id) = account_raw.parse::<Id>() else {
-        return ApiError::not_found().into_response();
-    };
-    let target = match store.account_by_id(target_id) {
-        Ok(Some(account)) => account,
-        Ok(None) => return ApiError::not_found().into_response(),
-        Err(err) => return ApiError::from(err).into_response(),
-    };
-    if target.id == viewer {
-        return ApiError::new(axum::http::StatusCode::UNPROCESSABLE_ENTITY, "Validation failed: You cannot report yourself").into_response();
-    }
     let comment = forms::get(&pairs, "comment").unwrap_or_default().to_string();
     if comment.chars().count() > COMMENT_LIMIT {
         return ApiError::new(axum::http::StatusCode::UNPROCESSABLE_ENTITY, "Validation failed: Comment is too long").into_response();
     }
-    let mut status_ids = Vec::new();
-    for raw in forms::all(&pairs, "status_ids[]") {
-        let Ok(id) = raw.parse::<Id>() else {
-            return ApiError::not_found().into_response();
-        };
-        match store.status_by_id(id) {
-            Ok(Some(status)) if status.account_id == target.id => status_ids.push(id),
-            Ok(_) => return ApiError::not_found().into_response(),
-            Err(err) => return ApiError::from(err).into_response(),
-        }
-    }
+    let status_ids = match resolve_report_statuses(store, &pairs, &target) {
+        Ok(ids) => ids,
+        Err(response) => return response,
+    };
     let forward = forms::get(&pairs, "forward").is_some_and(|v| v == "true");
     // `forward_to_domains[]` (upstream `report_params`): the report is
     // forwarded only when the target's domain is listed (default: just the
@@ -98,47 +81,14 @@ pub async fn create(State(state): State<ApiState>, auth: Auth, LenientForm(pairs
         forward_to_domains.push(target.domain.clone());
     }
     let forwarded = forward && !target.local && forward_to_domains.contains(&target.domain);
-    // `rule_ids[]` (upstream `report_params` + `ReportService#call`): present
-    // ids force the `violation` category and must name real server rules
-    // (upstream `validate_rule_ids` → 422 otherwise).
-    let mut rule_ids: Vec<Id> = Vec::new();
-    for raw in forms::all(&pairs, "rule_ids[]") {
-        let Ok(id) = raw.parse::<Id>() else {
-            return ApiError::not_found().into_response();
-        };
-        rule_ids.push(id);
-    }
-    if !rule_ids.is_empty() {
-        let known = match store.admin_rules_by_ids(&rule_ids) {
-            Ok(rules) => rules,
-            Err(err) => return ApiError::from(err).into_response(),
-        };
-        if known.len() != rule_ids.len() {
-            return ApiError::new(
-                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-                "Validation failed: Rule ids is invalid",
-            )
-            .into_response();
-        }
-    }
-    // `category` (upstream `report_params` + `ReportService#call`): one of
-    // the enum values; any `rule_ids` force `violation`.
-    let category = match report_category(forms::get(&pairs, "category"), !rule_ids.is_empty()) {
-        Ok(category) => category,
-        Err(message) => {
-            return ApiError::new(axum::http::StatusCode::UNPROCESSABLE_ENTITY, message).into_response();
-        }
+    let (rule_ids, category) = match resolve_report_rules(store, &pairs) {
+        Ok(ids) => ids,
+        Err(response) => return response,
     };
-    // `collection_ids[]` (upstream `report_params`): accepted and validated
-    // as numeric, then persisted on the report row. Unknown collections
-    // cannot be checked without that store, so every numeric id is accepted.
-    let mut collection_ids: Vec<Id> = Vec::new();
-    for raw in forms::all(&pairs, "collection_ids[]") {
-        let Ok(id) = raw.parse::<Id>() else {
-            return ApiError::not_found().into_response();
-        };
-        collection_ids.push(id);
-    }
+    let collection_ids = match resolve_report_collections(&pairs) {
+        Ok(ids) => ids,
+        Err(response) => return response,
+    };
     let now = state.context.now_ms();
     let report = match store.insert_report(
         NewReport {
@@ -178,4 +128,98 @@ pub async fn create(State(state): State<ApiState>, auth: Auth, LenientForm(pairs
         "target_account": dto::account_json(&state.server, &target),
     }))
     .into_response()
+}
+
+/// Resolve the reported account: present id, existing row, never the
+/// reporter themselves.
+fn resolve_report_target(
+    store: &dyn Store,
+    pairs: &[(String, String)],
+    viewer: Id,
+) -> Result<crate::domain::Account, Response> {
+    let Some(account_raw) = forms::get(pairs, "account_id") else {
+        return Err(ApiError::new(axum::http::StatusCode::UNPROCESSABLE_ENTITY, "Validation failed: Account can't be blank").into_response());
+    };
+    let Ok(target_id) = account_raw.parse::<Id>() else {
+        return Err(ApiError::not_found().into_response());
+    };
+    let target = match store.account_by_id(target_id) {
+        Ok(Some(account)) => account,
+        Ok(None) => return Err(ApiError::not_found().into_response()),
+        Err(err) => return Err(ApiError::from(err).into_response()),
+    };
+    if target.id == viewer {
+        return Err(ApiError::new(axum::http::StatusCode::UNPROCESSABLE_ENTITY, "Validation failed: You cannot report yourself").into_response());
+    }
+    Ok(target)
+}
+
+/// Resolve `status_ids[]`: numeric ids whose statuses belong to the target.
+fn resolve_report_statuses(
+    store: &dyn Store,
+    pairs: &[(String, String)],
+    target: &crate::domain::Account,
+) -> Result<Vec<Id>, Response> {
+    let mut status_ids = Vec::new();
+    for raw in forms::all(pairs, "status_ids[]") {
+        let Ok(id) = raw.parse::<Id>() else {
+            return Err(ApiError::not_found().into_response());
+        };
+        match store.status_by_id(id) {
+            Ok(Some(status)) if status.account_id == target.id => status_ids.push(id),
+            Ok(_) => return Err(ApiError::not_found().into_response()),
+            Err(err) => return Err(ApiError::from(err).into_response()),
+        }
+    }
+    Ok(status_ids)
+}
+
+/// Resolve `rule_ids[]` + `category`: present ids force the `violation`
+/// category and must name real server rules (upstream `validate_rule_ids`
+/// -> 422 otherwise).
+fn resolve_report_rules(
+    store: &dyn Store,
+    pairs: &[(String, String)],
+) -> Result<(Vec<Id>, String), Response> {
+    let mut rule_ids: Vec<Id> = Vec::new();
+    for raw in forms::all(pairs, "rule_ids[]") {
+        let Ok(id) = raw.parse::<Id>() else {
+            return Err(ApiError::not_found().into_response());
+        };
+        rule_ids.push(id);
+    }
+    if !rule_ids.is_empty() {
+        let known = match store.admin_rules_by_ids(&rule_ids) {
+            Ok(rules) => rules,
+            Err(err) => return Err(ApiError::from(err).into_response()),
+        };
+        if known.len() != rule_ids.len() {
+            return Err(ApiError::new(
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "Validation failed: Rule ids is invalid",
+            )
+            .into_response());
+        }
+    }
+    let category = match report_category(forms::get(pairs, "category"), !rule_ids.is_empty()) {
+        Ok(category) => category,
+        Err(message) => {
+            return Err(ApiError::new(axum::http::StatusCode::UNPROCESSABLE_ENTITY, message).into_response());
+        }
+    };
+    Ok((rule_ids, category))
+}
+
+/// Resolve `collection_ids[]`: accepted and validated as numeric, then
+/// persisted on the report row. Unknown collections cannot be checked
+/// without that store, so every numeric id is accepted.
+fn resolve_report_collections(pairs: &[(String, String)]) -> Result<Vec<Id>, Response> {
+    let mut collection_ids: Vec<Id> = Vec::new();
+    for raw in forms::all(pairs, "collection_ids[]") {
+        let Ok(id) = raw.parse::<Id>() else {
+            return Err(ApiError::not_found().into_response());
+        };
+        collection_ids.push(id);
+    }
+    Ok(collection_ids)
 }

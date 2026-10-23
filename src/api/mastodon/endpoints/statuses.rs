@@ -23,22 +23,17 @@ use crate::api::mastodon::ApiState;
 use crate::application::ports::{AccountStatusesQuery, Store};
 use crate::application::streaming::StreamEvent;
 use crate::application::statuses::{
-    self, CreateStatusCommand, PollCommand, UpdateStatusCommand,
+    self, CreateStatusCommand, CreateStatusResult, PollCommand, UpdateStatusCommand,
 };
-use crate::domain::{AccountStats, Error as DomainError, Id, Status};
+use crate::domain::{Error as DomainError, Id, Status};
+pub mod interactions;
+
+pub use self::interactions::{bookmark, favourited_by, favourite, pin, reblog, reblogged_by, unbookmark, unfavourite, unpin, unreblog};
 
 /// Read scopes for status reads.
 const READ_SCOPES: &[&str] = &["read", "read:statuses"];
 /// Write scopes for status writes.
 const WRITE_SCOPES: &[&str] = &["write", "write:statuses"];
-/// Favourite scopes.
-const FAVOURITE_SCOPES: &[&str] = &["write", "write:favourites"];
-/// Bookmark scopes.
-const BOOKMARK_SCOPES: &[&str] = &["write", "write:bookmarks"];
-/// Pin scopes.
-const PIN_SCOPES: &[&str] = &["write", "write:accounts"];
-/// Account-list read scopes (favourited_by / reblogged_by).
-const READ_ACCOUNT_SCOPES: &[&str] = &["read", "read:accounts"];
 
 fn bool_cast(value: &str) -> bool {
     matches!(
@@ -399,6 +394,10 @@ pub async fn history(
 ///
 /// Honors the `Idempotency-Key` header: a replay within one hour returns the
 /// originally created status (still 200), matching Mastodon.
+///
+/// Thin adapter: auth + wire parse, then delegate to the use case (or
+/// schedule when `scheduled_at` names a valid future time). All validation
+/// lives in the use case; this function only preserves wire shapes.
 pub async fn create(
     State(state): State<ApiState>,
     auth: Auth,
@@ -412,9 +411,89 @@ pub async fn create(
         Ok(id) => id,
         Err(err) => return err.into_response(),
     };
+    let parsed = match parse_create_command(&body, &headers, viewer, &auth) {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
+    };
+    let store: &dyn Store = &*state.context.store;
+    let now_ms = state.context.now_ms();
+    let Ok(scheduled_at) = crate::application::scheduled_statuses::parse_scheduled_at(
+        parsed.scheduled_at.as_deref(),
+        now_ms,
+    ) else {
+        return ApiError::unprocessable("Record invalid").into_response();
+    };
+    if let Some(scheduled_at_ms) = scheduled_at {
+        return schedule_response(&state, store, parsed.cmd, parsed.place_id, scheduled_at_ms, now_ms);
+    }
+    match statuses::create_status(
+        store,
+        &state.server.public_url,
+        state.context.now_ms(),
+        parsed.cmd,
+        state.server.max_status_chars,
+        &state.server.license_policy,
+        &state.server.place_policy,
+        parsed.place_id,
+        &state.server.alt_text_policy,
+    ) {
+        Ok(created) => created_response(&state, store, viewer, created),
+        Err(err) => match err {
+            // Reply/quote misses keep their exact custom messages.
+            DomainError::NotFound(msg) if msg.contains("does not appear to exist") => {
+                ApiError::new(axum::http::StatusCode::NOT_FOUND, msg).into_response()
+            }
+            other => status_error(other).into_response(),
+        },
+    }
+}
 
-    let pairs = body;
-    let field = |key: &str| forms::get(&pairs, key).map(str::to_string);
+/// Render a created status: stream the creation (unless an idempotent
+/// replay) and pack the status JSON with the nag header when enabled.
+fn created_response(
+    state: &ApiState,
+    store: &dyn Store,
+    viewer: Id,
+    created: CreateStatusResult,
+) -> Response {
+    // An idempotent replay committed nothing new, so nothing streams.
+    if !created.replayed {
+        state.context.streaming.publish(StreamEvent::StatusCreated {
+            status_id: created.status.id,
+        });
+        crate::api::mastodon::endpoints::conversations::publish_conversation_events(
+            &state,
+            &created.status,
+        );
+    }
+    // Core extension CORE-T: nag header on success when enabled.
+    let attachments = alt_pairs(store, &created.status.media_ids);
+    crate::api::mastodon::with_alt_text_nag(
+        status_response(&state, Some(viewer), created.status, StatusSourceMode::Content),
+        &state.server.alt_text_policy,
+        &attachments,
+    )
+}
+
+/// Parsed wire inputs for `POST /api/v1/statuses`: the use-case command plus
+/// the two values the endpoint branches on before delegating.
+struct ParsedCreate {
+    cmd: CreateStatusCommand,
+    place_id: Option<Id>,
+    scheduled_at: Option<String>,
+}
+
+/// Parse the form body + `Idempotency-Key` header into a [`CreateStatusCommand`].
+/// Every early return preserves its exact wire body: unparsable reply/quote
+/// ids 404 with their custom messages, unparsable `place_id` 422s, poll
+/// problems 422 via [`build_poll_command`].
+fn parse_create_command(
+    pairs: &[(String, String)],
+    headers: &HeaderMap,
+    viewer: Id,
+    auth: &Auth,
+) -> Result<ParsedCreate, Response> {
+    let field = |key: &str| forms::get(pairs, key).map(str::to_string);
 
     // Reply/quote targets: a present-but-unparsable id behaves like an
     // unknown one (Mastodon `Status.find`).
@@ -423,11 +502,11 @@ pub async fn create(
         Some(raw) => match raw.parse::<Id>() {
             Ok(id) => Some(id),
             Err(_) => {
-                return ApiError::new(
+                return Err(ApiError::new(
                     axum::http::StatusCode::NOT_FOUND,
                     "The post you are trying to reply to does not appear to exist.",
                 )
-                .into_response();
+                .into_response());
             }
         },
     };
@@ -436,26 +515,26 @@ pub async fn create(
         Some(raw) => match raw.parse::<Id>() {
             Ok(id) => Some(id),
             Err(_) => {
-                return ApiError::new(
+                return Err(ApiError::new(
                     axum::http::StatusCode::NOT_FOUND,
                     "The post you are trying to quote does not appear to exist.",
                 )
-                .into_response();
+                .into_response());
             }
         },
     };
 
     // Nested `poll[...]` params.
     let poll = if pairs.iter().any(|(k, _)| k.starts_with("poll[")) {
-        match build_poll_command(&pairs) {
+        match build_poll_command(pairs) {
             Ok(poll) => Some(poll),
-            Err(err) => return err.into_response(),
+            Err(err) => return Err(err.into_response()),
         }
     } else {
         None
     };
 
-    let media_ids = forms::all(&pairs, "media_ids")
+    let media_ids = forms::all(pairs, "media_ids")
         .iter()
         .filter_map(|raw| raw.parse::<Id>().ok())
         .collect();
@@ -468,8 +547,8 @@ pub async fn create(
         Some(raw) => match raw.parse::<Id>() {
             Ok(id) => Some(id),
             Err(_) => {
-                return ApiError::unprocessable("Validation failed: Place not found")
-                    .into_response();
+                return Err(ApiError::unprocessable("Validation failed: Place not found")
+                    .into_response());
             }
         },
     };
@@ -480,98 +559,63 @@ pub async fn create(
         .map(str::to_string)
         .filter(|key| !key.is_empty());
 
-    let cmd = CreateStatusCommand {
-        account_id: viewer,
-        text: field("status"),
-        in_reply_to_id,
-        quoted_status_id,
-        quote_approval_policy: field("quote_approval_policy"),
-        sensitive: forms::get(&pairs, "sensitive").map(bool_cast),
-        spoiler_text: field("spoiler_text"),
-        visibility: field("visibility"),
-        language: field("language"),
-        media_ids,
-        poll,
-        application_name: Some(auth.0.app.name.clone()),
-        application_website: auth.0.app.website.clone(),
-        idempotency_key,
-    };
-
-    let store: &dyn Store = &*state.context.store;
-
-    // `scheduled_at`: a valid future time (>5 min out) schedules instead of
-    // posting (200 + ScheduledStatusSerializer); a past/blank value posts
-    // immediately; an unparseable value is Mastodon's 422 `Record invalid`.
-    let now_ms = state.context.now_ms();
-    let scheduled_at =
-        match crate::application::scheduled_statuses::parse_scheduled_at(
-            field("scheduled_at").as_deref(),
-            now_ms,
-        ) {
-            Ok(scheduled) => scheduled,
-            Err(_) => {
-                return ApiError::unprocessable("Record invalid").into_response();
-            }
-        };
-    if let Some(scheduled_at_ms) = scheduled_at {
-        return match crate::application::scheduled_statuses::schedule_status(
-            store,
-            &state.server.public_url,
-            now_ms,
-            cmd,
-            scheduled_at_ms,
-            state.server.max_status_chars,
-            &state.server.license_policy,
-            &state.server.place_policy,
-            place_id,
-            &state.server.alt_text_policy,
-        ) {
-            Ok(row) => {
-                let media = store
-                    .attachable_media(row.account_id, &row.media_ids, None)
-                    .unwrap_or_default();
-                axum::Json(dto::scheduled_status_json(
-                    &state.server,
-                    &row,
-                    &media,
-                ))
-                .into_response()
-            }
-            // Validation failures keep the exact 422 bodies (limits, media).
-            Err(DomainError::InvalidInput(message)) => {
-                ApiError::unprocessable(message).into_response()
-            }
-            Err(err) => ApiError::from(err).into_response(),
-        };
-    }
-
-    match statuses::create_status(store, &state.server.public_url, state.context.now_ms(), cmd, state.server.max_status_chars, &state.server.license_policy, &state.server.place_policy, place_id, &state.server.alt_text_policy) {
-        Ok(created) => {
-            // An idempotent replay committed nothing new, so nothing streams.
-            if !created.replayed {
-                state.context.streaming.publish(StreamEvent::StatusCreated {
-                    status_id: created.status.id,
-                });
-                crate::api::mastodon::endpoints::conversations::publish_conversation_events(
-                    &state,
-                    &created.status,
-                );
-            }
-            // Core extension CORE-T: nag header on success when enabled.
-            let attachments = alt_pairs(store, &created.status.media_ids);
-            crate::api::mastodon::with_alt_text_nag(
-                status_response(&state, Some(viewer), created.status, StatusSourceMode::Content),
-                &state.server.alt_text_policy,
-                &attachments,
-            )
-        }
-        Err(err) => match err {
-            // Reply/quote misses keep their exact custom messages.
-            DomainError::NotFound(msg) if msg.contains("does not appear to exist") => {
-                ApiError::new(axum::http::StatusCode::NOT_FOUND, msg).into_response()
-            }
-            other => status_error(other).into_response(),
+    Ok(ParsedCreate {
+        cmd: CreateStatusCommand {
+            account_id: viewer,
+            text: field("status"),
+            in_reply_to_id,
+            quoted_status_id,
+            quote_approval_policy: field("quote_approval_policy"),
+            sensitive: forms::get(pairs, "sensitive").map(bool_cast),
+            spoiler_text: field("spoiler_text"),
+            visibility: field("visibility"),
+            language: field("language"),
+            media_ids,
+            poll,
+            application_name: Some(auth.0.app.name.clone()),
+            application_website: auth.0.app.website.clone(),
+            idempotency_key,
         },
+        place_id,
+        scheduled_at: field("scheduled_at"),
+    })
+}
+
+/// The `scheduled_at` branch of `create`: schedule instead of posting (200 +
+/// `ScheduledStatusSerializer`). Validation failures keep the exact 422
+/// bodies (limits, media); `attachable_media` failure reads as empty (no nag
+/// source needed on this path — unchanged).
+fn schedule_response(
+    state: &ApiState,
+    store: &dyn Store,
+    cmd: CreateStatusCommand,
+    place_id: Option<Id>,
+    scheduled_at_ms: u64,
+    now_ms: u64,
+) -> Response {
+    match crate::application::scheduled_statuses::schedule_status(
+        store,
+        &state.server.public_url,
+        now_ms,
+        cmd,
+        scheduled_at_ms,
+        state.server.max_status_chars,
+        &state.server.license_policy,
+        &state.server.place_policy,
+        place_id,
+        &state.server.alt_text_policy,
+    ) {
+        Ok(row) => {
+            let media = store
+                .attachable_media(row.account_id, &row.media_ids, None)
+                .unwrap_or_default();
+            axum::Json(dto::scheduled_status_json(&state.server, &row, &media)).into_response()
+        }
+        // Validation failures keep the exact 422 bodies (limits, media).
+        Err(DomainError::InvalidInput(message)) => {
+            ApiError::unprocessable(message).into_response()
+        }
+        Err(err) => ApiError::from(err).into_response(),
     }
 }
 
@@ -729,326 +773,13 @@ pub async fn destroy(
     }
 }
 
-/// `POST /api/v1/statuses/{id}/favourite` (200 with the status).
-pub async fn favourite(
-    State(state): State<ApiState>,
-    auth: Auth,
-    Path(raw): Path<String>,
-) -> Response {
-    status_interaction(&state, &auth, raw, FAVOURITE_SCOPES, |store, viewer, id, now| {
-        crate::application::interactions::favourite(store, viewer, id, now)
-    })
-    .await
-}
 
-/// `POST /api/v1/statuses/{id}/unfavourite` (200; no-op when not favourited).
-pub async fn unfavourite(
-    State(state): State<ApiState>,
-    auth: Auth,
-    Path(raw): Path<String>,
-) -> Response {
-    status_interaction(&state, &auth, raw, FAVOURITE_SCOPES, |store, viewer, id, now| {
-        crate::application::interactions::unfavourite(store, viewer, id, now)
-    })
-    .await
-}
-
-/// `POST /api/v1/statuses/{id}/bookmark`.
-pub async fn bookmark(
-    State(state): State<ApiState>,
-    auth: Auth,
-    Path(raw): Path<String>,
-) -> Response {
-    status_interaction(&state, &auth, raw, BOOKMARK_SCOPES, |store, viewer, id, now| {
-        crate::application::interactions::bookmark(store, viewer, id, now)
-    })
-    .await
-}
-
-/// `POST /api/v1/statuses/{id}/unbookmark`.
-pub async fn unbookmark(
-    State(state): State<ApiState>,
-    auth: Auth,
-    Path(raw): Path<String>,
-) -> Response {
-    status_interaction(&state, &auth, raw, BOOKMARK_SCOPES, |store, viewer, id, now| {
-        crate::application::interactions::unbookmark(store, viewer, id, now)
-    })
-    .await
-}
-
-/// `POST /api/v1/statuses/{id}/reblog` — answers 200 with the NEW reblog.
-pub async fn reblog(
-    State(state): State<ApiState>,
-    auth: Auth,
-    Path(raw): Path<String>,
-    LenientForm(body): LenientForm,
-) -> Response {
-    if let Err(err) = auth.0.require_scopes(WRITE_SCOPES) {
-        return err.into_response();
-    }
-    let viewer = match auth.0.require_user() {
-        Ok(id) => id,
-        Err(err) => return err.into_response(),
-    };
-    let Ok(status_id) = raw.parse::<Id>() else {
-        return ApiError::new(axum::http::StatusCode::NOT_FOUND, "Not Found").into_response();
-    };
-    let pairs = body;
-    let visibility = forms::get(&pairs, "visibility").map(str::to_string);
-    let store: &dyn Store = &*state.context.store;
-    // A repeat reblog returns the existing wrapper and creates nothing, so only
-    // a fresh wrapper streams (upstream's `ReblogService` returns early too).
-    let target = match store.status_by_id(status_id) {
-        Ok(Some(status)) => status.reblog_of_id.unwrap_or(status_id),
-        _ => status_id,
-    };
-    let existed = store.own_reblog(viewer, target).ok().flatten().is_some();
-    match crate::application::interactions::reblog(
-        store,
-        viewer,
-        status_id,
-        visibility.as_deref(),
-        state.context.now_ms(),
-    ) {
-        Ok(status) => {
-            if !existed {
-                // The wrapper is what followers' home streams carry.
-                state.context.streaming.publish(StreamEvent::StatusCreated {
-                    status_id: status.id,
-                });
-            }
-            status_response(&state, Some(viewer), status, StatusSourceMode::Content)
-        }
-        Err(err) => status_error(err).into_response(),
-    }
-}
-
-/// `POST /api/v1/statuses/{id}/unreblog` — answers 200 with the ORIGINAL.
-///
-/// The viewer's wrapper is read before the unreblog, so its `delete` can be
-/// published after the commit.
-pub async fn unreblog(
-    State(state): State<ApiState>,
-    auth: Auth,
-    Path(raw): Path<String>,
-) -> Response {
-    if let Err(err) = auth.0.require_scopes(WRITE_SCOPES) {
-        return err.into_response();
-    }
-    let viewer = match auth.0.require_user() {
-        Ok(id) => id,
-        Err(err) => return err.into_response(),
-    };
-    let Ok(status_id) = raw.parse::<Id>() else {
-        return ApiError::new(axum::http::StatusCode::NOT_FOUND, "Not Found").into_response();
-    };
-    let store: &dyn Store = &*state.context.store;
-    // The unreblog takes the original's id; a wrapper id resolves to its target.
-    let target = match store.status_by_id(status_id) {
-        Ok(Some(status)) => status.reblog_of_id.unwrap_or(status_id),
-        _ => status_id,
-    };
-    let wrapper = store.own_reblog(viewer, target).ok().flatten();
-    match crate::application::interactions::unreblog(store, viewer, status_id, state.context.now_ms()) {
-        Ok(status) => {
-            if let Some(wrapper) = wrapper {
-                state.context.streaming.publish(StreamEvent::StatusDeleted {
-                    status: wrapper,
-                    reblogs: Vec::new(),
-                });
-            }
-            status_response(&state, Some(viewer), status, StatusSourceMode::Content)
-        }
-        Err(err) => status_error(err).into_response(),
-    }
-}
-
-/// `POST /api/v1/statuses/{id}/pin`.
-pub async fn pin(
-    State(state): State<ApiState>,
-    auth: Auth,
-    Path(raw): Path<String>,
-) -> Response {
-    status_interaction(&state, &auth, raw, PIN_SCOPES, |store, viewer, id, now| {
-        crate::application::interactions::pin(store, viewer, id, now)
-    })
-    .await
-}
-
-/// `POST /api/v1/statuses/{id}/unpin` (idempotent no-op).
-pub async fn unpin(
-    State(state): State<ApiState>,
-    auth: Auth,
-    Path(raw): Path<String>,
-) -> Response {
-    status_interaction(&state, &auth, raw, PIN_SCOPES, |store, viewer, id, now| {
-        crate::application::interactions::unpin(store, viewer, id, now)
-    })
-    .await
-}
-
-/// Shared shape for the status sub-route interactions.
-async fn status_interaction(
-    state: &ApiState,
-    auth: &Auth,
-    raw: String,
-    scopes: &'static [&'static str],
-    action: fn(
-        &dyn Store,
-        Id,
-        Id,
-        u64,
-    ) -> crate::domain::Result<Status>,
-) -> Response {
-    if let Err(err) = auth.0.require_scopes(scopes) {
-        return err.into_response();
-    }
-    let viewer = match auth.0.require_user() {
-        Ok(id) => id,
-        Err(err) => return err.into_response(),
-    };
-    let Ok(status_id) = raw.parse::<Id>() else {
-        return ApiError::new(axum::http::StatusCode::NOT_FOUND, "Not Found").into_response();
-    };
-    let store: &dyn Store = &*state.context.store;
-    match action(store, viewer, status_id, state.context.now_ms()) {
-        Ok(status) => status_response(state, Some(viewer), status, StatusSourceMode::Content),
-        Err(err) => status_error(err).into_response(),
-    }
-}
-
-/// `GET /api/v1/statuses/{id}/favourited_by` — accounts, paginated by
-/// favourite id (cursor hidden in `Link`).
-pub async fn favourited_by(
-    State(state): State<ApiState>,
-    auth: OptionalAuth,
-    Path(raw): Path<String>,
-    uri: Uri,
-) -> Response {
-    interacted_by(&state, &auth, raw, uri, ByWhich::Favourited).await
-}
-
-/// `GET /api/v1/statuses/{id}/reblogged_by` — accounts, paginated by reblog id.
-pub async fn reblogged_by(
-    State(state): State<ApiState>,
-    auth: OptionalAuth,
-    Path(raw): Path<String>,
-    uri: Uri,
-) -> Response {
-    interacted_by(&state, &auth, raw, uri, ByWhich::Reblogged).await
-}
-
-#[derive(Clone, Copy)]
-enum ByWhich {
-    Favourited,
-    Reblogged,
-}
-
-async fn interacted_by(
-    state: &ApiState,
-    auth: &OptionalAuth,
-    raw: String,
-    uri: Uri,
-    which: ByWhich,
-) -> Response {
-    if let Err(err) = optional_scopes(auth, READ_ACCOUNT_SCOPES) {
-        return err.into_response();
-    }
-    let viewer = viewer_of(auth);
-    let Ok(status_id) = raw.parse::<Id>() else {
-        return ApiError::new(axum::http::StatusCode::NOT_FOUND, "Not Found").into_response();
-    };
-    let page = match parse_page(&uri, 40, 80) {
-        Ok(page) => page,
-        Err(err) => return err.into_response(),
-    };
-    let store: &dyn Store = &*state.context.store;
-    // The show gate applies first (404 for invisible statuses).
-    if let Err(err) = statuses::show_status(store, viewer, status_id, state.context.now_ms()) {
-        return status_error(err).into_response();
-    }
-    let pairs = match which {
-        ByWhich::Favourited => store.favourited_by(status_id, page.max_id, page.limit),
-        // D52 distributable-visibility scope (gaps G-C): only public/unlisted
-        // wrappers attribute reblogs; private/direct wrappers never leak
-        // through this read.
-        ByWhich::Reblogged => store.reblogged_by_distributable(status_id, page.max_id, page.limit),
-    };
-    let pairs = match pairs {
-        Ok(pairs) => pairs,
-        Err(err) => return ApiError::from(err).into_response(),
-    };
-    // Upstream `load_accounts`
-    // (`favourited_by_accounts_controller.rb` /
-    // `reblogged_by_accounts_controller.rb` at pin `8ff11c2b`):
-    // `without_suspended` always applies, and an authenticated viewer never
-    // sees accounts they block/mute or are blocked by
-    // (`not_excluded_by_account`, i.e. upstream's blocks + blocked-bys +
-    // mutes — domain blocks are account-scoped here, not domain-scoped).
-    // Anonymous viewers get every resolvable non-suspended account.
-    let excluded: std::collections::HashSet<Id> = match viewer {
-        Some(viewer) => {
-            let ids: Vec<Id> = pairs.iter().map(|(account_id, _)| *account_id).collect();
-            match store.batch_pair_states(viewer, &ids, state.context.now_ms()) {
-                // `(incoming, outgoing)`: `incoming.blocking` = the account
-                // blocks the viewer; `outgoing.blocking`/`muting` = the
-                // viewer blocks/mutes the account.
-                Ok(states) => states
-                    .into_iter()
-                    .filter_map(|(id, (incoming, outgoing))| {
-                        (outgoing.blocking || outgoing.muting || incoming.blocking)
-                            .then_some(id)
-                    })
-                    .collect(),
-                Err(err) => return ApiError::from(err).into_response(),
-            }
-        }
-        None => std::collections::HashSet::new(),
-    };
-    let mut accounts = Vec::with_capacity(pairs.len());
-    let mut kept: Vec<(Id, Id)> = Vec::with_capacity(pairs.len());
-    for (account_id, cursor) in &pairs {
-        if excluded.contains(account_id) {
-            continue;
-        }
-        match store.account_by_id(*account_id) {
-            Ok(Some(account)) if !account.suspended => {
-                kept.push((*account_id, *cursor));
-                accounts.push(account);
-            }
-            Ok(_) => continue,
-            Err(err) => return ApiError::from(err).into_response(),
-        }
-    }
-    // Cursors are interaction ids (favourite id / reblog status id), derived
-    // from the filtered page like upstream's `pagination_max_id`.
-    let next = (pairs.len() == page.limit)
-        .then(|| kept.last().map(|(_, cursor)| *cursor))
-        .flatten();
-    let prev = kept.first().map(|(_, cursor)| *cursor);
-    let mut response = axum::Json(
-        accounts
-            .iter()
-            .map(|account| {
-                let stats: Option<AccountStats> = store.account_stats(account.id).ok();
-                dto::account_json_with_stats(&state.server, account, stats.as_ref())
-            })
-            .collect::<Vec<Value>>(),
-    )
-    .into_response();
-    if let Some(link) = pagination::link_header(&uri, next, prev) {
-        if let Ok(value) = header::HeaderValue::from_str(&link) {
-            response.headers_mut().insert(header::LINK, value);
-        }
-    }
-    response
-}
 
 fn parse_page(uri: &Uri, default: usize, max: usize) -> ApiResult<pagination::Page> {
     let pairs = match uri.query() {
         Some(query) => forms::parse(query.as_bytes()),
         None => Vec::new(),
+
     };
     pagination::parse(
         forms::get(&pairs, "limit"),
@@ -1060,7 +791,7 @@ fn parse_page(uri: &Uri, default: usize, max: usize) -> ApiResult<pagination::Pa
     )
 }
 
-/// `GET /api/v1/accounts/{id}/statuses` — one account's statuses with
+/// `GET /api/v1/accounts/{id}/statuses` ΓÇö one account's statuses with
 /// `pinned`/`exclude_replies`/`exclude_reblogs` filters and `Link` headers.
 pub async fn account_statuses(
     State(state): State<ApiState>,
@@ -1111,7 +842,7 @@ pub async fn account_statuses(
     }
 }
 
-/// `GET /api/v1/statuses/{id}/quotes` — accepted quotes of a status as
+/// `GET /api/v1/statuses/{id}/quotes` ΓÇö accepted quotes of a status as
 /// statuses; the token is mandatory (401 when absent). Cursor = quoting
 /// status id.
 pub async fn quotes_index(
@@ -1158,7 +889,7 @@ pub async fn quotes_index(
     }
 }
 
-/// `POST /api/v1/statuses/{id}/quotes/{quoting_status_id}/revoke` — answers
+/// `POST /api/v1/statuses/{id}/quotes/{quoting_status_id}/revoke` ΓÇö answers
 /// 200 with the QUOTING status (its `quote.state` becomes `revoked`).
 pub async fn quotes_revoke(
     State(state): State<ApiState>,
@@ -1193,7 +924,7 @@ pub async fn quotes_revoke(
     }
 }
 
-/// `PUT/PATCH /api/v1/statuses/{id}/interaction_policy` — set
+/// `PUT/PATCH /api/v1/statuses/{id}/interaction_policy` ΓÇö set
 /// `quote_approval_policy` on one's own status (200 with the status).
 pub async fn interaction_policy(
     State(state): State<ApiState>,

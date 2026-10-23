@@ -17,4 +17,5 @@ pub mod resolver;
 pub mod retry;
 pub mod threads;
 pub mod threads_auth;
+pub mod threads_auth_stages;
 pub mod tombstone;

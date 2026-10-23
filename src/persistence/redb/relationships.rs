@@ -153,6 +153,8 @@ fn remove_endorsement_txn(
 }
 
 impl RelationshipStore for RedbStore {
+    // WHY single-txn: one begin_write owns the follow row + counters + follow-up job atomically
+    // (architecture rule); splitting would move work across the commit boundary.
     fn follow(
         &self,
         follower_id: Id,

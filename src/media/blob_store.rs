@@ -353,7 +353,6 @@ impl FsBlobStore {
 
     /// Depth-first walk in key order (directories sort as `name/`, so the
     /// traversal order equals the plain string order of the full keys).
-    #[allow(clippy::too_many_arguments)]
     fn walk_sorted(
         &self,
         dir: &Path,

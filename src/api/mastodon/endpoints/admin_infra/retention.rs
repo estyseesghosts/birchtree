@@ -100,15 +100,6 @@ fn render_cohorts(
             ms - ms % DAY_MS
         }
     };
-    // Retention periods from each cohort start to `end_ms`, one step each.
-    let step_ms = |from_ms: u64| -> u64 {
-        if frequency == "month" {
-            month_start_ms(from_ms.saturating_add(32 * DAY_MS)).saturating_sub(from_ms)
-        } else {
-            DAY_MS
-        }
-    };
-
     let mut cohorts: HashMap<u64, Vec<Id>> = HashMap::new();
     for account in accounts {
         if account.created_at_ms < start_ms || account.created_at_ms > end_ms {
@@ -122,40 +113,17 @@ fn render_cohorts(
     let mut cohort_keys: Vec<u64> = cohorts.keys().copied().collect();
     cohort_keys.sort_unstable();
 
-    // Active periods per account: authored statuses plus password
-    // sign-ins (round 3 sign-in cohorts; either signal counts).
-    let mut active_periods: HashMap<Id, Vec<u64>> = HashMap::new();
-    for row in status_rows {
-        active_periods
-            .entry(row.account_id)
-            .or_default()
-            .push(row.created_at_ms);
-    }
-    if let Ok(sign_ins) = store.admin_sign_ins(METRIC_SCAN_CAP) {
-        for (who, at) in sign_ins {
-            active_periods.entry(who).or_default().push(at);
-        }
-    }
-    for periods in active_periods.values_mut() {
-        periods.sort_unstable();
-    }
+    let active_periods = collect_active_periods(store, status_rows);
 
     let mut out = Vec::new();
     for cohort_start in cohort_keys {
         let members = &cohorts[&cohort_start];
         let created_count = members.len() as u64;
-        let mut periods = Vec::new();
-        let mut cursor = cohort_start;
-        while cursor <= end_ms {
-            periods.push(cursor);
-            cursor = cursor.saturating_add(step_ms(cursor).max(1));
-            if periods.len() > 366 {
-                break;
-            }
-        }
         let mut data = Vec::new();
-        for period in periods {
-            let period_end = period.saturating_add(step_ms(period)).saturating_sub(1);
+        for period in cohort_periods(cohort_start, end_ms, is_month) {
+            let period_end = period
+                .saturating_add(cohort_step_ms(period, is_month))
+                .saturating_sub(1);
             let active_count = members
                 .iter()
                 .filter(|id| {
@@ -182,6 +150,53 @@ fn render_cohorts(
         }));
     }
     out
+}
+
+/// Active periods per account: authored statuses plus password sign-ins
+/// (round 3 sign-in cohorts; either signal counts).
+fn collect_active_periods(
+    store: &dyn Store,
+    status_rows: &[StatusMetricRow],
+) -> HashMap<Id, Vec<u64>> {
+    let mut active_periods: HashMap<Id, Vec<u64>> = HashMap::new();
+    for row in status_rows {
+        active_periods
+            .entry(row.account_id)
+            .or_default()
+            .push(row.created_at_ms);
+    }
+    if let Ok(sign_ins) = store.admin_sign_ins(METRIC_SCAN_CAP) {
+        for (who, at) in sign_ins {
+            active_periods.entry(who).or_default().push(at);
+        }
+    }
+    for periods in active_periods.values_mut() {
+        periods.sort_unstable();
+    }
+    active_periods
+}
+
+/// Retention periods from one cohort start to `end_ms`, one step each.
+fn cohort_periods(cohort_start: u64, end_ms: u64, is_month: bool) -> Vec<u64> {
+    let mut periods = Vec::new();
+    let mut cursor = cohort_start;
+    while cursor <= end_ms {
+        periods.push(cursor);
+        cursor = cursor.saturating_add(cohort_step_ms(cursor, is_month).max(1));
+        if periods.len() > 366 {
+            break;
+        }
+    }
+    periods
+}
+
+/// One retention step from `from_ms`: a month (via the 32-day probe) or a day.
+fn cohort_step_ms(from_ms: u64, is_month: bool) -> u64 {
+    if is_month {
+        month_start_ms(from_ms.saturating_add(32 * DAY_MS)).saturating_sub(from_ms)
+    } else {
+        DAY_MS
+    }
 }
 
 /// `POST /api/v1/admin/retention` with read scope upstream (kept).

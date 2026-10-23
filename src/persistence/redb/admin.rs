@@ -437,6 +437,8 @@ impl AdminStore for RedbStore {
         Ok(true)
     }
 
+    // WHY single-txn: one begin_write owns the moderation row + audit + counters atomically
+    // (architecture rule); splitting would move work across the commit boundary.
     fn admin_account_action(
         &self,
         actor_account_id: Id,

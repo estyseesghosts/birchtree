@@ -3,6 +3,8 @@
 //! surface (always empty until the notification-policy filter pipeline
 //! lands — this server never fabricates rows).
 
+use std::collections::HashMap;
+
 use axum::extract::{Path, State};
 use axum::http::Uri;
 use axum::response::{IntoResponse, Response};
@@ -17,8 +19,8 @@ use crate::api::mastodon::pagination;
 use crate::api::mastodon::status_view::load_status_views;
 use crate::api::mastodon::{ApiState, ServerInfo};
 use crate::application::notifications::{
-    self, COUNT_DEFAULT_LIMIT, COUNT_MAX_LIMIT, DEFAULT_LIMIT, MAX_LIMIT, NotificationQuery,
-    PolicyChanges,
+    self, COUNT_DEFAULT_LIMIT, COUNT_MAX_LIMIT, DEFAULT_LIMIT, MAX_LIMIT, NotificationCtx,
+    NotificationQuery, PolicyChanges,
 };
 use crate::application::ports::Store;
 use crate::domain::{Id, NotificationRequest, NotificationType};
@@ -65,105 +67,23 @@ pub async fn index(State(state): State<ApiState>, auth: Auth, uri: Uri) -> Respo
         Some(query) => forms::parse(query.as_bytes()),
         None => Vec::new(),
     };
-    // Mastodon `limit_param`: absent -> 20, else `min(abs(to_i), 40)` (so
-    // `limit=0` and non-numeric values yield an empty page). Cursors keep
-    // the shared numeric parsing.
-    let limit: usize = match forms::get(&pairs, "limit") {
-        None => DEFAULT_LIMIT,
-        Some(raw) => {
-            let value: i64 = raw.parse().unwrap_or(0);
-            (value.unsigned_abs() as usize).min(MAX_LIMIT)
-        }
+    let params = match parse_index_params(&pairs) {
+        Ok(params) => params,
+        Err(response) => return response,
     };
-    let page = match pagination::parse(
-        None,
-        forms::get(&pairs, "max_id"),
-        forms::get(&pairs, "since_id"),
-        forms::get(&pairs, "min_id"),
-        limit,
-        MAX_LIMIT,
-    ) {
-        Ok(page) => page,
-        Err(err) => return err.into_response(),
-    };
-    // `exclude_types[]` subtracts from the full set; `types[]` narrows to the
-    // intersection (unknown values match nothing).
-    let excluded: Vec<NotificationType> = forms::all(&pairs, "exclude_types")
-        .iter()
-        .filter_map(|raw| parse_type(raw))
-        .collect();
-    let explicit_types: Option<Vec<NotificationType>> = {
-        let requested: Vec<NotificationType> = forms::all(&pairs, "types")
-            .iter()
-            .filter_map(|raw| parse_type(raw))
-            .collect();
-        if requested.is_empty() && forms::all(&pairs, "types").is_empty() {
-            None
-        } else if requested.is_empty() {
-            // `types[]` present but nothing valid: the intersection is empty.
-            Some(Vec::new())
-        } else {
-            Some(requested)
-        }
-    };
-    // Upstream `browserable_params`: `account_id` narrows to one actor;
-    // `include_filtered` also serves filtered rows (the store page excludes
-    // them — honored once the store gains the flag; accepted without effect
-    // until then, see the use-case docs); `supported_types[]` only gates the
-    // `fallback` rendering for non-baseline types, which this server never
-    // emits, so it is accepted and carried on pagination links.
-    let from_account = match forms::get(&pairs, "account_id").map(|raw| raw.parse::<Id>()) {
-        Some(Ok(id)) => Some(id),
-        Some(Err(_)) => None,
-        None => None,
-    };
-    let include_filtered = bool_cast(forms::get(&pairs, "include_filtered").unwrap_or("false"));
-    // `supported_types[]` gates the `fallback` rendering for non-baseline
-    // types (upstream `NotificationFallbackConcern`); absent = no fallbacks.
-    let supported_types: Option<Vec<NotificationType>> = {
-        let raw = forms::all(&pairs, "supported_types");
-        if raw.is_empty() {
-            None
-        } else {
-            Some(raw.iter().filter_map(|v| parse_type(v)).collect())
-        }
-    };
-
     let store: &dyn Store = &*state.context.store;
-    let query = NotificationQuery {
-        max_id: page.max_id,
-        since_id: page.since_id,
-        min_id: page.min_id,
-        limit: page.limit,
-        from_account,
-        include_filtered,
-    };
-    let fetched = match notifications::index(store, recipient, query) {
-        Ok(notifications) => notifications,
-        Err(err) => return ApiError::from(err).into_response(),
-    };
-    let mut notifications = fetched;
-    if let Some(types) = &explicit_types {
-        notifications.retain(|n| types.contains(&n.r#type));
-    }
-    notifications.retain(|n| !excluded.contains(&n.r#type));
-    // `include_filtered=true` serves the filtered rows the store page
-    // excludes (upstream `browserable`), merged newest-first by numeric id.
-    if include_filtered {
-        let extra = match store.filtered_notifications_page(
-            recipient,
-            page.limit,
-            page.max_id,
-            page.since_id,
-            page.min_id,
-        ) {
-            Ok(extra) => extra,
-            Err(err) => return ApiError::from(err).into_response(),
+    let notifications =
+        match load_index_notifications(store, recipient, &params) {
+            Ok(notifications) => notifications,
+            Err(err) => return err.into_response(),
         };
-        notifications = notifications::merge_filtered_index(notifications, extra, &query);
-    }
 
-    match render_notifications(&state.server, store, state.context.now_ms(), recipient, notifications, supported_types.as_deref()) {
+    let ctx = NotificationCtx {
+        store,
+        recipient_id: recipient,
+        now_ms: state.context.now_ms(),
+    };
+    match render_notifications(&ctx, &state.server, notifications, params.supported_types.as_deref()) {
         Ok((body, first, last)) => {
             let mut response = axum::Json(body).into_response();
             if let Some(link) = pagination::link_header(&uri, last, first) {
@@ -181,21 +101,195 @@ pub async fn index(State(state): State<ApiState>, auth: Auth, uri: Uri) -> Respo
     }
 }
 
+/// Parsed `GET /api/v1/notifications` query: cursors, explicit/excluded
+/// types, the actor narrow, the filtered toggle, and the fallback gate.
+struct IndexParams {
+    page: pagination::Page,
+    excluded: Vec<NotificationType>,
+    explicit_types: Option<Vec<NotificationType>>,
+    from_account: Option<Id>,
+    include_filtered: bool,
+    supported_types: Option<Vec<NotificationType>>,
+}
+
+fn parse_index_params(pairs: &[(String, String)]) -> Result<IndexParams, Response> {
+    // Mastodon `limit_param`: absent -> 20, else `min(abs(to_i), 40)` (so
+    // `limit=0` and non-numeric values yield an empty page). Cursors keep
+    // the shared numeric parsing.
+    let limit: usize = match forms::get(pairs, "limit") {
+        None => DEFAULT_LIMIT,
+        Some(raw) => {
+            let value: i64 = raw.parse().unwrap_or(0);
+            (value.unsigned_abs() as usize).min(MAX_LIMIT)
+        }
+    };
+    let page = match pagination::parse(
+        None,
+        forms::get(pairs, "max_id"),
+        forms::get(pairs, "since_id"),
+        forms::get(pairs, "min_id"),
+        limit,
+        MAX_LIMIT,
+    ) {
+        Ok(page) => page,
+        Err(err) => return Err(err.into_response()),
+    };
+    // `exclude_types[]` subtracts from the full set; `types[]` narrows to the
+    // intersection (unknown values match nothing).
+    let excluded: Vec<NotificationType> = forms::all(pairs, "exclude_types")
+        .iter()
+        .filter_map(|raw| parse_type(raw))
+        .collect();
+    let explicit_types: Option<Vec<NotificationType>> = {
+        let requested: Vec<NotificationType> = forms::all(pairs, "types")
+            .iter()
+            .filter_map(|raw| parse_type(raw))
+            .collect();
+        if requested.is_empty() && forms::all(pairs, "types").is_empty() {
+            None
+        } else if requested.is_empty() {
+            // `types[]` present but nothing valid: the intersection is empty.
+            Some(Vec::new())
+        } else {
+            Some(requested)
+        }
+    };
+    // Upstream `browserable_params`: `account_id` narrows to one actor;
+    // `include_filtered` also serves filtered rows (the store page excludes
+    // them — honored once the store gains the flag; accepted without effect
+    // until then, see the use-case docs); `supported_types[]` only gates the
+    // `fallback` rendering for non-baseline types, which this server never
+    // emits, so it is accepted and carried on pagination links.
+    let from_account = match forms::get(pairs, "account_id").map(|raw| raw.parse::<Id>()) {
+        Some(Ok(id)) => Some(id),
+        Some(Err(_)) => None,
+        None => None,
+    };
+    let include_filtered = bool_cast(forms::get(pairs, "include_filtered").unwrap_or("false"));
+    // `supported_types[]` gates the `fallback` rendering for non-baseline
+    // types (upstream `NotificationFallbackConcern`); absent = no fallbacks.
+    let supported_types: Option<Vec<NotificationType>> = {
+        let raw = forms::all(pairs, "supported_types");
+        if raw.is_empty() {
+            None
+        } else {
+            Some(raw.iter().filter_map(|v| parse_type(v)).collect())
+        }
+    };
+    Ok(IndexParams {
+        page,
+        excluded,
+        explicit_types,
+        from_account,
+        include_filtered,
+        supported_types,
+    })
+}
+
+fn load_index_notifications(
+    store: &dyn Store,
+    recipient: Id,
+    params: &IndexParams,
+) -> Result<Vec<crate::domain::Notification>, ApiError> {
+    let query = NotificationQuery {
+        max_id: params.page.max_id,
+        since_id: params.page.since_id,
+        min_id: params.page.min_id,
+        limit: params.page.limit,
+        from_account: params.from_account,
+        include_filtered: params.include_filtered,
+    };
+    let fetched = notifications::index(store, recipient, query)?;
+    let mut notifications = fetched;
+    if let Some(types) = &params.explicit_types {
+        notifications.retain(|n| types.contains(&n.r#type));
+    }
+    notifications.retain(|n| !params.excluded.contains(&n.r#type));
+    // `include_filtered=true` serves the filtered rows the store page
+    // excludes (upstream `browserable`), merged newest-first by numeric id.
+    if params.include_filtered {
+        let extra = store.filtered_notifications_page(
+            recipient,
+            params.page.limit,
+            params.page.max_id,
+            params.page.since_id,
+            params.page.min_id,
+        )?;
+        notifications = notifications::merge_filtered_index(notifications, extra, &query);
+    }
+    Ok(notifications)
+}
+
 /// Render a page of notifications for `recipient` (shared by the REST index
 /// and the notification streams, so both show the same payloads).
 /// `supported` is the v1 `supported_types[]` gate for `fallback` rendering
 /// (`None` = absent = no fallbacks; streams always pass `None`, like upstream).
 pub fn render_notifications(
+    ctx: &NotificationCtx<'_>,
     server: &ServerInfo,
-    store: &dyn Store,
-    now_ms: u64,
-    recipient: Id,
     notifications: Vec<crate::domain::Notification>,
     supported: Option<&[NotificationType]>,
 ) -> Result<(Vec<Value>, Option<Id>, Option<Id>), ApiError> {
+    let recipient = ctx.recipient_id;
     let first = notifications.first().map(|n| n.id);
     let last = notifications.last().map(|n| n.id);
 
+    let batch = load_notification_batch(ctx, server, &notifications)?;
+
+    let mut out = Vec::with_capacity(notifications.len());
+    for notification in notifications {
+        let actor = notification.actor_id;
+        let account = match actor.and_then(|actor| batch.accounts.get(&actor)) {
+            Some(account) => account,
+            // Actor-less rows (warnings, severances, annual reports, admin
+            // events) render against the recipient's own account (upstream
+            // `set_from_account`). A row whose actor row is gone is still
+            // skipped (never fabricate an account).
+            None => match actor {
+                None => match batch.accounts.get(&recipient) {
+                    Some(account) => account,
+                    None => continue,
+                },
+                Some(_) => continue,
+            },
+        };
+        let actor_name = if account.display_name.trim().is_empty() {
+            account.username.clone()
+        } else {
+            account.display_name.clone()
+        };
+        let account =
+            dto::account_json_with_stats(server, account, batch.stats.get(&actor.unwrap_or(recipient)));
+        let status = notification
+            .status_id
+            .and_then(|id| batch.status_json.iter().find(|(sid, _)| *sid == id).map(|(_, json)| json.clone()));
+        let mut rendered = dto::notification_json(&notification, account, status);
+        if notifications::needs_fallback(notification.r#type, supported, false) {
+            // activity_present=false: our rows carry no severance-event /
+            // report / collection linkage yet, so those three get no fallback
+            // (never fabricated); moderation_warning + admin.sign_up do.
+            // Revisit when activity linkage lands.
+            rendered["fallback"] = notifications::fallback_for(notification.r#type, &actor_name);
+        }
+        out.push(rendered);
+    }
+    Ok((out, first, last))
+}
+
+struct NotificationBatch {
+    accounts: HashMap<crate::domain::Id, crate::domain::Account>,
+    stats: HashMap<crate::domain::Id, crate::domain::AccountStats>,
+    status_json: Vec<(Id, Value)>,
+}
+
+fn load_notification_batch(
+    ctx: &NotificationCtx<'_>,
+    server: &ServerInfo,
+    notifications: &[crate::domain::Notification],
+) -> Result<NotificationBatch, ApiError> {
+    let store = ctx.store;
+    let now_ms = ctx.now_ms;
+    let recipient = ctx.recipient_id;
     // Batch: actors (+ the recipient itself for actor-less rows, which
     // upstream maps to the recipient's own account), their stats, and the
     // referenced statuses' views.
@@ -246,44 +340,11 @@ pub fn render_notifications(
             (id, json)
         })
         .collect();
-
-    let mut out = Vec::with_capacity(notifications.len());
-    for notification in notifications {
-        let actor = notification.actor_id;
-        let account = match actor.and_then(|actor| accounts.get(&actor)) {
-            Some(account) => account,
-            // Actor-less rows (warnings, severances, annual reports, admin
-            // events) render against the recipient's own account (upstream
-            // `set_from_account`). A row whose actor row is gone is still
-            // skipped (never fabricate an account).
-            None => match actor {
-                None => match accounts.get(&recipient) {
-                    Some(account) => account,
-                    None => continue,
-                },
-                Some(_) => continue,
-            },
-        };
-        let actor_name = if account.display_name.trim().is_empty() {
-            account.username.clone()
-        } else {
-            account.display_name.clone()
-        };
-        let account = dto::account_json_with_stats(server, account, stats.get(&actor.unwrap_or(recipient)));
-        let status = notification
-            .status_id
-            .and_then(|id| status_json.iter().find(|(sid, _)| *sid == id).map(|(_, json)| json.clone()));
-        let mut rendered = dto::notification_json(&notification, account, status);
-        if notifications::needs_fallback(notification.r#type, supported, false) {
-            // activity_present=false: our rows carry no severance-event /
-            // report / collection linkage yet, so those three get no fallback
-            // (never fabricated); moderation_warning + admin.sign_up do.
-            // Revisit when activity linkage lands.
-            rendered["fallback"] = notifications::fallback_for(notification.r#type, &actor_name);
-        }
-        out.push(rendered);
-    }
-    Ok((out, first, last))
+    Ok(NotificationBatch {
+        accounts,
+        stats,
+        status_json,
+    })
 }
 
 /// `GET /api/v1/notifications/{id}`.
@@ -303,13 +364,16 @@ pub async fn show(
         return ApiError::not_found().into_response();
     };
     let store: &dyn Store = &*state.context.store;
+    let ctx = NotificationCtx {
+        store,
+        recipient_id: recipient,
+        now_ms: state.context.now_ms(),
+    };
     match notifications::show(store, recipient, id) {
         Ok(notification) => {
             match render_notifications(
+                &ctx,
                 &state.server,
-                store,
-                state.context.now_ms(),
-                recipient,
                 vec![notification],
                 // `show` carries no query string: no `supported_types[]`.
                 None,

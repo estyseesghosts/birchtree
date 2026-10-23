@@ -83,7 +83,16 @@ pub fn fan_out_from_payload(store: &dyn Store, payload: &Value) -> Result<Option
         // `NotifyService` `FilterCondition`/`DropCondition` policy branches):
         // a filtered notification is stored hidden and filed on the request
         // queue instead of streaming; a dropped one leaves no trace.
-        match evaluate_policy(store, recipient_id, kind, actor_id, status_id, created_at_ms)? {
+        match evaluate_policy(
+            &NotificationCtx {
+                store,
+                recipient_id,
+                now_ms: created_at_ms,
+            },
+            kind,
+            actor_id,
+            status_id,
+        )? {
             FilterVerdict::Accept => {}
             FilterVerdict::Drop => return Ok(None),
             FilterVerdict::Filter => {
@@ -372,19 +381,38 @@ pub fn filterable_type(kind: NotificationType) -> bool {
     )
 }
 
+/// Ambient read context shared by the notification-policy evaluation and the
+/// REST/stream rendering of notification rows.
+///
+/// Bundles only the handles that are constant across a request (or a fan-out
+/// job): the store, the recipient, and the clock reading. Per-notification
+/// inputs (type, actor, status) and per-request wire inputs (`ServerInfo`,
+/// `supported_types[]`) stay explicit parameters at each call site so the
+/// application layer never imports adapter types.
+#[derive(Clone, Copy)]
+pub struct NotificationCtx<'a> {
+    /// Store handle for policy rows, accounts, and statuses.
+    pub store: &'a dyn Store,
+    /// Owner of the notification rows being evaluated or rendered.
+    pub recipient_id: Id,
+    /// Clock reading (`state.context.now_ms()` / job `created_at_ms` basis).
+    pub now_ms: u64,
+}
+
 /// Evaluate the recipient's notification policy for one notification
 /// (upstream `FilterCondition#filter?` / `DropCondition` policy branches).
 ///
 /// `status_id` is needed for the private-mention check; notifications without
 /// an actor never reach here (the caller files those unfiltered).
 pub fn evaluate_policy(
-    store: &dyn Store,
-    recipient_id: Id,
+    ctx: &NotificationCtx<'_>,
     kind: NotificationType,
     actor_id: Id,
     status_id: Option<Id>,
-    now_ms: u64,
 ) -> Result<FilterVerdict> {
+    let store = ctx.store;
+    let recipient_id = ctx.recipient_id;
+    let now_ms = ctx.now_ms;
     if !filterable_type(kind) {
         return Ok(FilterVerdict::Accept);
     }

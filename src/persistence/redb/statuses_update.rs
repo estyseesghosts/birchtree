@@ -13,17 +13,11 @@
 
 use redb::{ReadableTable, WriteTransaction};
 
-use crate::application::ports::{NewPollSpec, StatusUpdate};
-use crate::domain::{
-    Error, Id, Job, JobKind, Poll, PollOption, QuotePolicy, Result, Status, StatusVersion,
-    Visibility,
-};
+use crate::application::ports::StatusUpdate;
+use crate::domain::{Error, Id, Job, JobKind, Poll, Result, Status, StatusVersion};
 
-use super::media::{check_attachable_txn, read_media_txn, write_media_txn};
-use super::schema::{
-    self, HASHTAG_INDEX, POLL_BY_STATUS, POLLS, QUOTES_BY_QUOTED, STATUS_VERSIONS,
-};
-use super::statuses_delete::clear_poll_votes;
+use super::media::check_attachable_txn;
+use super::schema::{self, HASHTAG_INDEX, POLLS, QUOTES_BY_QUOTED, STATUS_VERSIONS};
 use super::statuses_read::{read_status_txn, write_status_txn};
 use super::{RedbStore, StoreResult, decode, encode};
 
@@ -41,30 +35,19 @@ pub(super) struct ScalarDiff {
 /// The poll side of an edit, computed before the change check.
 pub(super) struct PollPlan {
     /// Row to upsert into `POLLS`.
-    poll_write: Option<Poll>,
+    pub(super) poll_write: Option<Poll>,
     /// Freshly minted poll id (needs a `POLL_BY_STATUS` mapping).
-    poll_new_id: Option<Id>,
+    pub(super) poll_new_id: Option<Id>,
     /// Poll whose ballots must be reset first.
-    poll_clear_votes: Option<Id>,
+    pub(super) poll_clear_votes: Option<Id>,
     /// `PollExpired` due time.
-    poll_job_due: Option<u64>,
-    poll_changed: bool,
+    pub(super) poll_job_due: Option<u64>,
+    pub(super) poll_changed: bool,
 }
 
 /// Treat `Some("")` and `None` as the same (empty) spoiler.
 fn norm_spoiler_text(spoiler: &Option<String>) -> Option<&str> {
     spoiler.as_deref().filter(|v| !v.is_empty())
-}
-
-/// Whether an edit poll spec matches the stored poll's options shape.
-fn same_shape_poll(existing: &Poll, spec: &NewPollSpec) -> bool {
-    existing.multiple == spec.multiple
-        && existing.options.len() == spec.options.len()
-        && existing
-            .options
-            .iter()
-            .zip(spec.options.iter())
-            .all(|(option, title)| option.title == *title)
 }
 
 /// Read a poll row inside an open write transaction.
@@ -167,66 +150,25 @@ pub(super) fn plan_poll(
     };
 
     if let Some(spec) = &update.poll {
-        let same_shape = old_poll.as_ref().is_some_and(|p| same_shape_poll(p, spec));
         match old_poll.as_ref() {
             // Same options/multiple: adjust in place, no vote reset.
-            Some(p) if same_shape => {
-                let mut p = p.clone();
-                let mut touched = false;
-                if p.hide_totals != spec.hide_totals {
-                    p.hide_totals = spec.hide_totals;
-                    touched = true;
-                }
-                if p.expires_at_ms != Some(spec.expires_at_ms) {
-                    p.expires_at_ms = Some(spec.expires_at_ms);
-                    touched = true;
-                }
-                if touched {
-                    plan.poll_write = Some(p);
-                    plan.poll_job_due = Some(spec.expires_at_ms);
+            Some(p) if super::statuses_update_stages::same_shape_poll(p, spec) => {
+                if let Some((row, due)) =
+                    super::statuses_update_stages::adjust_poll_in_place(p, spec)
+                {
+                    plan.poll_write = Some(row);
+                    plan.poll_job_due = Some(due);
                     plan.poll_changed = true;
                 }
             }
             // No poll yet, or options/multiple changed: rebuild with all
             // tallies reset (Mastodon resets votes on option edits).
             existing => {
-                let mut p = match existing {
-                    Some(p) => {
-                        plan.poll_clear_votes = Some(p.id);
-                        p.clone()
-                    }
-                    None => {
-                        let pid = store.next_id();
-                        plan.poll_new_id = Some(pid);
-                        Poll {
-                            id: pid,
-                            status_id: status.id,
-                            account_id: status.account_id,
-                            multiple: spec.multiple,
-                            hide_totals: spec.hide_totals,
-                            expires_at_ms: Some(spec.expires_at_ms),
-                            expired: false,
-                            options: Vec::new(),
-                            voters_count: 0,
-                            votes_count: 0,
-                        }
-                    }
-                };
-                p.multiple = spec.multiple;
-                p.hide_totals = spec.hide_totals;
-                p.expires_at_ms = Some(spec.expires_at_ms);
-                p.expired = false;
-                p.options = spec
-                    .options
-                    .iter()
-                    .map(|title| PollOption {
-                        title: title.clone(),
-                        votes_count: 0,
-                    })
-                    .collect();
-                p.voters_count = 0;
-                p.votes_count = 0;
-                plan.poll_write = Some(p);
+                let (row, new_id, clear) =
+                    super::statuses_update_stages::rebuild_poll(store, status, existing, spec);
+                plan.poll_write = Some(row);
+                plan.poll_new_id = new_id;
+                plan.poll_clear_votes = clear;
                 plan.poll_job_due = Some(spec.expires_at_ms);
                 plan.poll_changed = true;
             }
@@ -236,21 +178,14 @@ pub(super) fn plan_poll(
     if let Some(secs) = update.poll_expires_in_ms {
         // Extend the (possibly just-planned) poll without resetting votes;
         // ignored when the status has no poll.
-        let current = plan.poll_write.take().or_else(|| old_poll.clone());
-        if let Some(mut p) = current {
-            let new_expiry = now_ms.saturating_add(secs.saturating_mul(1000));
-            if p.expires_at_ms != Some(new_expiry) {
-                p.expires_at_ms = Some(new_expiry);
-                plan.poll_job_due = Some(new_expiry);
-                plan.poll_changed = true;
-            }
-            plan.poll_write = Some(p);
-        }
+        super::statuses_update_stages::extend_poll_expiry(&mut plan, old_poll.as_ref(), secs, now_ms);
     }
 
     Ok((old_poll, plan))
 }
 
+/// Apply the patch: pre-edit snapshot, media/poll/scalar/tag writes and the
+/// post-edit snapshot.
 /// Apply the patch: pre-edit snapshot, media/poll/scalar/tag writes and the
 /// post-edit snapshot.
 pub(super) fn apply_patch_txn(
@@ -267,174 +202,45 @@ pub(super) fn apply_patch_txn(
 ) -> Result<()> {
     let id = status.id;
 
-    // -- Version snapshot: record the pre-edit state once as version 0.
-    let mut version_count = 0u64;
-    {
-        let table = write.open_table(STATUS_VERSIONS)?;
-        let lo = schema::pair_key(id.value(), 0);
-        let hi = schema::pair_key(id.value(), u64::MAX);
-        for entry in table.range(lo.as_slice()..=hi.as_slice())? {
-            let (_key, _value) = entry?;
-            version_count += 1;
-        }
-    }
-    if version_count == 0 {
-        let pre_edit = StatusVersion {
-            status_id: id,
-            version: 0,
-            account_id,
-            content_html: status.content_html.clone(),
-            source_text: status.source_text.clone(),
-            spoiler_text: status.spoiler_text.clone(),
-            sensitive: status.sensitive,
-            media_ids: status.media_ids.clone(),
-            poll_options: old_poll.map(|p| {
-                p.options
-                    .iter()
-                    .map(|option| option.title.clone())
-                    .collect()
-            }),
-            created_at_ms: status.created_at_ms,
-        };
-        insert_version(write, &pre_edit)?;
-        version_count = 1;
-    }
+    let version_count = super::statuses_update_stages::snapshot_pre_edit_txn(
+        write,
+        status,
+        account_id,
+        old_poll,
+    )?;
 
     // -- Media: detach rows leaving the list, attach rows joining it.
     if media_changed {
         let old_media = status.media_ids.clone();
-        for mid in &old_media {
-            if !new_media.contains(mid)
-                && let Some(mut media) = read_media_txn(write, *mid)?
-            {
-                media.status_id = None;
-                write_media_txn(write, &media)?;
-            }
-        }
-        for mid in new_media {
-            if !old_media.contains(mid) {
-                let Some(mut media) = read_media_txn(write, *mid)? else {
-                    return Err(Error::InvalidInput(format!(
-                        "Media {mid} not found or already attached to another post"
-                    )));
-                };
-                media.status_id = Some(id);
-                write_media_txn(write, &media)?;
-            }
-        }
+        super::statuses_update_stages::reattach_media_txn(write, id, &old_media, new_media)?;
     }
 
     // -- Poll: mapping + ballot reset + row write + expiry job.
-    if let Some(pid) = plan.poll_new_id {
-        let mut by_status = write.open_table(POLL_BY_STATUS)?;
-        by_status.insert(id.value(), pid.value())?;
-    }
-    if let Some(pid) = plan.poll_clear_votes {
-        clear_poll_votes(write, pid)?;
-    }
-    if let Some(poll) = &plan.poll_write {
-        let mut polls = write.open_table(POLLS)?;
-        polls.insert(poll.id.value(), encode(poll)?.as_slice())?;
-    }
-    if let Some(pid) = plan.poll_new_id {
-        status.poll_id = Some(pid);
-    }
-    if let (Some(due), Some(poll)) = (plan.poll_job_due, &plan.poll_write) {
-        let job = Job::new(
-            store.next_id(),
-            JobKind::PollExpired,
-            serde_json::json!({ "poll_id": poll.id.value() }),
-            due,
-            now_ms,
-        );
-        super::jobs::insert_job(write, &job)?;
-    }
+    super::statuses_update_stages::write_poll_side_txn(store, write, status, plan, now_ms)?;
 
     // -- Apply the scalar fields.
-    if let Some(v) = &update.source_text {
-        status.source_text = v.clone();
-    }
-    if let Some(v) = &update.content_html {
-        status.content_html = v.clone();
-    }
-    if update.spoiler_text.is_some() {
-        status.spoiler_text = update
-            .spoiler_text
-            .clone()
-            .flatten()
-            .filter(|s| !s.is_empty());
-    }
-    if let Some(v) = update.sensitive {
-        status.sensitive = v;
-    }
-    if let Some(v) = &update.language {
-        status.language = Some(v.clone());
-    }
-    if media_changed {
-        status.media_ids = new_media.to_vec();
-    }
-    if let Some(place) = update.place_id {
-        status.place_id = place;
-    }
+    super::statuses_update_stages::apply_scalar_fields(status, update, media_changed, new_media);
     // -- Tags: replace the stored list and move the hashtag-index keys
     // in this same transaction (bug 4: edits used to leave both stale).
     if let Some(new_tags) = &update.tags {
-        if *new_tags != status.tags {
-            let mut index = write.open_table(HASHTAG_INDEX)?;
-            for tag in &status.tags {
-                if !new_tags.contains(tag) {
-                    index.remove(schema::hashtag_key(tag, id.value()).as_slice())?;
-                }
-            }
-            for tag in new_tags {
-                if !status.tags.contains(tag) {
-                    index.insert(schema::hashtag_key(tag, id.value()).as_slice(), id.value())?;
-                }
-            }
-            status.tags = new_tags.clone();
-        }
+        super::statuses_update_stages::move_tag_index_txn(write, status, new_tags)?;
     }
-    // `quote_approval_policy` rides along with a real edit but is not a
-    // change by itself (no snapshot, no `edited_at`); the dedicated
-    // `set_quote_policy` endpoint owns standalone policy updates.
-    if let Some(policy) = update.quote_approval_policy {
-        status.quote_policy = match status.visibility {
-            Visibility::Private | Visibility::Direct => QuotePolicy::Nobody,
-            _ => policy,
-        };
-    }
+    super::statuses_update_stages::apply_quote_policy(status, update);
     status.edited_at_ms = Some(now_ms);
 
     // -- Post-edit snapshot: version `count` (0 was just appended when the
     //    history was empty).
-    let edited_poll_options: Option<Vec<String>> = match status.poll_id {
-        Some(pid) => read_poll_txn(write, pid)?.map(|p| {
-            p.options
-                .iter()
-                .map(|option| option.title.clone())
-                .collect()
-        }),
-        None => None,
-    };
-    let snapshot = StatusVersion {
-        status_id: id,
-        version: version_count,
+    super::statuses_update_stages::snapshot_post_edit_txn(
+        write,
+        status,
         account_id,
-        content_html: status.content_html.clone(),
-        source_text: status.source_text.clone(),
-        spoiler_text: status.spoiler_text.clone(),
-        sensitive: status.sensitive,
-        media_ids: status.media_ids.clone(),
-        poll_options: edited_poll_options,
-        created_at_ms: now_ms,
-    };
-    insert_version(write, &snapshot)?;
+        version_count,
+        now_ms,
+    )?;
 
     write_status_txn(write, status)?;
     Ok(())
 }
-
-/// Enqueue the edit's follow-up jobs: federation event, live-reblogger and
 /// accepted-quoter fan-out, and the search-index job.
 pub(super) fn enqueue_edit_jobs_txn(
     store: &RedbStore,

@@ -159,15 +159,17 @@ pub async fn index(State(state): State<ApiState>, auth: OptionalAuth, uri: Uri) 
         state.server.search_mode,
         store,
         Some(crate::search::global()),
-        viewer,
-        &query,
-        kind.as_deref(),
-        offset,
-        limit,
-        following,
-        account_id,
-        max_id,
-        min_id,
+        &crate::application::search_query::SearchQuery::new(
+            viewer,
+            &query,
+            kind.as_deref(),
+            offset,
+            limit,
+            following,
+            account_id,
+            max_id,
+            min_id,
+        ),
     ) {
         Ok(results) => {
             let mut found = results.accounts;

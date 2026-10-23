@@ -114,6 +114,13 @@ fn pack_base(
     source: StatusSourceMode,
     object: &mut Map<String, Value>,
 ) {
+    pack_scalars(view, source, object);
+    pack_reblog(server, viewer, now_ms, view, object);
+    pack_attachments(server, viewer, view, object);
+}
+
+/// Scalar keys plus the `content`/`text` source switch.
+fn pack_scalars(view: &StatusView, source: StatusSourceMode, object: &mut Map<String, Value>) {
     let status = &view.status;
     object.insert("id".into(), json!(status.id.to_string()));
     object.insert("created_at".into(), json!(rfc3339_ms(status.created_at_ms)));
@@ -151,7 +158,16 @@ fn pack_base(
             object.insert("text".into(), json!(status.source_text));
         }
     }
+}
 
+/// Reblog recursion (one nesting level; reblogs of reblogs unwrap at assembly).
+fn pack_reblog(
+    server: &ServerInfo,
+    viewer: Option<Id>,
+    now_ms: u64,
+    view: &StatusView,
+    object: &mut Map<String, Value>,
+) {
     object.insert(
         "reblog".into(),
         view.reblog
@@ -159,6 +175,15 @@ fn pack_base(
             .map(|inner| status_json(server, viewer, now_ms, inner, StatusSourceMode::Content))
             .unwrap_or(Value::Null),
     );
+}
+
+/// Nested application/account/media/mentions/tags/emojis/location/card keys.
+fn pack_attachments(
+    server: &ServerInfo,
+    viewer: Option<Id>,
+    view: &StatusView,
+    object: &mut Map<String, Value>,
+) {
     object.insert(
         "application".into(),
         view.status

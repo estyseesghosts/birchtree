@@ -117,14 +117,15 @@ pub fn record_metadata_first(
     let mut ledger = remote_cache::process_ledger()
         .lock()
         .map_err(|e| CacheError::Store(format!("cache ledger poisoned: {e}")))?;
-    let entry = remote_cache::RemoteCacheEntry::metadata_only(
+    let entry_ctx = remote_cache::CacheEntryCtx {
         source_url,
-        ATTACHMENT_VARIANT,
-        MediaClass::Full,
-        &remote_cache::blob_key_for_media(media_id.value()),
+        variant: ATTACHMENT_VARIANT,
+        class: MediaClass::Full,
+        blob_key: &remote_cache::blob_key_for_media(media_id.value()),
         now_ms,
-        &RemoteCacheConfig::default(),
-    );
+        cfg: &RemoteCacheConfig::default(),
+    };
+    let entry = remote_cache::RemoteCacheEntry::metadata_only(&entry_ctx);
     ledger.record_metadata(entry.clone());
     Ok(entry)
 }
@@ -222,7 +223,6 @@ where
 }
 
 /// Undo a settle: blob, durable row and ledger mapping (all best-effort).
-#[allow(clippy::too_many_arguments)]
 fn rollback_settle<StoreT, BlobsT>(
     store: &StoreT,
     blobs: &BlobsT,
@@ -246,6 +246,8 @@ fn rollback_settle<StoreT, BlobsT>(
 /// blob, durable row and ledger mapping — and frees the reservation through
 /// the guard, so a failed fetch leaves no orphan blob, no row claiming
 /// bytes and no in-flight budget behind.
+// WHY: settle is one atomic commit (ledger + durable row + media row) with a single
+// rollback shape; the 11 params are the row identity and S7 owns any further split.
 #[allow(clippy::too_many_arguments)]
 pub fn settle_staged<StoreT, BlobsT>(
     store: &StoreT,
@@ -284,13 +286,15 @@ where
     // Ledger settlement. On refusal the durable row goes too, not just the
     // blob: a row claiming deleted bytes would never heal.
     let entry = remote_cache::RemoteCacheEntry::stored(
-        source_url,
-        variant,
-        MediaClass::Full,
-        blob_key,
+        &remote_cache::CacheEntryCtx {
+            source_url,
+            variant,
+            class: MediaClass::Full,
+            blob_key,
+            now_ms,
+            cfg,
+        },
         staged,
-        now_ms,
-        cfg,
     );
     let cache_key = entry.cache_key();
     let reserved = reservation.remaining();
@@ -675,26 +679,30 @@ pub fn store_remote_emoji(
     // refusal unwinds blobs, durable rows, and whatever the first commit
     // already recorded.
     let image_entry = remote_cache::RemoteCacheEntry::stored(
-        source_url,
-        remote_cache::EMOJI_VARIANT,
-        MediaClass::AvatarEmoji,
-        &image_key,
+        &remote_cache::CacheEntryCtx {
+            source_url,
+            variant: remote_cache::EMOJI_VARIANT,
+            class: MediaClass::AvatarEmoji,
+            blob_key: &image_key,
+            now_ms,
+            cfg,
+        },
         size,
-        now_ms,
-        cfg,
     );
     if let Err(err) = reservation.commit_entry(size, image_entry) {
         rollback_emoji(cache, blobs, ledger, source_url, &image_key, &static_key);
         return Err(err.to_string());
     }
     let static_entry = remote_cache::RemoteCacheEntry::stored(
-        source_url,
-        remote_cache::EMOJI_STATIC_VARIANT,
-        MediaClass::AvatarEmoji,
-        &static_key,
+        &remote_cache::CacheEntryCtx {
+            source_url,
+            variant: remote_cache::EMOJI_STATIC_VARIANT,
+            class: MediaClass::AvatarEmoji,
+            blob_key: &static_key,
+            now_ms,
+            cfg,
+        },
         size,
-        now_ms,
-        cfg,
     );
     if let Err(err) = reservation.commit_entry(size, static_entry) {
         rollback_emoji(cache, blobs, ledger, source_url, &image_key, &static_key);

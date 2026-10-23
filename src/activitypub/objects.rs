@@ -39,16 +39,23 @@ impl Object for NoteRef {
     async fn into_json(self, data: &Data<FedContext>) -> Result<NoteOrQuestion, FedError> {
         let store = &*data.app.store;
         let now = data.app.now_ms();
+        let ctx = outgoing::OutgoingCtx {
+            store,
+            public_url: &data.public_url,
+            now_ms: now,
+            license_policy: &data.license_policy,
+            place_policy: &data.place_policy,
+        };
         let poll = store.poll_by_status(self.status.id)?;
         match poll {
             Some(poll) => {
-                let value = outgoing::question_for_status(store, &data.public_url, &self.status, &poll, now, &data.license_policy, &data.place_policy)?;
+                let value = outgoing::question_for_status(&ctx, &self.status, &poll)?;
                 serde_json::from_value(value)
                     .map(|q| NoteOrQuestion::Question(Box::new(q)))
                     .map_err(|e| FedError::Refused(format!("question does not serialize: {e}")))
             }
             None => {
-                let value = outgoing::note_for_status(store, &data.public_url, &self.status, now, &data.license_policy, &data.place_policy)?;
+                let value = outgoing::note_for_status(&ctx, &self.status)?;
                 serde_json::from_value(value)
                     .map(|n| NoteOrQuestion::Note(Box::new(n)))
                     .map_err(|e| FedError::Refused(format!("note does not serialize: {e}")))

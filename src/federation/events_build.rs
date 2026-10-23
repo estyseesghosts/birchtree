@@ -15,6 +15,7 @@ use serde_json::Value;
 use crate::activitypub::FedContext;
 use crate::activitypub::actor::ActorRecord;
 use crate::activitypub::outgoing;
+use crate::activitypub::outgoing::OutgoingCtx;
 use crate::application::federation_ports::DeliverySpec;
 use crate::application::ports::Store;
 use crate::domain::{Account, Id, Job, JobKind, Result, Status};
@@ -97,18 +98,19 @@ pub async fn build_create_update_delete(
 ) -> std::result::Result<Option<(Vec<Value>, Vec<String>)>, DeliveryError> {
     use activitypub_federation::traits::Object;
     let retry = |e: crate::domain::Error| DeliveryError::Retry(e.to_string());
+    let ctx = OutgoingCtx {
+        store,
+        public_url: public,
+        now_ms: now,
+        license_policy,
+        place_policy,
+    };
     match event {
         "create" | "update" | "delete" => {
             let status = status_of(store, status_id)?;
             let body = match event {
-                "create" => {
-                    outgoing::create(store, public, &status, now, license_policy, place_policy)
-                        .map_err(retry)?
-                }
-                "update" => {
-                    outgoing::update(store, public, &status, now, license_policy, place_policy)
-                        .map_err(retry)?
-                }
+                "create" => outgoing::create(&ctx, &status).map_err(retry)?,
+                "update" => outgoing::update(&ctx, &status).map_err(retry)?,
                 _ => outgoing::delete(author, &status),
             };
             let inboxes = status_audience(store, author, &status).map_err(retry)?;
@@ -180,6 +182,13 @@ pub fn build_poll_vote(
 ) -> std::result::Result<Option<(Vec<Value>, Vec<String>)>, DeliveryError> {
     let retry = |e: crate::domain::Error| DeliveryError::Retry(e.to_string());
     let quarantine = |msg: String| DeliveryError::Quarantine(msg);
+    let ctx = OutgoingCtx {
+        store,
+        public_url: public,
+        now_ms: now,
+        license_policy,
+        place_policy,
+    };
     let status = status_of(store, status_id)?;
     if event == "question_update" {
         if status.account_id != author.id {
@@ -194,9 +203,7 @@ pub fn build_poll_vote(
         if poll.hide_totals {
             return Ok(None);
         }
-        let body =
-            outgoing::question_update(store, public, &status, now, license_policy, place_policy)
-                .map_err(retry)?;
+        let body = outgoing::question_update(&ctx, &status).map_err(retry)?;
         let inboxes = status_audience(store, author, &status).map_err(retry)?;
         return Ok(Some((vec![body], inboxes)));
     }
@@ -329,6 +336,13 @@ pub fn build_quote(
 ) -> std::result::Result<Option<(Vec<Value>, Vec<String>)>, DeliveryError> {
     let retry = |e: crate::domain::Error| DeliveryError::Retry(e.to_string());
     let quarantine = |msg: String| DeliveryError::Quarantine(msg);
+    let ctx = OutgoingCtx {
+        store,
+        public_url: public,
+        now_ms: now,
+        license_policy,
+        place_policy,
+    };
     if event == "quote_revoke" {
         let quote = quote_of(store, quote_id)?;
         let approval = quote.approval_uri.clone();
@@ -362,17 +376,8 @@ pub fn build_quote(
             uri
         }
     };
-    let request = outgoing::quote_request(
-        store,
-        public,
-        &request_uri,
-        &quoting,
-        &quoted,
-        now,
-        license_policy,
-        place_policy,
-    )
-    .map_err(retry)?;
+    let request =
+        outgoing::quote_request(&ctx, &request_uri, &quoting, &quoted).map_err(retry)?;
     match event {
         "quote_request" => {
             let inboxes = outgoing::inboxes_of(store, &[quote.quoted_account_id]).map_err(retry)?;

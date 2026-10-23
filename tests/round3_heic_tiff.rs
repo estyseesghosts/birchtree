@@ -337,7 +337,6 @@ fn new_stills_route_to_image_to_webp_with_recorded_knobs() {
     let config = TranscodeConfig::default();
     assert_eq!(config.webp_quality, 80);
     let argv = build_argv(
-        "ffmpeg",
         std::path::Path::new("/tmp/in.heic"),
         std::path::Path::new("/tmp/out.webp"),
         TranscodePlan::ImageToWebp,

@@ -83,6 +83,37 @@ pub fn account_json_with_stats(
     stats: Option<&AccountStats>,
 ) -> Value {
     let mut object = Map::new();
+    pack_identity(server, account, &mut object);
+    pack_counts(stats, &mut object);
+    pack_details(account, &mut object);
+    object.insert(
+        "feature_approval".into(),
+        json!({ "automatic": [], "manual": [], "current_user": "missing" }),
+    );
+    if account.local {
+        object.insert("roles".into(), json!([]));
+        object.insert("noindex".into(), json!(false));
+    }
+    if account.suspended {
+        object.insert("suspended".into(), json!(true));
+    }
+    if let Some(moved_to) = account.moved_to {
+        // A full nested account is not available in Phase 2; expose the id-only
+        // moving signal rather than fabricating a nested object.
+        object.insert("moved".into(), json!({ "id": moved_to.to_string() }));
+    }
+    // Core extension CORE-L: `preferredLicense` renders only when the policy
+    // is enabled (`off` omits the key); enabled + `None` renders `null`.
+    if let Some(value) =
+        license_policy::license_wire_value(&server.license_policy, account.default_license)
+    {
+        object.insert("preferredLicense".into(), value);
+    }
+    Value::Object(object)
+}
+
+/// Identity + avatar/header keys.
+fn pack_identity(server: &ServerInfo, account: &Account, object: &mut Map<String, Value>) {
     object.insert("id".into(), json!(account.id.to_string()));
     object.insert("username".into(), json!(account.username));
     object.insert("acct".into(), json!(account.acct()));
@@ -117,6 +148,10 @@ pub fn account_json_with_stats(
         "header_description".into(),
         json!(account.header_description.clone()),
     );
+}
+
+/// Counter keys (structural zero counts when `stats` is `None`).
+fn pack_counts(stats: Option<&AccountStats>, object: &mut Map<String, Value>) {
     object.insert(
         "followers_count".into(),
         json!(stats.map_or(0, |s| s.followers_count)),
@@ -136,6 +171,10 @@ pub fn account_json_with_stats(
             None => Value::Null,
         },
     );
+}
+
+/// Flags, emojis and profile fields.
+fn pack_details(account: &Account, object: &mut Map<String, Value>) {
     object.insert(
         "hide_collections".into(),
         account
@@ -161,30 +200,6 @@ pub fn account_json_with_stats(
                 .collect::<Vec<_>>()
         ),
     );
-    object.insert(
-        "feature_approval".into(),
-        json!({ "automatic": [], "manual": [], "current_user": "missing" }),
-    );
-    if account.local {
-        object.insert("roles".into(), json!([]));
-        object.insert("noindex".into(), json!(false));
-    }
-    if account.suspended {
-        object.insert("suspended".into(), json!(true));
-    }
-    if let Some(moved_to) = account.moved_to {
-        // A full nested account is not available in Phase 2; expose the id-only
-        // moving signal rather than fabricating a nested object.
-        object.insert("moved".into(), json!({ "id": moved_to.to_string() }));
-    }
-    // Core extension CORE-L: `preferredLicense` renders only when the policy
-    // is enabled (`off` omits the key); enabled + `None` renders `null`.
-    if let Some(value) =
-        license_policy::license_wire_value(&server.license_policy, account.default_license)
-    {
-        object.insert("preferredLicense".into(), value);
-    }
-    Value::Object(object)
 }
 
 /// `REST::CredentialAccountSerializer`: the account plus `source` and a single

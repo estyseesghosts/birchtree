@@ -5,11 +5,7 @@
 
 use super::create::PollCommand;
 use super::create_mentions::canonical_tags;
-use super::create_mentions::language_regex;
-use super::create_mentions::render_html;
-use super::create_validate::ERR_LANGUAGE;
-use super::create_validate::ERR_RECORD_INVALID;
-use super::create_validate::build_poll_spec;
+use super::update_stages;
 use crate::application::policy;
 use crate::application::ports::AccountStatusesQuery;
 use crate::application::ports::DeletedStatus;
@@ -18,10 +14,8 @@ use crate::application::ports::StatusUpdate;
 use crate::application::ports::Store;
 use crate::domain::Error;
 use crate::domain::Id;
-use crate::domain::QuotePolicy;
 use crate::domain::Result;
 use crate::domain::Status;
-use crate::domain::Visibility;
 
 /// Input for `PUT /api/v1/statuses/:id`.
 ///
@@ -66,111 +60,17 @@ pub fn update_status(
     }
 
     let mut update = StatusUpdate::default();
-    if let Some(text) = &cmd.text {
-        update.source_text = Some(text.clone());
-        update.content_html = Some(render_html(text));
-    }
-    if let Some(spoiler) = cmd.spoiler_text {
-        // Present-and-blank clears the CW (`Some(None)`, as in Mastodon).
-        update.spoiler_text = Some(if spoiler.trim().is_empty() {
-            None
-        } else {
-            Some(spoiler)
-        });
-    }
-    if let Some(sensitive) = cmd.sensitive {
-        update.sensitive = Some(sensitive);
-    }
-    if let Some(language) = cmd.language {
-        if !language_regex().is_match(&language) {
-            return Err(Error::InvalidInput(ERR_LANGUAGE.into()));
-        }
-        update.language = Some(language);
-    }
-    // Core extension CORE-P: same place gate as creation (`None` leaves
-    // the stored place unchanged; independent of media edits). Replies
-    // and DMs exempt.
-    if let Some(raw_place) = place_id {
-        let resolves = match raw_place {
-            None => false,
-            Some(id) => store.place_by_id(id)?.is_some(),
-        };
-        update.place_id = Some(crate::application::place_policy::check_place_policy(
-            place_policy,
-            status.visibility == Visibility::Direct,
-            status.in_reply_to_id.is_some(),
-            raw_place,
-            resolves,
-        )?);
-    }
-    if let Some(media_ids) = cmd.media_ids {
-        // Core extension CORE-L: same enforced gate as creation, evaluated
-        // against the resulting attachment set. Replies and DMs exempt.
-        if license_policy == "enforced"
-            && status.in_reply_to_id.is_none()
-            && status.visibility != Visibility::Direct
-            && !media_ids.is_empty()
-        {
-            let attached = store.media_by_ids(&media_ids)?;
-            let author = store
-                .account_by_id(cmd.account_id)?
-                .ok_or_else(|| Error::NotFound("account".into()))?;
-            let mut effective = Vec::with_capacity(media_ids.len());
-            for id in &media_ids {
-                if let Some(media) = attached.get(id) {
-                    effective.push(crate::application::license_policy::effective_license(
-                        media.license,
-                        author.default_license,
-                    ));
-                }
-            }
-            if effective.len() == media_ids.len() {
-                crate::application::license_policy::check_status_licenses(
-                    license_policy,
-                    false,
-                    false,
-                    true,
-                    &effective,
-                )?;
-            }
-        }
-        update.media_ids = Some(media_ids);
-    }
-    if let Some(poll) = cmd.poll {
-        update.poll = Some(build_poll_spec(now_ms, poll)?);
-    }
-    if let Some(raw) = cmd.quote_approval_policy {
-        update.quote_approval_policy = Some(
-            QuotePolicy::from_wire(&raw)
-                .ok_or_else(|| Error::InvalidInput(ERR_RECORD_INVALID.into()))?,
-        );
-    }
-    // Core extension CORE-T: same block gate as creation, evaluated
-    // against the resulting attachment set (patched or stored). Replies
-    // are NOT exempt here (the rule covers every write leaving an
-    // undescribed image/video); text-only edits pass.
-    if matches!(alt_text_policy, "nag" | "block") {
-        let resulting: Vec<Id> = match &update.media_ids {
-            Some(ids) => ids.clone(),
-            None => status.media_ids.clone(),
-        };
-        if !resulting.is_empty() {
-            let attached = store.media_by_ids(&resulting)?;
-            let mut pairs = Vec::with_capacity(resulting.len());
-            for id in &resulting {
-                if let Some(media) = attached.get(id) {
-                    pairs.push((media.r#type.clone(), media.description.clone()));
-                }
-            }
-            if pairs.len() == resulting.len() {
-                crate::application::alt_text_policy::check_block(alt_text_policy, &pairs)?;
-            }
-        }
-    }
+    update_stages::apply_text(&cmd.text, &mut update);
+    update_stages::apply_spoiler(cmd.spoiler_text, &mut update);
+    update_stages::apply_language(cmd.language, &mut update)?;
+    update.place_id = update_stages::resolve_place(store, place_policy, &status, place_id)?;
+    update.media_ids =
+        update_stages::resolve_media(store, license_policy, &status, cmd.account_id, cmd.media_ids)?;
+    update_stages::apply_poll(cmd.poll, now_ms, &mut update)?;
+    update_stages::apply_quote_policy(cmd.quote_approval_policy, &mut update)?;
+    update_stages::check_alt_text(store, alt_text_policy, &status, &update)?;
     // Tags are re-derived on every edit (steady-state write path): the
-    // effective text is the edited text, or the stored text when the edit
-    // leaves it alone. The store replaces the tag list and moves the
-    // hashtag-index keys in the same transaction.
+    // effective text is the edited text, or the stored text when unchanged.
     let effective_text = cmd
         .text
         .clone()

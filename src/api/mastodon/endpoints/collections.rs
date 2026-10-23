@@ -274,6 +274,40 @@ pub fn collections_destroy(
 const ITEMS_DEFAULT_LIMIT: usize = 20;
 const ITEMS_MAX_LIMIT: usize = 40;
 
+/// Ambient handles shared by the collection-items endpoints.
+///
+/// `store` and `collections` are usually the same `Arc<dyn Store>` handle
+/// passed twice (the G-C port joins `Store` at the parent merge); `server`
+/// is carried for rendering even though `items_add` ignores it, so both
+/// axum adapters construct the context identically. Per-request wire values
+/// (`auth`, `raw`, `query`/`body`) stay explicit parameters.
+pub struct CollectionCtx<'a> {
+    /// Broad store handle (accounts, statuses, notifications).
+    pub store: &'a dyn Store,
+    /// Narrow collections-table handle.
+    pub collections: &'a dyn CollectionStore,
+    /// Server info for status rendering.
+    pub server: &'a ServerInfo,
+    /// Clock reading, bound once per request in the adapter.
+    pub now_ms: u64,
+}
+
+/// Cursor window for [`scan_notifications`]: the v2 grouping scan over one
+/// recipient's rows. Bundles the five scan inputs that are not the store so
+/// the private helper takes two parameters.
+pub struct CollectionScan {
+    /// Owner of the scanned notification rows.
+    pub recipient: Id,
+    /// Exclusive upper cursor over numeric notification ids.
+    pub max_id: Option<Id>,
+    /// Exclusive lower cursor (newer side).
+    pub since_id: Option<Id>,
+    /// Exclusive lower cursor (older side).
+    pub min_id: Option<Id>,
+    /// Row-scan bound (`V2_SCAN_ROWS` at both call sites).
+    pub cap: usize,
+}
+
 /// `GET /api/v1/collections/:id/items` — member statuses, newest first.
 ///
 /// Privacy: the collection itself must be visible (see `show`); when the
@@ -281,15 +315,11 @@ const ITEMS_MAX_LIMIT: usize = 40;
 /// members hide (`200 []`, counts stay on the collection row — D30/D52).
 /// Each candidate status additionally passes the `show_status` policy gate
 /// for the viewer, so private statuses in a public collection never leak.
-#[allow(clippy::too_many_arguments)]
 pub fn items_index(
-    store: &dyn Store,
-    collections: &dyn CollectionStore,
-    server: &ServerInfo,
+    ctx: &CollectionCtx<'_>,
     auth: &OptionalAuth,
     raw: &str,
     query: Option<&str>,
-    now_ms: u64,
 ) -> Response {
     let viewer = match optional_viewer(auth, READ_SCOPES) {
         Ok(viewer) => viewer,
@@ -311,12 +341,12 @@ pub fn items_index(
         Ok(page) => page,
         Err(err) => return err.into_response(),
     };
-    let record = match collections::show(collections, viewer, id) {
+    let record = match collections::show(ctx.collections, viewer, id) {
         Ok(record) => record,
         Err(err) => return ApiError::from(err).into_response(),
     };
     // `hide_collections`: members hidden for flagged owners (counts stay).
-    let hide = match store.account_by_id(record.account_id) {
+    let hide = match ctx.store.account_by_id(record.account_id) {
         Ok(Some(owner)) => !collections::members_visible(owner.hide_collections, viewer, owner.id),
         // A missing owner row reads like "never set" (fail-open, matching
         // the approval fail-open in `auth.rs`).
@@ -325,23 +355,23 @@ pub fn items_index(
     if hide {
         return axum::Json(Vec::<Value>::new()).into_response();
     }
-    let ids = match collections::items(collections, viewer, id, page.max_id, page.limit) {
+    let ids = match collections::items(ctx.collections, viewer, id, page.max_id, page.limit) {
         Ok(ids) => ids,
         Err(err) => return ApiError::from(err).into_response(),
     };
     // Batch-resolve + per-viewer policy gate (one `show_status` per
     // candidate, bounded by the page limit).
-    let statuses = match store.statuses_by_ids(&ids) {
+    let statuses = match ctx.store.statuses_by_ids(&ids) {
         Ok(statuses) => statuses,
         Err(err) => return ApiError::from(err).into_response(),
     };
     let mut visible = Vec::new();
     for status in statuses {
-        if crate::application::statuses::show_status(store, viewer, status.id, now_ms).is_ok() {
+        if crate::application::statuses::show_status(ctx.store, viewer, status.id, ctx.now_ms).is_ok() {
             visible.push(status);
         }
     }
-    let views = match load_status_views(server, store, viewer, visible, now_ms) {
+    let views = match load_status_views(ctx.server, ctx.store, viewer, visible, ctx.now_ms) {
         Ok(views) => views,
         Err(err) => return ApiError::from(err).into_response(),
     };
@@ -349,9 +379,9 @@ pub fn items_index(
         .iter()
         .map(|view| {
             dto::status_json(
-                server,
+                ctx.server,
                 viewer,
-                now_ms,
+                ctx.now_ms,
                 view,
                 dto::StatusSourceMode::Content,
             )
@@ -379,12 +409,10 @@ fn body_response(query: Option<&str>, body: Vec<Value>, kept: Vec<Id>) -> Respon
 
 /// `POST /api/v1/collections/:id/items` — add `status_ids[]` (`200 {added:[...]}`).
 pub fn items_add(
-    store: &dyn Store,
-    collections: &dyn CollectionStore,
+    ctx: &CollectionCtx<'_>,
     auth: &Auth,
     raw: &str,
     body: &[(String, String)],
-    now_ms: u64,
 ) -> Response {
     let viewer = match authed(auth, WRITE_SCOPES) {
         Ok(viewer) => viewer,
@@ -394,7 +422,7 @@ pub fn items_add(
         Ok(id) => id,
         Err(response) => return response,
     };
-    match collections::add_items(store, collections, viewer, id, &status_ids(body), now_ms) {
+    match collections::add_items(ctx.store, ctx.collections, viewer, id, &status_ids(body), ctx.now_ms) {
         Ok(added) => axum::Json(
             serde_json::json!({ "added": added.iter().map(|id| id.to_string()).collect::<Vec<_>>() }),
         )
@@ -658,26 +686,22 @@ fn parse_group_key(raw: &str) -> Option<(NotificationType, u64)> {
 /// Newest-first row scan for one recipient, bounded by `V2_SCAN_ROWS`.
 fn scan_notifications(
     store: &dyn Store,
-    recipient: Id,
-    max_id: Option<Id>,
-    since_id: Option<Id>,
-    min_id: Option<Id>,
-    cap: usize,
+    scan: CollectionScan,
 ) -> Result<Vec<Notification>, ApiError> {
     let mut out = Vec::new();
-    let mut cursor = max_id;
+    let mut cursor = scan.max_id;
     loop {
-        let remaining = cap.saturating_sub(out.len()).min(V2_SCAN_PAGE);
+        let remaining = scan.cap.saturating_sub(out.len()).min(V2_SCAN_PAGE);
         if remaining == 0 {
             break;
         }
         let page = notifications::index(
             store,
-            recipient,
+            scan.recipient,
             NotificationQuery {
                 max_id: cursor,
-                since_id,
-                min_id,
+                since_id: scan.since_id,
+                min_id: scan.min_id,
                 limit: remaining,
                 from_account: None,
                 include_filtered: false,
@@ -689,7 +713,7 @@ fn scan_notifications(
         cursor = page.last().map(|n| n.id);
         let full = page.len() >= remaining;
         out.extend(page);
-        if out.len() >= cap || !full {
+        if out.len() >= scan.cap || !full {
             break;
         }
     }
@@ -764,7 +788,16 @@ pub fn v2_index(store: &dyn Store, auth: &Auth, query: Option<&str>) -> Response
         Ok(page) => page,
         Err(err) => return err.into_response(),
     };
-    let rows = match scan_notifications(store, recipient, page.max_id, page.since_id, page.min_id, V2_SCAN_ROWS) {
+    let rows = match scan_notifications(
+        store,
+        CollectionScan {
+            recipient,
+            max_id: page.max_id,
+            since_id: page.since_id,
+            min_id: page.min_id,
+            cap: V2_SCAN_ROWS,
+        },
+    ) {
         Ok(rows) => rows,
         Err(err) => return err.into_response(),
     };
@@ -823,8 +856,17 @@ pub fn v2_unread_count(store: &dyn Store, auth: &Auth, query: Option<&str>) -> R
 /// success that hides a typo'd key).
 fn group_lookup(store: &dyn Store, recipient: Id, raw: &str) -> Result<Vec<Notification>, Response> {
     let (kind, _anchor) = parse_group_key(raw).ok_or_else(|| ApiError::not_found().into_response())?;
-    let rows = scan_notifications(store, recipient, None, None, None, V2_SCAN_ROWS)
-        .map_err(|err| err.into_response())?;
+    let rows = scan_notifications(
+        store,
+        CollectionScan {
+            recipient,
+            max_id: None,
+            since_id: None,
+            min_id: None,
+            cap: V2_SCAN_ROWS,
+        },
+    )
+    .map_err(|err| err.into_response())?;
     let matching: Vec<Notification> = rows
         .into_iter()
         .filter(|n| n.r#type == kind && group_key(n) == raw)
@@ -993,15 +1035,13 @@ pub async fn route_items_index(
     RawQuery(query): RawQuery,
 ) -> Response {
     let (store, collections) = collection_handles(&state);
-    items_index(
+    let ctx = CollectionCtx {
         store,
         collections,
-        &state.server,
-        &auth,
-        &raw,
-        query.as_deref(),
-        state.context.now_ms(),
-    )
+        server: &state.server,
+        now_ms: state.context.now_ms(),
+    };
+    items_index(&ctx, &auth, &raw, query.as_deref())
 }
 
 pub async fn route_items_add(
@@ -1011,7 +1051,13 @@ pub async fn route_items_add(
     FormBody(pairs): FormBody,
 ) -> Response {
     let (store, collections) = collection_handles(&state);
-    items_add(store, collections, &auth, &raw, &pairs, state.context.now_ms())
+    let ctx = CollectionCtx {
+        store,
+        collections,
+        server: &state.server,
+        now_ms: state.context.now_ms(),
+    };
+    items_add(&ctx, &auth, &raw, &pairs)
 }
 
 pub async fn route_items_remove(

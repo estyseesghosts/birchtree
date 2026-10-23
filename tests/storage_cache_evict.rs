@@ -30,7 +30,7 @@ use birchtree::media::cache_maintenance::{
     CacheMaintenance, MAINTENANCE_BATCH, evict_pressure_durable_first,
 };
 use birchtree::media::remote_cache::{
-    self, CacheError, CacheLedger, MediaClass, PER_FILE_CEILING_BYTES, RemoteCacheEntry,
+    self, CacheEntryCtx, CacheError, CacheLedger, MediaClass, PER_FILE_CEILING_BYTES, RemoteCacheEntry,
 };
 use birchtree::persistence::redb::RedbStore;
 
@@ -64,7 +64,17 @@ fn stored_full(
     now: u64,
     cfg: &RemoteCacheConfig,
 ) -> RemoteCacheEntry {
-    RemoteCacheEntry::stored(source, "original", MediaClass::Full, blob, size, now, cfg)
+    RemoteCacheEntry::stored(
+        &CacheEntryCtx {
+            source_url: source,
+            variant: "original",
+            class: MediaClass::Full,
+            blob_key: blob,
+            now_ms: now,
+            cfg,
+        },
+        size,
+    )
 }
 
 /// Concurrent reservations never exceed the cap: every thread checks the
@@ -190,13 +200,15 @@ fn avatar_reserve_survives_image_pressure() {
             MediaClass::AvatarEmoji,
             256 * 1024,
             RemoteCacheEntry::stored(
-                "https://cdn.example/avatar.png",
-                "avatar",
-                MediaClass::AvatarEmoji,
-                "remote/9",
+                &CacheEntryCtx {
+                    source_url: "https://cdn.example/avatar.png",
+                    variant: "avatar",
+                    class: MediaClass::AvatarEmoji,
+                    blob_key: "remote/9",
+                    now_ms: T0,
+                    cfg: &cfg,
+                },
                 256 * 1024,
-                T0,
-                &cfg,
             ),
         )
         .unwrap();
@@ -258,13 +270,15 @@ fn local_uploads_survive_aggressive_eviction() {
 
     // Durable keys are refused by the ledger outright.
     let bad = RemoteCacheEntry::stored(
-        "https://cdn.example/evil.png",
-        "original",
-        MediaClass::Full,
-        durable_key,
+        &CacheEntryCtx {
+            source_url: "https://cdn.example/evil.png",
+            variant: "original",
+            class: MediaClass::Full,
+            blob_key: durable_key,
+            now_ms: T0,
+            cfg: &cfg,
+        },
         12,
-        T0,
-        &cfg,
     );
     assert!(matches!(
         ledger.commit(MediaClass::Full, 0, bad),
@@ -352,13 +366,15 @@ fn admission_eviction_keeps_redb_and_disk_in_agreement() {
                     MediaClass::Full,
                     4096,
                     RemoteCacheEntry::stored(
-                        &source,
-                        "original",
-                        MediaClass::Full,
-                        &blob_key,
+                        &CacheEntryCtx {
+                            source_url: &source,
+                            variant: "original",
+                            class: MediaClass::Full,
+                            blob_key: &blob_key,
+                            now_ms: T0,
+                            cfg: &cfg,
+                        },
                         4096,
-                        T0,
-                        &cfg,
                     ),
                 )
                 .unwrap();

@@ -4,8 +4,16 @@ license = "AGPL-3.0"
 version = "0.1.0"
 edition = "2024"
 
+# Disk budget: full debuginfo and the incremental cache dominate target/.
+# Line tables keep panic locations; incremental=false drops target/debug/incremental.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
 [profile.test]
 opt-level = 1
+debug = "line-tables-only"
+incremental = false
 
 [dependencies]
 redb = "4.4.0"

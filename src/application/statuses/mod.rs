@@ -9,9 +9,11 @@
 
 pub mod create;
 pub mod create_mentions;
+pub mod create_stages;
 pub mod create_validate;
 pub mod threads;
 pub mod update;
+pub mod update_stages;
 
 pub use self::create::CreateStatusCommand;
 pub use self::create::CreateStatusResult;

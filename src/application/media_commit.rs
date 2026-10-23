@@ -86,6 +86,8 @@ pub fn stage_bytes<'blobs>(
 /// `create_media_upload` call carrying the staged keys, then the guard commit.
 /// A failed row commit propagates with the guard still uncommitted, so every
 /// staged key is rolled back exactly as inline.
+// WHY: mirrors create_media_upload field-for-field in one transaction;
+// UploadInput owns the upload path, this row-commit keeps the column order.
 #[allow(clippy::too_many_arguments)]
 pub fn commit_row(
     store: &dyn Store,

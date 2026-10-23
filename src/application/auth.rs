@@ -150,6 +150,8 @@ pub fn issue_client_credentials_token(
 
 /// Issue a one-time authorization code bound to the user, app, redirect URI,
 /// granted scopes and PKCE challenge.
+// WHY: OAuth authorization-code grant fields (RFC 6749 Section 4.1.2 + PKCE);
+// one struct would hide the wire mapping.
 #[allow(clippy::too_many_arguments)]
 pub fn create_authorization_code(
     store: &dyn OAuthStore,

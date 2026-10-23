@@ -21,7 +21,9 @@ use crate::application::ports::{BlobStore, CacheStore, MediaStore};
 use crate::domain::{Error, Id, Result};
 use crate::media::blob_store::FsBlobStore;
 use crate::media::reconciler::ReconStore;
-use crate::media::remote_cache::{self, CacheUsage, MediaClass, RemoteCacheEntry};
+use crate::media::remote_cache::{
+    self, CacheEntryCtx, CacheUsage, MediaClass, RemoteCacheEntry,
+};
 
 use super::RedbStore;
 use super::schema::{self, CACHE_ACCOUNTING, REMOTE_CACHE};
@@ -87,6 +89,8 @@ impl CacheStore for RedbStore {
         Ok(())
     }
 
+    // WHY single-txn: one begin_write owns the byte-row accounting + ledger commit atomically
+    // (architecture rule); splitting would move work across the commit boundary.
     fn cache_mark_stored(
         &self,
         source_url: &str,
@@ -133,7 +137,15 @@ impl CacheStore for RedbStore {
                 let old_size = if row.has_bytes { row.size } else { 0 };
                 let old_class = row.class;
                 let mut entry = RemoteCacheEntry::stored(
-                    source_url, variant, class, blob_key, size, now_ms, cfg,
+                    &CacheEntryCtx {
+                        source_url,
+                        variant,
+                        class,
+                        blob_key,
+                        now_ms,
+                        cfg,
+                    },
+                    size,
                 );
                 entry.etag = etag;
                 // Preserve the sharing count on same-key rewrites (resize
@@ -176,8 +188,17 @@ impl CacheStore for RedbStore {
                 write.commit()?;
                 return Ok(());
             }
-            let mut entry =
-                RemoteCacheEntry::stored(source_url, variant, class, blob_key, size, now_ms, cfg);
+            let mut entry = RemoteCacheEntry::stored(
+                &CacheEntryCtx {
+                    source_url,
+                    variant,
+                    class,
+                    blob_key,
+                    now_ms,
+                    cfg,
+                },
+                size,
+            );
             entry.etag = etag;
             cache.insert(key.as_slice(), super::encode(&entry)?.as_slice())?;
             // Counters move with the mapping, saturating both ways.
@@ -273,6 +294,8 @@ impl CacheStore for RedbStore {
         })
     }
 
+    // WHY single-txn: one begin_write owns the victim unmapping (rows + counters) atomically
+    // (architecture rule); blobs delete only after the mapping commits.
     fn cache_evict_batch(
         &self,
         need: MediaClass,
