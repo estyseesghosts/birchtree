@@ -15,15 +15,17 @@ use std::collections::{HashMap, HashSet};
 
 use crate::api::mastodon::errors::ApiError;
 use crate::api::mastodon::{ServerInfo, dto};
+
+use super::status_view_batch::StatusViewBatch;
 use crate::application::ports::{PairState, StatusViewFlags, Store};
 use crate::domain::{
-    Account, AccountStats, CustomEmoji, Id, MediaAttachment, Poll, QuoteRecord, Status,
+    Account, AccountStats, Id, MediaAttachment, Poll, QuoteRecord, Status,
 };
 
 /// Prefetch rounds over the discovered reblog/quote closure. Each round is a
 /// bounded set of batched lookups; chains deeper than this fall back to point
 /// lookups (never to missing data).
-const MAX_PREFETCH_ROUNDS: usize = 8;
+pub(crate) const MAX_PREFETCH_ROUNDS: usize = 8;
 
 /// Load a single assembled status view.
 pub fn load_status_view(
@@ -90,31 +92,11 @@ pub struct StatusViewContext<'a> {
     store: &'a dyn Store,
     viewer: Option<Id>,
     now_ms: u64,
-    /// Every status known to this page (rows, reblog targets, quoted
-    /// statuses), by id.
-    statuses: HashMap<Id, Status>,
-    accounts: HashMap<Id, Account>,
-    stats: HashMap<Id, AccountStats>,
-    /// Quote records keyed by quoting status id.
-    quotes: HashMap<Id, QuoteRecord>,
+    /// Every record kind the assembly reads, loaded once per page (see
+    /// [`StatusViewBatch`]).
+    batch: StatusViewBatch,
     /// Statuses whose quote lookup already ran (so a round never repeats it).
     quote_probed: HashSet<Id>,
-    media: HashMap<Id, MediaAttachment>,
-    /// Stored remote origin URLs by media id (page-batched; absent =
-    /// local media). Rendered as `remote_url`/`preview_remote_url`.
-    remote_sources: HashMap<Id, String>,
-    polls: HashMap<Id, Poll>,
-    ballots: HashMap<Id, Vec<u64>>,
-    /// Core extension CORE-P: places by id, batch-loaded per page.
-    places: HashMap<Id, crate::domain::Place>,
-    /// Viewer flags keyed by row-exact status id.
-    flags: HashMap<Id, StatusViewFlags>,
-    /// Conversation-mute flags keyed by row-exact status id (Phase 7).
-    muted_by_status: HashMap<Id, bool>,
-    /// `(incoming, outgoing)` pair states keyed by the other account id.
-    pairs: HashMap<Id, (PairState, PairState)>,
-    /// Custom emoji referenced by the page's statuses, by shortcode.
-    emoji_entities: HashMap<String, CustomEmoji>,
 }
 
 impl<'a> StatusViewContext<'a> {
@@ -129,195 +111,15 @@ impl<'a> StatusViewContext<'a> {
             store,
             viewer,
             now_ms,
-            statuses: HashMap::new(),
-            accounts: HashMap::new(),
-            stats: HashMap::new(),
-            quotes: HashMap::new(),
+            batch: StatusViewBatch::empty(),
             quote_probed: HashSet::new(),
-            media: HashMap::new(),
-            remote_sources: HashMap::new(),
-            polls: HashMap::new(),
-            ballots: HashMap::new(),
-            places: HashMap::new(),
-            flags: HashMap::new(),
-            muted_by_status: HashMap::new(),
-            pairs: HashMap::new(),
-            emoji_entities: HashMap::new(),
         }
     }
 
     /// Discover the reblog/quote closure of `roots`, then batch-load every
-    /// record kind the assembly reads.
+    /// record kind the assembly reads (one batched snapshot for the page).
     pub fn prefetch(&mut self, roots: &[Status]) -> Result<(), ApiError> {
-        for status in roots {
-            self.statuses.insert(status.id, status.clone());
-        }
-
-        // Rounds: reblog targets and quoted statuses pull in more statuses;
-        // each round adds at least one batched lookup and stops at fixpoint.
-        for _ in 0..MAX_PREFETCH_ROUNDS {
-            let mut changed = false;
-
-            let missing_targets: Vec<Id> = self
-                .statuses
-                .values()
-                .filter_map(|status| status.reblog_of_id)
-                .filter(|id| !self.statuses.contains_key(id))
-                .collect();
-            if !missing_targets.is_empty() {
-                changed = true;
-                let targets = self.store.statuses_by_ids(&missing_targets)?;
-                for target in targets {
-                    self.statuses.insert(target.id, target);
-                }
-            }
-
-            let unprobed: Vec<Id> = self
-                .statuses
-                .keys()
-                .copied()
-                .filter(|id| !self.quote_probed.contains(id))
-                .collect();
-            if !unprobed.is_empty() {
-                changed = true;
-                let quotes = self.store.quotes_by_quoting_ids(&unprobed)?;
-                for id in &unprobed {
-                    self.quote_probed.insert(*id);
-                }
-                for (id, quote) in quotes {
-                    self.quotes.insert(id, quote);
-                }
-            }
-
-            let missing_quoted: Vec<Id> = self
-                .quotes
-                .values()
-                .map(|quote| quote.quoted_status_id)
-                .filter(|id| !self.statuses.contains_key(id))
-                .collect();
-            if !missing_quoted.is_empty() {
-                changed = true;
-                let quoted = self.store.statuses_by_ids(&missing_quoted)?;
-                for status in quoted {
-                    self.statuses.insert(status.id, status);
-                }
-            }
-
-            if !changed {
-                break;
-            }
-        }
-
-        // Authors, mentioned accounts and quoted authors, batched once.
-        let mut account_ids: Vec<Id> = Vec::new();
-        for status in self.statuses.values() {
-            account_ids.push(status.account_id);
-            account_ids.extend(status.mentions.iter().copied());
-        }
-        account_ids.sort_unstable();
-        account_ids.dedup();
-        self.accounts.extend(self.store.accounts_by_ids(&account_ids)?);
-
-        let authors: Vec<Id> = {
-            let mut authors: Vec<Id> = self.statuses.values().map(|s| s.account_id).collect();
-            authors.sort_unstable();
-            authors.dedup();
-            authors
-        };
-        self.stats.extend(self.store.account_stats_by_ids(&authors)?);
-
-        // Attachments and polls, batched.
-        let mut media_ids: Vec<Id> = Vec::new();
-        let mut poll_ids: Vec<Id> = Vec::new();
-        for status in self.statuses.values() {
-            media_ids.extend(status.media_ids.iter().copied());
-            if let Some(poll_id) = status.poll_id {
-                poll_ids.push(poll_id);
-            }
-        }
-        media_ids.sort_unstable();
-        media_ids.dedup();
-        poll_ids.sort_unstable();
-        poll_ids.dedup();
-        self.media.extend(self.store.media_by_ids(&media_ids)?);
-        // Remote origin URLs for the page's attachments, in one batched
-        // lookup (D1; missing ids are local media). Empty strings never
-        // count as a source (ingest stores the attachment URL verbatim).
-        if !media_ids.is_empty() {
-            for (id, source) in self.store.remote_media_sources_by_ids(&media_ids)? {
-                if !source.is_empty() {
-                    self.remote_sources.insert(id, source);
-                }
-            }
-        }
-        self.polls.extend(self.store.polls_by_ids(&poll_ids)?);
-        // Core extension CORE-P: places attached to the page's statuses,
-        // batched once (missing rows read as no place at pack time).
-        let mut place_ids: Vec<Id> = self
-            .statuses
-            .values()
-            .filter_map(|status| status.place_id)
-            .collect();
-        place_ids.sort_unstable();
-        place_ids.dedup();
-        if !place_ids.is_empty() {
-            self.places.extend(self.store.places_by_ids(&place_ids)?);
-        }
-        if let Some(viewer) = self.viewer {
-            self.ballots.extend(self.store.ballots(&poll_ids, viewer)?);
-            // Conversation mutes for the whole page in ONE batched call.
-            let page_statuses: Vec<Status> =
-                self.statuses.values().cloned().collect();
-            self.muted_by_status.extend(
-                crate::application::conversations::muted_map_for_statuses(
-                    self.store,
-                    viewer,
-                    &page_statuses,
-                )?,
-            );
-        }
-
-        // Viewer flags for every row and every proper target in ONE call.
-        if let Some(viewer) = self.viewer {
-            let mut flag_ids: Vec<Id> = Vec::new();
-            for status in self.statuses.values() {
-                flag_ids.push(status.id);
-                flag_ids.push(status.reblog_of_id.unwrap_or(status.id));
-            }
-            flag_ids.sort_unstable();
-            flag_ids.dedup();
-            self.flags.extend(self.store.viewer_status_flags(viewer, &flag_ids)?);
-        }
-
-        // Pair states (both directions) for every account on the page.
-        if let Some(viewer) = self.viewer {
-            let others: Vec<Id> = self.accounts.keys().copied().collect();
-            self.pairs = self.store.batch_pair_states(viewer, &others, self.now_ms)?;
-        }
-
-        // Custom emoji referenced by the page's text, in ONE lookup.
-        let shortcodes: Vec<String> = {
-            let mut shortcodes: Vec<String> = Vec::new();
-            for status in self.statuses.values() {
-                shortcodes.extend(crate::application::statuses::extract_emoji_shortcodes(
-                    &status.source_text,
-                ));
-                if let Some(spoiler) = &status.spoiler_text {
-                    shortcodes.extend(crate::application::statuses::extract_emoji_shortcodes(
-                        spoiler,
-                    ));
-                }
-            }
-            shortcodes.sort();
-            shortcodes.dedup();
-            shortcodes
-        };
-        if !shortcodes.is_empty() {
-            for emoji in self.store.emojis_by_shortcodes(&shortcodes)? {
-                self.emoji_entities.insert(emoji.shortcode.clone(), emoji);
-            }
-        }
-
+        self.batch = StatusViewBatch::load_for_statuses(self.store, self.viewer, roots, self.now_ms)?;
         Ok(())
     }
 
@@ -382,14 +184,14 @@ impl<'a> StatusViewContext<'a> {
         shortcodes.dedup();
         let mut emojis: Vec<serde_json::Value> = shortcodes
             .iter()
-            .filter_map(|shortcode| self.emoji_entities.get(shortcode))
+            .filter_map(|shortcode| self.batch.emoji_entities.get(shortcode))
             .map(|emoji| dto::custom_emoji_json(self.server, emoji, false))
             .collect();
         // Remote emoji (federation tail, G-D): shortcodes with no local row
         // render from the remote table (never picker-visible, never listed).
         let missing: Vec<String> = shortcodes
             .iter()
-            .filter(|shortcode| !self.emoji_entities.contains_key(*shortcode))
+            .filter(|shortcode| !self.batch.emoji_entities.contains_key(*shortcode))
             .cloned()
             .collect();
         if !missing.is_empty() {
@@ -407,7 +209,7 @@ impl<'a> StatusViewContext<'a> {
 
         // Core extension CORE-P: the attached place (batched above;
         // dangling ids read as no place).
-        let place = status.place_id.and_then(|id| self.places.get(&id).cloned());
+        let place = status.place_id.and_then(|id| self.batch.places.get(&id).cloned());
         // Remote origin URLs for this status's attachments (batch-loaded
         // above; point lookup only for chains beyond the prefetch rounds).
         let mut remote_media_sources = HashMap::with_capacity(media.len());
@@ -443,49 +245,49 @@ impl<'a> StatusViewContext<'a> {
     }
 
     fn account_opt(&mut self, id: Id) -> Result<Option<Account>, ApiError> {
-        if let Some(account) = self.accounts.get(&id) {
+        if let Some(account) = self.batch.accounts.get(&id) {
             return Ok(Some(account.clone()));
         }
         let fetched = self.store.accounts_by_ids(&[id])?;
         let account = fetched.get(&id).cloned();
         if let Some(account) = &account {
-            self.accounts.insert(id, account.clone());
+            self.batch.accounts.insert(id, account.clone());
         }
         Ok(account)
     }
 
     fn stats(&mut self, id: Id) -> Result<AccountStats, ApiError> {
-        if let Some(stats) = self.stats.get(&id) {
+        if let Some(stats) = self.batch.stats.get(&id) {
             return Ok(*stats);
         }
         let fetched = self
             .store
             .account_stats_by_ids(std::slice::from_ref(&id))?;
         let stats = fetched.get(&id).copied().unwrap_or_default();
-        self.stats.insert(id, stats);
+        self.batch.stats.insert(id, stats);
         Ok(stats)
     }
 
     fn status_row(&mut self, id: Id) -> Result<Option<Status>, ApiError> {
-        if let Some(status) = self.statuses.get(&id) {
+        if let Some(status) = self.batch.statuses.get(&id) {
             return Ok(Some(status.clone()));
         }
         let fetched = self.store.statuses_by_ids(std::slice::from_ref(&id))?;
         let status = fetched.into_iter().next();
         if let Some(status) = &status {
-            self.statuses.insert(id, status.clone());
+            self.batch.statuses.insert(id, status.clone());
         }
         Ok(status)
     }
 
     fn media(&mut self, id: Id) -> Result<Option<MediaAttachment>, ApiError> {
-        if let Some(media) = self.media.get(&id) {
+        if let Some(media) = self.batch.media.get(&id) {
             return Ok(Some(media.clone()));
         }
         let fetched = self.store.media_by_ids(std::slice::from_ref(&id))?;
         let media = fetched.get(&id).cloned();
         if let Some(media) = &media {
-            self.media.insert(id, media.clone());
+            self.batch.media.insert(id, media.clone());
         }
         Ok(media)
     }
@@ -494,13 +296,13 @@ impl<'a> StatusViewContext<'a> {
     /// never count). Served from the page-batched cache; the point lookup
     /// is only reachable for chains beyond the prefetch rounds.
     fn remote_source(&mut self, id: Id) -> Result<Option<String>, ApiError> {
-        if let Some(source) = self.remote_sources.get(&id) {
+        if let Some(source) = self.batch.remote_sources.get(&id) {
             return Ok(Some(source.clone()));
         }
         let fetched = self.store.remote_media_source(id)?;
         match fetched.filter(|source| !source.is_empty()) {
             Some(source) => {
-                self.remote_sources.insert(id, source.clone());
+                self.batch.remote_sources.insert(id, source.clone());
                 Ok(Some(source))
             }
             None => Ok(None),
@@ -508,25 +310,25 @@ impl<'a> StatusViewContext<'a> {
     }
 
     fn poll(&mut self, id: Id) -> Result<Option<Poll>, ApiError> {
-        if let Some(poll) = self.polls.get(&id) {
+        if let Some(poll) = self.batch.polls.get(&id) {
             return Ok(Some(poll.clone()));
         }
         let fetched = self.store.polls_by_ids(std::slice::from_ref(&id))?;
         let poll = fetched.get(&id).cloned();
         if let Some(poll) = &poll {
-            self.polls.insert(id, poll.clone());
+            self.batch.polls.insert(id, poll.clone());
         }
         Ok(poll)
     }
 
     fn ballot(&mut self, poll_id: Id, viewer: Id) -> Result<Option<Vec<u64>>, ApiError> {
-        if let Some(ballot) = self.ballots.get(&poll_id) {
+        if let Some(ballot) = self.batch.ballots.get(&poll_id) {
             return Ok(Some(ballot.clone()));
         }
         let fetched = self.store.ballots(std::slice::from_ref(&poll_id), viewer)?;
         let ballot = fetched.get(&poll_id).cloned();
         if let Some(ballot) = &ballot {
-            self.ballots.insert(poll_id, ballot.clone());
+            self.batch.ballots.insert(poll_id, ballot.clone());
         }
         Ok(ballot)
     }
@@ -551,23 +353,23 @@ impl<'a> StatusViewContext<'a> {
     /// a point lookup fallback (only reachable for chains beyond the prefetch
     /// rounds).
     fn muted_for(&mut self, viewer: Id, status: &Status) -> Result<bool, ApiError> {
-        if let Some(muted) = self.muted_by_status.get(&status.id) {
+        if let Some(muted) = self.batch.muted_by_status.get(&status.id) {
             return Ok(*muted);
         }
         let muted = crate::application::conversations::status_muted(self.store, viewer, status)?;
-        self.muted_by_status.insert(status.id, muted);
+        self.batch.muted_by_status.insert(status.id, muted);
         Ok(muted)
     }
 
     /// Flags for one id, from the batched cache (point lookup on a miss —
     /// only reachable for chains beyond the prefetch rounds).
     fn flag_for(&mut self, viewer: Id, id: Id) -> Result<StatusViewFlags, ApiError> {
-        if let Some(flags) = self.flags.get(&id) {
+        if let Some(flags) = self.batch.flags.get(&id) {
             return Ok(*flags);
         }
         let mut fetched = self.store.viewer_status_flags(viewer, &[id])?;
         let flags = fetched.remove(&id).unwrap_or_default();
-        self.flags.insert(id, flags);
+        self.batch.flags.insert(id, flags);
         Ok(flags)
     }
 
@@ -648,7 +450,7 @@ impl<'a> StatusViewContext<'a> {
     /// `pair_state(account, viewer)` — does the account block/follow/mute the
     /// viewer?
     fn incoming_pair(&mut self, account: Id) -> Result<PairState, ApiError> {
-        if let Some((incoming, _)) = self.pairs.get(&account) {
+        if let Some((incoming, _)) = self.batch.pairs.get(&account) {
             return Ok(*incoming);
         }
         let Some(viewer) = self.viewer else {
@@ -659,14 +461,14 @@ impl<'a> StatusViewContext<'a> {
             .get(&account)
             .map(|(incoming, _)| *incoming)
             .unwrap_or_default();
-        self.pairs.insert(account, (pair, PairState::default()));
+        self.batch.pairs.insert(account, (pair, PairState::default()));
         Ok(pair)
     }
 
     /// `pair_state(viewer, account)` — does the viewer block/follow/mute the
     /// account?
     fn outgoing_pair(&mut self, account: Id) -> Result<PairState, ApiError> {
-        if let Some((_, outgoing)) = self.pairs.get(&account) {
+        if let Some((_, outgoing)) = self.batch.pairs.get(&account) {
             return Ok(*outgoing);
         }
         let Some(viewer) = self.viewer else {
@@ -677,12 +479,12 @@ impl<'a> StatusViewContext<'a> {
             .get(&account)
             .map(|(_, outgoing)| *outgoing)
             .unwrap_or_default();
-        self.pairs.insert(account, (PairState::default(), pair));
+        self.batch.pairs.insert(account, (PairState::default(), pair));
         Ok(pair)
     }
 
     fn quote_record(&mut self, quoting_status_id: Id) -> Result<Option<QuoteRecord>, ApiError> {
-        if let Some(quote) = self.quotes.get(&quoting_status_id) {
+        if let Some(quote) = self.batch.quotes.get(&quoting_status_id) {
             return Ok(Some(quote.clone()));
         }
         if self.quote_probed.contains(&quoting_status_id) {
@@ -692,7 +494,7 @@ impl<'a> StatusViewContext<'a> {
         self.quote_probed.insert(quoting_status_id);
         let quote = fetched.get(&quoting_status_id).cloned();
         if let Some(quote) = &quote {
-            self.quotes.insert(quoting_status_id, quote.clone());
+            self.batch.quotes.insert(quoting_status_id, quote.clone());
         }
         Ok(quote)
     }

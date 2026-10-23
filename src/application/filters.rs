@@ -18,9 +18,8 @@ use std::collections::HashMap;
 
 use regex::RegexBuilder;
 
-use crate::api::mastodon::dto;
 use crate::application::policy;
-use crate::application::ports::{FilterBundle, FilterPatch, NewFilter, Store};
+use crate::application::ports::{FilterBundle, FilterPatch, NewFilter, Store, filter_result_json};
 use crate::domain::{CustomFilter, Error, FilterAction, FilterKeyword, FilterStatus, Id, Result, Status};
 
 /// Mastodon en.yml validation messages (exact strings, 422 bodies).
@@ -673,7 +672,7 @@ fn filter_results_scoped(
             if keyword_matches.is_empty() && status_matches.is_empty() {
                 continue;
             }
-            let entry = dto::filter_result_json(bundle, keyword_matches, status_matches);
+            let entry = filter_result_json(bundle, keyword_matches, status_matches);
             out.entry(status.id).or_default().push(entry.clone());
             if let Some(reblog_of) = status.reblog_of_id {
                 out.entry(reblog_of).or_default().push(entry);

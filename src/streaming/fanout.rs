@@ -87,7 +87,14 @@ fn status_changed(core: &Core, status_id: Id, edited: bool) {
     // The anonymous public payload is rendered once per event, then shared.
     let mut anonymous: Option<Value> = None;
     for (conn, sub) in core.subscriptions() {
-        let frames = match status_frames(core, now, &sub, &status, edited, event, &mut anonymous) {
+        let ctx = FrameCtx {
+            now,
+            sub: &sub,
+            status: &status,
+            edited,
+            event,
+        };
+        let frames = match status_frames(core, &ctx, &mut anonymous) {
             Ok(frames) => frames,
             Err(err) => {
                 warn("status gate or render", err);
@@ -100,58 +107,84 @@ fn status_changed(core: &Core, status_id: Id, edited: bool) {
     }
 }
 
+/// Per-subscription frame context for [`status_frames`]: the event being
+/// fanned out, the subscription under test, and the status (plus its edit
+/// flag). The anonymous-payload cache stays with the caller: it is shared
+/// across subscriptions for one event, not per-subscription state.
+pub(super) struct FrameCtx<'a> {
+    pub now: u64,
+    pub sub: &'a Subscription,
+    pub status: &'a Status,
+    pub edited: bool,
+    pub event: &'static str,
+}
+
 /// The frames one status produces for one subscription.
 fn status_frames(
     core: &Core,
-    now: u64,
-    sub: &Subscription,
-    status: &Status,
-    edited: bool,
-    event: &'static str,
+    ctx: &FrameCtx,
     anonymous: &mut Option<Value>,
 ) -> Result<Vec<(&'static str, Value)>, String> {
     let store = &*core.store;
-    let viewer = sub.viewer;
-    let mentioned = edited && status.mentions.contains(&viewer);
+    let viewer = ctx.sub.viewer;
+    let mentioned = ctx.edited && ctx.status.mentions.contains(&viewer);
     let mut out = Vec::new();
-    match &sub.kind {
+    match &ctx.sub.kind {
         StreamKind::User => {
-            if timelines::home_includes(store, viewer, status, now).map_err(err)? {
-                out.push((event, personal(core, now, viewer, status)?));
+            if timelines::home_includes(store, viewer, ctx.status, ctx.now).map_err(err)? {
+                out.push((ctx.event, personal(core, ctx.now, viewer, ctx.status)?));
             }
             // Upstream's notification channel carries edits to mentioned
             // viewers, and `user` includes that channel when the token may
             // read notifications. A followed mention therefore gets the edit
             // twice, as upstream does.
-            if mentioned && sub.notifications_scope {
-                out.push(("status.update", personal(core, now, viewer, status)?));
+            if mentioned && ctx.sub.notifications_scope {
+                out.push((
+                    "status.update",
+                    personal(core, ctx.now, viewer, ctx.status)?,
+                ));
             }
         }
         StreamKind::UserNotification => {
             if mentioned {
-                out.push(("status.update", personal(core, now, viewer, status)?));
+                out.push((
+                    "status.update",
+                    personal(core, ctx.now, viewer, ctx.status)?,
+                ));
             }
         }
         StreamKind::Direct => {}
         StreamKind::Public { locality, media } => {
-            let selected = public_selected(store, status, *locality, *media);
-            if selected && timelines::public_stream_includes(store, Some(viewer), status, now).map_err(err)? {
-                out.push((event, public(core, now, viewer, status, anonymous)?));
+            let selected = public_selected(store, ctx.status, *locality, *media);
+            if selected
+                && timelines::public_stream_includes(store, Some(viewer), ctx.status, ctx.now)
+                    .map_err(err)?
+            {
+                out.push((
+                    ctx.event,
+                    public(core, ctx.now, viewer, ctx.status, anonymous)?,
+                ));
             }
         }
         StreamKind::Hashtag { tag, local } => {
-            let tagged = status.tags.iter().any(|t| t == tag);
-            let local_ok = !*local || is_local(store, status.account_id);
+            let tagged = ctx.status.tags.iter().any(|t| t == tag);
+            let local_ok = !*local || is_local(store, ctx.status.account_id);
             if tagged
                 && local_ok
-                && timelines::tag_stream_includes(store, Some(viewer), status, now).map_err(err)?
+                && timelines::tag_stream_includes(store, Some(viewer), ctx.status, ctx.now)
+                    .map_err(err)?
             {
-                out.push((event, public(core, now, viewer, status, anonymous)?));
+                out.push((
+                    ctx.event,
+                    public(core, ctx.now, viewer, ctx.status, anonymous)?,
+                ));
             }
         }
         StreamKind::List { list_id } => {
-            if timelines::list_stream_includes(store, viewer, *list_id, status, now).map_err(err)? {
-                out.push((event, personal(core, now, viewer, status)?));
+            if timelines::list_stream_includes(store, viewer, *list_id, ctx.status, ctx.now)
+                .map_err(err)?
+            {
+                out.push((ctx.event, personal(core, ctx.now, viewer, ctx.status)?));
             }
         }
     }

@@ -7,6 +7,7 @@ pub mod pagination;
 pub mod rate_limits;
 pub mod dto;
 pub mod status_view;
+pub mod status_view_batch;
 pub mod endpoints;
 
 use std::net::IpAddr;
