@@ -9,6 +9,7 @@ use activitypub_federation::protocol::context::WithContext;
 use birchtree::activitypub::activities::Activity;
 
 const PINETREE_QUOTE_CREATE: &str = include_str!("fixtures/pinetree-quote-create.json");
+const MISSKEY_QUOTE_CREATE: &str = include_str!("fixtures/misskey-quote-create.json");
 
 #[test]
 fn pinetree_quote_create_parses() {
@@ -38,3 +39,37 @@ fn quote_aliases_merge_with_canonical_priority() {
     );
     assert_eq!(note.quote_uri().map(|u| u.as_str()), Some(target));
 }
+
+// Upstream Misskey (2026.10.1-alpha.1, captured live from the native rig)
+// emits only the legacy _misskey_quote + quoteUrl spellings - no
+// canonical FEP-044f quote, no quoteUri, no interaction policy.
+// The pre-d46444b parser rejected even this shape (duplicate alias hits),
+// so this test pins receiver generality beyond pinetree's superset shape.
+#[test]
+fn misskey_quote_create_parses() {
+    let act: WithContext<Activity> = serde_json::from_str(MISSKEY_QUOTE_CREATE)
+        .expect("upstream misskey quote Create must parse");
+    match act.inner() {
+        Activity::Create(c) => {
+            assert_eq!(
+                c.id.as_str(),
+                "http://misskey.lab/notes/aspddpm3y2/activity",
+            );
+        }
+        other => panic!("expected Create, got {other:?}"),
+    }
+}
+
+#[test]
+fn misskey_quote_target_resolves_without_canonical() {
+    let doc: serde_json::Value = serde_json::from_str(MISSKEY_QUOTE_CREATE).unwrap();
+    let note: birchtree::activitypub::wire::Note =
+        serde_json::from_value(doc.get("object").unwrap().clone()).unwrap();
+    // No canonical quote; the legacy alias still yields the target.
+    assert!(note.quote.is_none());
+    assert_eq!(
+        note.quote_uri().map(|u| u.as_str()),
+        Some("http://misskey.lab/notes/asp78cxjon")
+    );
+}
+
